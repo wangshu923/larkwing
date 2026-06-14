@@ -1,0 +1,37 @@
+[package]
+name = "larkwing-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.2"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+# 影音转发服务(localhost 流中继):只开 http1+tokio+query,不带宏/多余中间件
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
+bytes = "1"
+bzip2 = "0.5.2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+cpal = "0.17.1"
+futures-util = "0.3"
+# fs_find 的 glob 匹配(只用 Pattern 匹配器,目录行走自己来——要管深度/隐藏/上限)
+glob = "0.3"
+msedge-tts = "0.4.0"
+pinyin = "0.11.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+# web 工具的 HTML 解析(搜索结果页 + 正文抽取)
+scraper = "0.23"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 组件下载的完整性校验(SHA2-256SUMS)
+sha2 = "0.10"
+sherpa-onnx = "1.13.2"
+symphonia = { version = "0.5.5", default-features = false, features = ["mp3"] }
+tar = "0.4.46"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "fs", "io-util"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = "0.1"
+# ffmpeg 发行包是 zip(yt-dlp 是裸二进制不经它)
+zip = { version = "2", default-features = false, features = ["deflate"] }

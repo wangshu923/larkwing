@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Tauri v2 自动合并进 bundle;mac 麦克风权限文案(听写,PLAN §11)。
+     发布目标是 Windows(无此要求),这份只服务 mac 开发机。 -->
+<plist version="1.0">
+<dict>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>用于听你说话(语音输入)。声音只在本机处理,不上传。</string>
+</dict>
+</plist>

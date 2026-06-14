@@ -1,0 +1,49 @@
+# ── Rust / Cargo ──────────────────────────────────────────────
+# 编译产物(workspace 根 + src-tauri,Tauri 打包输出也在 target 下)
+**/target/
+# 保留 Cargo.lock:这是应用(二进制),锁版本随仓库走 —— 不要忽略
+
+# ── Tauri ─────────────────────────────────────────────────────
+# 生成的 schema(src-tauri/.gitignore 也覆盖,这里兜底)
+src-tauri/gen/schemas/
+
+# ── Node / 前端(Vite + Vue + pnpm)─────────────────────────────
+node_modules/
+# Vite 构建输出(tauri.conf.json 的 frontendDist 指向它,pnpm build 重新生成)
+/dist/
+.vite/
+# 保留 pnpm-lock.yaml —— 不要忽略
+
+# ── TypeScript ────────────────────────────────────────────────
+*.tsbuildinfo
+
+# ── 密钥 / 环境(LLM key 等绝不进仓库)────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── 日志 ──────────────────────────────────────────────────────
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ── Python(scripts/ 下的资产生成脚本)─────────────────────────────
+__pycache__/
+*.py[cod]
+
+# ── 编辑器 / IDE ──────────────────────────────────────────────
+.idea/
+*.swp
+*.swo
+*~
+
+# ── macOS ─────────────────────────────────────────────────────
+.DS_Store
+
+# ── 协作 / 内部文档(业务无关,不进仓库)──────────────────────────
+# Claude Code 指令 + 分阶段规划 + Claude 本地配置
+CLAUDE.md
+PLAN.md
+.claude/
