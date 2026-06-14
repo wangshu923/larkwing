@@ -115,12 +115,37 @@ function toggle() {
 // 单击 / 双击区分(同一胶囊):单击延迟一拍执行展开/收起,期间若来了双击就取消、改为开主窗
 let tapTimer: ReturnType<typeof setTimeout> | undefined
 function onCapTap() {
+  if (suppressClick) return // 刚才是拖动,不当点击(见 onCapDown);复位交给那里的 timer
   clearTimeout(tapTimer)
   tapTimer = setTimeout(() => void toggle(), 230)
 }
 function onCapDouble() {
   clearTimeout(tapTimer)
   openMain()
+}
+
+// 拖动:手动接管,不用 data-tauri-drag-region —— 后者在 Windows 上会吞掉单击 click
+//(Tauri v2 已知问题 #9751/#9901),Mac 不暴露。做法:按下后只有移动超阈值才进原生拖动;
+// 纯点击(不动)照常触发 click/dblclick,展开/开主窗不受影响。
+let suppressClick = false
+function onCapDown(e: MouseEvent) {
+  if (e.button !== 0) return // 只左键拖
+  const sx = e.screenX
+  const sy = e.screenY
+  const onMove = (m: MouseEvent) => {
+    if (Math.abs(m.screenX - sx) > 4 || Math.abs(m.screenY - sy) > 4) {
+      cleanup()
+      suppressClick = true // 抑制拖动收尾时可能合成的误触 click(本意是拖,不是展开)
+      setTimeout(() => (suppressClick = false), 400)
+      floatWin.startDragging()
+    }
+  }
+  const cleanup = () => {
+    window.removeEventListener('mousemove', onMove)
+    window.removeEventListener('mouseup', cleanup)
+  }
+  window.addEventListener('mousemove', onMove)
+  window.addEventListener('mouseup', cleanup, { once: true })
 }
 
 // 点通知 → 唤主窗 + 跳对应会话;关闭走框外"小耳朵"(只收起回胶囊,不误关整窗)
@@ -173,7 +198,7 @@ onUnmounted(() => stopMoved())
     <!-- shell:column = 胶囊顶 / 内容下(向下展开);column-reverse = 内容上 / 胶囊底(向上展开) -->
     <div class="shell" :class="{ up: openUp }">
       <!-- 胶囊:始终在(锚点不动);单击 toggle、按住拖。内部 pointer-events:none 让点击穿透到胶囊 -->
-      <div class="cap" data-tauri-drag-region @click="onCapTap" @dblclick="onCapDouble">
+      <div class="cap" @mousedown="onCapDown" @click="onCapTap" @dblclick="onCapDouble">
         <div class="bar">
           <span class="bar-text" :class="bar.tone">{{ bar.text }}</span>
           <span v-if="bar.wave" class="wave"><i v-for="(h, i) in waveBars" :key="i" :style="{ height: h + 'px' }" /></span>

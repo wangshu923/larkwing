@@ -29,3 +29,8 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 flate2 = "1"
 time = "0.3"
+# rustls 0.23 进程级 crypto provider:依赖树里 aws-lc-rs(reqwest)与 ring
+# (msedge-tts→rustls-platform-verifier)并存,启动时显式装一个,否则语音合成 panic。
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
+# 终端 CTRL+C 兜底:GUI/托盘设计下事件循环不理会 SIGINT,开发时进程停不掉。
+ctrlc = "3"

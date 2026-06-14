@@ -1,0 +1,15 @@
+# ── Windows (MSVC) 专属:静态链接 CRT(/MT)──────────────────────────────
+#
+# 缘由:语音栈依赖 sherpa-onnx-sys,它在 Windows 上下载的预编译库是
+#   sherpa-onnx-v*-win-x64-static-MT-Release(静态 CRT,即 /MT)。
+# 而 Rust + Tauri 在 windows-msvc 下默认用动态 CRT(/MD),两者混链会报:
+#   LNK2038: mismatch detected for 'RuntimeLibrary': 'MT_StaticRelease' vs 'MD_DynamicRelease'
+#
+# 开 +crt-static 让整个 Rust 侧统一到 /MT;连带 cc 编译的 rusqlite(bundled
+# SQLite)、bzip2-sys 也会跟着切到 /MT,与 sherpa 的预编译库一致,链接干净。
+# 全静态还有个好处:产出的 exe 不依赖 vcruntime140.dll,目标机直接能跑。
+#
+# 仅作用于 windows-msvc,不影响 macOS / Linux 已经跑通的 static 链路
+#(那两个平台的 C 运行时没有 MT/MD 之分,无需此设置)。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

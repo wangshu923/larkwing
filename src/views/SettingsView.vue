@@ -62,9 +62,31 @@ async function loadVoice() {
 // 喊名字唤醒(C 期):开关 = voice_wake_set 一体化入口(写库 + 起停;首次开会
 // 下 KWS 模型 + 预合成应答音,按钮转菊花)。wakeRunning 是事实,失败自然回弹。
 const wakeBusy = ref(false)
+// 开启失败的可见出口(铁律 §3.5:能点的必有反应、出错有友好退路)。原先失败只
+// console.error → Win 上看不到任何反馈,开关只闪一下就回弹 = 用户眼里"打不开"。
+const wakeError = ref('')
+// 唤醒词合法性,与后端 encode_keywords 同口径:逐词必须纯中文,否则整词被丢弃;
+// 一个能用的都没有 = 根本起不来(就是唤醒词填 "BT" 这种坑)。空 = 用默认词,不算问题。
+function keywordIssue(text: string): 'ok' | 'all-bad' | 'some-bad' {
+  const words = text.split(/[、,，;；\s]+/).map((s) => s.trim()).filter(Boolean)
+  if (words.length === 0) return 'ok'
+  const good = words.filter((w) => /^[一-鿿]+$/.test(w)) // 纯中文(CJK 基本区)
+  if (good.length === 0) return 'all-bad'
+  return good.length < words.length ? 'some-bad' : 'ok'
+}
 async function toggleWake() {
   if (wakeBusy.value) return
   const target = !(voiceInfo.value?.wakeRunning ?? false)
+  wakeError.value = ''
+  // 拦在最前(也拦在调后端之前):唤醒词全不是中文时后端必抛(keywords_buf 为空),
+  // 与其白跑一趟再静默回弹,不如就地给精确话(这正是 "BT" 打不开的根因)。
+  if (target) {
+    const eff = keywordsDraft.value.trim() || (voiceInfo.value?.keywords ?? []).join('、')
+    if (keywordIssue(eff) === 'all-bad') {
+      wakeError.value = t('settings.voice.keywordsAllInvalid')
+      return
+    }
+  }
   if (!isTauri()) {
     if (voiceInfo.value) voiceInfo.value.wakeRunning = target // 预览:纯看交互
     return
@@ -73,13 +95,16 @@ async function toggleWake() {
   try {
     voiceInfo.value = await api.voiceWakeSet(target)
   } catch (e) {
-    console.error('唤醒开关失败', e)
+    console.error('唤醒开关失败', e) // message 进日志,给用户的是友好兜底文案
+    wakeError.value = t('settings.voice.wakeFailed')
   } finally {
     wakeBusy.value = false
   }
 }
-// 唤醒词:失焦保存;开着唤醒时重启循环让新词立即生效
+// 唤醒词:失焦保存;开着唤醒时重启循环让新词立即生效。边打边提示非中文(拦输入)
 const keywordsDraft = ref('')
+const keywordWarn = computed(() => keywordIssue(keywordsDraft.value))
+watch(keywordsDraft, () => (wakeError.value = '')) // 一动词就清掉上次开启失败的红字,别让它发霉
 async function saveKeywords() {
   const v = keywordsDraft.value.trim()
   if (!v) return
@@ -90,6 +115,7 @@ async function saveKeywords() {
       voiceInfo.value = await api.voiceWakeSet(true)
     } catch (e) {
       console.error('唤醒词生效失败', e)
+      wakeError.value = t('settings.voice.wakeFailed')
     }
   } else if (isTauri()) {
     voiceInfo.value = await api.voiceStatus().catch(() => voiceInfo.value)
@@ -120,6 +146,9 @@ function setMic(ev: Event) {
 const needKey = computed(() => chat.ready && !chat.hasApiKey)
 
 // —— 系统 tab:开机自启(OS 真相源,独立命令)+ 桌面悬浮窗(ui.float.* 设置,PLAN §12) ——
+// dev(tauri dev)下前端走 Vite devUrl、二进制在 target/debug —— 此时设自启会写一条指向 debug exe 的注册表项,
+// 开机却连不上 1420 → 白屏。故 dev build 禁用开关(import.meta.env.DEV 精确反映"前端是否走 dev server")。
+const isDev = import.meta.env.DEV
 const autostart = ref(false)
 const autostartBusy = ref(false)
 async function loadAutostart() {
@@ -131,7 +160,7 @@ async function loadAutostart() {
   }
 }
 async function toggleAutostart() {
-  if (autostartBusy.value) return
+  if (autostartBusy.value || isDev) return // dev 下禁用(见上);UI 已 disabled,这里再挡一道
   const target = !autostart.value
   if (!isTauri()) {
     autostart.value = target
@@ -474,7 +503,9 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             </button>
           </span>
         </div>
-        <p class="hint">{{ t('settings.voice.wakeHint') }}</p>
+        <!-- 失败有了去处:不再只闪一下回弹(铁律 §3.5) -->
+        <p v-if="wakeError" class="hint err">{{ wakeError }}</p>
+        <p v-else class="hint">{{ t('settings.voice.wakeHint') }}</p>
 
         <p class="section">{{ t('settings.voice.advanced') }}</p>
         <div class="row">
@@ -482,12 +513,16 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           <input
             v-model="keywordsDraft"
             class="s-input"
+            :class="{ bad: keywordWarn === 'all-bad' }"
             :placeholder="(voiceInfo?.keywords ?? []).join('、') || t('settings.voice.keywordsPlaceholder')"
             @blur="saveKeywords"
             @keyup.enter="saveKeywords"
           />
         </div>
-        <p class="hint">{{ t('settings.voice.keywordsHint') }}</p>
+        <!-- 拦输入:非中文当场标出来,不等点「打开」才暴露 -->
+        <p v-if="keywordWarn === 'all-bad'" class="hint err">{{ t('settings.voice.keywordsAllInvalid') }}</p>
+        <p v-else-if="keywordWarn === 'some-bad'" class="hint warn">{{ t('settings.voice.keywordsSomeInvalid') }}</p>
+        <p v-else class="hint">{{ t('settings.voice.keywordsHint') }}</p>
         <div v-for="(seg, name) in { rate: segs.rate, patience: segs.patience }" :key="name" class="row">
           <span class="label">{{ t(`settings.voice.${name}`) }}</span>
           <span class="seg">
@@ -553,12 +588,12 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           <span class="label">{{ t('settings.system.autostart') }}</span>
           <span class="key-state">
             <span class="chip" :class="{ on: autostart }">{{ autostart ? t('settings.system.on') : t('settings.system.off') }}</span>
-            <button class="link" :disabled="autostartBusy" @click="toggleAutostart">
-              {{ autostartBusy ? t('settings.system.busy') : autostart ? t('settings.system.turnOff') : t('settings.system.turnOn') }}
+            <button class="link" :disabled="autostartBusy || isDev" @click="toggleAutostart">
+              {{ isDev ? t('settings.system.autostartDevTag') : autostartBusy ? t('settings.system.busy') : autostart ? t('settings.system.turnOff') : t('settings.system.turnOn') }}
             </button>
           </span>
         </div>
-        <p class="hint">{{ t('settings.system.autostartHint') }}</p>
+        <p class="hint">{{ isDev ? t('settings.system.autostartDev') : t('settings.system.autostartHint') }}</p>
         <div class="row">
           <span class="label">{{ t('settings.system.floatWin') }}</span>
           <span class="key-state">
@@ -647,6 +682,9 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .chip.on { border-color: rgba(95, 200, 255, 0.45); color: var(--cy); }
 .chip.future { opacity: .62; color: var(--txt2); }
 .hint { font-size: 12px; color: var(--txt2); line-height: 1.7; display: flex; align-items: center; gap: 10px; padding-top: 13px; }
+.hint.err { color: #f09595; }
+.hint.warn { color: #ffc85f; }
+.s-input.bad { border-color: #f09595; }
 
 .teaser { padding: 26px 0; color: var(--txt2); font-size: 13.5px; }
 .teaser p { margin: 10px 0 0; }

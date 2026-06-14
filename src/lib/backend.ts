@@ -335,6 +335,10 @@ export const floatWin = {
   hideSelf: () => {
     if (isTauri()) void getCurrentWindow().hide()
   },
+  /** 手动拖动:替代 data-tauri-drag-region(它在 Windows 上会吞掉单击 click,见 FloatWindow 手势)。 */
+  startDragging: () => {
+    if (isTauri()) void getCurrentWindow().startDragging()
+  },
   /** 读当前窗口盒 + 所在屏幕上下边(逻辑像素):前端据此算锚点 / 判断向上还是向下展开。 */
   box: async (): Promise<{
     x: number

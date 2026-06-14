@@ -74,7 +74,7 @@ larkwing/
 
 - **Rust**(stable,≥ 1.77.2)
 - **Node.js** + **pnpm**
-- **Tauri v2 系统依赖**:macOS 装 Xcode Command Line Tools;出 Windows 包需 WebView2 + MSVC(见 [Tauri 文档](https://tauri.app/start/prerequisites/))
+- **Tauri v2 系统依赖**:macOS 装 Xcode Command Line Tools;Linux 见 [`.github/workflows/release.yml`](.github/workflows/release.yml) 里的 apt 清单;Windows 本地编译见 [docs/BUILD-WINDOWS.md](docs/BUILD-WINDOWS.md)(VS Build Tools + WebView2 等,附 winget 一键)
 
 ### 跑起来
 
@@ -90,8 +90,12 @@ cargo test            # Rust 核心测试(workspace 全量)
 ### 出包
 
 ```bash
-pnpm tauri build      # 桌面安装包(在 Windows 上构建即出 Windows 包)
+pnpm tauri build      # 在当前平台出当前平台的包(产物在 target/release/bundle/)
 ```
+
+> ⚠️ **不能跨平台出包**:Mac 上编不出 Windows 包(Tauri 不支持跨平台打包,且语音栈 sherpa-onnx 的预编译库按平台分发)。出 Windows 包走以下任一:
+> - **(a) GitHub Actions** —— [`.github/workflows/release.yml`](.github/workflows/release.yml),Actions 页面手动 Run 或打 `v*` tag,一次出 Windows/macOS/Linux 三平台。
+> - **(b) 一台 Windows 机器** —— 按 [docs/BUILD-WINDOWS.md](docs/BUILD-WINDOWS.md) 装好后 `pnpm tauri build`。
 
 > **首次运行会按需下载外部组件**(yt-dlp / ffmpeg / 语音模型)到数据目录 —— 安装包里不含它们,性质同浏览器下载文件。
 

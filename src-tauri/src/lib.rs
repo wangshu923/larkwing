@@ -16,6 +16,19 @@ struct LogGuard(#[allow(dead_code)] tracing_appender::non_blocking::WorkerGuard)
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+  // rustls 0.23 不再自动选 crypto provider:依赖树里 aws-lc-rs(reqwest 拉)与 ring
+  // (msedge-tts→rustls-platform-verifier 拉)同时存在,不在进程级装一个默认 provider,
+  // msedge-tts 合成走 ClientConfig::with_platform_verifier()→ClientConfig::builder() 时
+  // 会因"两个 feature 都在、无法自动裁决"而 panic(表现:免手唤醒应答音 / 语音回复全静默)。
+  // 这里装配最前装一次,所有 rustls 消费方(reqwest 的 get_default + msedge-tts)统一用它。
+  let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+  // 终端 CTRL+C 兜底:正常退出走托盘菜单「退出」(§12 托盘锚点;关窗=隐藏)。但从终端起
+  // 的开发/调试场景,GUI 事件循环不接管 SIGINT,进程停不掉。ctrlc 用独立线程接管信号
+  // (跨平台:Unix SIGINT / Windows CTRL_C_EVENT,后者仅在带控制台时有效),硬退出。
+  // release 的 windows_subsystem="windows" 无控制台,本就收不到信号,不影响托盘退出语义。
+  let _ = ctrlc::set_handler(|| std::process::exit(0));
+
   // WebView2 跟 Chromium 自动播放策略:工具触发的播放(IPC 事件)不算用户手势,
   // 不放开会被静音拦截。WKWebView(Mac 开发机)不吃这套,失败兜底 = 播放条点 ▶。
   #[cfg(windows)]

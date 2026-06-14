@@ -250,9 +250,14 @@ export default {
       wakeListening: '听「{kw}」', // 只读状态,不是输入框
       wakeIdle: '关着',
       wakeHint: '打开后它会一直竖着耳朵等你喊名字;听到的声音只在本机处理,不上传。首次打开会准备一个小模型。',
+      // 开启失败的友好兜底(铁律 §3.5:后端 message 进日志,不给普通人看)。唤醒词
+      // 这类已知坑由前端就地拦下并给精确话;这里只兜剩下的(麦克风/网络/模型)。
+      wakeFailed: '没能打开 —— 看看麦克风权限和网络,或者过会儿再试一次。',
       keywords: '唤醒词',
       keywordsPlaceholder: '中文词,顿号分隔,比如:小七、旺财',
       keywordsHint: '想换个名字喊它,就改这里(只认中文)。', // 改词的唯一入口
+      keywordsAllInvalid: '唤醒词只认中文 —— 换成中文名字(比如「小七」)才喊得醒它。',
+      keywordsSomeInvalid: '只有中文词能用,带字母/数字的那些会被忽略。',
       winDuckHint: 'Windows 上若开唤醒后其它声音变小:系统设置 → 声音 → 通信 → 选「不执行任何操作」。',
       advanced: '高级',
       rate: '语速',
@@ -281,6 +286,8 @@ export default {
       desktop: '开机与桌面',
       autostart: '开机自启',
       autostartHint: '开机时让旺财自己上线、缩在托盘里候着;关掉主窗它也不退,点托盘图标随时唤回。',
+      autostartDevTag: '仅正式版',
+      autostartDev: '开发调试版(tauri dev)下设了不管用 —— 自启会指向临时调试程序、还连不上本地前端;装好正式版再来开。',
       floatWin: '桌面悬浮窗',
       floatOpacity: '悬浮窗透明度',
       floatUsage: '待机轮播带用量(今日花费 / 余额)',
