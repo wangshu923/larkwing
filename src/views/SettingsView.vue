@@ -145,19 +145,32 @@ async function saveSensitivity(v: number) {
 }
 
 const previewing = ref('')
+let previewAudio: HTMLAudioElement | null = null
 async function previewSpeaker(id: string) {
   settings.set('voice.speaker', id)
-  if (!isTauri() || previewing.value) return
+  if (!isTauri()) return
+  // 换试听:先停掉上一条。原来若上一条还在放就 `return` 吞掉本次点击 —— 表现成"有的音色
+  // 点了不出声"(其实是被前一条挡住),连点几个时每隔一个就哑。改成"后点覆盖先点"。
+  if (previewAudio) {
+    previewAudio.pause()
+    previewAudio = null
+  }
   previewing.value = id
   try {
     const url = await api.voicePreview(id, t('settings.voice.previewLine'))
+    if (previewing.value !== id) return // 合成期间又点了别的:只认最后那次
     const a = new Audio(url)
-    a.addEventListener('ended', () => (previewing.value = ''))
-    a.addEventListener('error', () => (previewing.value = ''))
+    previewAudio = a
+    const clear = () => {
+      if (previewAudio === a) previewAudio = null
+      if (previewing.value === id) previewing.value = ''
+    }
+    a.addEventListener('ended', clear)
+    a.addEventListener('error', clear)
     void a.play()
   } catch (e) {
     console.error('试听失败', e)
-    previewing.value = ''
+    if (previewing.value === id) previewing.value = ''
   }
 }
 function setMic(ev: Event) {
@@ -556,6 +569,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               max="100"
               step="5"
               :value="Number(settings.get('voice.wake.sensitivity') || '50')"
+              @input="settings.set('voice.wake.sensitivity', ($event.target as HTMLInputElement).value)"
               @change="saveSensitivity(Number(($event.target as HTMLInputElement).value))"
             />
             <small>{{ t('settings.voice.sensKeen') }}</small>

@@ -5,7 +5,9 @@
 //! 编排者仍是前端 VM(它才知道回合/念话何时结束);本线程只管声学侧。
 
 use std::collections::HashSet;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -57,6 +59,128 @@ enum Phase {
     FollowUp,
 }
 
+impl Phase {
+    fn label(&self) -> &'static str {
+        match self {
+            Phase::Watch => "Watch",
+            Phase::AwaitTurn(_) => "AwaitTurn",
+            Phase::FollowUp => "FollowUp",
+        }
+    }
+}
+
+/// 临时诊断(生产默认零开销):设了环境变量 `LARKWING_KWS_DUMP_DIR=<目录>` 时,把
+/// Watch 阶段「原样喂给 KWS 的 16k mono 音频」连续写成 wav,并每 2s 报一次电平。
+/// 用法:把产物 wav 离线喂 `examples/kws_replay`——命中 = 采集没问题(真因在循环时序);
+/// 不命中 = 采集质量(声道下混/重采样)坐实。peak 接近 0 = 信号过弱(疑下混砍电平/死声道)。
+struct WatchDump {
+    file: std::fs::File,
+    path: PathBuf,
+    data_bytes: u32,
+    win_peak: f32,
+    win_sumsq: f64,
+    win_n: usize,
+    last_log: Instant,
+}
+
+impl WatchDump {
+    fn from_env() -> Option<Self> {
+        let dir = std::env::var("LARKWING_KWS_DUMP_DIR").ok().filter(|s| !s.is_empty())?;
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let path = PathBuf::from(dir).join(format!("kws_watch_{millis}.wav"));
+        let mut file = match std::fs::File::create(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!("KWS 诊断 wav 建不了({}): {e}", path.display());
+                return None;
+            }
+        };
+        if let Err(e) = write_wav_header(&mut file, 0) {
+            tracing::error!("KWS 诊断 wav 头写失败: {e}");
+            return None;
+        }
+        tracing::warn!("⚑ KWS 诊断落盘开启 → {}(Watch 音频原样写入)", path.display());
+        Some(Self {
+            file,
+            path,
+            data_bytes: 0,
+            win_peak: 0.0,
+            win_sumsq: 0.0,
+            win_n: 0,
+            last_log: Instant::now(),
+        })
+    }
+
+    /// 喂一段 16k mono 帧:写盘 + 累计电平;每 2s 报电平并回填 wav 长度(硬退出也可读)。
+    fn push(&mut self, frames: &[f32]) {
+        let mut buf = Vec::with_capacity(frames.len() * 2);
+        for &s in frames {
+            buf.extend_from_slice(&((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
+            self.win_peak = self.win_peak.max(s.abs());
+            self.win_sumsq += (s as f64) * (s as f64);
+            self.win_n += 1;
+        }
+        match self.file.write_all(&buf) {
+            Ok(()) => self.data_bytes = self.data_bytes.saturating_add(buf.len() as u32),
+            Err(e) => tracing::error!("KWS 诊断 wav 写失败: {e}"),
+        }
+        if self.last_log.elapsed() >= Duration::from_secs(2) && self.win_n > 0 {
+            let rms = (self.win_sumsq / self.win_n as f64).sqrt();
+            let dbfs = 20.0 * self.win_peak.max(1e-6).log10();
+            tracing::info!(
+                "KWS 监听电平(2s 窗): peak={:.3} peak_dBFS={:.1} rms={:.4}",
+                self.win_peak,
+                dbfs,
+                rms
+            );
+            self.win_peak = 0.0;
+            self.win_sumsq = 0.0;
+            self.win_n = 0;
+            self.last_log = Instant::now();
+            let _ = write_wav_sizes(&mut self.file, self.data_bytes);
+            let _ = self.file.seek(SeekFrom::End(0)); // 回末尾续写,别覆盖音频
+        }
+    }
+}
+
+impl Drop for WatchDump {
+    fn drop(&mut self) {
+        let _ = self.file.flush();
+        let _ = write_wav_sizes(&mut self.file, self.data_bytes);
+        tracing::warn!("⚑ KWS 诊断 wav 写完 {} bytes → {}", self.data_bytes, self.path.display());
+    }
+}
+
+/// 16k/mono/16-bit WAV 头(data_len 先占位,收尾回填)。
+fn write_wav_header(f: &mut std::fs::File, data_len: u32) -> std::io::Result<()> {
+    let sr = super::TARGET_RATE;
+    f.write_all(b"RIFF")?;
+    f.write_all(&(36 + data_len).to_le_bytes())?;
+    f.write_all(b"WAVE")?;
+    f.write_all(b"fmt ")?;
+    f.write_all(&16u32.to_le_bytes())?;
+    f.write_all(&1u16.to_le_bytes())?; // PCM
+    f.write_all(&1u16.to_le_bytes())?; // mono
+    f.write_all(&sr.to_le_bytes())?;
+    f.write_all(&(sr * 2).to_le_bytes())?; // byte rate = sr * 1ch * 2byte
+    f.write_all(&2u16.to_le_bytes())?; // block align
+    f.write_all(&16u16.to_le_bytes())?; // bits
+    f.write_all(b"data")?;
+    f.write_all(&data_len.to_le_bytes())?;
+    Ok(())
+}
+
+fn write_wav_sizes(f: &mut std::fs::File, data_len: u32) -> std::io::Result<()> {
+    f.seek(SeekFrom::Start(4))?;
+    f.write_all(&(36 + data_len).to_le_bytes())?;
+    f.seek(SeekFrom::Start(40))?;
+    f.write_all(&data_len.to_le_bytes())?;
+    Ok(())
+}
+
 pub(super) fn run_wake_loop(deps: WakeDeps, cmd: Receiver<WakeCmd>) {
     if let Err(e) = wake_loop(&deps, &cmd) {
         tracing::error!(err = %format!("{e:#}"), "唤醒循环挂了");
@@ -85,8 +209,10 @@ fn wake_loop(d: &WakeDeps, cmd: &Receiver<WakeCmd>) -> Result<()> {
     let hangover = hangover_secs(&d.rt.patience());
     let vad = new_vad(&d.vad_model, hangover)?;
     let mut pipe = open_capture(d.rt.input_device())?;
+    let mut dump = WatchDump::from_env(); // 诊断:设了 LARKWING_KWS_DUMP_DIR 才落盘
     let mut suspended = false;
     let mut phase = Phase::Watch;
+    let mut last_state: &'static str = "init"; // 状态切换日志(判喊话时循环是否在 Watch)
     let mut last_frame = Instant::now(); // watchdog:上次从麦克风拿到帧的时刻
     let mut force_reopen = false; // 流断开/无帧 → 下一轮重开采集
     tracing::info!("唤醒监听中(KWS 常驻)");
@@ -119,6 +245,13 @@ fn wake_loop(d: &WakeDeps, cmd: &Receiver<WakeCmd>) -> Result<()> {
         if suspended || !matches!(phase, Phase::Watch) {
             last_frame = Instant::now();
         }
+        // 状态切换日志:喊「旺财」时若不在 Watch(挂起/回合中/跟进),帧会被丢——
+        // 这能把"采集质量"和"循环时序漏接"分开。
+        let cur_state: &'static str = if suspended { "Suspended" } else { phase.label() };
+        if cur_state != last_state {
+            tracing::info!("唤醒循环状态: {last_state} → {cur_state}");
+            last_state = cur_state;
+        }
         // watchdog:监听态持续无帧 / 流断开 → 重开采集(sounddevice 偶发回调卡死、
         // 设备热插拔的唯一稳定恢复路径,robot 同款)。VAD/KWS 模型不动,只换采集流。
         if matches!(phase, Phase::Watch) && !suspended && (force_reopen || last_frame.elapsed() > WATCHDOG_SILENCE) {
@@ -145,6 +278,9 @@ fn wake_loop(d: &WakeDeps, cmd: &Receiver<WakeCmd>) -> Result<()> {
                 Ok(chunk) => {
                     last_frame = Instant::now();
                     let s16k = pipe.to_16k(&chunk);
+                    if let Some(dp) = dump.as_mut() {
+                        dp.push(&s16k); // 诊断落盘:原样记下喂给 KWS 的音频
+                    }
                     kstream.accept_waveform(super::TARGET_RATE as i32, &s16k);
                     while spotter.is_ready(&kstream) {
                         spotter.decode(&kstream);
@@ -199,6 +335,20 @@ fn wake_loop(d: &WakeDeps, cmd: &Receiver<WakeCmd>) -> Result<()> {
     }
 }
 
+/// 播一条短句的同时持续清麦(实时清回声、不积压),输出收尾(ready)即返回 —— 调用方紧接开录。
+/// 比"阻塞播完再一次性 drain"少丢用户紧接应答音抢说的头几个字(#5)。无音频(降级)= 不阻塞、清一次。
+fn ack_and_drain(prompts: &PromptBank, pipe: &super::CapturePipe, kind: PromptKind) {
+    let mut drained = 0usize;
+    if let Some(ready) = prompts.play_async(kind) {
+        while !ready.load(Ordering::Acquire) {
+            drained += pipe.drain();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    drained += pipe.drain(); // 收尾再清一次,此后到的都是用户的话
+    tracing::info!(drained, "应答音期间清麦帧数(#5 真机诊断:积压越大越说明阻塞期丢帧)");
+}
+
 /// 唤醒命中后的一轮交互:应答 → 听 →(两段式兜底)→ 产出或告退。
 fn on_wake(
     d: &WakeDeps,
@@ -207,8 +357,7 @@ fn on_wake(
     hangover: f32,
 ) -> Result<Phase> {
     d.rt.publish(VoiceEvent::WakeTriggered);
-    d.prompts.play_blocking(PromptKind::Ack); // 同进程定时:播完即开录(0 间隙)
-    pipe.drain(); // 应答音期间的帧(含它自己)全扔
+    ack_and_drain(&d.prompts, pipe, PromptKind::Ack); // 边播应答音边清麦,播完即开录(0 间隙)
 
     for attempt in 0..2 {
         vad.reset();
@@ -222,8 +371,7 @@ fn on_wake(
         if attempt == 0 {
             // 第一次没听到/没听出字:出声追问,立即重听(绝不静默失败)
             d.rt.publish(VoiceEvent::ListenEnded { reason: "no_speech_retry".into() });
-            d.prompts.play_blocking(PromptKind::Retry);
-            pipe.drain();
+            ack_and_drain(&d.prompts, pipe, PromptKind::Retry);
         }
     }
     // 两轮都空:有声告退(robot 是安静退,用户点名要出声)

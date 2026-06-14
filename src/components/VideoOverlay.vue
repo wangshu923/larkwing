@@ -67,6 +67,37 @@ function onKey(e: KeyboardEvent) {
   }
 }
 
+// 全屏 = 影院视图:控制条覆盖在画面上,播放中 2.8s 无操作自动隐藏(鼠标一动即现);
+// 窗口模式常显。这样全屏不再"一直挂着标题栏 X、画面被上下条夹小"。
+const controlsVisible = ref(true)
+let hideTimer = 0
+function showControls() {
+  if (!state.fullscreen) return
+  controlsVisible.value = true
+  clearTimeout(hideTimer)
+  if (state.status === 'playing') {
+    hideTimer = window.setTimeout(() => (controlsVisible.value = false), 2800)
+  }
+}
+watch(
+  () => state.fullscreen,
+  (fs) => {
+    clearTimeout(hideTimer)
+    controlsVisible.value = true
+    if (fs) showControls()
+  },
+)
+watch(
+  () => state.status,
+  (s) => {
+    if (s === 'playing') showControls()
+    else {
+      clearTimeout(hideTimer) // 暂停/加载时别把控制条藏了
+      controlsVisible.value = true
+    }
+  },
+)
+
 let stopResize = () => {}
 watch(video, (el) => registerVideoEl(el))
 onMounted(() => {
@@ -79,6 +110,7 @@ onMounted(() => {
 })
 onUnmounted(() => {
   window.removeEventListener('keydown', onKey)
+  clearTimeout(hideTimer)
   stopResize()
   registerVideoEl(null)
 })
@@ -86,12 +118,17 @@ onUnmounted(() => {
 
 <template>
   <div v-if="show" class="veil">
-    <div class="panel" :class="{ maximized: state.fullscreen }">
+    <div
+      class="panel"
+      :class="{ maximized: state.fullscreen, 'controls-hidden': state.fullscreen && !controlsVisible }"
+      @mousemove="showControls"
+    >
       <header class="bar top">
         <span class="title">{{ state.current!.title }}</span>
         <button class="vbtn" @click="stop" :title="t('media.closeVideo')">✕</button>
       </header>
-      <video ref="video" class="screen" playsinline></video>
+      <video ref="video" class="screen" playsinline @dblclick="toggleFullscreen"></video>
+      <div v-if="state.status === 'loading'" class="spinner" aria-hidden="true"></div>
       <footer class="bar bottom">
         <button class="vbtn" @click="toggle">
           {{ state.status === 'playing' ? '⏸' : '▶' }}
@@ -135,6 +172,7 @@ onUnmounted(() => {
   backdrop-filter: blur(5px); -webkit-backdrop-filter: blur(5px);
 }
 .panel {
+  position: relative;
   width: min(80vw, 980px);
   display: flex; flex-direction: column;
   border-radius: 14px; overflow: hidden;
@@ -142,11 +180,38 @@ onUnmounted(() => {
   border: 1px solid rgba(95, 200, 255, 0.22);
   box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55), 0 0 30px rgba(95, 200, 255, 0.08);
 }
-/* 全屏 = 原生窗口全屏 + 这个类铺满(不再用 :fullscreen 伪类;height:100% 让包壳在 .veil 内撑开)。 */
-.panel.maximized { width: 100%; height: 100%; border-radius: 0; }
-.panel.maximized .screen { flex: 1; max-height: none; }
+/* 全屏 = 原生窗口全屏 + 这个类铺满(不再用 :fullscreen 伪类)。影院视图:画面铺满整屏(黑底、
+   无边框无投影),控制条覆盖在画面上(不再夹小画面、不再露主窗一圈透明边框)。 */
+.panel.maximized {
+  width: 100%; height: 100%;
+  border: none; border-radius: 0; box-shadow: none; background: #000;
+}
+.panel.maximized .screen {
+  position: absolute; inset: 0; z-index: 0;
+  width: 100%; height: 100%; min-height: 0; max-height: none;
+  object-fit: contain; /* 不裁不拉伸,留黑边 */
+}
+.panel.maximized .bar {
+  position: absolute; left: 0; right: 0; z-index: 2;
+  transition: opacity 0.25s ease;
+}
+.panel.maximized .bar.top { top: 0; background: linear-gradient(to bottom, rgba(0, 0, 0, 0.65), rgba(0, 0, 0, 0)); }
+.panel.maximized .bar.bottom { bottom: 0; padding-bottom: 14px; background: linear-gradient(to top, rgba(0, 0, 0, 0.65), rgba(0, 0, 0, 0)); }
+/* 影院视图播放中自动隐藏控制条(鼠标一动即现) */
+.panel.controls-hidden { cursor: none; }
+.panel.controls-hidden .bar { opacity: 0; pointer-events: none; }
 
 .screen { width: 100%; max-height: 62vh; background: #000; display: block; }
+
+/* 加载/混流换台 spinner:黑屏期间显示"在转",别看着像卡死(混流 ?t= seek 必有黑屏间隙)。 */
+.spinner {
+  position: absolute; top: 50%; left: 50%; z-index: 1;
+  width: 34px; height: 34px; margin: -17px 0 0 -17px;
+  border: 3px solid rgba(95, 200, 255, 0.22);
+  border-top-color: #5fd2ff; border-radius: 50%;
+  animation: lw-spin 0.8s linear infinite; pointer-events: none;
+}
+@keyframes lw-spin { to { transform: rotate(360deg); } }
 
 .bar {
   display: flex; align-items: center; gap: 10px;

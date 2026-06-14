@@ -5,7 +5,7 @@ export default {
     name: '7274', // 默认助手名(宪法 §1,2026-06):科幻调性;"旺财"留给暖萌皮
   },
   status: {
-    idle: '在线待命,随时喊我',
+    idle: '在线待命,随时找我',
     thinking: '让我想想…',
     speaking: '正在说…',
     listening: '在听你说…',
@@ -166,7 +166,7 @@ export default {
     listening: '在听你说…',
     thinking: '正在想…',
     speaking: '正在说…',
-    idle: '我在这儿,有事喊我',
+    idle: '我在这儿,有事找我', // 待机问候:channel-neutral,不写"喊"(语音关着时也显示,见 wakeArmed 才是语音态)
     wakeArmed: '🎙 等你喊「{kw}」', // 待机轮播·麦克风在等唤醒词(免手唤醒开着时)
     zoneNow: '正在进行',
     zoneNews: '最近消息',

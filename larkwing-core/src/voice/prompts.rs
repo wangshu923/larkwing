@@ -4,7 +4,7 @@
 //! 同进程精确知道播完时刻 → 应答一停立即开录(0 间隙)。
 //! 话术全部来自场景数据(人格中立底座:这里没有任何一句写死的话)。
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -99,7 +99,7 @@ impl PromptBank {
         Some(&bucket[self.rotor.fetch_add(1, Ordering::Relaxed) % bucket.len()])
     }
 
-    /// 播一条短句并**阻塞到播完**(wake 线程专用;同进程定时 = 播完即开录)。
+    /// 播一条短句并**阻塞到播完**(Retry/Farewell 用,无延迟敏感)。
     pub fn play_blocking(&self, kind: PromptKind) -> bool {
         let Some(clip) = self.pick(kind) else { return false };
         if let Err(e) = play_pcm_blocking(&clip.samples, clip.rate) {
@@ -107,6 +107,24 @@ impl PromptBank {
             return false;
         }
         true
+    }
+
+    /// 后台播一条短句,返回"输出已收尾"信号(wake 用)。要点:播放不再阻塞 wake 线程,
+    /// 后者可在播放期间持续清麦(实时清回声、不积压),信号一亮即开录 —— 比"阻塞播完再
+    /// 一次性大清"少丢用户紧接应答音抢说的头几个字(#5)。None = 该类目无音频(降级无声)。
+    pub fn play_async(&self, kind: PromptKind) -> Option<Arc<AtomicBool>> {
+        let clip = self.pick(kind)?;
+        let samples = clip.samples.clone(); // 短句几 KB,克隆进后台线程
+        let rate = clip.rate;
+        let ready = Arc::new(AtomicBool::new(false));
+        let ready2 = ready.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = play_pcm_blocking_signaled(&samples, rate, Some(&ready2)) {
+                tracing::warn!(err = %format!("{e:#}"), "短句播放失败");
+            }
+            ready2.store(true, Ordering::Release); // 失败兜底:别让 wake 线程死等
+        });
+        Some(ready)
     }
 }
 
@@ -172,8 +190,18 @@ pub(super) fn trim_silence(pcm: &[f32], rate: u32) -> Vec<f32> {
     }
 }
 
-/// 阻塞播放一段 PCM 到默认输出设备(cpal 直出;输入输出独立流,无 PortAudio 双工坑)。
+/// 阻塞播放(Retry/Farewell 用)。
 pub(super) fn play_pcm_blocking(samples: &[f32], rate: u32) -> Result<()> {
+    play_pcm_blocking_signaled(samples, rate, None)
+}
+
+/// 阻塞播放一段 PCM 到默认输出设备(cpal 直出;输入输出独立流,无 PortAudio 双工坑)。
+/// ready:输出回调读完整段(应答音实际收尾)时置位 —— 调用方据此"播完即开录"。
+pub(super) fn play_pcm_blocking_signaled(
+    samples: &[f32],
+    rate: u32,
+    ready: Option<&AtomicBool>,
+) -> Result<()> {
     let host = cpal::default_host();
     let device = host.default_output_device().ok_or_else(|| anyhow!("没有输出设备"))?;
     let supported = device.default_output_config().context("读取输出配置失败")?;
@@ -231,6 +259,11 @@ pub(super) fn play_pcm_blocking(samples: &[f32], rate: u32) -> Result<()> {
     let cap = Duration::from_millis(total as u64 * 1000 / out_rate.max(1) as u64 + 1500);
     let guard = m.lock().expect("done lock");
     let _ = cv.wait_timeout_while(guard, cap, |fin| !*fin).expect("condvar");
+    // 输出回调已读完整段 = 应答音收尾。先放行开录(wake 据此 0 间隙起听),再 sleep 让设备
+    // 缓冲里最后一截放净 —— 这点尾音此刻已在录,靠硬件 AEC 抑回声(宪法 §9 假设家用麦带 AEC)。
+    if let Some(r) = ready {
+        r.store(true, Ordering::Release);
+    }
     std::thread::sleep(Duration::from_millis(80)); // 设备缓冲里最后一截放完
     drop(stream);
     Ok(())

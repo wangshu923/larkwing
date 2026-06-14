@@ -640,9 +640,13 @@ impl CapturePipe {
         }
     }
 
-    /// 清空积压帧(robot 坑:唤醒后队列积压拖慢"开始听")。
-    pub(super) fn drain(&self) {
-        while self.rx.try_recv().is_ok() {}
+    /// 清空积压帧(robot 坑:唤醒后队列积压拖慢"开始听")。返回清掉的帧数(观测用)。
+    pub(super) fn drain(&self) -> usize {
+        let mut n = 0;
+        while self.rx.try_recv().is_ok() {
+            n += 1;
+        }
+        n
     }
 }
 

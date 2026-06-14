@@ -71,11 +71,25 @@ export function registerVideoEl(el: HTMLVideoElement | null) {
   el.addEventListener('timeupdate', () => {
     if (state.current?.kind === 'video') state.position = videoBase + el.currentTime
   })
+  // 时长:本地/直转单文件的真时长直到元数据加载才知道(np.duration_seconds 常为空 →
+  // 进度条死、显示 /0:00 拖不动)。混流(/m/ fMP4)无可靠时长(el.duration=Infinity/NaN),
+  // 保留 resolver 给的 np.duration_seconds 不被覆盖。
+  const syncDuration = () => {
+    const cur = state.current
+    if (cur?.kind !== 'video' || cur.stream_url.includes('/m/')) return
+    if (Number.isFinite(el.duration) && el.duration > 0) state.duration = el.duration
+  }
+  el.addEventListener('loadedmetadata', syncDuration)
+  el.addEventListener('durationchange', syncDuration)
   el.addEventListener('playing', () => (state.status = 'playing'))
   el.addEventListener('pause', () => {
     if (state.status !== 'idle') state.status = 'paused'
   })
   el.addEventListener('ended', stop)
+  // 出错别卡在 loading(否则换台/混流 seek 失败时 spinner 转不停)
+  el.addEventListener('error', () => {
+    if (state.current?.kind === 'video') state.status = 'paused'
+  })
   el.volume = state.volume
   el.playbackRate = state.rate
   if (state.current?.kind === 'video') {
@@ -193,9 +207,10 @@ function seek(seconds: number) {
   if (cur.kind === 'video' && videoEl) {
     if (cur.stream_url.includes('/m/')) {
       videoBase = seconds
+      state.status = 'loading' // 换 src 重启混流,黑屏期间显示 spinner(别看着像卡死);playing 事件复位
       const base = cur.stream_url.split('?')[0]
       videoEl.src = `${base}?t=${seconds.toFixed(1)}`
-      void videoEl.play().catch(() => {})
+      void videoEl.play().catch(() => (state.status = 'paused'))
     } else {
       videoEl.currentTime = seconds
     }
