@@ -29,6 +29,8 @@ const DEFAULTS: Record<string, string> = {
   'voice.patience': 'standard',
   'voice.volume': '100',
   'voice.input_device': '',
+  'voice.wake.sensitivity': '50', // 唤醒灵敏度 0~100(global)→ KWS 阈值;'50' = 经验折中
+
   'voice.tts_backend': 'online', // 在线 edge / 离线 vits(断网兜底,需下大模型)
   // 桌面悬浮窗(PLAN §12);ui.* 走 engine set_setting 的 ui. 分支自动放行(无需改 Rust 白名单)
   'ui.float.enabled': '1', // '1' 开 / '0' 关

@@ -321,6 +321,19 @@ export const win = {
   },
   isFullscreen: (): Promise<boolean> =>
     isTauri() ? getCurrentWindow().isFullscreen() : Promise.resolve(false),
+  /** 把当前窗口叫到最前:显示 + 取消最小化 + 聚焦。视频起播用 —— 否则窗口藏在托盘/
+   *  别的窗后面时,视频在后台播,用户"只闻其声"(实测)。已在前台则全是 no-op,不闪。 */
+  bringToFront: async () => {
+    if (!isTauri()) return
+    const w = getCurrentWindow()
+    await w.show()
+    await w.unminimize()
+    await w.setFocus()
+  },
+  /** 置顶开关:看电影期间开,放完关 —— 别被别的窗口盖住(用户要"置顶")。 */
+  setAlwaysOnTop: async (on: boolean) => {
+    if (isTauri()) await getCurrentWindow().setAlwaysOnTop(on)
+  },
   /** ✕ = 隐藏到托盘,不退进程(真退出走托盘菜单 quit)。 */
   hideToTray: () => {
     if (isTauri()) void getCurrentWindow().hide()

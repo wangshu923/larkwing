@@ -32,8 +32,9 @@ pub(super) enum WakeCmd {
 
 // ---- KWS 参数 ----
 // threshold 不再锁死:由「唤醒灵敏度」滑块经 voice.wake.sensitivity 映射(见 mod.rs
-// wake_threshold,默认对齐 robot 实战 0.45),建 spotter 时由 deps 传入。
-// score 暂不暴露:关键词加分提召回,误触靠 threshold 拦。
+// wake_threshold,默认对齐 robot 实战 0.2),建 spotter 时由 deps 传入。
+// score 暂不暴露:真机实测它对召回无正增益(s2.5/s3.5 在 t0.45 仍不应,只有降阈管用),
+// 唤醒难易完全由 threshold 拦。
 const KWS_SCORE: f32 = 1.5;
 const WAKE_START_TIMEOUT: Duration = Duration::from_secs(6); // 应答后没人开口
 const FOLLOW_UP_WINDOW: Duration = Duration::from_secs(6); // 跟进窗(robot 终值)
@@ -205,6 +206,13 @@ fn wake_loop(d: &WakeDeps, cmd: &Receiver<WakeCmd>) -> Result<()> {
     let spotter =
         sherpa_onnx::KeywordSpotter::create(&kcfg).ok_or_else(|| anyhow!("KWS 创建失败"))?;
     let kstream = spotter.create_stream();
+    // 诊断:打出实际生效的 threshold/score/编码词——滑块坏了就靠这行确认到底用了多少。
+    tracing::info!(
+        "KWS 建好(实际生效值):threshold={:.3} score={:.2} 唤醒词编码={:?}",
+        d.kws_threshold,
+        KWS_SCORE,
+        d.keywords_buf
+    );
 
     let hangover = hangover_secs(&d.rt.patience());
     let vad = new_vad(&d.vad_model, hangover)?;

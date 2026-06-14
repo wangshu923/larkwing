@@ -37,3 +37,13 @@ input, textarea, [contenteditable="true"] {
 }
 
 #app { width: 100%; height: 100%; }
+
+/* 全局滚动条:WebView2(Windows)默认是粗灰原生条,贴在窗口边很丑;统一成细玻璃风。
+   Mac WKWebView 本来就是 overlay 细条 —— 两端观感拉齐(webview2≠wkwebview 分叉一例)。
+   已自定义的 .stream/.body 选择器更具体,各按各的,不冲突。故意不设 scrollbar-width:
+   新版 Chromium 一旦设了它就会忽略 ::-webkit-scrollbar 的主题色,反而变回默认细条。 */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(95, 200, 255, 0.2); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(95, 200, 255, 0.34); }
+::-webkit-scrollbar-corner { background: transparent; }

@@ -128,8 +128,11 @@ function play(np: NowPlaying) {
       void videoEl.play().catch(() => (state.status = 'paused'))
     }
     // videoEl 还没挂:VideoOverlay 随 current 出现,registerVideoEl 接力起播。
-    // 视频默认全屏(用户要求):置位放在 videoEl 守卫外,后挂场景也直接铺满、不窗口化闪一下;
-    //.maximized 绑 state.fullscreen,浮层挂载瞬间即全屏。此处必是主窗(float 已在函数开头早退)。
+    // 视频默认:叫主窗到最前(藏在托盘/别的窗后面时只闻其声)+ 置顶(别被盖住)+ 全屏(用户要求)。
+    // 置位放在 videoEl 守卫外,后挂场景也直接铺满、不窗口化闪一下;.maximized 绑 state.fullscreen,
+    // 浮层挂载瞬间即全屏。此处必是主窗(float 已在函数开头早退)。
+    void win.bringToFront()
+    void win.setAlwaysOnTop(true)
     state.fullscreen = true
     void win.setFullscreen(true)
   }
@@ -185,9 +188,12 @@ function stopElements() {
 
 function stop() {
   stopElements()
-  // 关播放器顺带退原生全屏,别把整个 app 卡在全屏(✕/ended/模型 stop 都汇到这里)。
-  // 守卫:float 的 fullscreen 恒 false(play 早退,从不置位)→ 永不误退悬浮窗。
-  if (state.fullscreen) void win.setFullscreen(false)
+  // 退出视频的窗口态:退全屏 + 撤置顶(✕/ended/模型 stop 都汇到这里)。float 不碰自身窗口
+  // ——它的"播放"只是镜像,对悬浮窗做 setFullscreen/setAlwaysOnTop 会误伤它(它常驻置顶)。
+  if (windowLabel() !== 'float') {
+    if (state.fullscreen) void win.setFullscreen(false)
+    void win.setAlwaysOnTop(false)
+  }
   state.current = null
   state.status = 'idle'
   state.position = 0

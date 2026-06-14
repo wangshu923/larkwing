@@ -333,8 +333,10 @@ impl VoiceRuntime {
     }
 
     /// 唤醒灵敏度(voice.wake.sensitivity 0~100,global)→ KWS threshold。
-    /// 高灵敏 = 低阈值 = 容易被唤醒(也更易误触);默认 50 → 0.45(robot 实战折中)。
-    /// 范围锁 [0.2, 0.7]:robot 经验 <0.25 客厅/电视声误触严重,>0.7 太钝(几乎叫不应)。
+    /// 高灵敏 = 低阈值 = 容易被唤醒(也更易误触)。默认 50 → 0.2(对齐 robot 实战 8/10;
+    /// 真机实测:口语「旺财」KWS 分数多落 ~0.3,旧默认 0.45 太严会大面积漏,0.2 才接得住)。
+    /// 分段映射、滑块中点=默认=0.2:灵敏半区 [50,100]→[0.2,0.1],稳重半区 [0,50]→[0.5,0.2]。
+    /// 范围 [0.1, 0.5]:robot 经验 <0.25 客厅/电视声误触会多,但本家用 0.2 实测体验好;吵就往左调。
     fn wake_threshold(&self) -> f32 {
         let sens: f32 = self
             .inner
@@ -345,7 +347,13 @@ impl VoiceRuntime {
             .flatten()
             .and_then(|v| v.parse().ok())
             .unwrap_or(50.0);
-        (0.7 - sens.clamp(0.0, 100.0) / 100.0 * 0.5).clamp(0.2, 0.7)
+        let sens = sens.clamp(0.0, 100.0);
+        let thr = if sens >= 50.0 {
+            0.2 - (sens - 50.0) / 50.0 * 0.1 // 灵敏半区:0.2 → 0.1
+        } else {
+            0.5 - sens / 50.0 * 0.3 // 稳重半区:0.5 → 0.2
+        };
+        thr.clamp(0.1, 0.5)
     }
 
     async fn wake_start(&self) -> Result<()> {

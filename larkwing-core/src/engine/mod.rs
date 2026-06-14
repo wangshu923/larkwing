@@ -151,6 +151,7 @@ const APP_SETTING_KEYS: &[&str] = &[
     "voice.input_device",
     "voice.wake.enabled",
     "voice.wake.keywords",
+    "voice.wake.sensitivity",
     "voice.tts_backend",
 ];
 
@@ -580,6 +581,16 @@ impl Engine {
                 self.store.settings.set(None, key, value)?;
                 Ok(())
             }
+            // 唤醒灵敏度(app 级,机器属性):0~100 整数 → wake_threshold 映射成 KWS 阈值。
+            // 漏了这条 → 写被白名单拒 → 前端乐观写回滚,滑块"一闪一闪"且从不落库(灵敏度其实没生效)。
+            // 开着唤醒时前端 saveSensitivity 会重启循环让新阈值生效。
+            "voice.wake.sensitivity" => match value.parse::<u32>() {
+                Ok(n) if n <= 100 => {
+                    self.store.settings.set(None, key, value)?;
+                    Ok(())
+                }
+                _ => Err(invalid("唤醒灵敏度需为 0~100 的整数")),
+            },
             "voice.tts_backend" => {
                 if !["online", "offline"].contains(&value) {
                     return Err(invalid("未知的语音合成档"));

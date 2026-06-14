@@ -107,10 +107,14 @@ fn main() {
     }
 
     // 生产档(int8/1.5/0.45)是关键:它若命中=音频没问题。其余档位看天花板。
-    let configs: [(&str, bool, f32, f32); 3] = [
-        ("int8 生产档   1.5/0.45", true, 1.5, 0.45),
-        ("int8 灵敏拉满 1.5/0.20", true, 1.5, 0.20),
-        ("fp32 全精度   1.5/0.45", false, 1.5, 0.45),
+    let configs: [(&str, bool, f32, f32); 7] = [
+        ("s1.5 t0.45  ← 当前默认       ", true, 1.5, 0.45),
+        ("s1.5 t0.20  ← robot 阈值      ", true, 1.5, 0.20),
+        ("s2.5 t0.45  ← 仅升 score(robot)", true, 2.5, 0.45),
+        ("s2.5 t0.35  ← score+略降阈    ", true, 2.5, 0.35),
+        ("s2.5 t0.20  ← full robot      ", true, 2.5, 0.20),
+        ("s3.5 t0.45  ← 高加分保默认阈  ", true, 3.5, 0.45),
+        ("s1.5 t0.30  ← 仅降阈到 0.30   ", true, 1.5, 0.30),
     ];
     println!("\n命中判定:");
     for (label, int8, score, thr) in configs {
