@@ -23,6 +23,8 @@ const LAZY_HARD = 140
 const STALL_MS = 1200 // LLM 停流多久算"卡住"
 const STALL_GRACE_MS = 1000 // 卡住后再宽限多久就全量硬切
 const INFLIGHT_MAX = 2 // 并行合成上限(顺序入队,完成乱序无妨)
+const SYNTH_TIMEOUT_MS = 12000 // 单句合成兜底:在线 TTS 偶发挂起会让队列卡死→playing 永真→唤醒被永久丢帧;超时即当失败跳过
+const PLAY_GRACE_MS = 5000 // 播放看门狗余量:真实时长 + 此值还没 ended 就强制推进
 
 const STRONG = new Set(['。', '!', '?', '…', ';', '\n', '!', '?', ';'])
 const WEAK = new Set([',', '、', ':', ',', ':', '—'])
@@ -52,6 +54,7 @@ let stallTimer: ReturnType<typeof setInterval> | undefined
 let players: [HTMLAudioElement, HTMLAudioElement] | null = null
 let playerFlip = 0
 let fakeEndTimer: ReturnType<typeof setTimeout> | undefined
+let playWatchdog: ReturnType<typeof setTimeout> | undefined // 播放看门狗:ended 没触发时强制推进
 const settings = useSettings()
 
 function syncBusy() {
@@ -180,6 +183,18 @@ function evaluate() {
   }
 }
 
+/** 合成带超时:在线 TTS 偶发挂起(promise 既不 resolve 也不 reject)会让该句永停在
+ *  synth、队列永不空 → playing/busy 永真 → 唤醒循环被永久 suspend 丢帧。超时即拒绝,
+ *  上游 catch 把这句标 failed 跳过,队列得以继续清空。 */
+function synthWithTimeout(text: string): Promise<string> {
+  return Promise.race([
+    api.ttsSynthesize(text),
+    new Promise<string>((_, reject) =>
+      setTimeout(() => reject(new Error('synth-timeout')), SYNTH_TIMEOUT_MS),
+    ),
+  ])
+}
+
 /** 合成泵:≤2 在飞;预览态直接标 ready(时序照真,不出声)。 */
 function pump() {
   if (!isTauri()) {
@@ -194,8 +209,7 @@ function pump() {
     if (c.status !== 'pending') continue
     c.status = 'synth'
     inflight++
-    api
-      .ttsSynthesize(c.text)
+    synthWithTimeout(c.text)
       .then((url) => {
         c.url = url
         c.status = 'ready'
@@ -203,7 +217,7 @@ function pump() {
         pump()
       })
       .catch((e) => {
-        console.error('TTS 合成失败(这句跳过,文字照常显示)', e)
+        console.error('TTS 合成失败/超时(这句跳过,文字照常显示)', e)
         c.status = 'failed'
         tryPlay()
         pump()
@@ -236,10 +250,23 @@ function tryPlay() {
   const c = current
   el.volume = ttsVolume()
   if (el.src !== c.url) el.src = c.url! // 预载命中就不重设(保住缓冲)
+  // 播放看门狗:正常靠 'ended' 推进;万一 ended/error 都没触发(解码异常/被媒体抢占
+  // 音频),到点强制推进——别让 current 卡住→playing 永真→唤醒被永久 suspend。
+  const armWatchdog = (ms: number) => {
+    clearTimeout(playWatchdog)
+    playWatchdog = setTimeout(() => {
+      console.warn('TTS 播放未收尾,看门狗强制推进')
+      advance()
+    }, ms)
+  }
+  armWatchdog((c.durMs ?? estimateMs(c.text)) * 1.5 + PLAY_GRACE_MS)
   el.addEventListener(
     'loadedmetadata',
     () => {
-      if (Number.isFinite(el.duration)) c.durMs = el.duration * 1000
+      if (Number.isFinite(el.duration)) {
+        c.durMs = el.duration * 1000
+        armWatchdog(c.durMs + PLAY_GRACE_MS) // 有真实时长后收紧,避免误杀长句
+      }
     },
     { once: true },
   )
@@ -259,6 +286,7 @@ function preloadNext() {
 
 function advance() {
   clearTimeout(fakeEndTimer)
+  clearTimeout(playWatchdog)
   current = null
   syncBusy()
   tryPlay()
@@ -328,6 +356,7 @@ function abort() {
   queue = []
   current = null
   clearTimeout(fakeEndTimer)
+  clearTimeout(playWatchdog)
   clearInterval(stallTimer)
   stallTimer = undefined
   if (players) {

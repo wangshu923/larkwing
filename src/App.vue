@@ -13,10 +13,9 @@ import { useSettings } from './composables/useSettings'
 import {
   api,
   isTauri,
-  isWindowFocused,
   onOpenConversation,
-  onWindowFocus,
   setFloatVisible,
+  win,
   windowLabel,
 } from './lib/backend'
 
@@ -35,18 +34,19 @@ if (!isFloat && isTauri()) {
   const settings = useSettings()
   void api.setTrayMenu(t('tray.open'), t('tray.quit'))
   const floatOn = () => settings.get('ui.float.enabled') !== '0'
-  // 显隐规则(§12 E):主窗在前藏悬浮窗、退后 / 最小化显;启动按当前聚焦定初值
-  // (静默启动主窗不在前 → 显;正常启动主窗在前 → 藏)。
-  watch(
-    () => settings.state.ready,
-    async (ready) => {
-      if (!ready) return
-      const focused = await isWindowFocused()
-      void setFloatVisible(floatOn() && !focused)
-    },
-    { immediate: true },
-  )
-  onWindowFocus((focused) => void setFloatVisible(floatOn() && !focused))
+  // 显隐规则(§12 E 修订 2026-06-14):悬浮窗与主窗共存——master 开关 ui.float.enabled 开着就常驻,
+  // 不再随主窗聚焦藏匿(用户:开了就一直有)。唯一例外:主窗全屏(沉浸观感,如看视频)时让位,退出即恢复
+  // ——float 是 always_on_top,不显式藏会浮在全屏画面上。全屏切换会触发 resize,借 onResized 兜住。
+  let lastFs: boolean | null = null
+  const syncFloat = async () => {
+    if (!settings.state.ready) return
+    const fs = await win.isFullscreen()
+    if (fs === lastFs) return // 拖拽改窗口大小也发 resize;只在全屏态真变化时动手,免反复 show/hide
+    lastFs = fs
+    void setFloatVisible(floatOn() && !fs)
+  }
+  watch(() => settings.state.ready, () => void syncFloat(), { immediate: true })
+  win.onResized(syncFloat)
   // 悬浮窗点通知 → 主窗切到该会话
   onOpenConversation((convId) => useChat().selectConversation(convId))
 }

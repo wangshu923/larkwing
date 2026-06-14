@@ -324,11 +324,11 @@ mod tests {
             id, user_id: 1, kind: "fact".into(), content: content.into(),
             created_at: 0, updated_at: 0,
         };
-        let memories = vec![mem(1, "女儿叫朵朵,生日在十月"), mem(2, "用户对花生过敏")];
+        let memories = vec![mem(1, "用户不吃香菜"), mem(2, "用户对花生过敏")];
         let briefs = vec![brief(1, "media", "电影在 \\\\nas\\film;动画片在 \\\\nas\\kids")];
         let history = vec![
             msg(1, "user", "今晚吃什么好", None),
-            msg(2, "assistant", "朵朵爱吃的番茄锅怎么样?记得避开花生酱蘸料哦", None),
+            msg(2, "assistant", "番茄锅怎么样?不放香菜,蘸料也帮你避开花生~", None),
         ];
         let req = build_context(scene, Some(DEFAULT_PERSONA_STYLE), &memories, &briefs, &history, &defs);
         println!("\n========== system(OpenAI 系翻成首条 system 消息) ==========\n{}", req.system);

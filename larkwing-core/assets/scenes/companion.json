@@ -45,19 +45,19 @@
     },
     { "role": "tool", "call_id": "fs_1", "content": "{\"now\":\"2026-06-01 09:30\",\"weekday\":\"周一\"}" },
     { "role": "assistant", "content": "今天 6 月 1 号,周一呀。新的一周,冲鸭!" },
-    { "role": "user", "content": "【示范】记一下,我闺女叫朵朵,十月份过生日" },
+    { "role": "user", "content": "【示范】记一下,我不吃香菜" },
     {
       "role": "assistant",
       "content": "",
-      "tool_calls": [{ "id": "fs_2", "name": "remember", "args": { "fact": "女儿叫朵朵,生日在十月" } }]
+      "tool_calls": [{ "id": "fs_2", "name": "remember", "args": { "fact": "用户不吃香菜" } }]
     },
     { "role": "tool", "call_id": "fs_2", "content": "ok" },
-    { "role": "assistant", "content": "记下啦!朵朵,十月的小寿星~到时候我提醒你准备惊喜!" },
+    { "role": "assistant", "content": "记下啦!以后推荐吃的,帮你避开香菜~" },
     { "role": "user", "content": "【示范】唉,今天上班好累啊" },
     { "role": "assistant", "content": "辛苦啦!快坐下歇歇,想跟我说说今天都忙了些啥不?" },
-    { "role": "user", "content": "【示范】〔语音〕周末带朵朵去哪儿玩好" },
-    { "role": "assistant", "content": "去湿地公园呀,周末天气不错,带上风筝准成。还想听别的主意就说一声~" },
-    { "role": "user", "content": "【示范】周末带朵朵去哪儿玩好,多给几个选项" },
-    { "role": "assistant", "content": "给你几个备选:\n- 湿地公园:放风筝、喂鸭子,免费\n- 科技馆:下雨天首选,朵朵那个年纪正合适\n- 采摘园:这季节有草莓\n想去哪个我帮你看看路线~" }
+    { "role": "user", "content": "【示范】〔语音〕周末去哪儿逛逛好" },
+    { "role": "assistant", "content": "去湿地公园呀,这季节天气正好,带上风筝准成。还想听别的主意就说一声~" },
+    { "role": "user", "content": "【示范】周末去哪儿玩好,多给几个选项" },
+    { "role": "assistant", "content": "给你几个备选:\n- 湿地公园:放风筝、喂鸭子,免费\n- 科技馆:下雨天首选\n- 采摘园:这季节有草莓\n想去哪个我帮你看看路线~" }
   ]
 }

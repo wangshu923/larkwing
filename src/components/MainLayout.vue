@@ -41,7 +41,7 @@ const petName = computed(() => settings.get('ui.pet_name') || t('pet.name'))
 const textScale = computed(() => (settings.get('ui.text_scale') === 'large' ? '16.5px' : '14px'))
 const activeRail = ref<'chat' | 'scenes' | 'memory' | 'settings'>('chat')
 
-const { state: chat, send: chatSend, cancel, selectConversation, newConversation, saveApiKey } = useChat()
+const { state: chat, send: chatSend, cancel, selectConversation, newConversation, ensureVoiceConv, saveApiKey } = useChat()
 const messages = computed(() => chat.messages)
 
 const input = ref('')
@@ -55,7 +55,10 @@ function send() {
 // —— 语音(PLAN §11):听写(mic,UI 交互不念)与唤醒(wake,语音会话必念)
 //    都从这里进既有 send 链;via 决定回合形态(二分纪律) ——
 const voice = useVoice()
-onTranscribed((text, via, speaker) => chatSend(text, via, speaker))
+onTranscribed(async (text, via, speaker) => {
+  if (via === 'wake') await ensureVoiceConv() // 唤醒走语音专属会话;mic/打字进当前会话(交互二分)
+  chatSend(text, via, speaker)
+})
 
 // —— 朗读(B 期):状态/停念/重听;正在念时点麦克风 = 停念+开听(一步打断) ——
 const speech = useSpeech()

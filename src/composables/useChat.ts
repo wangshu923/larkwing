@@ -17,6 +17,7 @@ import {
 import { applyLocale, i18n } from '../i18n'
 import { hydrateUserName, onProvidersUsable, useSettings } from './useSettings'
 import { useSpeech } from './useSpeech'
+import { useMedia } from './useMedia'
 
 const t = i18n.global.t
 
@@ -552,6 +553,50 @@ async function newConversation() {
   }
 }
 
+// ---- 语音(免手唤醒)专属会话(PLAN §11):语音交互不灌进当前打字会话,自起一个;
+// 活着就续,「完全无动作」满 30 分钟才弃——媒体在播算动作(看电影不打断续接),停播
+// 后才开始计时;重启不接续(纯内存态)。喊醒说话时切到它显示,它照常进会话列表、可点
+// 进去打字接力(交互二分:wake=语音会话,mic 按住说话/打字=当前会话)。----
+const VOICE_CONV_TTL = 30 * 60 * 1000
+let voiceConvId: number | null = null
+let lastVoiceActivity = 0
+let voiceWired = false
+
+function mediaBusy(): boolean {
+  const s = useMedia().state.status
+  // 暂停也算「还在看」(用户确认):暂停不开始计时,会话续着。
+  return s === 'playing' || s === 'loading' || s === 'paused'
+}
+
+/** 只有「停止」(回到 idle:手动停止 或 电影自然播完)才记一笔活动、从此刻起算那
+ *  30 分钟;暂停(paused)视为还在看,不计时(用户确认的口径)。 */
+function wireVoiceActivity() {
+  if (voiceWired) return
+  voiceWired = true
+  const media = useMedia()
+  watch(
+    () => media.state.status,
+    (s, prev) => {
+      if (s === 'idle' && prev !== 'idle') lastVoiceActivity = Date.now()
+    },
+  )
+}
+
+/** 喊醒说话前调:有活的语音会话→切过去续;无/过期→新起一个。两种都切到它显示。 */
+async function ensureVoiceConv() {
+  const alive =
+    voiceConvId != null &&
+    state.conversations.some((c) => c.id === voiceConvId) &&
+    (mediaBusy() || Date.now() - lastVoiceActivity <= VOICE_CONV_TTL)
+  if (alive) {
+    if (state.convId !== voiceConvId) await selectConversation(voiceConvId!)
+  } else {
+    await newConversation()
+    voiceConvId = state.convId
+  }
+  lastVoiceActivity = Date.now()
+}
+
 async function saveApiKey(key: string) {
   if (!state.inTauri) return
   try {
@@ -622,5 +667,6 @@ function fakeStream(msg: UiMessage, full: string, speak = false) {
 
 export function useChat() {
   void boot()
-  return { state, send, cancel, selectConversation, newConversation, saveApiKey }
+  wireVoiceActivity()
+  return { state, send, cancel, selectConversation, newConversation, ensureVoiceConv, saveApiKey }
 }

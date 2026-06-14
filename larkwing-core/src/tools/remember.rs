@@ -26,7 +26,7 @@ impl Remember {
                     "properties": {
                         "fact": {
                             "type": "string",
-                            "description": "要记住的事实,第三人称简短陈述,如「女儿叫朵朵,生日在十月」"
+                            "description": "要记住的事实,第三人称简短陈述,如「用户对花生过敏」"
                         }
                     },
                     "required": ["fact"]

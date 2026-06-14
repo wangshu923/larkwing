@@ -10,9 +10,17 @@ use serde::Serialize;
 /// 音频优先选 m4a:WebView2(Chromium)和开发机 WKWebView 都原生解码 AAC;
 /// opus/webm 在 WKWebView 放不了,别让开发机和发布机行为分叉。
 const AUDIO_FORMAT: &str = "ba[ext=m4a]/ba/b";
-/// 视频:mp4 容器 + 1080p 封顶(家庭场景够用,流量也省);音视频分离时两路都拿,
-/// 交给 relay 的 ffmpeg 混流;实在没有就退单文件。
-const VIDEO_FORMAT: &str = "bv*[ext=mp4][height<=1080]+ba[ext=m4a]/bv*+ba/b";
+/// 视频:**强制 H.264(avc)** + 1080p 封顶。`[ext=mp4]` 只约束容器不约束编码,
+/// B 站(尤其登录后)常给 HEVC/AV1;WebView2(Windows 发布机)解不了 HEVC(要付费扩展)
+/// /AV1(要免费扩展,常缺)→ 视频轨黑屏、只剩 AAC 声音(开发机 WKWebView 有硬解,故漏网)。
+/// relay 是 `-c copy` 纯复制,编码选择是唯一低成本杠杆(转码毁掉"CPU 近零")。
+/// 逐级放宽:avc≤1080+m4a → avc 任意分辨率 → avc+任意音频 → avc 单文件;末段保留旧串做
+/// 兜底地板(HEVC/AV1-only 的极少数视频仍能出声,不硬失败)。音视频分离两路交 ffmpeg 混流。
+const VIDEO_FORMAT: &str = "bv*[vcodec^=avc][height<=1080]+ba[ext=m4a]/\
+                            bv*[vcodec^=avc]+ba[ext=m4a]/\
+                            bv*[vcodec^=avc]+ba/\
+                            b[vcodec^=avc]/\
+                            bv*[ext=mp4][height<=1080]+ba[ext=m4a]/bv*+ba/b";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UpStream {
@@ -133,7 +141,23 @@ pub(super) fn parse_resolved(json: &serde_json::Value) -> Result<Resolved> {
         tracing::warn!(n = streams.len(), "requested_formats 超过两路,只取前两路");
         streams.truncate(2);
     }
+    // 观测(宪法 §7):记下实际选中的编码。B 站只给 HEVC/AV1 时 WebView2 黑屏只剩声音,
+    // 这条 info 是 Windows 真机唯一能看出"到底选了什么编码"的地方(强制 avc 是否生效)。
+    let fmts: Vec<String> = match json["requested_formats"].as_array() {
+        Some(arr) => arr.iter().map(fmt_tag).collect(),
+        None => vec![fmt_tag(json)],
+    };
+    tracing::info!(title = %title, streams = streams.len(), fmts = ?fmts, "媒体解析完成");
     Ok(Resolved { title, uploader, duration_seconds, streams })
+}
+
+/// 一个格式的紧凑诊断标签:`format_id/vcodec`(给日志看选中编码用)。
+fn fmt_tag(v: &serde_json::Value) -> String {
+    format!(
+        "{}/{}",
+        v["format_id"].as_str().unwrap_or("?"),
+        v["vcodec"].as_str().unwrap_or("?")
+    )
 }
 
 fn stream_of(v: &serde_json::Value) -> Option<UpStream> {

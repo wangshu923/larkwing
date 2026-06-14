@@ -3,7 +3,17 @@
 // 浏览器预览:?demo=player 注入假"正在播放",纯看视觉。
 
 import { reactive } from 'vue'
-import { api, isTauri, onAppEvent, windowLabel, type MediaEvent, type NowPlaying } from '../lib/backend'
+import {
+  api,
+  emitNowPlaying,
+  isTauri,
+  onAppEvent,
+  onNowPlaying,
+  win,
+  windowLabel,
+  type MediaEvent,
+  type NowPlaying,
+} from '../lib/backend'
 import { i18n } from '../i18n'
 
 export type PlayStatus = 'idle' | 'loading' | 'playing' | 'paused'
@@ -90,18 +100,25 @@ function play(np: NowPlaying) {
   state.duration = np.duration_seconds ?? 0
   state.rate = 1 // 倍速不跨播放粘住;音量粘住
   videoBase = 0
+  syncToPeers() // 广播"在放这个"给悬浮窗镜像
   if (np.kind === 'audio') {
     const a = ensureAudio()
     a.playbackRate = 1
     a.src = np.stream_url
     void a.play().catch(() => (state.status = 'paused'))
-  } else if (videoEl) {
-    videoEl.playbackRate = 1
-    videoEl.volume = state.volume
-    videoEl.src = np.stream_url
-    void videoEl.play().catch(() => (state.status = 'paused'))
+  } else if (np.kind === 'video') {
+    if (videoEl) {
+      videoEl.playbackRate = 1
+      videoEl.volume = state.volume
+      videoEl.src = np.stream_url
+      void videoEl.play().catch(() => (state.status = 'paused'))
+    }
+    // videoEl 还没挂:VideoOverlay 随 current 出现,registerVideoEl 接力起播。
+    // 视频默认全屏(用户要求):置位放在 videoEl 守卫外,后挂场景也直接铺满、不窗口化闪一下;
+    //.maximized 绑 state.fullscreen,浮层挂载瞬间即全屏。此处必是主窗(float 已在函数开头早退)。
+    state.fullscreen = true
+    void win.setFullscreen(true)
   }
-  // kind=video 且 videoEl 还没挂:VideoOverlay 随 current 出现,registerVideoEl 接力起播
 }
 
 function activeEl(): HTMLMediaElement | null {
@@ -135,6 +152,12 @@ function setRate(v: number) {
   if (el) el.playbackRate = state.rate
 }
 
+/** 主窗(唯一真播放位)把 current 全量广播给悬浮窗(被动镜像)。绝对态快照 → 幂等;
+ *  只主窗发、只悬浮窗收(见 wire),无回声环。悬浮窗自身调用是 no-op(它不该出声当真相源)。 */
+function syncToPeers() {
+  if (windowLabel() !== 'float') emitNowPlaying(state.current)
+}
+
 function stopElements() {
   if (audio) {
     audio.pause()
@@ -148,11 +171,15 @@ function stopElements() {
 
 function stop() {
   stopElements()
+  // 关播放器顺带退原生全屏,别把整个 app 卡在全屏(✕/ended/模型 stop 都汇到这里)。
+  // 守卫:float 的 fullscreen 恒 false(play 早退,从不置位)→ 永不误退悬浮窗。
+  if (state.fullscreen) void win.setFullscreen(false)
   state.current = null
   state.status = 'idle'
   state.position = 0
   state.duration = 0
   state.fullscreen = false
+  syncToPeers() // 广播"停了"给悬浮窗(修:UI 点停止 / 自然播完时它仍显在放)
 }
 
 /** seek:音频/直转流走原生(转发层透传 Range);混流视频换 src 重启(?t=)。 */
@@ -218,6 +245,13 @@ function wire() {
     onAppEvent((ev) => {
       if (ev.type === 'media') onMedia(ev.data)
     })
+    // 悬浮窗 = 主窗播放位的被动镜像:current 跟主窗广播走,主窗停了它才清得掉。
+    if (windowLabel() === 'float') {
+      onNowPlaying((np) => {
+        state.current = np
+        state.status = np ? 'playing' : 'idle'
+      })
+    }
     return
   }
   const demo = new URLSearchParams(location.search).get('demo') ?? ''

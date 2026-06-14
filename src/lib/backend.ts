@@ -313,6 +313,12 @@ export const win = {
     const w = getCurrentWindow()
     await w.setFullscreen(!(await w.isFullscreen()))
   },
+  /** 确定性进/退全屏(视频浮层用:自动进 / 关闭强制退,不能用 toggle 读当前态——会竞态)。
+   *  视频走原生窗口全屏而非 HTML5 requestFullscreen:后者在 WebView2 上与 DWM 合成器打架
+   *  (闪烁/退出穿帮),与本 app 其余全屏路径(toggleFullscreen)对齐才稳。 */
+  setFullscreen: async (on: boolean) => {
+    if (isTauri()) await getCurrentWindow().setFullscreen(on)
+  },
   isFullscreen: (): Promise<boolean> =>
     isTauri() ? getCurrentWindow().isFullscreen() : Promise.resolve(false),
   /** ✕ = 隐藏到托盘,不退进程(真退出走托盘菜单 quit)。 */
@@ -405,21 +411,6 @@ export async function setFloatVisible(visible: boolean) {
   else await w.hide()
 }
 
-/** 当前窗口是否聚焦(主窗启动判初值用)。 */
-export function isWindowFocused(): Promise<boolean> {
-  return isTauri() ? getCurrentWindow().isFocused() : Promise.resolve(true)
-}
-
-/** 监听本窗聚焦变化(主窗在前藏悬浮窗、退后显;PLAN §12 E 显隐规则);返回取消订阅。 */
-export function onWindowFocus(cb: (focused: boolean) => void): () => void {
-  if (!isTauri()) return () => {}
-  let un = () => {}
-  void getCurrentWindow()
-    .onFocusChanged((e) => cb(e.payload))
-    .then((f) => (un = f))
-  return () => un()
-}
-
 // ---- 跨窗口对齐(PLAN §12 E):两个 WebView 不共享内存,靠全局事件广播 ----
 
 /** 任一窗口改设置 → 广播,各窗口 useSettings 跟随(主窗换形象 / 透明度,悬浮窗实时跟上)。 */
@@ -450,6 +441,18 @@ export function onWakeChanged(cb: (running: boolean, keywords: string[]) => void
   void listen<{ running: boolean; keywords: string[] }>('lw:wake', (e) =>
     cb(e.payload.running, e.payload.keywords),
   )
+}
+
+/** 主窗是全 app 唯一真出声的播放位;current 一变(放 / 停 / 放完)就把全量快照广播给悬浮窗。
+ *  悬浮窗(被动镜像、不出声)据此跟随。传整份 NowPlaying|null = 绝对态 → 幂等、不怕重放,
+ *  也不会像广播相对动作(louder/toggle)那样翻车。只主窗发、只悬浮窗收(见 useMedia.wire)→ 无回声环。
+ *  补 core 事件的盲区:UI 点停止 / 自然播完不经 core,只有这条能让悬浮窗清掉"正在放"。 */
+export function emitNowPlaying(np: NowPlaying | null) {
+  if (isTauri()) void emit('lw:nowplaying', { np })
+}
+export function onNowPlaying(cb: (np: NowPlaying | null) => void): void {
+  if (!isTauri()) return
+  void listen<{ np: NowPlaying | null }>('lw:nowplaying', (e) => cb(e.payload.np))
 }
 
 export const api = {

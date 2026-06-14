@@ -20,7 +20,7 @@ const total = computed(() => memories.value.length + briefings.value.length)
 async function load() {
   if (!isTauri()) {
     memories.value = [
-      { id: 1, user_id: 1, kind: 'fact', content: '女儿叫朵朵,生日在十月', created_at: Date.now() - 5 * 86400_000, updated_at: 0 },
+      { id: 1, user_id: 1, kind: 'fact', content: '不吃香菜', created_at: Date.now() - 5 * 86400_000, updated_at: 0 },
       { id: 2, user_id: 1, kind: 'fact', content: '对花生过敏', created_at: Date.now() - 2 * 86400_000, updated_at: 0 },
     ]
     briefings.value = [

@@ -5,8 +5,12 @@
 import { onMounted, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { win } from '../lib/backend'
+import { useMedia } from '../composables/useMedia'
 
 const { t } = useI18n()
+// 视频全屏时藏三键(影院视图;退出靠 Esc / 浮层 ✕⛶)。只看 media.fullscreen:
+// 手动整窗全屏(无视频)时 media.fullscreen 为 false,三键仍在,用户能点退出。
+const { state: media } = useMedia()
 const fullscreen = ref(false)
 let stop = () => {}
 
@@ -21,7 +25,7 @@ onUnmounted(() => stop())
 </script>
 
 <template>
-  <div class="wc">
+  <div class="wc" v-show="!media.fullscreen">
     <button class="wcb" :title="t('win.minimize')" @click="win.minimize()">
       <svg viewBox="0 0 12 12"><line x1="2.5" y1="6.5" x2="9.5" y2="6.5" /></svg>
     </button>
