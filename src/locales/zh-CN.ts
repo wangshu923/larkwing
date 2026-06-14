@@ -167,6 +167,7 @@ export default {
     thinking: '正在想…',
     speaking: '正在说…',
     idle: '我在这儿,有事喊我',
+    wakeArmed: '🎙 等你喊「{kw}」', // 待机轮播·麦克风在等唤醒词(免手唤醒开着时)
     zoneNow: '正在进行',
     zoneNews: '最近消息',
     todayCost: '今日 {amount}',
@@ -258,6 +259,10 @@ export default {
       keywordsHint: '想换个名字喊它,就改这里(只认中文)。', // 改词的唯一入口
       keywordsAllInvalid: '唤醒词只认中文 —— 换成中文名字(比如「小七」)才喊得醒它。',
       keywordsSomeInvalid: '只有中文词能用,带字母/数字的那些会被忽略。',
+      sensitivity: '唤醒灵敏度',
+      sensSteady: '稳重',
+      sensKeen: '灵敏',
+      sensitivityHint: '叫不应就往右拖(更容易叫醒,但也更容易被无关声音误触);老被吵醒就往左。默认是经验折中值。',
       winDuckHint: 'Windows 上若开唤醒后其它声音变小:系统设置 → 声音 → 通信 → 选「不执行任何操作」。',
       advanced: '高级',
       rate: '语速',

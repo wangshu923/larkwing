@@ -332,6 +332,22 @@ impl VoiceRuntime {
         }
     }
 
+    /// 唤醒灵敏度(voice.wake.sensitivity 0~100,global)→ KWS threshold。
+    /// 高灵敏 = 低阈值 = 容易被唤醒(也更易误触);默认 50 → 0.45(robot 实战折中)。
+    /// 范围锁 [0.2, 0.7]:robot 经验 <0.25 客厅/电视声误触严重,>0.7 太钝(几乎叫不应)。
+    fn wake_threshold(&self) -> f32 {
+        let sens: f32 = self
+            .inner
+            .store
+            .settings
+            .get(None, "voice.wake.sensitivity")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50.0);
+        (0.7 - sens.clamp(0.0, 100.0) / 100.0 * 0.5).clamp(0.2, 0.7)
+    }
+
     async fn wake_start(&self) -> Result<()> {
         if self.wake_running() {
             return Ok(());
@@ -366,6 +382,7 @@ impl VoiceRuntime {
             asr,
             prompts,
             keywords_buf,
+            kws_threshold: self.wake_threshold(),
             speaker,
         };
         if let Err(e) =

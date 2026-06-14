@@ -78,7 +78,8 @@ export function useFloat() {
     () => voice.state.phase === 'listening' || voice.state.phase === 'transcribing',
   )
   const level = computed(() => voice.state.level) // 聆听波形(胶囊条 + 面板共用)
+  const wakeArmed = computed(() => voice.state.wakeArmed) // 免手唤醒在跑(头像加"竖耳"环)
   const newCount = computed(() => state.notices.length)
   const openMain = () => void summonWindow('main')
-  return { state, running, nowPlaying, listening, level, newCount, dismissNotice, openMain }
+  return { state, running, nowPlaying, listening, level, wakeArmed, newCount, dismissNotice, openMain }
 }

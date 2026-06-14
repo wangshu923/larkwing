@@ -28,9 +28,11 @@ pub(super) enum WakeCmd {
     Resume,
 }
 
-// ---- 锁死参数(robot 终值;PLAN §11 不暴露清单) ----
-const KWS_THRESHOLD: f32 = 0.5; // 默认词偏短,比 robot 终值 0.45 再严一档防误触
-const KWS_SCORE: f32 = 1.5; // 关键词加分提召回(误触靠 threshold 拦)
+// ---- KWS 参数 ----
+// threshold 不再锁死:由「唤醒灵敏度」滑块经 voice.wake.sensitivity 映射(见 mod.rs
+// wake_threshold,默认对齐 robot 实战 0.45),建 spotter 时由 deps 传入。
+// score 暂不暴露:关键词加分提召回,误触靠 threshold 拦。
+const KWS_SCORE: f32 = 1.5;
 const WAKE_START_TIMEOUT: Duration = Duration::from_secs(6); // 应答后没人开口
 const FOLLOW_UP_WINDOW: Duration = Duration::from_secs(6); // 跟进窗(robot 终值)
 const AWAIT_TURN_CAP: Duration = Duration::from_secs(180); // 前端没回信的兜底
@@ -43,6 +45,8 @@ pub(super) struct WakeDeps {
     pub asr: Arc<SherpaAsr>,
     pub prompts: PromptBank,
     pub keywords_buf: String,
+    /// KWS 触发阈值(唤醒灵敏度滑块映射而来;建 spotter 时锁定,改灵敏度需重启循环)。
+    pub kws_threshold: f32,
     /// 声纹(有家人注册才有;None = 不识别说话人,走会话用户)。
     pub speaker: Option<Arc<SpeakerId>>,
 }
@@ -71,7 +75,7 @@ fn wake_loop(d: &WakeDeps, cmd: &Receiver<WakeCmd>) -> Result<()> {
     kcfg.model_config.transducer.decoder = p("decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx");
     kcfg.model_config.transducer.joiner = p("joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx");
     kcfg.model_config.tokens = p("tokens.txt");
-    kcfg.keywords_threshold = KWS_THRESHOLD;
+    kcfg.keywords_threshold = d.kws_threshold;
     kcfg.keywords_score = KWS_SCORE;
     kcfg.keywords_buf = Some(d.keywords_buf.clone());
     let spotter =
@@ -291,8 +295,14 @@ pub(super) fn encode_keywords(
     (lines.join("\n"), dropped)
 }
 
-/// 单音节按词表切:声母(2 字优先,如 zh/ch/sh)+ 带调韵母;整音节兜底。
+/// 单音节按词表切。**先试整音节**:零声母音节(韵母开头,如 ài/ān/ér)本身就是
+/// 词表里的一个 token,必须整体匹配——否则会被下面的拆分逻辑错切成「首字符+剩余」
+/// (ài→à+i),喂给模型的是它不认的 token,唤醒永不命中。有声母音节(xiǎo)整音节
+/// 不在词表,自然落到拆分:声母(2 字优先,如 zh/ch/sh)+ 带调韵母。
 fn split_syllable(s: &str, vocab: &HashSet<String>) -> Option<Vec<String>> {
+    if vocab.contains(s) {
+        return Some(vec![s.to_string()]);
+    }
     let chars: Vec<char> = s.chars().collect();
     for plen in [2usize, 1] {
         if chars.len() > plen {
@@ -303,7 +313,7 @@ fn split_syllable(s: &str, vocab: &HashSet<String>) -> Option<Vec<String>> {
             }
         }
     }
-    vocab.contains(s).then(|| vec![s.to_string()])
+    None
 }
 
 pub(super) fn load_vocab(tokens_txt: &std::path::Path) -> Result<HashSet<String>> {
@@ -348,5 +358,17 @@ mod tests {
         let v = vocab(&["zh", "ōng", "z", "hōng"]);
         let got = split_syllable("zhōng", &v).unwrap();
         assert_eq!(got, vec!["zh".to_string(), "ōng".to_string()]);
+    }
+
+    #[test]
+    fn zero_initial_syllable_kept_whole_even_if_fragments_in_vocab() {
+        // 真实模型词表同时含韵母 ài/ér 和它们的"碎片" à/i、é/r。零声母字必须整体
+        // 匹配(ài/ér),不能被错拆成 à+i、é+r(修复前的 bug:plen=1 先于整音节)。
+        let v = vocab(&["x", "iǎo", "ài", "à", "i", "n", "ǚ", "ér", "é", "r"]);
+        let (buf, dropped) = encode_keywords(&["小爱".into(), "女儿".into()], &v);
+        assert!(dropped.is_empty(), "都应编码成功: {dropped:?}");
+        let lines: Vec<&str> = buf.lines().collect();
+        assert_eq!(lines[0], "x iǎo ài @小爱", "ài 整体,不拆成 à i");
+        assert_eq!(lines[1], "n ǚ ér @女儿", "ér 整体,不拆成 é r");
     }
 }

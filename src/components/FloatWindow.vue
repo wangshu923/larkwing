@@ -17,7 +17,7 @@ import catIdle from '../assets/cat-idle.png'
 
 const { t, te } = useI18n()
 const settings = useSettings()
-const { state, running, nowPlaying, listening, level, dismissNotice, openMain } = useFloat()
+const { state, running, nowPlaying, listening, level, wakeArmed, dismissNotice, openMain } = useFloat()
 const mood = useAgentMood()
 const idle = useFloatIdle()
 
@@ -77,6 +77,7 @@ const orbState = computed(() => {
   if (listening.value) return 'listen'
   if (mood.state.mood === 'thinking') return 'think'
   if (mood.state.mood === 'speaking') return 'speak'
+  if (wakeArmed.value) return 'armed' // 待机·免手唤醒在跑:头像一圈很淡的常亮环(竖着耳朵)
   return ''
 })
 
@@ -112,10 +113,10 @@ async function collapse() {
 function toggle() {
   void (state.expanded ? collapse() : expand())
 }
-// 单击 / 双击区分(同一胶囊):单击延迟一拍执行展开/收起,期间若来了双击就取消、改为开主窗
+// 单击 / 双击区分(矮条):单击延迟一拍执行展开/收起,期间若来了双击就取消、改为开主窗。
+// 拖动已分到头像手柄(见 onOrbDown),这里不再有"拖 vs 点"要消歧,纯按 click/dblclick。
 let tapTimer: ReturnType<typeof setTimeout> | undefined
 function onCapTap() {
-  if (suppressClick) return // 刚才是拖动,不当点击(见 onCapDown);复位交给那里的 timer
   clearTimeout(tapTimer)
   tapTimer = setTimeout(() => void toggle(), 230)
 }
@@ -124,28 +125,12 @@ function onCapDouble() {
   openMain()
 }
 
-// 拖动:手动接管,不用 data-tauri-drag-region —— 后者在 Windows 上会吞掉单击 click
-//(Tauri v2 已知问题 #9751/#9901),Mac 不暴露。做法:按下后只有移动超阈值才进原生拖动;
-// 纯点击(不动)照常触发 click/dblclick,展开/开主窗不受影响。
-let suppressClick = false
-function onCapDown(e: MouseEvent) {
+// 拖动:只有头像是手柄,按下即进原生拖动(imperative startDragging,不用 data-tauri-drag-region
+// —— 后者在 Windows 上吞单击,#9751/#9901)。职责分区 = 头像抓着挪、矮条点开,从根上消掉
+// Windows 上"整条又拖又点"的互吞(真鼠标点击常抖 >4px → 被当拖动 → 吞掉展开)。
+function onOrbDown(e: MouseEvent) {
   if (e.button !== 0) return // 只左键拖
-  const sx = e.screenX
-  const sy = e.screenY
-  const onMove = (m: MouseEvent) => {
-    if (Math.abs(m.screenX - sx) > 4 || Math.abs(m.screenY - sy) > 4) {
-      cleanup()
-      suppressClick = true // 抑制拖动收尾时可能合成的误触 click(本意是拖,不是展开)
-      setTimeout(() => (suppressClick = false), 400)
-      floatWin.startDragging()
-    }
-  }
-  const cleanup = () => {
-    window.removeEventListener('mousemove', onMove)
-    window.removeEventListener('mouseup', cleanup)
-  }
-  window.addEventListener('mousemove', onMove)
-  window.addEventListener('mouseup', cleanup, { once: true })
+  floatWin.startDragging()
 }
 
 // 点通知 → 唤主窗 + 跳对应会话;关闭走框外"小耳朵"(只收起回胶囊,不误关整窗)
@@ -197,8 +182,9 @@ onUnmounted(() => stopMoved())
   >
     <!-- shell:column = 胶囊顶 / 内容下(向下展开);column-reverse = 内容上 / 胶囊底(向上展开) -->
     <div class="shell" :class="{ up: openUp }">
-      <!-- 胶囊:始终在(锚点不动);单击 toggle、按住拖。内部 pointer-events:none 让点击穿透到胶囊 -->
-      <div class="cap" @mousedown="onCapDown" @click="onCapTap" @dblclick="onCapDouble">
+      <!-- 胶囊:始终在(锚点不动)。矮条单击 toggle / 双击开主窗(bar 内 pointer-events:none,
+           点击穿透到 cap);头像 = 拖动手柄(职责分区,避免 Win 上又拖又点互吞,见 onOrbDown) -->
+      <div class="cap" @click="onCapTap" @dblclick="onCapDouble">
         <div class="bar">
           <span class="bar-text" :class="bar.tone">{{ bar.text }}</span>
           <span v-if="bar.wave" class="wave"><i v-for="(h, i) in waveBars" :key="i" :style="{ height: h + 'px' }" /></span>
@@ -206,7 +192,7 @@ onUnmounted(() => stopMoved())
           <em v-if="bar.pct != null" class="pct">{{ Math.round(bar.pct * 100) }}%</em>
           <span v-if="bar.count" class="bar-dot">{{ bar.count }}</span>
         </div>
-        <div class="orb" :class="orbState"><img :src="avatar" :alt="petName" /></div>
+        <div class="orb" :class="orbState" @mousedown="onOrbDown"><img :src="avatar" :alt="petName" /></div>
       </div>
 
       <!-- 展开内容:两区 —— 正在进行(钉住) / 最近消息(新→旧);全显示,不取舍 -->
@@ -312,12 +298,15 @@ onUnmounted(() => stopMoved())
   display: flex;
   align-items: center;
   justify-content: center;
-  pointer-events: none; /* 点击穿透到 cap → 整条可拖 / 单击 toggle */
+  pointer-events: auto; /* 头像 = 拖动手柄(其余区域 pointer-events:none 穿透到 cap 点击展开) */
+  cursor: move;
 }
 .orb img { width: 36px; height: 36px; object-fit: contain; pointer-events: none; }
 /* 头像状态灯:语音/mood 给圆头像加辉光环(box-shadow 严格贴圆,不用 drop-shadow 防 WKWebView 方块影) */
 .orb.listen { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 2px var(--f-cy); }
 .orb.think { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 2px rgba(95, 200, 255, 0.5); }
+/* 待机·麦克风在等唤醒:比 think 更轻的常亮细环,只透出"竖着耳朵"的存在感 */
+.orb.armed { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 1.5px rgba(95, 200, 255, 0.3); }
 .orb.speak {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 2px var(--f-cy);
   animation: orbpulse 1.4s ease-in-out infinite;

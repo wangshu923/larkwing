@@ -14,9 +14,10 @@ import {
 } from '../lib/backend'
 import { i18n } from '../i18n'
 import { useSettings } from './useSettings'
+import { useVoice } from './useVoice'
 
 export interface IdleItem {
-  kind: 'reminder' | 'line' | 'cost' | 'balance'
+  kind: 'wake' | 'reminder' | 'cost' | 'balance'
   text: string
 }
 
@@ -33,6 +34,7 @@ const state = reactive({
 
 let wired = false
 let timer: ReturnType<typeof setInterval> | undefined
+let voiceState: ReturnType<typeof useVoice>['state'] | null = null // 唤醒态归 useVoice 单例,这里只读
 
 /** due_at(ms)→ HH:MM(时分;日期/区域格式归 OS,这里只取钟点)。 */
 function hhmm(ms: number): string {
@@ -64,12 +66,12 @@ async function refresh() {
 function wire() {
   if (wired) return
   wired = true
+  voiceState = useVoice().state
   if (!isTauri()) {
-    // 浏览器预览:?demo=float 塞一条提醒 + 一句话,纯看轮播视觉
+    // 浏览器预览:?demo=float 塞一条提醒,纯看轮播视觉(唤醒那条由 useVoice 的 demo 塞)
     if (new URLSearchParams(location.search).get('demo')?.includes('float')) {
       state.data = {
         next_reminder: { content: '吃药', due_at: Date.now() + 3 * 3600_000 },
-        latest_line: '记得多喝热水哦~',
       }
     }
   } else {
@@ -87,9 +89,14 @@ function wire() {
 
 const items = computed<IdleItem[]>(() => {
   const out: IdleItem[] = []
+  // ① 麦克风在等唤醒(最该让人知道"它在听着我"):喊名字唤醒开着时置顶,与提醒/问候轮播
+  if (voiceState?.wakeArmed) {
+    const kw = voiceState.wakeKeywords.length ? voiceState.wakeKeywords.join('、') : '小七'
+    out.push({ kind: 'wake', text: t('float.wakeArmed', { kw }) })
+  }
   const r = state.data?.next_reminder
   if (r) out.push({ kind: 'reminder', text: `${hhmm(r.due_at)}  ${r.content}` })
-  if (state.data?.latest_line) out.push({ kind: 'line', text: state.data.latest_line })
+  // (去掉"最近一句旺财说的话":用户反馈意义不大)
   if (showUsage()) {
     if (state.today) {
       out.push({ kind: 'cost', text: t('float.todayCost', { amount: `$${state.today.cost_usd.toFixed(3)}` }) })

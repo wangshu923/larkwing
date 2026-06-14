@@ -4,7 +4,7 @@
 // 浏览器预览降级:假电平 + 假识别文本(UI 优先工作流,?demo 不需要,点了就动)。
 
 import { reactive } from 'vue'
-import { api, isTauri, onAppEvent, type VoicePhase } from '../lib/backend'
+import { api, isTauri, onAppEvent, onWakeChanged, type VoicePhase } from '../lib/backend'
 import { useMedia } from './useMedia'
 
 const state = reactive({
@@ -17,6 +17,10 @@ const state = reactive({
   lastEnd: '',
   /** 唤醒交互区间(喊名命中 → 回待唤醒):duck 全程保持,UI 可标"语音会话中"。 */
   wakeActive: false,
+  /** 免手唤醒此刻在跑(事实,来自 voiceStatus / lw:wake);悬浮窗待机栏据此显「等你喊…」。 */
+  wakeArmed: false,
+  /** 当前唤醒词(显示用;默认「小七」)。 */
+  wakeKeywords: [] as string[],
 })
 
 /** Transcribed → send 链的接线口(MainLayout 注入,避免组合式互相 import)。
@@ -76,7 +80,26 @@ function wire() {
   if (wired) return
   wired = true
   media = useMedia()
-  if (!isTauri()) return
+  if (!isTauri()) {
+    // 浏览器预览:?demo=float 让待机栏显示"在等唤醒"那条(纯看视觉)
+    if (new URLSearchParams(location.search).get('demo')?.includes('float')) {
+      state.wakeArmed = true
+      state.wakeKeywords = ['小七']
+    }
+    return
+  }
+  // 唤醒是"事实"(开机自启时可能已起来):启动先拉一次兜底,之后靠 lw:wake 实时跟随
+  api
+    .voiceStatus()
+    .then((s) => {
+      state.wakeArmed = s.wakeRunning
+      state.wakeKeywords = s.keywords
+    })
+    .catch(() => {})
+  onWakeChanged((running, keywords) => {
+    state.wakeArmed = running
+    if (keywords.length) state.wakeKeywords = keywords
+  })
   onAppEvent((ev) => {
     if (ev.type !== 'voice') return
     const v = ev.data

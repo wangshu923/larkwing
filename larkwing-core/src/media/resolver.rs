@@ -74,20 +74,40 @@ pub async fn resolve(
 
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let tail: String = stderr.chars().rev().take(300).collect::<Vec<_>>().into_iter().rev().collect();
-        let lower = stderr.to_lowercase();
-        if lower.contains("login") || lower.contains("premium") || lower.contains("登录")
-            || lower.contains("大会员") || lower.contains("cookies")
-        {
-            return Err(ResolveError::AuthRequired(tail));
-        }
-        return Err(ResolveError::Other(anyhow::anyhow!("yt-dlp 解析失败: {tail}")));
+        // 观测(宪法 §7):真实失败原因进日志。之前只塞进 bail! 喂模型,控制台看不见 ——
+        // 用户实测"控制台看不出问题"正是这条缺位;解析失败是冷路径,全量记录不会刷屏。
+        tracing::warn!(url = page_url, "yt-dlp 解析失败:\n{}", stderr.trim());
+        return Err(classify_failure(&stderr));
     }
 
     let json: serde_json::Value = serde_json::from_slice(&out.stdout)
         .context("yt-dlp 输出不是 JSON")
         .map_err(ResolveError::Other)?;
     parse_resolved(&json).map_err(ResolveError::Other)
+}
+
+/// 失败分类(纯函数,可测):风控/登录类 → AuthRequired(UI 出扫码入口、模型换话术);
+/// 其余 → Other。HTTP 412(Precondition Failed)/403 是 B 站对**匿名请求**的拦截,
+/// 远端语义就是"得先登录"——与搜索路径把 412/403 当 RiskControl 一致;旧 robot 靠
+/// `cookies-from-browser=firefox` 借浏览器登录态绕过,Larkwing 改走 app 内扫码(宪法 §4)。
+/// 故意不收"已删除/地区限制":那类登录救不了,留给 Other 如实上报。
+fn classify_failure(stderr: &str) -> ResolveError {
+    let tail: String =
+        stderr.chars().rev().take(300).collect::<Vec<_>>().into_iter().rev().collect();
+    let lower = stderr.to_lowercase();
+    let needs_login = lower.contains("login")
+        || lower.contains("premium")
+        || lower.contains("登录")
+        || lower.contains("大会员")
+        || lower.contains("cookies")
+        || lower.contains("precondition failed") // HTTP 412:B 站风控匿名请求
+        || lower.contains("http error 403")
+        || lower.contains("风控");
+    if needs_login {
+        ResolveError::AuthRequired(tail)
+    } else {
+        ResolveError::Other(anyhow::anyhow!("yt-dlp 解析失败: {tail}"))
+    }
 }
 
 /// 纯函数,可测:从 yt-dlp -j 输出抽出流清单。
@@ -168,5 +188,35 @@ mod tests {
     #[test]
     fn no_stream_is_an_error() {
         assert!(parse_resolved(&serde_json::json!({ "title": "x" })).is_err());
+    }
+
+    #[test]
+    fn http_412_and_403_classify_as_auth() {
+        // B 站对匿名请求的实拍报错(本机复现 萌鸡小队 即此):412 = 风控 = 需要登录
+        let e = classify_failure(
+            "ERROR: [BiliBili] 1P87Z6SEfN: Unable to download JSON metadata: \
+             HTTP Error 412: Precondition Failed",
+        );
+        assert!(matches!(e, ResolveError::AuthRequired(_)), "412 风控应判为需要登录");
+        assert!(matches!(
+            classify_failure("ERROR: HTTP Error 403: Forbidden"),
+            ResolveError::AuthRequired(_)
+        ));
+    }
+
+    #[test]
+    fn explicit_login_keywords_classify_as_auth() {
+        assert!(matches!(classify_failure("需要大会员才能观看"), ResolveError::AuthRequired(_)));
+        assert!(matches!(classify_failure("This video requires login"), ResolveError::AuthRequired(_)));
+    }
+
+    #[test]
+    fn deleted_or_georestricted_is_not_auth() {
+        // 登录救不了的:照实当 Other 报"没解析出来",别误导用户去扫码
+        let e = classify_failure(
+            "ERROR: [BiliBili] x: This video may be deleted or geo-restricted. \
+             You might want to try a VPN or a proxy server",
+        );
+        assert!(matches!(e, ResolveError::Other(_)), "已删除/地区限制不归 auth");
     }
 }

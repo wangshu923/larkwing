@@ -3,7 +3,7 @@
 // 暗 tab 可点、进 teaser 页 —— 能点的必有反应(铁律3),绝不放灰掉的死控件。
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { api, isTauri, setFloatVisible, type ProviderView, type VoiceStatus } from '../lib/backend'
+import { api, emitWakeChanged, isTauri, setFloatVisible, type ProviderView, type VoiceStatus } from '../lib/backend'
 import { useChat } from '../composables/useChat'
 import { useSettings } from '../composables/useSettings'
 
@@ -93,7 +93,9 @@ async function toggleWake() {
   }
   wakeBusy.value = true
   try {
-    voiceInfo.value = await api.voiceWakeSet(target)
+    const s = await api.voiceWakeSet(target)
+    voiceInfo.value = s
+    emitWakeChanged(s.wakeRunning, s.keywords) // 实时同步给悬浮窗待机栏
   } catch (e) {
     console.error('唤醒开关失败', e) // message 进日志,给用户的是友好兜底文案
     wakeError.value = t('settings.voice.wakeFailed')
@@ -112,13 +114,33 @@ async function saveKeywords() {
   if (isTauri() && voiceInfo.value?.wakeRunning) {
     try {
       await api.voiceWakeSet(false)
-      voiceInfo.value = await api.voiceWakeSet(true)
+      const s = await api.voiceWakeSet(true)
+      voiceInfo.value = s
+      emitWakeChanged(s.wakeRunning, s.keywords)
     } catch (e) {
       console.error('唤醒词生效失败', e)
       wakeError.value = t('settings.voice.wakeFailed')
     }
   } else if (isTauri()) {
     voiceInfo.value = await api.voiceStatus().catch(() => voiceInfo.value)
+    if (voiceInfo.value) emitWakeChanged(voiceInfo.value.wakeRunning, voiceInfo.value.keywords)
+  }
+}
+
+// 唤醒灵敏度:滑块松手(@change)保存;开着唤醒时重启循环让新阈值生效(同唤醒词机制)。
+// 刻意用 @change 而非 @input —— 拖动途中不反复重启唤醒。
+async function saveSensitivity(v: number) {
+  await settings.set('voice.wake.sensitivity', String(v))
+  if (isTauri() && voiceInfo.value?.wakeRunning) {
+    try {
+      await api.voiceWakeSet(false)
+      const s = await api.voiceWakeSet(true)
+      voiceInfo.value = s
+      emitWakeChanged(s.wakeRunning, s.keywords)
+    } catch (e) {
+      console.error('灵敏度生效失败', e)
+      wakeError.value = t('settings.voice.wakeFailed')
+    }
   }
 }
 
@@ -523,6 +545,23 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         <p v-if="keywordWarn === 'all-bad'" class="hint err">{{ t('settings.voice.keywordsAllInvalid') }}</p>
         <p v-else-if="keywordWarn === 'some-bad'" class="hint warn">{{ t('settings.voice.keywordsSomeInvalid') }}</p>
         <p v-else class="hint">{{ t('settings.voice.keywordsHint') }}</p>
+        <div class="row">
+          <span class="label">{{ t('settings.voice.sensitivity') }}</span>
+          <span class="sens">
+            <small>{{ t('settings.voice.sensSteady') }}</small>
+            <input
+              class="v-vol"
+              type="range"
+              min="0"
+              max="100"
+              step="5"
+              :value="Number(settings.get('voice.wake.sensitivity') || '50')"
+              @change="saveSensitivity(Number(($event.target as HTMLInputElement).value))"
+            />
+            <small>{{ t('settings.voice.sensKeen') }}</small>
+          </span>
+        </div>
+        <p class="hint">{{ t('settings.voice.sensitivityHint') }}</p>
         <div v-for="(seg, name) in { rate: segs.rate, patience: segs.patience }" :key="name" class="row">
           <span class="label">{{ t(`settings.voice.${name}`) }}</span>
           <span class="seg">
@@ -717,6 +756,9 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .chip.sp.on { border-color: rgba(95, 200, 255, 0.55); color: var(--cy); background: rgba(95, 200, 255, 0.1); }
 .chip.sp.busy { animation: led 1.2s ease-in-out infinite; }
 .v-vol { width: 220px; accent-color: var(--cy); }
+.sens { display: inline-flex; align-items: center; gap: 10px; }
+.sens small { color: var(--txt2); font-size: 12px; white-space: nowrap; }
+.sens .v-vol { width: 150px; }
 .v-mic { max-width: 280px; }
 .comp { letter-spacing: 1px; color: var(--txt2); }
 .comp.ok { color: #5fe0b0; }

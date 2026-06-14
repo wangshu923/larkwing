@@ -340,9 +340,16 @@ async fn run_tools(
             return (call.clone(), "error".to_string(), format!("没有叫 {} 的工具", call.name));
         };
         match tokio::time::timeout(tool.spec().timeout, tool.run(call.args.clone(), ctx)).await {
-            Err(_) => (call.clone(), "timeout".to_string(), "工具执行超时,没有拿到结果".to_string()),
+            Err(_) => {
+                tracing::warn!(tool = %call.name, "工具执行超时,没有拿到结果");
+                (call.clone(), "timeout".to_string(), "工具执行超时,没有拿到结果".to_string())
+            }
             Ok(Err(e)) => {
-                let msg: String = format!("{e:#}").chars().take(500).collect();
+                // 观测:工具失败原因进日志(之前只回喂模型,控制台看不见 → 用户"看不出问题")。
+                // 错误仍当观察喂回模型(截断 500),但全量进日志便于排障。
+                let full = format!("{e:#}");
+                tracing::warn!(tool = %call.name, "工具执行出错: {full}");
+                let msg: String = full.chars().take(500).collect();
                 (call.clone(), "error".to_string(), msg)
             }
             Ok(Ok(out)) => (call.clone(), "ok".to_string(), out),

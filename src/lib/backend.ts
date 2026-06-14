@@ -358,12 +358,21 @@ export const floatWin = {
     const bottom = mon ? (mon.position.y + mon.size.height) / sf : 100000
     return { x: op.x / sf, y: op.y / sf, w: os.width / sf, h: os.height / sf, screenTop: top, screenBottom: bottom }
   },
-  /** 设窗口盒(逻辑像素):setPosition + setSize 一把搞定。 */
+  /** 设窗口盒(逻辑像素):resizable 临时开 → setPosition + setSize → 关回。
+   *  为什么 toggle:float 常态保持 resizable:false(否则用户能像普通窗口那样拖边把胶囊/面板缩放,
+   *  错了 —— 它只该点击展开)。但 Windows/tao 下 resizable:false 会把 min/max 尺寸钉成初始值、
+   *  程序化 setSize 被夹住长不大(tauri#5679;mac 不钳制)。故只在这一次程序化 resize 时短暂打开,
+   *  finally 里立刻关回 → 既能展开,用户又拖不动。 */
   setBox: async (x: number, y: number, w: number, h: number) => {
     if (!isTauri()) return
     const win = getCurrentWindow()
-    await win.setPosition(new LogicalPosition(Math.round(x), Math.round(y)))
-    await win.setSize(new LogicalSize(Math.round(w), Math.round(h)))
+    await win.setResizable(true)
+    try {
+      await win.setPosition(new LogicalPosition(Math.round(x), Math.round(y)))
+      await win.setSize(new LogicalSize(Math.round(w), Math.round(h)))
+    } finally {
+      await win.setResizable(false)
+    }
   },
   /** 监听本窗移动(逻辑坐标);返回取消订阅。 */
   onMoved(cb: (x: number, y: number) => void): () => void {
@@ -429,6 +438,18 @@ export function emitOpenConversation(convId: number) {
 export function onOpenConversation(cb: (convId: number) => void): void {
   if (!isTauri()) return
   void listen<{ conv_id: number }>('lw:open-conv', (e) => cb(e.payload.conv_id))
+}
+
+/** 设置里开/关免手唤醒 → 广播事实态(wakeRunning + 唤醒词):悬浮窗是另一个 WebView,
+ *  待机栏据此实时更新「等你喊…」(开机自启那次由 float 自己 voiceStatus() 兜底)。 */
+export function emitWakeChanged(running: boolean, keywords: string[]) {
+  if (isTauri()) void emit('lw:wake', { running, keywords })
+}
+export function onWakeChanged(cb: (running: boolean, keywords: string[]) => void): void {
+  if (!isTauri()) return
+  void listen<{ running: boolean; keywords: string[] }>('lw:wake', (e) =>
+    cb(e.payload.running, e.payload.keywords),
+  )
 }
 
 export const api = {
