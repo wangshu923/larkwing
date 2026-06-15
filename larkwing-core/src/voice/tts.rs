@@ -12,6 +12,12 @@ pub trait TtsEngine: Send + Sync {
     fn synthesize(&self, text: &str, voice: &str, rate_pct: i32) -> Result<Vec<u8>>;
     /// 产物容器扩展名(relay 按它给 Content-Type,缓存按它命名):mp3 | wav。
     fn ext(&self) -> &'static str;
+    /// 同一实例能否并发调用 synthesize。sherpa 的 OfflineTts(melo/克隆)**非可重入**——
+    /// 并发 generate 会在原生层崩溃(整进程退出,无 Rust panic)。默认 false(调用方串行化);
+    /// 仅无共享原生状态的引擎(EdgeTts 每次新建 websocket)才声明 true。
+    fn reentrant(&self) -> bool {
+        false
+    }
 }
 
 /// 微软 Edge 朗读 API(与 robot 的 edge-tts 同一服务,长期稳定)。
@@ -43,6 +49,10 @@ impl TtsEngine for EdgeTts {
 
     fn ext(&self) -> &'static str {
         "mp3"
+    }
+
+    fn reentrant(&self) -> bool {
+        true // 每次合成新建 websocket,无共享原生状态,可并发
     }
 }
 
@@ -102,8 +112,87 @@ impl TtsEngine for SherpaVits {
     }
 }
 
+/// 克隆音色引用解析:clone-id(已去 `clone:` 前缀)→ (参考音 wav 文件, 文字稿)。
+/// 闭包捕获 store,引擎本体因此不依赖具体存储类型(单一真相源 = cloned_voices 库)。
+pub type CloneResolver =
+    std::sync::Arc<dyn Fn(&str) -> Result<(std::path::PathBuf, String)> + Send + Sync>;
+
+/// 本地零样本音色克隆(ZipVoice,k2-fsa;PLAN §11 D-clone):参考音 prompt_audio(5-30s)
+/// + 文字稿 prompt_text 在生成时传入 → 克隆任意说话人,**免训练**;中英双语 distill int8,
+/// 跨语种(英文参考音说中文)亦可。出 wav(同 melo,免 mp3 编码)。模型贵,加载一次进 OnceCell。
+/// `voice` 参数 = `clone:<id>`,由 `resolve` 闭包查 (参考音 wav 路径, 文字稿)。
+pub struct ZipVoiceTts {
+    tts: sherpa_onnx::OfflineTts,
+    resolve: CloneResolver,
+}
+
+impl ZipVoiceTts {
+    /// 加载 ZipVoice 模型(encoder/decoder/vocoder/tokens + espeak-ng-data 目录 + lexicon)。
+    /// feat_scale/t_shift/target_rms/guidance_scale 取自 sherpa-onnx 官方 `zipvoice_tts` 例子
+    /// (Default 全 0 会跑不出声),锁死不暴露(同管线参数纪律)。
+    pub fn load(model_dir: &Path, resolve: CloneResolver) -> Result<ZipVoiceTts> {
+        let p = |n: &str| Some(model_dir.join(n).to_string_lossy().into_owned());
+        let mut cfg = sherpa_onnx::OfflineTtsConfig::default();
+        cfg.model.zipvoice.tokens = p("tokens.txt");
+        cfg.model.zipvoice.encoder = p("encoder.int8.onnx");
+        cfg.model.zipvoice.decoder = p("decoder.int8.onnx");
+        cfg.model.zipvoice.vocoder = p("vocos_24khz.onnx");
+        cfg.model.zipvoice.data_dir = p("espeak-ng-data");
+        cfg.model.zipvoice.lexicon = p("lexicon.txt");
+        cfg.model.zipvoice.feat_scale = 0.1;
+        cfg.model.zipvoice.t_shift = 0.5;
+        cfg.model.zipvoice.target_rms = 0.1;
+        cfg.model.zipvoice.guidance_scale = 1.0;
+        cfg.model.num_threads = 2;
+        let t0 = std::time::Instant::now();
+        let tts =
+            sherpa_onnx::OfflineTts::create(&cfg).ok_or_else(|| anyhow!("音色克隆模型加载失败"))?;
+        tracing::info!(ms = t0.elapsed().as_millis() as u64, "音色克隆模型加载完成(zipvoice)");
+        Ok(ZipVoiceTts { tts, resolve })
+    }
+}
+
+impl TtsEngine for ZipVoiceTts {
+    fn synthesize(&self, text: &str, voice: &str, rate_pct: i32) -> Result<Vec<u8>> {
+        // voice = "clone:<id>";查参考音 + 文字稿(零样本克隆的命门)。
+        let clone_id = voice.strip_prefix("clone:").unwrap_or(voice);
+        let (ref_wav, ref_text) =
+            (self.resolve)(clone_id).with_context(|| format!("克隆音色 {clone_id} 解析失败"))?;
+        let ref_path = ref_wav.to_string_lossy();
+        let wave = sherpa_onnx::Wave::read(ref_path.as_ref())
+            .ok_or_else(|| anyhow!("参考音读取失败:{}", ref_wav.display()))?;
+        let cfg = sherpa_onnx::GenerationConfig {
+            speed: 1.0 + rate_pct as f32 / 100.0,
+            reference_audio: Some(wave.samples().to_vec()),
+            reference_sample_rate: wave.sample_rate(),
+            reference_text: Some(ref_text),
+            num_steps: 4, // distill 档:官方例子值(质量/速度权衡)
+            ..Default::default()
+        };
+        let t0 = std::time::Instant::now();
+        let audio = self
+            .tts
+            .generate_with_config(text, &cfg, None::<fn(&[f32], f32) -> bool>)
+            .ok_or_else(|| anyhow!("音色克隆合成失败"))?;
+        let samples = audio.samples();
+        ensure!(!samples.is_empty(), "音色克隆返回了空音频");
+        let wav = pcm_f32_to_wav(samples, audio.sample_rate() as u32);
+        tracing::info!(
+            ms = t0.elapsed().as_millis() as u64,
+            chars = text.chars().count(),
+            "TTS 合成完成(克隆)"
+        );
+        Ok(wav)
+    }
+
+    fn ext(&self) -> &'static str {
+        "wav"
+    }
+}
+
 /// f32 PCM([-1,1])→ 16-bit WAV 字节(44 字节头 + i16 LE;WebView <audio> 原生可播)。
-fn pcm_f32_to_wav(samples: &[f32], rate: u32) -> Vec<u8> {
+/// pub(super):enrollment 录入也用它把参考音落成 wav(voice/mod.rs)。
+pub(super) fn pcm_f32_to_wav(samples: &[f32], rate: u32) -> Vec<u8> {
     let data_len = samples.len() * 2;
     let mut buf = Vec::with_capacity(44 + data_len);
     let byte_rate = rate * 2; // mono, 16-bit
@@ -188,6 +277,47 @@ mod tests {
     #[test]
     fn speaker_catalog_has_default() {
         assert!(SPEAKERS_ZH.iter().any(|s| s.id == DEFAULT_SPEAKER));
+    }
+
+    #[test]
+    fn clone_voices_are_cache_namespaced() {
+        // 不同克隆 id → 不同缓存键;克隆与内置在线音色互不串(voice 维度已在 cache_key)。
+        assert_ne!(cache_key("clone:a", 0, "你好"), cache_key("clone:b", 0, "你好"));
+        assert_ne!(cache_key("clone:a", 0, "你好"), cache_key("zh-CN-XiaoxiaoNeural", 0, "你好"));
+    }
+
+    /// 真模型冒烟(手动跑,需真模型 + 16k mono 参考 wav):用真 ZipVoice 端到端合成,
+    /// 顺带用 SenseVoice 转写参考音 → 验证 asr.rs + ZipVoiceTts 全链。跑法:
+    /// `ZIPVOICE_DIR=.. SENSEVOICE_DIR=.. BT_REF=ref.wav OUT=out.wav SAY="..." \
+    ///   cargo test -p larkwing-core --lib zipvoice_real_synth -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn zipvoice_real_synth_smoke() {
+        use crate::voice::asr::{Asr, SherpaAsr};
+        let zv = std::env::var("ZIPVOICE_DIR").expect("ZIPVOICE_DIR");
+        let sv = std::env::var("SENSEVOICE_DIR").expect("SENSEVOICE_DIR");
+        let ref_wav = std::env::var("BT_REF").expect("BT_REF");
+        let out = std::env::var("OUT").unwrap_or_else(|_| "/tmp/bt/bt_says.wav".into());
+        let say =
+            std::env::var("SAY").unwrap_or_else(|_| "相信我,飞行员。我会保护你。".into());
+
+        // 1) 用 SherpaAsr 转写参考音(16k mono)→ reference_text
+        let wave = sherpa_onnx::Wave::read(&ref_wav).expect("read ref wav");
+        let asr = SherpaAsr::sense_voice(Path::new(&sv), "zh").expect("load asr");
+        let ref_text = asr.transcribe(wave.samples()).expect("transcribe");
+        eprintln!("[REF TEXT] {ref_text}");
+        assert!(!ref_text.is_empty(), "参考音没转出文字");
+
+        // 2) 用 ZipVoiceTts(真模型)合成 BT 说新中文
+        let rp = ref_wav.clone();
+        let rt = ref_text.clone();
+        let resolve: CloneResolver =
+            std::sync::Arc::new(move |_id: &str| Ok((std::path::PathBuf::from(&rp), rt.clone())));
+        let tts = ZipVoiceTts::load(Path::new(&zv), resolve).expect("load zipvoice");
+        let wav = tts.synthesize(&say, "clone:bt", 0).expect("synthesize");
+        assert!(wav.len() > 1000, "合成音频太小");
+        std::fs::write(&out, &wav).expect("write out");
+        eprintln!("[OUT] {} bytes -> {out}  (说: {say})", wav.len());
     }
 
     #[test]

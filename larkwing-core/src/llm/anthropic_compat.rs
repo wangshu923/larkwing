@@ -14,6 +14,20 @@ const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Messages API 必填 max_tokens;未指定时的产品默认。
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 
+/// data:image/png;base64,XXXX → Anthropic base64 image block;非 data URL → url source。
+fn anthropic_image_block(url: &str) -> Value {
+    if let Some(rest) = url.strip_prefix("data:") {
+        if let Some((meta, data)) = rest.split_once(',') {
+            let media_type = meta.split(';').next().unwrap_or("image/jpeg");
+            return json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": media_type, "data": data }
+            });
+        }
+    }
+    json!({ "type": "image", "source": { "type": "url", "url": url } })
+}
+
 pub struct AnthropicCompatProvider {
     cfg: LlmConfig,
     http: reqwest::Client,
@@ -36,8 +50,24 @@ impl AnthropicCompatProvider {
             .messages
             .iter()
             .map(|m| match m {
-                super::ChatMessage::User { content } => {
-                    json!({ "role": "user", "content": content })
+                super::ChatMessage::User { content, parts } => {
+                    if parts.is_empty() {
+                        json!({ "role": "user", "content": content })
+                    } else {
+                        let mut blocks = Vec::with_capacity(parts.len() + 1);
+                        if !content.is_empty() {
+                            blocks.push(json!({ "type": "text", "text": content }));
+                        }
+                        for p in parts {
+                            blocks.push(match p {
+                                super::ContentPart::Text { text } => {
+                                    json!({ "type": "text", "text": text })
+                                }
+                                super::ContentPart::ImageUrl { url } => anthropic_image_block(url),
+                            });
+                        }
+                        json!({ "role": "user", "content": blocks })
+                    }
                 }
                 // reasoning 不回传:Anthropic 的 thinking block 要求原始签名,无法合成;
                 // 思考轮回传策略是 B 期联调课题(PLAN §8 watch-item)
@@ -335,6 +365,26 @@ mod tests {
 
     fn provider() -> AnthropicCompatProvider {
         AnthropicCompatProvider::new(LlmConfig::anthropic("sk-ant-test".into()))
+    }
+
+    // 媒体输入:带图 user 出向成 Anthropic content blocks(text + base64 image)
+    #[test]
+    fn to_wire_user_with_image_becomes_blocks() {
+        use crate::llm::ContentPart;
+        let p = provider();
+        let wire = p.to_wire(&ChatRequest {
+            messages: vec![ChatMessage::user_with_parts(
+                "这是什么菜",
+                vec![ContentPart::ImageUrl { url: "data:image/jpeg;base64,AAAA".into() }],
+            )],
+            ..Default::default()
+        });
+        let content = &wire["messages"][0]["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "base64");
+        assert_eq!(content[1]["source"]["media_type"], "image/jpeg");
+        assert_eq!(content[1]["source"]["data"], "AAAA");
     }
 
     fn chunk(json: &str) -> Value {

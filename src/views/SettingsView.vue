@@ -4,21 +4,25 @@
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { api, emitWakeChanged, isTauri, setFloatVisible, type ProviderView, type VoiceStatus } from '../lib/backend'
+import { applyLocale } from '../i18n'
 import { useChat } from '../composables/useChat'
 import { useSettings } from '../composables/useSettings'
+import { useWakeCalib } from '../composables/useWakeCalib'
+import { audioFileToWavBase64 } from '../composables/useAudioDecode'
 
 const emit = defineEmits<{ (e: 'close'): void }>()
 const { t } = useI18n()
 const settings = useSettings()
 const { state: chat } = useChat()
 
-type TabId = 'general' | 'brain' | 'voice' | 'family' | 'remote' | 'system'
+type TabId = 'general' | 'brain' | 'voice' | 'family' | 'remote' | 'services' | 'system'
 const tabs: { id: TabId; future?: boolean }[] = [
   { id: 'general' },
   { id: 'brain' },
   { id: 'voice' },
   { id: 'family' },
   { id: 'remote', future: true },
+  { id: 'services' },
   { id: 'system' },
 ]
 const tab = ref<TabId>('general')
@@ -46,6 +50,7 @@ async function loadVoice() {
         { id: 'zh-CN-XiaochenNeural', name: '晓辰 · 活泼' },
         { id: 'zh-CN-YunxiNeural', name: '云希 · 少年' },
         { id: 'zh-CN-YunjianNeural', name: '云健 · 沉稳' },
+        { id: 'clone:demo', name: '我的声音(示例)', isClone: true, builtin: false },
       ],
     }
   } else {
@@ -127,20 +132,115 @@ async function saveKeywords() {
   }
 }
 
-// 唤醒灵敏度:滑块松手(@change)保存;开着唤醒时重启循环让新阈值生效(同唤醒词机制)。
-// 刻意用 @change 而非 @input —— 拖动途中不反复重启唤醒。
+// 影响"正在监听的唤醒循环"的设置(阈值/唤醒词/麦克风/耐心)改完 → 自动 off→on 重启,
+// 让新值立即生效,不让用户手动重启(这不是服务器,改一下就重启体验差)。重启很轻
+// (模型已缓存,只重建 spotter/VAD/采集,无声、亚秒级);唤醒没开就只存库,下次开自然用上。
+async function restartWakeIfRunning() {
+  if (!isTauri() || !voiceInfo.value?.wakeRunning) return
+  try {
+    await api.voiceWakeSet(false)
+    const s = await api.voiceWakeSet(true)
+    voiceInfo.value = s
+    emitWakeChanged(s.wakeRunning, s.keywords) // 实时同步给悬浮窗待机栏
+  } catch (e) {
+    console.error('设置生效(重启唤醒)失败', e)
+    wakeError.value = t('settings.voice.wakeFailed')
+  }
+}
+
+// 唤醒灵敏度:滑块松手(@change)保存 + 重启生效;@input 只更新值,拖动途中不反复重启。
 async function saveSensitivity(v: number) {
   await settings.set('voice.wake.sensitivity', String(v))
-  if (isTauri() && voiceInfo.value?.wakeRunning) {
-    try {
-      await api.voiceWakeSet(false)
-      const s = await api.voiceWakeSet(true)
-      voiceInfo.value = s
-      emitWakeChanged(s.wakeRunning, s.keywords)
-    } catch (e) {
-      console.error('灵敏度生效失败', e)
-      wakeError.value = t('settings.voice.wakeFailed')
+  await restartWakeIfRunning()
+}
+
+// 录音标定:录几遍唤醒词 → 一次扫描定灵敏度(必要时连触发拼写)。落定后同步滑块+语音状态
+// (core 已直接写库并按需重启唤醒,这里只把前端反应态追平)。
+const { state: calib, start: startCalib, cancel: cancelCalib } = useWakeCalib()
+watch(
+  () => calib.phase,
+  async (p) => {
+    if (p === 'done' && calib.result?.ok) {
+      await settings.set('voice.wake.sensitivity', String(calib.result.sensitivity))
+      if (isTauri()) voiceInfo.value = await api.voiceStatus().catch(() => voiceInfo.value)
     }
+  },
+)
+const calibStepLabel = computed(() => {
+  if (calib.phase === 'computing') return t('settings.voice.calibComputing')
+  if (calib.total > 0 && calib.step >= calib.total) return t('settings.voice.calibAmbient')
+  return t('settings.voice.calibRound', { n: calib.step, total: Math.max(calib.total - 1, 0) })
+})
+const calibVerdict = computed(() =>
+  calib.result ? t(`settings.voice.calibVerdict_${calib.result.verdict}`, { sens: calib.result.sensitivity }) : '',
+)
+
+// 语速/耐心 seg:语速是 TTS、下句即用,不必动唤醒;耐心改 VAD 静音容忍,得重启唤醒才换。
+function onVoiceSeg(key: string, v: string) {
+  void settings.set(key, v)
+  if (key === 'voice.patience') void restartWakeIfRunning()
+}
+
+// 自定义音色:选本地音频文件 → 前端解码/重采样成 16k → 后端转写出草稿 → 起名/改稿 → 保存。
+const cloneFile = ref<HTMLInputElement | null>(null)
+const cloneBusy = ref(false)
+const cloneErr = ref('')
+const cloneDraft = ref<{ cloneId: string; name: string; transcript: string } | null>(null)
+function pickCustomVoice() {
+  cloneErr.value = ''
+  cloneFile.value?.click()
+}
+async function onCustomFile(ev: Event) {
+  const input = ev.target as HTMLInputElement
+  const f = input.files?.[0]
+  input.value = '' // 允许重选同一文件
+  if (!f) return
+  cloneBusy.value = true
+  cloneErr.value = ''
+  cloneDraft.value = null
+  try {
+    const { base64 } = await audioFileToWavBase64(f)
+    const d = await api.voiceCloneImport(base64)
+    cloneDraft.value = { cloneId: d.cloneId, name: f.name.replace(/\.[^.]+$/, ''), transcript: d.transcript }
+  } catch (e) {
+    console.error('导入音色失败', e)
+    cloneErr.value = t('settings.voice.cloneImportFailed')
+  } finally {
+    cloneBusy.value = false
+  }
+}
+async function saveClone() {
+  const d = cloneDraft.value
+  if (!d || !d.name.trim() || !d.transcript.trim()) return
+  cloneBusy.value = true
+  try {
+    await api.voiceCloneSave(d.cloneId, d.name.trim(), d.transcript.trim())
+    cloneDraft.value = null
+    await loadVoice()
+  } catch (e) {
+    console.error('保存音色失败', e)
+    cloneErr.value = t('settings.voice.cloneSaveFailed')
+  } finally {
+    cloneBusy.value = false
+  }
+}
+function cancelClone() {
+  cloneDraft.value = null
+  cloneErr.value = ''
+}
+// 删除二次确认走 arm 模式(同 MemoryView):Tauri WebView 里 window.confirm 不可靠(返回 falsy)。
+const cloneArm = ref('')
+async function removeClone(speakerId: string) {
+  if (cloneArm.value !== speakerId) {
+    cloneArm.value = speakerId // 第一下:亮起「删?」,再点一下才真删
+    return
+  }
+  cloneArm.value = ''
+  try {
+    await api.deleteVoiceClone(speakerId.replace(/^clone:/, ''))
+    await loadVoice()
+  } catch (e) {
+    console.error('删除音色失败', e)
   }
 }
 
@@ -174,7 +274,8 @@ async function previewSpeaker(id: string) {
   }
 }
 function setMic(ev: Event) {
-  settings.set('voice.input_device', (ev.target as HTMLSelectElement).value)
+  void settings.set('voice.input_device', (ev.target as HTMLSelectElement).value)
+  void restartWakeIfRunning() // 换麦立即生效:运行中的唤醒也重开采集用新设备
 }
 
 // 唯一脉冲:全局任何时刻最多一个光点,指向当前唯一需要行动的事(现在 = 缺钥匙)
@@ -226,6 +327,27 @@ function toggleFloatUsage() {
   settings.set('ui.float.show_usage', floatShowUsage.value ? '0' : '1')
 }
 
+// 天气服务(PLAN 天气块):默认免 key Open-Meteo;填和风 key → 切国内稳源(后端按 key 有无选源)。
+// key 是秘密 → 后端只回掩码;草稿本地隔离、空草稿不覆盖(同供应商 saveKey 纪律,防掩码回存)。
+const weatherKeyDraft = ref('')
+const weatherKeyMasked = computed(() => settings.get('weather.qweather.key'))
+const weatherKeySet = computed(() => !!weatherKeyMasked.value)
+function saveWeatherKey() {
+  const k = weatherKeyDraft.value.trim()
+  if (!k) return
+  settings.set('weather.qweather.key', k)
+  weatherKeyDraft.value = ''
+}
+function clearWeatherKey() {
+  settings.set('weather.qweather.key', '')
+}
+function setWeatherHost(ev: Event) {
+  settings.set('weather.qweather.host', (ev.target as HTMLInputElement).value.trim())
+}
+function openQWeatherSite() {
+  window.open('https://dev.qweather.com/', '_blank', 'noopener')
+}
+
 // 段选控件的数据驱动写法:一行配置 = 一个设置项
 const segs = computed(() => ({
   character: {
@@ -267,6 +389,17 @@ const segs = computed(() => ({
   },
 }))
 
+// 界面语言:选项用各语言自称(不翻译),用户在任何当前语言下都能认出自己那项。
+// 切换即时落库 + applyLocale 当窗实时刷新;持久化靠 boot 的 applyLocale(snap.locale)。
+const localeOptions = [
+  { v: 'zh-CN', label: '中文' },
+  { v: 'en', label: 'English' },
+]
+function setLocale(v: string) {
+  settings.set('ui.locale', v)
+  applyLocale(v)
+}
+
 // 标题里的名字跟「叫我什么」联动(ui.pet_name 空 = 默认名 pet.name);
 // 与 MainLayout / FloatWindow 同一口径 —— 这是当前 agent 的名字,不是 app 名
 const petName = computed(() => settings.get('ui.pet_name') || t('pet.name'))
@@ -302,7 +435,8 @@ function saveField(p: ProviderView, field: 'baseUrl' | 'model', ev: Event) {
   settings.saveProvider({ id: p.id, [field]: v })
 }
 function protoLabel(p: ProviderView) {
-  return p.protocol === 'anthropic_compat' ? 'ANTHROPIC 兼容' : 'OPENAI 兼容'
+  const vendor = p.protocol === 'anthropic_compat' ? 'ANTHROPIC' : 'OPENAI'
+  return t('settings.brain.compat', { vendor })
 }
 
 // 自定义卡:「自己接一个大脑」
@@ -404,6 +538,17 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             >{{ o.label }}</button>
           </span>
         </div>
+        <div class="row">
+          <span class="label">{{ t('settings.general.language') }}</span>
+          <span class="seg">
+            <button
+              v-for="o in localeOptions"
+              :key="o.v"
+              :class="{ on: settings.get('ui.locale') === o.v }"
+              @click="setLocale(o.v)"
+            >{{ o.label }}</button>
+          </span>
+        </div>
       </div>
 
       <!-- 大脑:高频策略行在上,供应商卡片(装机区)在下 -->
@@ -459,8 +604,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           <div class="p-head">
             <b>{{ t('settings.brain.addCustom') }}</b>
             <span class="seg">
-              <button :class="{ on: custom.protocol === 'openai_compat' }" @click="custom.protocol = 'openai_compat'">OpenAI 兼容</button>
-              <button :class="{ on: custom.protocol === 'anthropic_compat' }" @click="custom.protocol = 'anthropic_compat'">Anthropic 兼容</button>
+              <button :class="{ on: custom.protocol === 'openai_compat' }" @click="custom.protocol = 'openai_compat'">{{ t('settings.brain.compat', { vendor: 'OpenAI' }) }}</button>
+              <button :class="{ on: custom.protocol === 'anthropic_compat' }" @click="custom.protocol = 'anthropic_compat'">{{ t('settings.brain.compat', { vendor: 'Anthropic' }) }}</button>
             </span>
           </div>
           <div class="p-grid">
@@ -511,15 +656,58 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         <div class="row v-speaker">
           <span class="label">{{ t('settings.voice.speaker') }}</span>
           <span class="sp-list">
-            <button
-              v-for="sp in voiceInfo?.speakers ?? []"
-              :key="sp.id"
-              class="chip sp"
-              :class="{ on: settings.get('voice.speaker') === sp.id, busy: previewing === sp.id }"
-              :title="t('settings.voice.preview')"
-              @click="previewSpeaker(sp.id)"
-            >{{ sp.name }}</button>
+            <template v-for="sp in voiceInfo?.speakers ?? []" :key="sp.id">
+              <button
+                class="chip sp"
+                :class="{ on: settings.get('voice.speaker') === sp.id, busy: previewing === sp.id }"
+                :title="t('settings.voice.preview')"
+                @click="previewSpeaker(sp.id)"
+              >{{ sp.name }}</button>
+              <button
+                v-if="sp.isClone && !sp.builtin"
+                class="chip-del"
+                :class="{ armed: cloneArm === sp.id }"
+                :title="t('settings.voice.cloneDelete')"
+                @click="removeClone(sp.id)"
+              >{{ cloneArm === sp.id ? t('settings.voice.cloneDeleteArm') : '✕' }}</button>
+            </template>
+            <button class="chip sp custom" :disabled="cloneBusy" @click="pickCustomVoice">
+              {{ cloneBusy && !cloneDraft ? t('settings.voice.cloneImporting') : '+ ' + t('settings.voice.customAdd') }}
+            </button>
+            <input ref="cloneFile" type="file" accept="audio/*" class="hidden-file" @change="onCustomFile" />
           </span>
+        </div>
+        <!-- 自定义音色草稿:转写可改 + 起名 → 保存落库(选文件→解码→import→draft→save) -->
+        <div v-if="cloneErr" class="row v-speaker">
+          <span class="label"></span>
+          <span class="clone-err">{{ cloneErr }}</span>
+        </div>
+        <div v-if="cloneDraft" class="row v-speaker clone-edit">
+          <span class="label">{{ t('settings.voice.customAdd') }}</span>
+          <div class="clone-form">
+            <input
+              v-model="cloneDraft.name"
+              class="clone-input"
+              :placeholder="t('settings.voice.cloneNamePlaceholder')"
+            />
+            <textarea
+              v-model="cloneDraft.transcript"
+              class="clone-text"
+              rows="3"
+              :placeholder="t('settings.voice.transcriptPlaceholder')"
+            ></textarea>
+            <p class="clone-hint">{{ t('settings.voice.transcriptHint') }}</p>
+            <div class="clone-actions">
+              <button class="chip" :disabled="cloneBusy" @click="cancelClone">
+                {{ t('settings.voice.cloneCancel') }}
+              </button>
+              <button
+                class="chip on"
+                :disabled="cloneBusy || !cloneDraft.name.trim() || !cloneDraft.transcript.trim()"
+                @click="saveClone"
+              >{{ cloneBusy ? t('settings.voice.cloneSaving') : t('settings.voice.cloneSave') }}</button>
+            </div>
+          </div>
         </div>
         <!-- 朗读策略固定「跟着我」(语音问才念,UI 交互安静):不放旋钮(铁律 §3.1
              强默认收口;always/off 仍可从设置库手动写)。喊名字唤醒 = 常驻监听的隐私
@@ -576,6 +764,27 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           </span>
         </div>
         <p class="hint">{{ t('settings.voice.sensitivityHint') }}</p>
+        <!-- 录音标定:不想盲拖滑块就录几遍,按真实发音+环境把灵敏度(必要时连触发拼写)定到正好 -->
+        <div class="row">
+          <span class="label">{{ t('settings.voice.calib') }}</span>
+          <span class="key-state">
+            <span v-if="calib.running" class="calib-live" :class="{ pulse: calib.listening }">{{ calibStepLabel }}</span>
+            <span
+              v-else-if="calib.phase === 'done' && calib.result"
+              class="calib-done"
+              :class="{ ok: calib.result.ok }"
+            >{{ calibVerdict }}</span>
+            <button v-if="calib.running" class="link" @click="cancelCalib">{{ t('settings.voice.calibCancel') }}</button>
+            <button v-else class="link" :disabled="keywordWarn === 'all-bad'" @click="startCalib">
+              {{ calib.phase === 'done' ? t('settings.voice.calibAgain') : t('settings.voice.calibStart') }}
+            </button>
+          </span>
+        </div>
+        <p class="hint">
+          {{ calib.running
+            ? t('settings.voice.calibSayHint', { kw: (voiceInfo?.keywords ?? []).join('、') })
+            : t('settings.voice.calibHint') }}
+        </p>
         <div v-for="(seg, name) in { rate: segs.rate, patience: segs.patience }" :key="name" class="row">
           <span class="label">{{ t(`settings.voice.${name}`) }}</span>
           <span class="seg">
@@ -583,7 +792,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               v-for="o in seg.options"
               :key="o.v"
               :class="{ on: settings.get(seg.key) === o.v }"
-              @click="settings.set(seg.key, o.v)"
+              @click="onVoiceSeg(seg.key, o.v)"
             >{{ o.label }}</button>
           </span>
         </div>
@@ -632,6 +841,47 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
       <div v-else-if="tab === 'remote'" class="teaser">
         <span class="s-mono badge">{{ t('settings.remote.badge') }}</span>
         <p>{{ t('settings.remote.teaser') }}</p>
+      </div>
+
+      <!-- 服务/接入:外部数据源与设备接入(天气源 key;以后智能家居 HA 等同构进驻) -->
+      <div v-else-if="tab === 'services'">
+        <p class="section">{{ t('settings.services.weather') }}</p>
+        <p class="hint">{{ t('settings.services.weatherHint') }}</p>
+        <div class="row">
+          <span class="label">{{ t('settings.services.weatherKey') }}</span>
+          <input
+            class="s-input"
+            type="password"
+            v-model="weatherKeyDraft"
+            :placeholder="weatherKeyMasked || t('settings.services.weatherKeyPlaceholder')"
+            @keyup.enter="saveWeatherKey"
+            @blur="saveWeatherKey"
+          />
+        </div>
+        <div class="row">
+          <span class="label">{{ t('settings.services.weatherSource') }}</span>
+          <span class="key-state">
+            <span class="chip" :class="{ on: weatherKeySet }">
+              {{ weatherKeySet ? t('settings.services.weatherSrcQweather') : t('settings.services.weatherSrcFree') }}
+            </span>
+            <button v-if="weatherKeySet" class="link" @click="clearWeatherKey">
+              {{ t('settings.services.weatherKeyClear') }}
+            </button>
+          </span>
+        </div>
+        <div v-if="weatherKeySet" class="row">
+          <span class="label">{{ t('settings.services.weatherHost') }}</span>
+          <input
+            class="s-input s-mono-input"
+            :value="settings.get('weather.qweather.host')"
+            :placeholder="t('settings.services.weatherHostPlaceholder')"
+            @change="setWeatherHost"
+          />
+        </div>
+        <p class="hint">
+          {{ t('settings.services.weatherLinkPre') }}
+          <button class="link" @click="openQWeatherSite">{{ t('settings.services.weatherLink') }}</button>
+        </p>
       </div>
 
       <!-- 系统:开机与桌面(PLAN §12)+ 关于 -->
@@ -711,10 +961,12 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 @keyframes led { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
 
 .s-body { max-width: 640px; }
-.row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 13px 0; border-bottom: 1px solid var(--line); font-size: 13.5px; }
+/* flex-wrap:控件(尤其长英文段选)放不下时整组折到次行,而非压缩裁字或溢出 */
+.row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 14px; padding: 13px 0; border-bottom: 1px solid var(--line); font-size: 13.5px; }
 .label { color: var(--txt); flex: 0 0 auto; }
 
-.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+/* flex: none —— 段选不被行压缩(否则 overflow:hidden 会裁掉按钮文字);宁可整组换行 */
+.seg { display: inline-flex; flex: none; max-width: 100%; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
 .seg button { background: none; border: none; color: var(--txt2); cursor: pointer; padding: 6px 13px; font-size: 12.5px; }
 .seg button + button { border-left: 1px solid var(--line); }
 .seg button.on { color: var(--cy); background: rgba(95, 200, 255, 0.12); }
@@ -765,6 +1017,24 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 /* —— 声音 tab —— */
 .v-speaker { align-items: flex-start; }
 .sp-list { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; max-width: 420px; }
+.chip.sp.custom { border-style: dashed; opacity: 0.75; }
+.chip.sp.custom:hover { opacity: 1; }
+.chip-del { border: none; background: transparent; color: #8aa3b5; cursor: pointer; font-size: 11px; padding: 0 2px; align-self: center; opacity: 0.55; }
+.chip-del:hover { color: #ff8a8a; opacity: 1; }
+.chip-del.armed { color: #ff8a8a; opacity: 1; font-weight: 600; }
+.hidden-file { display: none; }
+.clone-edit { align-items: flex-start; }
+.clone-form { display: flex; flex-direction: column; gap: 6px; max-width: 420px; width: 100%; }
+.clone-input, .clone-text { background: rgba(255,255,255,0.04); border: 1px solid var(--line); border-radius: 8px; color: inherit; font: inherit; padding: 6px 9px; }
+.clone-text { resize: vertical; min-height: 56px; }
+.clone-hint { font-size: 11.5px; opacity: 0.6; margin: 0; }
+.clone-actions { display: flex; gap: 8px; justify-content: flex-end; }
+/* 与音色 chip 同一套薄玻璃质感(否则 <button> 默认灰底会很出戏);保存走 .on 青色描边 */
+.clone-actions .chip { cursor: pointer; background: rgba(95, 200, 255, 0.04); transition: border-color .15s, color .15s, background .15s; }
+.clone-actions .chip:hover:not(:disabled) { border-color: rgba(95, 200, 255, 0.45); }
+.clone-actions .chip.on { border-color: rgba(95, 200, 255, 0.55); color: var(--cy); background: rgba(95, 200, 255, 0.1); }
+.clone-actions .chip:disabled { opacity: 0.4; cursor: default; }
+.clone-err { color: #ff9a9a; font-size: 12.5px; }
 .chip.sp { cursor: pointer; background: rgba(95, 200, 255, 0.04); transition: border-color .15s, color .15s; }
 .chip.sp:hover { border-color: rgba(95, 200, 255, 0.45); }
 .chip.sp.on { border-color: rgba(95, 200, 255, 0.55); color: var(--cy); background: rgba(95, 200, 255, 0.1); }
@@ -779,4 +1049,10 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 
 /* 唤醒状态:纯文本(刻意不做成 chip/输入框样,免和下面「唤醒词」框混淆) */
 .wake-cur { color: var(--txt2); font-size: 12.5px; }
+
+/* 录音标定:进行中文本走辉光脉冲(复用 led),结果走成功绿/中性灰 */
+.calib-live { color: var(--cy); font-size: 12.5px; }
+.calib-live.pulse { animation: led 1.2s ease-in-out infinite; }
+.calib-done { color: var(--txt2); font-size: 12.5px; }
+.calib-done.ok { color: #5fe0b0; }
 </style>

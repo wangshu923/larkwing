@@ -19,6 +19,7 @@ const DEFAULTS: Record<string, string> = {
   'ui.character': 'titan',
   'ui.bubble_shape': 'round',
   'ui.text_scale': 'standard',
+  'ui.locale': 'zh-CN', // 界面语言;'ui.' 前缀自动过 Rust 白名单。对话语言由模型跟随用户,与此解耦
   'llm.strategy': 'balanced',
   'llm.thinking': 'off',
   // 声音(PLAN §11):与 Rust 白名单逐键对应(user 级 speaker/auto_speak/rate/patience/volume,
@@ -32,6 +33,9 @@ const DEFAULTS: Record<string, string> = {
   'voice.wake.sensitivity': '50', // 唤醒灵敏度 0~100(global)→ KWS 阈值;'50' = 经验折中
 
   'voice.tts_backend': 'online', // 在线 edge / 离线 vits(断网兜底,需下大模型)
+  // 天气(PLAN 天气块):key 是秘密 → 后端回掩码(····xxxx),空 = 用免 key Open-Meteo;host 非秘密专属接口地址
+  'weather.qweather.key': '',
+  'weather.qweather.host': '',
   // 桌面悬浮窗(PLAN §12);ui.* 走 engine set_setting 的 ui. 分支自动放行(无需改 Rust 白名单)
   'ui.float.enabled': '1', // '1' 开 / '0' 关
   'ui.float.opacity': '0.8', // 0.4–1.0

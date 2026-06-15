@@ -7,10 +7,14 @@ import {
   isTauri,
   onAppEvent,
   type AccountBalance,
+  type AttachmentRef,
   type Conversation,
   type DayUsage,
   type ErrorKind,
   type Message,
+  type OutAttachment,
+  type TraceStep,
+  type TurnTrace,
   type UsageDigest,
   type UsageTotals,
 } from '../lib/backend'
@@ -32,12 +36,28 @@ export interface TurnStats {
   cost_usd: number | null
 }
 
+/** 气泡里的附件:图缩略 / 文件小票。dataUrl 仅本会话内存有(重载后历史只剩 kind/name)。 */
+export interface UiAttachment {
+  kind: 'image' | 'doc'
+  name: string
+  mime?: string
+  dataUrl?: string
+  /** 出站 base64(发送用,不进持久展示态)。 */
+  base64?: string
+}
+
 export interface UiMessage {
   id: number
   role: 'user' | 'wang'
   text: string
   /** 仅本次会话内产生的回复有;历史消息不回填(流水在库里,要看走分析)。 */
   stats?: TurnStats
+  /** 本条带过的附件(图缩略 / 文件小票)。 */
+  attachments?: UiAttachment[]
+  /** 「想了想」轨迹(PLAN §9):折叠药丸 + 展开技术细节(工具名/入参/结果 + CoT 原文)。空 = 不显药丸。 */
+  trace?: { steps: TraceStep[]; reasoning?: string }
+  /** 这条消息的时刻(unix ms):用户气泡 hover 显时间。历史取 created_at,在飞取发送时刻。 */
+  at?: number
 }
 
 const state = reactive({
@@ -49,6 +69,8 @@ const state = reactive({
   /** 工具状态泡:i18n 键(如 'tool.remember'),空 = 没在用工具。 */
   toolAction: '',
   messages: [] as UiMessage[],
+  /** 排队区(Phase A):7274 还在回话时打字发的消息攒这儿,整轮结束自动合并成下一轮发出。 */
+  queue: [] as { text: string; attachments: UiAttachment[] }[],
   conversations: [] as Conversation[],
   openingLine: '', // 真值来自场景数据(boot);空时显示字典里的 fallback
   /** 记账灯带:本回合消耗(工具轮累加)/ 今日累计 / 账户余额;null = 还没数据。 */
@@ -66,6 +88,8 @@ const state = reactive({
 })
 
 let localId = -1 // 本地占位 id 用负数,与落库的正数 id 永不冲突
+let turnSeq = 0 // 回合序号:流中再发会开新回合,旧回合的迟到事件按此作废,不串台(并发发送防竞态)
+let turnInFlight = false // 回合是否在飞:打字发送遇它=进排队区(Phase A:整轮结束自动合并发)
 let bootStarted = false
 let fakeTimer: ReturnType<typeof setTimeout> | undefined
 
@@ -75,7 +99,23 @@ onProvidersUsable(() => {
 })
 
 function toUi(m: Message): UiMessage {
-  return { id: m.id, role: m.role === 'user' ? 'user' : 'wang', text: m.content }
+  const ui: UiMessage = { id: m.id, role: m.role === 'user' ? 'user' : 'wang', text: m.content, at: m.created_at }
+  // 历史里的附件小票:从 user 行 payload(UserMeta)解出,显「📷/📄 名字」(无 dataUrl)
+  if (m.role === 'user' && m.payload) {
+    try {
+      const refs = (JSON.parse(m.payload) as { attachments?: AttachmentRef[] }).attachments
+      if (refs?.length) {
+        ui.attachments = refs.map((a) => ({
+          kind: a.kind === 'image' ? 'image' : 'doc',
+          name: a.name,
+          mime: a.mime,
+        }))
+      }
+    } catch {
+      /* payload 非 JSON / 旧格式:忽略 */
+    }
+  }
+  return ui
 }
 
 /** 内部行不进聊天流:'tool' 行、'event' 行(定时触发,7274 的转述才是给人看的)、
@@ -260,6 +300,25 @@ async function hydrateStats(convId: number) {
   }
 }
 
+/** 历史/自启回合的「想了想」轨迹(PLAN §9):load 会话后回填到代表气泡
+ *  (在飞回合由 TurnEvent 实时攒,不走这条)。 */
+async function hydrateTrace(convId: number) {
+  if (!state.inTauri) return
+  try {
+    const list = await api.conversationTrace(convId)
+    if (state.convId !== convId) return
+    const map = new Map(list.map((tr) => [tr.message_id, tr]))
+    for (const m of state.messages) {
+      if (m.role === 'wang' && m.id > 0 && map.has(m.id)) {
+        const tr = map.get(m.id)!
+        m.trace = { steps: tr.steps, reasoning: tr.reasoning ?? undefined }
+      }
+    }
+  } catch (e) {
+    console.error('读取思考轨迹失败', e)
+  }
+}
+
 /** 余额是锦上添花:节流轻刷(回合后/开机),失败静默保留旧值。 */
 let balanceFetchedAt = 0
 function refreshBalance(force = false) {
@@ -320,6 +379,7 @@ async function boot() {
         .then((msgs) => {
           state.messages = msgs.filter(visible).map(toUi)
           void hydrateStats(state.convId) // 提醒/自启回合的气泡也带上 hover 读数
+          void hydrateTrace(state.convId) // …和「想了想」轨迹
           // 提醒到点自动开口(PLAN §11 B 期):设备主动叫人,off 档才闭嘴;
           // 回合没标〔语音〕(屏幕排版),念之前净化兜底。跨会话提醒念话 C 期随唤醒流程
           const last = msgs.filter(visible).at(-1)
@@ -353,6 +413,7 @@ async function boot() {
     api.usageToday().then((d) => (state.usage.today = d)).catch(() => {})
     loadConvUsage(snap.conversation.id)
     void hydrateStats(snap.conversation.id) // 首屏历史气泡的 hover 读数
+    void hydrateTrace(snap.conversation.id) // 首屏历史气泡的「想了想」轨迹
     refreshBalance(true)
   } catch (e) {
     console.error('boot 失败', e)
@@ -370,9 +431,44 @@ async function refreshConversations() {
   }
 }
 
-function send(text: string, source: 'typed' | 'mic' | 'wake' = 'typed', speaker?: number) {
+/** 回合任一出口收尾:解除"在飞" + 把排队区攒的消息合并成下一轮发出(Phase A:整轮结束自动发)。 */
+function settleInFlight() {
+  turnInFlight = false
+  flushQueue()
+}
+/** 把排队区攒的消息合并成一条作为下一轮发出(文本换行拼接,附件并起来);在飞或空则不动。 */
+function flushQueue() {
+  if (turnInFlight || !state.queue.length) return
+  const items = state.queue.splice(0, state.queue.length)
+  const text = items.map((it) => it.text).filter(Boolean).join('\n')
+  const attachments = items.flatMap((it) => it.attachments)
+  send(text, 'typed', undefined, attachments)
+}
+/** 排队区移除一条(还没发出前反悔)。 */
+function dequeue(i: number) {
+  state.queue.splice(i, 1)
+}
+
+function send(
+  text: string,
+  source: 'typed' | 'mic' | 'wake' = 'typed',
+  speaker?: number,
+  attachments: UiAttachment[] = [],
+) {
   const content = text.trim()
-  if (!content) return
+  if (!content && attachments.length === 0) return
+
+  // 排队(Phase A):7274 还在回话时,打字发送不打断 → 进排队区;整轮结束后自动合并成下一轮发出。
+  // (语音 mic/wake 不排队:开口即应,沿用既有打断。)
+  if (turnInFlight && source === 'typed') {
+    state.queue.push({ text: content, attachments })
+    return
+  }
+
+  // 本回合序号:流中再发时,engine 会先取消旧回合 → 旧 channel 迟到的 cancelled/残余 delta
+  // 会回调进来。它们与新回合共用 tw/mood/clock,不挡住会把新回合的打字机拆了(新回复变空泡)。
+  // 用它给每个回调闸一道:不是当前回合就直接丢弃。
+  const myTurn = ++turnSeq
 
   // 语音会话模式(PLAN §11 二分):打字/按钮说话 = UI 交互,默认不念;
   // wake = 语音交互必念(off 档不管它——喊它就是要它说话);always 档 = 全念。
@@ -404,9 +500,19 @@ function send(text: string, source: 'typed' | 'mic' | 'wake' = 'typed', speaker?
     api.voiceWakeResume().catch(() => {})
   }
   let fullText = '' // __IGNORE__ 判定要看全量(打字机还没放完的字不算数)
+  let turnHadTrace = false // 本回合动过工具或脑 → done 后补拉 trace(详情从落库 payload 重建)
 
   twFlush() // 上一回合的字还在放:立刻放完并收尾,别让两台打字机打架
-  state.messages.push({ id: localId--, role: 'user', text: content })
+  state.messages.push({
+    id: localId--,
+    role: 'user',
+    text: content,
+    at: Date.now(),
+    // 立即显:图缩略 + 文件小票(base64 不进展示态,只随发送走)
+    attachments: attachments.length
+      ? attachments.map((a) => ({ kind: a.kind, name: a.name, mime: a.mime, dataUrl: a.dataUrl }))
+      : undefined,
+  })
   state.messages.push({ id: localId--, role: 'wang', text: '' })
   // 必须从 reactive 数组取回代理再改:reactive() 是惰性代理,push 存的是裸对象,
   // 直接改裸对象 Vue 不追踪 —— 流式逐字、deep watch、物理避让全都会失灵
@@ -416,6 +522,7 @@ function send(text: string, source: 'typed' | 'mic' | 'wake' = 'typed', speaker?
   state.usage.turnStartedAt = Date.now() // 端到端计时:从用户按下发送起(体感真值)
   startLiveClock()
   twStart(wang)
+  turnInFlight = true // 占住"在飞":后续打字发送进排队区,直到本轮收尾
 
   if (!state.inTauri) {
     fakeStream(wang, `(浏览器预览)滴——收到「${content}」!进 Tauri 壳里我就接上真模型咯!`, speak)
@@ -423,8 +530,12 @@ function send(text: string, source: 'typed' | 'mic' | 'wake' = 'typed', speaker?
   }
 
   const sentConv = state.convId // 话题快照只认发送时的会话:流中切走了别把旧账写到新话题上
+  const outAtts: OutAttachment[] = attachments
+    .filter((a) => a.base64)
+    .map((a) => ({ name: a.name, mime: a.mime || '', data: a.base64! }))
   api
-    .sendMessage(state.convId, content, { input: source, speak, speaker_user: speaker }, (ev) => {
+    .sendMessage(state.convId, content, { input: source, speak, speaker_user: speaker }, outAtts, (ev) => {
+      if (myTurn !== turnSeq) return // 旧回合的迟到事件:新回合已接管,丢弃不串台
       switch (ev.type) {
         case 'delta':
           fullText += ev.data
@@ -435,10 +546,14 @@ function send(text: string, source: 'typed' | 'mic' | 'wake' = 'typed', speaker?
           break
         case 'tool_use':
           // label 是 i18n 键;它在场时旺财保持"思考中"的体感
-          if (ev.data.state === 'started') state.toolAction = ev.data.label
+          if (ev.data.state === 'started') {
+            state.toolAction = ev.data.label
+            turnHadTrace = true // 这回合有工具步骤 → done 后补拉 trace
+          }
           state.mood = 'thinking'
           break
         case 'thinking':
+          turnHadTrace = true
           state.mood = 'thinking'
           break
         case 'usage':
@@ -457,6 +572,7 @@ function send(text: string, source: 'typed' | 'mic' | 'wake' = 'typed', speaker?
             state.mood = 'idle'
             state.toolAction = ''
             wakeResume()
+            settleInFlight()
             break
           }
           if (speak) speech.endTurn() // 残余缓冲 flush(音频节奏独立于打字机)
@@ -464,11 +580,13 @@ function send(text: string, source: 'typed' | 'mic' | 'wake' = 'typed', speaker?
           // 收尾等字放完再生效:状态/读数与画面同步,结尾不"啪"地补一大段
           twEnd(() => {
             wang.id = ev.data.message_id // 流式文本与落库消息对账
+            if (turnHadTrace) void hydrateTrace(sentConv) // 「想了想」详情从落库 payload 补拉
             settleTurn(wang) // 端到端时长定格,读数钉在气泡上
             state.mood = 'idle'
             state.toolAction = ''
             refreshConversations() // 标题/排序可能变了
             refreshBalance() // 花了钱,余额顺手轻刷(节流)
+            settleInFlight() // 整轮结束:把排队区攒的合并成下一轮发出
           })
           break
         case 'failed':
@@ -481,6 +599,7 @@ function send(text: string, source: 'typed' | 'mic' | 'wake' = 'typed', speaker?
           settleTurn() // 失败的半截话不钉读数,但计时归零
           state.mood = 'idle'
           state.toolAction = ''
+          settleInFlight()
           break
         case 'cancelled':
           speech.abort()
@@ -490,10 +609,12 @@ function send(text: string, source: 'typed' | 'mic' | 'wake' = 'typed', speaker?
           settleTurn()
           state.mood = 'idle'
           state.toolAction = ''
+          settleInFlight() // 停止后排队的仍发出(它们是你还想要的;不想要就在排队区划掉)
           break
       }
     })
     .catch((e) => {
+      if (myTurn !== turnSeq) return // 旧回合的迟到失败:新回合已接管,忽略
       // 前置错误(AppError):没 key / 会话不存在 / 建连失败
       speech.abort()
       wakeResume()
@@ -501,6 +622,7 @@ function send(text: string, source: 'typed' | 'mic' | 'wake' = 'typed', speaker?
       wang.text = friendly((e as { kind?: ErrorKind })?.kind)
       settleTurn()
       state.mood = 'idle'
+      settleInFlight()
     })
 }
 
@@ -512,6 +634,7 @@ function cancel() {
     twFlush()
     settleTurn()
     state.mood = 'idle'
+    settleInFlight()
     return
   }
   api.cancelGeneration(state.convId).catch(() => {})
@@ -520,6 +643,8 @@ function cancel() {
 async function selectConversation(convId: number) {
   if (convId === state.convId) return
   twFlush() // 旧会话还在放字:立刻收尾,别让打字机写进看不见的孤儿气泡
+  state.queue.splice(0) // 换话题:排队区清空(它属于旧会话的在飞流程)
+  turnInFlight = false
   state.convId = convId
   loadConvUsage(convId) // 灯带"话题"段跟着切
   if (!state.inTauri) return
@@ -527,6 +652,7 @@ async function selectConversation(convId: number) {
     const msgs = await api.loadConversation(convId)
     state.messages = msgs.filter(visible).map(toUi)
     void hydrateStats(convId) // 切回的历史会话:气泡 hover 读数从库回填
+    void hydrateTrace(convId) // …和「想了想」轨迹
     if (!msgs.length) pushOpening()
     state.mood = 'idle'
   } catch (e) {
@@ -536,6 +662,8 @@ async function selectConversation(convId: number) {
 
 async function newConversation() {
   twFlush()
+  state.queue.splice(0) // 新话题:排队区清空
+  turnInFlight = false
   state.usage.conv = null // 新话题还没花过,熄灯
   if (!state.inTauri) {
     state.messages = []
@@ -660,6 +788,7 @@ function fakeStream(msg: UiMessage, full: string, speak = false) {
       conv.cost_usd += round.cost_usd
       state.usage.conv = conv
       settleTurn(msg)
+      settleInFlight() // 假流收尾也走同一收口:排队区有就接着发(浏览器预览能验排队)
     })
   }
   pushChunk()
@@ -668,5 +797,5 @@ function fakeStream(msg: UiMessage, full: string, speak = false) {
 export function useChat() {
   void boot()
   wireVoiceActivity()
-  return { state, send, cancel, selectConversation, newConversation, ensureVoiceConv, saveApiKey }
+  return { state, send, cancel, selectConversation, newConversation, ensureVoiceConv, saveApiKey, dequeue }
 }

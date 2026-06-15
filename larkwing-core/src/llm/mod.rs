@@ -72,8 +72,19 @@ pub(crate) fn parse_tool_args(raw: &str, stop_reason: Option<&str>, tool: &str) 
     }
 }
 
+/// 多媒体内容块(媒体输入期,PLAN §9):User 消息可带图。纯文本 User 的 parts 为空
+/// → 出向仍翻成 `"content":"字符串"`,DeepSeek 自动前缀缓存零损伤(只有带图那条变数组)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    Text { text: String },
+    /// url = data URL(data:image/png;base64,…)或可取的 http(s) 链接。
+    /// 各方言自译:OpenAI 系 image_url 直收整串;Anthropic 系拆 media_type + base64。
+    ImageUrl { url: String },
+}
+
 /// 调用形态(≠ store::Message 持久形态)。PLAN §3 终态的工具期形状:
-/// content 暂为 String(Text-only 退化形,多媒体期换 Vec<ContentPart>)。
+/// User.content 是文本主体,带图时 parts 装多媒体块(出向才合成 content 数组)。
 /// system 独立成 ChatRequest 字段(Anthropic 兼容)。
 /// serde 形 = `{"role":"user","content":"…"}`——场景 few-shot 直接按此形手写(PLAN §8)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -81,6 +92,9 @@ pub(crate) fn parse_tool_args(raw: &str, stop_reason: Option<&str>, tool: &str) 
 pub enum ChatMessage {
     User {
         content: String,
+        /// 多媒体块(图等);空 = 纯文本退化形,出向仍是字符串(吃前缀缓存)。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        parts: Vec<ContentPart>,
     },
     Assistant {
         #[serde(default)]
@@ -101,7 +115,12 @@ pub enum ChatMessage {
 
 impl ChatMessage {
     pub fn user(content: impl Into<String>) -> Self {
-        ChatMessage::User { content: content.into() }
+        ChatMessage::User { content: content.into(), parts: Vec::new() }
+    }
+
+    /// 带多媒体块的 user 消息(媒体输入期):图等。
+    pub fn user_with_parts(content: impl Into<String>, parts: Vec<ContentPart>) -> Self {
+        ChatMessage::User { content: content.into(), parts }
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {

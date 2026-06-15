@@ -38,6 +38,8 @@ let audio: HTMLAudioElement | null = null
 let videoEl: HTMLVideoElement | null = null
 /** 混流视频 seek = 换 src 重启,这里记基准秒数,显示时间 = base + currentTime。 */
 let videoBase = 0
+/** 视频起播前主窗是否藏在托盘:停时据此藏回去(别看完视频凭空冒出主界面)。 */
+let videoWasHidden = false
 let wired = false
 
 function ensureAudio(): HTMLAudioElement {
@@ -114,6 +116,7 @@ function play(np: NowPlaying) {
   state.duration = np.duration_seconds ?? 0
   state.rate = 1 // 倍速不跨播放粘住;音量粘住
   videoBase = 0
+  videoWasHidden = false // 每次新播放复位;视频分支再据实际可见性置位
   syncToPeers() // 广播"在放这个"给悬浮窗镜像
   if (np.kind === 'audio') {
     const a = ensureAudio()
@@ -131,10 +134,14 @@ function play(np: NowPlaying) {
     // 视频默认:叫主窗到最前(藏在托盘/别的窗后面时只闻其声)+ 置顶(别被盖住)+ 全屏(用户要求)。
     // 置位放在 videoEl 守卫外,后挂场景也直接铺满、不窗口化闪一下;.maximized 绑 state.fullscreen,
     // 浮层挂载瞬间即全屏。此处必是主窗(float 已在函数开头早退)。
-    void win.bringToFront()
-    void win.setAlwaysOnTop(true)
-    state.fullscreen = true
-    void win.setFullscreen(true)
+    state.fullscreen = true // 同步置位:.maximized 立即生效,浮层挂载即全屏(不闪窗口化)
+    // 窗口动作串行:读"是否藏着"必须在 show 之前(停时据此藏回托盘),再 show + 置顶 + 全屏。
+    void (async () => {
+      videoWasHidden = await win.isHidden()
+      await win.bringToFront()
+      await win.setAlwaysOnTop(true)
+      await win.setFullscreen(true)
+    })()
   }
 }
 
@@ -193,7 +200,10 @@ function stop() {
   if (windowLabel() !== 'float') {
     if (state.fullscreen) void win.setFullscreen(false)
     void win.setAlwaysOnTop(false)
+    // 起播前主窗藏在托盘 → 看完藏回去(先退全屏后 hide,FIFO 保证下次唤出不残留全屏)。
+    if (videoWasHidden) win.hideToTray()
   }
+  videoWasHidden = false
   state.current = null
   state.status = 'idle'
   state.position = 0

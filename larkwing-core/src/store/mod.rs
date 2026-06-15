@@ -5,6 +5,8 @@ mod db;
 
 pub mod briefings;
 pub mod chat;
+pub mod cloned_voices;
+pub mod fsops;
 pub mod jobs;
 pub mod memory;
 pub mod settings;
@@ -14,7 +16,9 @@ pub mod voiceprints;
 
 pub use briefings::{Briefing, BriefingRepo};
 pub use chat::{ChatRepo, Conversation, Message};
+pub use cloned_voices::{ClonedVoice, ClonedVoiceRepo};
 pub use db::Db;
+pub use fsops::{FsOpRepo, FsOpRow};
 pub use jobs::{Job, JobRepo};
 pub use memory::{Memory, MemoryRepo};
 pub use settings::SettingsRepo;
@@ -27,11 +31,13 @@ pub use voiceprints::VoiceprintRepo;
 pub struct Store {
     pub users: UserRepo,
     pub chat: ChatRepo,
+    pub cloned_voices: ClonedVoiceRepo,
     pub memory: MemoryRepo,
     pub settings: SettingsRepo,
     pub usage: UsageRepo,
     pub briefings: BriefingRepo,
     pub jobs: JobRepo,
+    pub fsops: FsOpRepo,
     pub voiceprints: VoiceprintRepo,
 }
 
@@ -42,10 +48,12 @@ impl Store {
             users::MIGRATIONS,
             settings::MIGRATIONS,
             chat::MIGRATIONS,
+            cloned_voices::MIGRATIONS,
             memory::MIGRATIONS,
             usage::MIGRATIONS,
             briefings::MIGRATIONS,
             jobs::MIGRATIONS,
+            fsops::MIGRATIONS,
             voiceprints::MIGRATIONS,
         ]
         .concat();
@@ -53,11 +61,13 @@ impl Store {
         Ok(Store {
             users: UserRepo::new(db.clone()),
             chat: ChatRepo::new(db.clone()),
+            cloned_voices: ClonedVoiceRepo::new(db.clone()),
             memory: MemoryRepo::new(db.clone()),
             settings: SettingsRepo::new(db.clone()),
             usage: UsageRepo::new(db.clone()),
             briefings: BriefingRepo::new(db.clone()),
             jobs: JobRepo::new(db.clone()),
+            fsops: FsOpRepo::new(db.clone()),
             voiceprints: VoiceprintRepo::new(db),
         })
     }

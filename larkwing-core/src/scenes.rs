@@ -18,6 +18,11 @@ pub struct Scene {
     pub persona: String,
     /// 开场白:会话还没消息时 UI 显示(引导式上手)。
     pub opening_line: String,
+    /// 开场白的多语覆盖(locale → 文案);缺省回落 `opening_line`。开场白先于用户开口、
+    /// 无对话语言可跟随,故按 ui.locale 出对应语言——这是 locale 唯一触达人格数据之处,
+    /// 而非分叉整份人格(宪法 §5/§6:场景=数据,人格语言中立;对话语言由模型跟随用户)。
+    #[serde(default)]
+    pub openings: HashMap<String, String>,
     /// 场景级参数覆盖 —— ChatOptions 管道的合法用户之一。
     #[serde(default)]
     pub options: ChatOptions,
@@ -46,6 +51,14 @@ pub struct SceneVoice {
 }
 
 impl Scene {
+    /// 按 ui.locale 取开场白;无对应语言则回落基础 `opening_line`(它就是默认语言版本)。
+    pub fn opening_for(&self, locale: &str) -> String {
+        self.openings
+            .get(locale)
+            .cloned()
+            .unwrap_or_else(|| self.opening_line.clone())
+    }
+
     /// 加载时校验(PLAN §8):白名单引用必须已注册;few-shot 引用工具 ⊆ 基础工具∪白名单、
     /// call/result 配对完整且有序(孤儿 tool_call 会被严格端点 400)、示例 id 用 fs_ 前缀。
     pub fn validate(&self, registry: &Tools) -> Result<()> {
@@ -143,8 +156,10 @@ mod tests {
         // remember/briefing 三件套是常驻基础工具,白名单只声明场景特有的
         assert_eq!(
             s.tools,
-            ["now", "media_search", "media_play", "media_control", "fs_list", "fs_find",
-             "reminder_set", "reminder_list", "reminder_cancel", "web_search", "web_fetch"]
+            ["now", "weather", "media_search", "media_play", "media_control", "fs_list", "fs_find",
+             "fs_read_text", "fs_move", "fs_copy", "fs_mkdir", "fs_trash", "fs_write_text",
+             "fs_append", "fs_edit", "fs_undo",
+             "reminder_set", "reminder_list", "reminder_cancel", "watch_set", "web_search", "web_fetch"]
         );
         assert!(!s.few_shots.is_empty(), "companion 必须带 few-shot 示范");
         // 反例纪律:至少一段"不调工具直接聊"的示范

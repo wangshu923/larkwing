@@ -32,7 +32,7 @@ fn setup(name: &str, delay_ms: u64) -> (Store, Arc<Engine>, i64) {
 async fn turn_streams_and_persists_assistant_reply() {
     let (store, engine, conv_id) = setup("roundtrip", 1);
 
-    let mut rx = engine.send_message(conv_id, "你好呀".into(), None).await.unwrap();
+    let mut rx = engine.send_message(conv_id, "你好呀".into(), None, vec![]).await.unwrap();
     let mut streamed = String::new();
     let mut done_id = None;
     while let Some(ev) = rx.recv().await {
@@ -57,7 +57,7 @@ async fn turn_streams_and_persists_assistant_reply() {
 async fn cancel_mid_stream_persists_partial_and_emits_cancelled() {
     let (store, engine, conv_id) = setup("cancel", 25);
 
-    let mut rx = engine.send_message(conv_id, "讲个长故事".into(), None).await.unwrap();
+    let mut rx = engine.send_message(conv_id, "讲个长故事".into(), None, vec![]).await.unwrap();
     let mut cancelled = false;
     let mut deltas = 0;
     while let Some(ev) = rx.recv().await {
@@ -87,7 +87,7 @@ async fn new_send_cancels_inflight_and_history_stays_complete() {
     let (store, engine, conv_id) = setup("replace", 25);
 
     // 第一条还在飞
-    let mut rx1 = engine.send_message(conv_id, "第一条".into(), None).await.unwrap();
+    let mut rx1 = engine.send_message(conv_id, "第一条".into(), None, vec![]).await.unwrap();
     // 等到它至少吐了一个字,确保 partial 非空
     loop {
         match rx1.recv().await {
@@ -98,7 +98,7 @@ async fn new_send_cancels_inflight_and_history_stays_complete() {
     }
 
     // 立刻发第二条:隐式取消旧回合,且 await 其收尾(partial 先落库)
-    let mut rx2 = engine.send_message(conv_id, "第二条".into(), None).await.unwrap();
+    let mut rx2 = engine.send_message(conv_id, "第二条".into(), None, vec![]).await.unwrap();
 
     // 旧流收到 Cancelled
     let mut old_cancelled = false;
@@ -147,7 +147,7 @@ async fn tool_round_executes_persists_and_finishes() {
         FakeTurn { text: "记下啦!".into(), ..Default::default() },
     ]))));
 
-    let mut rx = engine.send_message(conv_id, "我对花生过敏,现在几点?".into(), None).await.unwrap();
+    let mut rx = engine.send_message(conv_id, "我对花生过敏,现在几点?".into(), None, vec![]).await.unwrap();
     let mut streamed = String::new();
     let mut tool_started = 0;
     let mut tool_finished = 0;
@@ -203,7 +203,7 @@ async fn tool_rounds_are_capped_and_forced_to_finish() {
         .collect();
     engine.set_provider(Some(Arc::new(FakeLlm::scripted(turns))));
 
-    let mut rx = engine.send_message(conv_id, "一直查时间".into(), None).await.unwrap();
+    let mut rx = engine.send_message(conv_id, "一直查时间".into(), None, vec![]).await.unwrap();
     let mut done = false;
     while let Some(ev) = rx.recv().await {
         if matches!(ev, TurnEvent::Done { .. }) {
@@ -232,7 +232,7 @@ async fn unknown_tool_becomes_error_observation() {
         FakeTurn { text: "啊我没这个本事,换个方式~".into(), ..Default::default() },
     ]))));
 
-    let mut rx = engine.send_message(conv_id, "干点怪事".into(), None).await.unwrap();
+    let mut rx = engine.send_message(conv_id, "干点怪事".into(), None, vec![]).await.unwrap();
     let mut done = false;
     while let Some(ev) = rx.recv().await {
         if matches!(ev, TurnEvent::Done { .. }) {
@@ -266,7 +266,7 @@ async fn usage_events_fire_per_round_and_accumulate_today() {
         },
     ]))));
 
-    let mut rx = engine.send_message(conv_id, "几点了?".into(), None).await.unwrap();
+    let mut rx = engine.send_message(conv_id, "几点了?".into(), None, vec![]).await.unwrap();
     let mut rounds = Vec::new();
     let mut last_today = None;
     let mut last_conv = None;
@@ -308,7 +308,7 @@ async fn send_without_provider_fails_preflight_with_no_api_key() {
     let user = store.users.ensure_default_user().unwrap();
     let conv = store.chat.create_conversation(user.id, "companion").unwrap();
 
-    let err = engine.send_message(conv.id, "在吗".into(), None).await.err().unwrap();
+    let err = engine.send_message(conv.id, "在吗".into(), None, vec![]).await.err().unwrap();
     assert_eq!(err.kind, larkwing_core::engine::ErrorKind::NoApiKey);
 }
 

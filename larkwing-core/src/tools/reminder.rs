@@ -199,7 +199,12 @@ impl Tool for ReminderList {
             .iter()
             .map(|j| {
                 let content: String = j.content.chars().take(80).collect();
-                format!("#{} {}({}){}", j.id, fmt_local(j.due_at), repeat_label(&j.repeat), content)
+                // 条件提醒(kind=cond)的 due_at 是「下次检查时刻」,显示成时间会误导 → 标条件
+                if j.kind == "cond" {
+                    format!("#{} [条件触发] {}", j.id, content)
+                } else {
+                    format!("#{} {}({}){}", j.id, fmt_local(j.due_at), repeat_label(&j.repeat), content)
+                }
             })
             .collect::<Vec<_>>()
             .join("\n"))

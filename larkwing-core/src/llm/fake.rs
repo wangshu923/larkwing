@@ -54,7 +54,7 @@ impl LlmProvider for FakeLlm {
                     .iter()
                     .rev()
                     .find_map(|m| match m {
-                        ChatMessage::User { content } => Some(content.clone()),
+                        ChatMessage::User { content, .. } => Some(content.clone()),
                         _ => None,
                     })
                     .unwrap_or_default();

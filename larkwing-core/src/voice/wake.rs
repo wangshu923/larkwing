@@ -35,7 +35,7 @@ pub(super) enum WakeCmd {
 // wake_threshold,默认对齐 robot 实战 0.2),建 spotter 时由 deps 传入。
 // score 暂不暴露:真机实测它对召回无正增益(s2.5/s3.5 在 t0.45 仍不应,只有降阈管用),
 // 唤醒难易完全由 threshold 拦。
-const KWS_SCORE: f32 = 1.5;
+pub(super) const KWS_SCORE: f32 = 1.5;
 const WAKE_START_TIMEOUT: Duration = Duration::from_secs(6); // 应答后没人开口
 const FOLLOW_UP_WINDOW: Duration = Duration::from_secs(6); // 跟进窗(robot 终值)
 const AWAIT_TURN_CAP: Duration = Duration::from_secs(180); // 前端没回信的兜底
@@ -193,16 +193,8 @@ pub(super) fn run_wake_loop(deps: WakeDeps, cmd: Receiver<WakeCmd>) {
 }
 
 fn wake_loop(d: &WakeDeps, cmd: &Receiver<WakeCmd>) -> Result<()> {
-    // ---- KWS(int8 三件套 + 词表;keywords_buf 免落盘) ----
-    let mut kcfg = sherpa_onnx::KeywordSpotterConfig::default();
-    let p = |name: &str| Some(d.kws_dir.join(name).to_string_lossy().into_owned());
-    kcfg.model_config.transducer.encoder = p("encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx");
-    kcfg.model_config.transducer.decoder = p("decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx");
-    kcfg.model_config.transducer.joiner = p("joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx");
-    kcfg.model_config.tokens = p("tokens.txt");
-    kcfg.keywords_threshold = d.kws_threshold;
-    kcfg.keywords_score = KWS_SCORE;
-    kcfg.keywords_buf = Some(d.keywords_buf.clone());
+    // ---- KWS(int8 三件套 + 词表;keywords_buf 免落盘;配置与 calib 标定共用) ----
+    let kcfg = kws_config(&d.kws_dir, &d.keywords_buf, d.kws_threshold, KWS_SCORE);
     let spotter =
         sherpa_onnx::KeywordSpotter::create(&kcfg).ok_or_else(|| anyhow!("KWS 创建失败"))?;
     let kstream = spotter.create_stream();
@@ -451,11 +443,40 @@ pub(super) fn encode_keywords(
     (lines.join("\n"), dropped)
 }
 
+/// 带「拼写覆盖」的 keywords_buf 构建:标定(calib)可为某个词产出一行更贴合用户发音的
+/// token 行,存进 `voice.wake.spelling`(词→整行 "tok … @词")。命中覆盖 → 直接用该行;
+/// 否则回落 canonical `encode_keywords`。覆盖按「词」键入,换了唤醒词旧覆盖自然失效(无对应键)。
+pub(super) fn build_keywords_buf(
+    words: &[String],
+    overrides: &std::collections::HashMap<String, String>,
+    vocab: &HashSet<String>,
+) -> (String, Vec<String>) {
+    let mut lines = Vec::new();
+    let mut dropped = Vec::new();
+    for word in words {
+        let word = word.trim();
+        if word.is_empty() {
+            continue;
+        }
+        if let Some(line) = overrides.get(word).filter(|l| !l.trim().is_empty()) {
+            lines.push(line.clone());
+            continue;
+        }
+        let (buf, drp) = encode_keywords(std::slice::from_ref(&word.to_string()), vocab);
+        if buf.is_empty() {
+            dropped.extend(drp);
+        } else {
+            lines.push(buf);
+        }
+    }
+    (lines.join("\n"), dropped)
+}
+
 /// 单音节按词表切。**先试整音节**:零声母音节(韵母开头,如 ài/ān/ér)本身就是
 /// 词表里的一个 token,必须整体匹配——否则会被下面的拆分逻辑错切成「首字符+剩余」
 /// (ài→à+i),喂给模型的是它不认的 token,唤醒永不命中。有声母音节(xiǎo)整音节
 /// 不在词表,自然落到拆分:声母(2 字优先,如 zh/ch/sh)+ 带调韵母。
-fn split_syllable(s: &str, vocab: &HashSet<String>) -> Option<Vec<String>> {
+pub(super) fn split_syllable(s: &str, vocab: &HashSet<String>) -> Option<Vec<String>> {
     if vocab.contains(s) {
         return Some(vec![s.to_string()]);
     }
@@ -476,6 +497,26 @@ pub(super) fn load_vocab(tokens_txt: &std::path::Path) -> Result<HashSet<String>
     let text = std::fs::read_to_string(tokens_txt)
         .with_context(|| format!("读 {} 失败", tokens_txt.display()))?;
     Ok(text.lines().filter_map(|l| l.split_whitespace().next()).map(str::to_string).collect())
+}
+
+/// KWS spotter 配置:int8 三件套 + 词表 + 阈值/boost + keywords_buf(免落盘)。
+/// 唤醒循环与 calib 标定共用同一份模型路径和默认参数 —— 改一处两处一致。
+pub(super) fn kws_config(
+    kws_dir: &std::path::Path,
+    keywords_buf: &str,
+    threshold: f32,
+    score: f32,
+) -> sherpa_onnx::KeywordSpotterConfig {
+    let mut kcfg = sherpa_onnx::KeywordSpotterConfig::default();
+    let p = |name: &str| Some(kws_dir.join(name).to_string_lossy().into_owned());
+    kcfg.model_config.transducer.encoder = p("encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx");
+    kcfg.model_config.transducer.decoder = p("decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx");
+    kcfg.model_config.transducer.joiner = p("joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx");
+    kcfg.model_config.tokens = p("tokens.txt");
+    kcfg.keywords_threshold = threshold;
+    kcfg.keywords_score = score;
+    kcfg.keywords_buf = Some(keywords_buf.to_string());
+    kcfg
 }
 
 #[cfg(test)]

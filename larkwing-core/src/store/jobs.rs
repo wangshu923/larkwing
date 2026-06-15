@@ -7,9 +7,10 @@ use serde::Serialize;
 
 use super::db::{m, now_ms, Db, Migration};
 
-pub const MIGRATIONS: &[Migration] = &[m(
-    "0009_jobs_init",
-    "CREATE TABLE jobs (
+pub const MIGRATIONS: &[Migration] = &[
+    m(
+        "0009_jobs_init",
+        "CREATE TABLE jobs (
         id           INTEGER PRIMARY KEY,
         user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         conv_id      INTEGER NOT NULL,
@@ -21,7 +22,15 @@ pub const MIGRATIONS: &[Migration] = &[m(
         updated_at   INTEGER NOT NULL
     );
     CREATE INDEX idx_jobs_due ON jobs (status, due_at);",
-)];
+    ),
+    // 条件提醒(PLAN 天气块):kind=time(到点,现有)| cond(满足条件才触发,due_at 复用成
+    // 「下次检查时刻」);condition = JSON 天气谓词(see scheduler::watch)。现有提醒走默认 time。
+    m(
+        "0010_jobs_condition",
+        "ALTER TABLE jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'time';
+         ALTER TABLE jobs ADD COLUMN condition TEXT;",
+    ),
+];
 
 /// status 词表:pending(待触发)/ done(一次性完成)/ cancelled / missed(错过太久不补发)。
 /// repeat 词表:once / daily / weekdays / weekly(每周同星期,锚定 due_at 的星期)。
@@ -31,10 +40,14 @@ pub struct Job {
     pub user_id: i64,
     pub conv_id: i64,
     pub content: String,
-    /// unix 毫秒(本地时区换算后的绝对时刻)。
+    /// unix 毫秒;time 型 = 触发时刻,cond 型 = 下次检查时刻。
     pub due_at: i64,
     pub repeat: String,
     pub status: String,
+    /// time(到点触发)| cond(满足 condition 才触发)。
+    pub kind: String,
+    /// cond 型的谓词 JSON(scheduler::watch 解析);time 型为 None。
+    pub condition: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -73,6 +86,42 @@ impl JobRepo {
                 due_at,
                 repeat: repeat.into(),
                 status: "pending".into(),
+                kind: "time".into(),
+                condition: None,
+                created_at: now,
+                updated_at: now,
+            })
+        })
+    }
+
+    /// 条件提醒(kind=cond):due_at = 首次检查时刻,condition = 谓词 JSON;repeat 固定 once
+    /// (满足即收尾)。检查节奏由 scheduler 推进 due_at 控制,不走 repeat。
+    pub fn add_watch(
+        &self,
+        user_id: i64,
+        conv_id: i64,
+        content: &str,
+        condition: &str,
+        first_check_at: i64,
+    ) -> Result<Job> {
+        self.db.with(|c| {
+            let now = now_ms();
+            c.execute(
+                "INSERT INTO jobs (user_id, conv_id, content, due_at, repeat, status, kind, condition, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'once', 'pending', 'cond', ?5, ?6, ?6)",
+                rusqlite::params![user_id, conv_id, content, first_check_at, condition, now],
+            )?;
+            let id = c.last_insert_rowid();
+            Ok(Job {
+                id,
+                user_id,
+                conv_id,
+                content: content.into(),
+                due_at: first_check_at,
+                repeat: "once".into(),
+                status: "pending".into(),
+                kind: "cond".into(),
+                condition: Some(condition.into()),
                 created_at: now,
                 updated_at: now,
             })
@@ -83,7 +132,7 @@ impl JobRepo {
     pub fn list_pending(&self, user_id: i64) -> Result<Vec<Job>> {
         self.db.with(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, user_id, conv_id, content, due_at, repeat, status, created_at, updated_at
+                "SELECT id, user_id, conv_id, content, due_at, repeat, status, created_at, updated_at, kind, condition
                  FROM jobs WHERE user_id = ?1 AND status = 'pending' ORDER BY due_at",
             )?;
             let rows = stmt
@@ -97,7 +146,7 @@ impl JobRepo {
     pub fn due(&self, now: i64) -> Result<Vec<Job>> {
         self.db.with(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, user_id, conv_id, content, due_at, repeat, status, created_at, updated_at
+                "SELECT id, user_id, conv_id, content, due_at, repeat, status, created_at, updated_at, kind, condition
                  FROM jobs WHERE status = 'pending' AND due_at <= ?1 ORDER BY due_at",
             )?;
             let rows = stmt
@@ -156,6 +205,8 @@ fn map_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         status: r.get(6)?,
         created_at: r.get(7)?,
         updated_at: r.get(8)?,
+        kind: r.get(9)?,
+        condition: r.get(10)?,
     })
 }
 

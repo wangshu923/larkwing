@@ -83,13 +83,37 @@ pub struct UserMeta {
     /// None = 用会话归属者。会话归属与性格设定不受影响(保前缀稳定)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speaker_user: Option<i64>,
+    /// 本回合带过的附件小票(媒体输入 PLAN §9):只存「📷/📄 名字」级指针给 UI 显历史,
+    /// 附件本体当轮注入 LLM 后不持久(省 token/体积)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentRef>,
+}
+
+/// 持久小票:历史里标「这条带过图/文档」。kind: image | doc。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentRef {
+    pub kind: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mime: String,
+}
+
+/// 入站附件(IPC 词汇):前端把图/文档读成 base64 随消息送来。当轮处理——图走 image_url,
+/// 文档抽文字注入当轮提示;不整体持久(只落 AttachmentRef 小票)。
+#[derive(Debug, Clone, Deserialize)]
+pub struct InAttachment {
+    pub name: String,
+    pub mime: String,
+    /// 原始字节的 base64(无 data: 前缀)。
+    pub data: String,
 }
 
 impl UserMeta {
-    /// 默认形(打字、不念、无声纹)不落 payload。
+    /// 默认形(打字、不念、无声纹、无附件)不落 payload。
     fn is_default(&self) -> bool {
         !self.speak
             && self.speaker_user.is_none()
+            && self.attachments.is_empty()
             && (self.input.is_empty() || self.input == "typed")
     }
 }
@@ -110,6 +134,28 @@ pub enum ErrorKind {
 pub struct AppError {
     pub kind: ErrorKind,
     pub message: String,
+}
+
+/// 「想了想」轨迹的一步(PLAN §9 思考漏出·展开层):一次工具调用的技术细节。
+/// ui_key 给折叠摘要兜底;name/args/result/status 是展开后给好奇/专业用户看的真东西。
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceStep {
+    pub name: String,
+    pub ui_key: String,
+    pub args: String,
+    pub result: String,
+    pub status: String,
+}
+
+/// 一回合的「想了想」轨迹:贴在该回合代表气泡上。折叠药丸只露「想了想 · N 步」(§3 干净默认);
+/// 展开 = 工具名/入参/结果 + CoT 原文(用户拍板:展开是给好奇/专业用户的技术披露,
+/// 非专业用户不必点开;§3 铁律2 在折叠层守住,展开层放开一格)。
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnTrace {
+    pub message_id: i64,
+    pub steps: Vec<TraceStep>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 impl AppError {
@@ -153,6 +199,7 @@ const APP_SETTING_KEYS: &[&str] = &[
     "voice.wake.keywords",
     "voice.wake.sensitivity",
     "voice.tts_backend",
+    "weather.qweather.host",
 ];
 
 /// 语音的用户级设置(PLAN §11 逐键放行,不开 voice.* 通配——同前缀跨两个 scope)。
@@ -426,16 +473,16 @@ impl Engine {
             None => self.store.chat.create_conversation(user.id, DEFAULT_SCENE_ID)?,
         };
         let messages = self.store.chat.recent_messages(conversation.id, 50)?;
-        let opening_line = if messages.is_empty() {
-            self.scenes.get(&conversation.scene_id).map(|s| s.opening_line.clone())
-        } else {
-            None
-        };
         let locale = self
             .store
             .settings
             .get(Some(user.id), "ui.locale")?
             .unwrap_or_else(|| "zh-CN".into());
+        let opening_line = if messages.is_empty() {
+            self.scenes.get(&conversation.scene_id).map(|s| s.opening_for(&locale))
+        } else {
+            None
+        };
         Ok(BootSnapshot {
             user,
             conversation,
@@ -500,6 +547,19 @@ impl Engine {
         for (key, value) in self.store.settings.list(None)? {
             if APP_SETTING_KEYS.contains(&key.as_str()) {
                 out.push(SettingEntry { scope: "app".into(), key, value });
+            }
+        }
+        // 天气和风 key 是秘密 —— 不过桥明文,只回掩码供前端显示"已配置"(同 provider 纪律)
+        if let Some(raw) = self.store.settings.get(None, "weather.qweather.key")? {
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                let tail: String =
+                    raw.chars().skip(raw.chars().count().saturating_sub(4)).collect();
+                out.push(SettingEntry {
+                    scope: "app".into(),
+                    key: "weather.qweather.key".into(),
+                    value: format!("····{tail}"),
+                });
             }
         }
         for (key, value) in self.store.settings.list(Some(user.id))? {
@@ -596,6 +656,24 @@ impl Engine {
                     return Err(invalid("未知的语音合成档"));
                 }
                 self.store.settings.set(None, key, value)?;
+                Ok(())
+            }
+            // 天气和风 key(app 级,秘密):填了即切和风源,空串 = 清空回落免 key 源;
+            // 掩码回显("····")不覆盖真值(同 provider 防误存)。下回合工具现读即生效。
+            "weather.qweather.key" => {
+                if value.contains('·') {
+                    return Ok(());
+                }
+                self.store.settings.set(None, key, value.trim())?;
+                Ok(())
+            }
+            // 和风专属 API Host(app 级,非秘密):空 = 用默认免费版 host,否则要 http(s)。
+            "weather.qweather.host" => {
+                let v = value.trim();
+                if !v.is_empty() && !v.starts_with("http") {
+                    return Err(invalid("天气服务地址要以 http(s) 开头"));
+                }
+                self.store.settings.set(None, key, v)?;
                 Ok(())
             }
             _ => Err(invalid("不在设置白名单内")),
@@ -758,6 +836,67 @@ impl Engine {
         Ok(())
     }
 
+    /// 提醒页:当前用户待触发的提醒(定时任务,按 due_at 升序;真相在库、回合无状态)。
+    pub fn list_reminders(&self) -> Result<Vec<crate::store::Job>, AppError> {
+        let user = self.store.users.ensure_default_user()?;
+        Ok(self.store.jobs.list_pending(user.id)?)
+    }
+
+    /// 提醒页「取消」:撤掉一条提醒(按当前用户限定,防串号)。
+    pub fn cancel_reminder(&self, id: i64) -> Result<(), AppError> {
+        let user = self.store.users.ensure_default_user()?;
+        if !self.store.jobs.cancel(user.id, id)? {
+            return Err(AppError {
+                kind: ErrorKind::NotFound,
+                message: format!("提醒 {id} 不存在"),
+            });
+        }
+        Ok(())
+    }
+
+    // ---- 文件操作记录(PLAN §9 文件能力):操作记录页 + 撤销/重做 ----
+
+    /// 操作记录页:当前用户最近的文件操作批次(最近在前)。
+    pub fn list_fsops(&self) -> Result<Vec<crate::store::FsOpRow>, AppError> {
+        let user = self.store.users.ensure_default_user()?;
+        Ok(self.store.fsops.list_for(user.id, 100)?)
+    }
+
+    /// 撤销一批(操作记录页「撤销」按钮;模型侧另有 fs_undo 工具)。
+    pub fn fsops_undo(&self, id: i64) -> Result<(), AppError> {
+        self.apply_fsops(id, "applied", "undone", true)
+    }
+
+    /// 重做一批(「重做」按钮)。功能性,非安全承诺。
+    pub fn fsops_redo(&self, id: i64) -> Result<(), AppError> {
+        self.apply_fsops(id, "undone", "applied", false)
+    }
+
+    /// 撤销/重做共用:校归属 + 校当前状态(已是目标态 = 幂等返回)→ 执行 → 翻状态。
+    /// 文件 I/O 直接在此(同 delete_* 等阻塞域方法,Tauri 在工作线程跑同步 command)。
+    fn apply_fsops(&self, id: i64, from: &str, to: &str, undo: bool) -> Result<(), AppError> {
+        let user = self.store.users.ensure_default_user()?;
+        let row = self.store.fsops.get(id)?.ok_or_else(|| AppError {
+            kind: ErrorKind::NotFound,
+            message: format!("操作记录 {id} 不存在"),
+        })?;
+        if row.user_id != user.id {
+            return Err(AppError { kind: ErrorKind::NotFound, message: "不是你的操作记录".into() });
+        }
+        if row.state != from {
+            return Ok(()); // 已是目标状态 → 幂等(前端刷新即可)
+        }
+        let items: Vec<crate::files::FsOpItem> =
+            serde_json::from_str(&row.ops).map_err(AppError::internal)?;
+        if undo {
+            crate::files::undo_batch(&items);
+        } else {
+            crate::files::redo_batch(&items);
+        }
+        self.store.fsops.set_state(id, to)?;
+        Ok(())
+    }
+
     pub fn rename_user(&self, name: &str) -> Result<User, AppError> {
         let name = name.trim();
         if name.is_empty() || name.chars().count() > 24 {
@@ -817,6 +956,81 @@ impl Engine {
             .collect())
     }
 
+    /// 历史回放的「想了想」轨迹:把每回合中途的工具调用(名/入参/结果/状态)+ CoT 原文,
+    /// 归到该回合代表气泡(其后最后一条有内容的 assistant)。全从落库 payload 重建。
+    /// live 回合落库后由前端补拉这条(不在 TurnEvent 里塞 args/result,免破流式词汇)。
+    pub fn conversation_trace(&self, conv_id: i64) -> Result<Vec<TurnTrace>, AppError> {
+        let msgs = self.store.chat.recent_messages(conv_id, 200)?;
+        let mut out = Vec::new();
+        let mut steps: Vec<TraceStep> = Vec::new();
+        let mut reasoning: Vec<String> = Vec::new();
+        let mut idx_by_call: HashMap<String, usize> = HashMap::new();
+        let reset = |steps: &mut Vec<TraceStep>, r: &mut Vec<String>, idx: &mut HashMap<String, usize>| {
+            steps.clear();
+            r.clear();
+            idx.clear();
+        };
+        for m in &msgs {
+            match m.role.as_str() {
+                "user" | "event" => reset(&mut steps, &mut reasoning, &mut idx_by_call),
+                "assistant" => {
+                    if let Some(p) = m
+                        .payload
+                        .as_deref()
+                        .and_then(|p| serde_json::from_str::<AssistantPayload>(p).ok())
+                    {
+                        for c in &p.tool_calls {
+                            let ui_key = self
+                                .tools
+                                .get(&c.name)
+                                .map(|t| t.spec().ui_key.to_string())
+                                .unwrap_or_else(|| "tool.unknown".into());
+                            idx_by_call.insert(c.id.clone(), steps.len());
+                            steps.push(TraceStep {
+                                name: c.name.clone(),
+                                ui_key,
+                                args: c.args.to_string(),
+                                result: String::new(),
+                                status: String::new(),
+                            });
+                        }
+                        if let Some(r) =
+                            p.reasoning.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                        {
+                            reasoning.push(r.to_string());
+                        }
+                    }
+                    // 有内容 = 这回合代表气泡(可见回复):结算并复位
+                    if !m.content.trim().is_empty() {
+                        if !steps.is_empty() || !reasoning.is_empty() {
+                            out.push(TurnTrace {
+                                message_id: m.id,
+                                steps: std::mem::take(&mut steps),
+                                reasoning: (!reasoning.is_empty()).then(|| reasoning.join("\n\n")),
+                            });
+                        }
+                        reset(&mut steps, &mut reasoning, &mut idx_by_call);
+                    }
+                }
+                // tool 行:按 call_id 回填结果/状态到对应步骤
+                "tool" => {
+                    if let Some(tp) = m
+                        .payload
+                        .as_deref()
+                        .and_then(|p| serde_json::from_str::<ToolRowPayload>(p).ok())
+                    {
+                        if let Some(step) = idx_by_call.get(&tp.call_id).and_then(|&i| steps.get_mut(i)) {
+                            step.result = m.content.clone();
+                            step.status = tp.status;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
     /// 主选供应商的账户余额。None = 没配供应商/不支持/查不到 —— 锦上添花,失败静默。
     /// 查到的值顺手落快照(变了才记):余额差值 = 供应商账面的真实花费,给分析对账用。
     pub async fn llm_balance(&self) -> Option<crate::llm::AccountBalance> {
@@ -856,6 +1070,7 @@ impl Engine {
         conv_id: i64,
         text: String,
         meta: Option<UserMeta>,
+        attachments: Vec<InAttachment>,
     ) -> Result<mpsc::Receiver<TurnEvent>, AppError> {
         // 1. 会话管控:必须 await 旧回合收尾,partial 先落库,新回合拼历史才完整
         self.cancel(conv_id).await;
@@ -884,17 +1099,47 @@ impl Engine {
         let conv_user = conversation.user_id;
         let (request, user_msg_id, mem_user) = tokio::task::spawn_blocking(
             move || -> anyhow::Result<(crate::llm::ChatRequest, i64, i64)> {
-            // 语音会话模式(PLAN §11):非默认的输入形态物化进 payload(真相在库)
-            let payload = meta
-                .as_ref()
-                .filter(|m| !m.is_default())
-                .map(serde_json::to_string)
+            use base64::Engine as _;
+            // 入站附件(媒体输入 PLAN §9):图 → image_url 当轮注入;文档 → 抽文字当轮注入;
+            // 只把小票(AttachmentRef)落 payload,附件本体不进持久前缀(省 token/体积)
+            let mut image_parts: Vec<crate::llm::ContentPart> = Vec::new();
+            let mut doc_text = String::new();
+            let mut att_refs: Vec<AttachmentRef> = Vec::new();
+            for a in &attachments {
+                if crate::attach::is_image(&a.mime) {
+                    // 图不在 core 解码,直接拼 data URL 交视觉模型
+                    image_parts.push(crate::llm::ContentPart::ImageUrl {
+                        url: format!("data:{};base64,{}", a.mime, a.data),
+                    });
+                    att_refs.push(AttachmentRef {
+                        kind: "image".into(), name: a.name.clone(), mime: a.mime.clone(),
+                    });
+                    continue;
+                }
+                let extracted = base64::engine::general_purpose::STANDARD
+                    .decode(a.data.as_bytes())
+                    .ok()
+                    .and_then(|bytes| crate::attach::extract_doc_text(&a.name, &a.mime, &bytes));
+                match extracted {
+                    Some(t) => doc_text.push_str(&format!("\n\n〔附件:{}〕\n{t}", a.name)),
+                    None => doc_text.push_str(&format!("\n\n〔附件:{}(暂时读不出内容)〕", a.name)),
+                }
+                att_refs.push(AttachmentRef {
+                    kind: "doc".into(), name: a.name.clone(), mime: a.mime.clone(),
+                });
+            }
+
+            // 语音会话模式(PLAN §11)+ 附件小票:非默认形态物化进 payload(真相在库)
+            let mut eff_meta = meta.unwrap_or_default();
+            eff_meta.attachments = att_refs;
+            let payload = (!eff_meta.is_default())
+                .then(|| serde_json::to_string(&eff_meta))
                 .transpose()?;
             let user_msg =
                 store.chat.append_message_full(conv_id, "user", &text, payload.as_deref())?;
             // 记忆归人(§6):声纹识别出且确属真实用户 → 本回合用 TA;否则会话归属者
             // (访客/电视声识别不出 → fallback,绝不误记到家人名下,robot 同款立场)
-            let mem_user = match meta.as_ref().and_then(|m| m.speaker_user) {
+            let mem_user = match eff_meta.speaker_user {
                 Some(sid) if sid != conv_user && store.users.get(sid)?.is_some() => sid,
                 _ => conv_user,
             };
@@ -926,6 +1171,19 @@ impl Engine {
                 &history,
                 &tool_defs,
             );
+            // 当轮注入附件(图 parts + 文档文字):挂到最后一条 user 消息上,持久前缀
+            // (few-shot/历史)字节不动 → 缓存不破,也不为历史里的旧图反复付 vision 费
+            if !image_parts.is_empty() || !doc_text.is_empty() {
+                if let Some(crate::llm::ChatMessage::User { content, parts }) = request
+                    .messages
+                    .iter_mut()
+                    .rev()
+                    .find(|m| matches!(m, crate::llm::ChatMessage::User { .. }))
+                {
+                    content.push_str(&doc_text);
+                    parts.extend(image_parts);
+                }
+            }
             // 反应模式(最快/轻度/中度/重度):每回合取值,改完下一句话就生效,无需重建 provider
             let thinking = match store.settings.get(None, "llm.thinking")?.as_deref() {
                 Some("light") => crate::llm::Thinking::Light,

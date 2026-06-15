@@ -11,6 +11,8 @@ mod media_search;
 mod now;
 mod remember;
 mod reminder;
+mod watch;
+mod weather;
 mod web;
 
 use std::collections::HashMap;
@@ -57,9 +59,23 @@ pub struct ToolCtx {
     pub media: crate::media::MediaRuntime,
 }
 
+/// 工具风险分级(预留 slot,PLAN §8):`Safe` = 读/记类;`Mutating` = 会改动用户文件
+/// (move/copy/trash/write…)。**引擎当前不据此拦截**(用户拍板:不强制确认、不设门禁)——
+/// 留作未来「执行前确认闸门」的判据 + 操作日志/HUD 措辞的元数据。纯数据,加它零行为变化。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolRisk {
+    Safe,
+    Mutating,
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> &ToolSpec;
+
+    /// 风险分级(预留 slot):默认 `Safe`,会动用户文件的工具覆盖成 `Mutating`。
+    fn risk(&self) -> ToolRisk {
+        ToolRisk::Safe
+    }
 
     /// 错误也是观察:Err 会被 engine 变成错误 ToolResult 喂回模型(模型自行换路),
     /// 不打断回合。取消语义:future 可能被 drop(回合取消),实现必须 drop-safe。
@@ -85,9 +101,22 @@ impl Tools {
         tools.register(Arc::new(media_control::MediaControl::new()));
         tools.register(Arc::new(fs::FsList::new()));
         tools.register(Arc::new(fs::FsFind::new()));
+        tools.register(Arc::new(fs::FsReadText::new()));
+        tools.register(Arc::new(fs::FsMove::new()));
+        tools.register(Arc::new(fs::FsCopy::new()));
+        tools.register(Arc::new(fs::FsMkdir::new()));
+        tools.register(Arc::new(fs::FsTrash::new()));
+        tools.register(Arc::new(fs::FsWriteText::new()));
+        tools.register(Arc::new(fs::FsAppend::new()));
+        tools.register(Arc::new(fs::FsEdit::new()));
+        tools.register(Arc::new(fs::FsUndo::new()));
         tools.register(Arc::new(reminder::ReminderSet::new()));
         tools.register(Arc::new(reminder::ReminderList::new()));
         tools.register(Arc::new(reminder::ReminderCancel::new()));
+        // 天气 + 条件提醒共享一个 WeatherClient(连接池);源按 settings 里和风 key 有无现选
+        let weather_client = Arc::new(crate::weather::WeatherClient::new());
+        tools.register(Arc::new(weather::WeatherTool::new(weather_client.clone())));
+        tools.register(Arc::new(watch::WatchSet::new(weather_client)));
         // 两个 web 工具共享一个客户端(连接池 + 正文短缓存)
         let web_client = Arc::new(crate::web::WebClient::new());
         tools.register(Arc::new(web::WebSearch::new(web_client.clone())));

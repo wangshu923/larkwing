@@ -12,7 +12,9 @@ use larkwing_core::engine::{
 };
 use larkwing_core::llm::AccountBalance;
 use larkwing_core::media::{CookieRec, MediaRuntime};
-use larkwing_core::store::{Briefing, Conversation, Memory, Message, UsageTotals, User};
+use larkwing_core::store::{
+    Briefing, ClonedVoice, Conversation, FsOpRow, Job, Memory, Message, UsageTotals, User,
+};
 use larkwing_core::voice::{FamilyMember, VoiceRuntime, VoiceStatus};
 
 pub struct AppState {
@@ -36,9 +38,13 @@ pub async fn send_message(
     conv_id: i64,
     text: String,
     meta: Option<larkwing_core::engine::UserMeta>,
+    attachments: Option<Vec<larkwing_core::engine::InAttachment>>,
     on_event: Channel<TurnEvent>,
 ) -> Result<(), AppError> {
-    let mut rx = state.engine.send_message(conv_id, text, meta).await?;
+    let mut rx = state
+        .engine
+        .send_message(conv_id, text, meta, attachments.unwrap_or_default())
+        .await?;
     tauri::async_runtime::spawn(async move {
         while let Some(ev) = rx.recv().await {
             // 前端不听了(窗口刷新等):drop rx 即可,落库由 engine 侧保证
@@ -131,6 +137,36 @@ pub fn delete_briefing(state: State<'_, AppState>, id: i64) -> Result<(), AppErr
     state.engine.delete_briefing(id)
 }
 
+/// 提醒页:当前用户待触发的提醒(定时任务,按时间升序)。
+#[tauri::command]
+pub fn list_reminders(state: State<'_, AppState>) -> Result<Vec<Job>, AppError> {
+    state.engine.list_reminders()
+}
+
+/// 提醒页「取消」:撤掉一条提醒(按当前用户限定)。
+#[tauri::command]
+pub fn cancel_reminder(state: State<'_, AppState>, id: i64) -> Result<(), AppError> {
+    state.engine.cancel_reminder(id)
+}
+
+/// 操作记录页(文件能力,PLAN §9):当前用户最近的文件操作批次(最近在前)。
+#[tauri::command]
+pub fn list_fsops(state: State<'_, AppState>) -> Result<Vec<FsOpRow>, AppError> {
+    state.engine.list_fsops()
+}
+
+/// 操作记录页「撤销」:把某批文件操作退回去(功能性,非安全承诺)。
+#[tauri::command]
+pub fn fsops_undo(state: State<'_, AppState>, id: i64) -> Result<(), AppError> {
+    state.engine.fsops_undo(id)
+}
+
+/// 操作记录页「重做」:把撤销过的那批再做一遍。
+#[tauri::command]
+pub fn fsops_redo(state: State<'_, AppState>, id: i64) -> Result<(), AppError> {
+    state.engine.fsops_redo(id)
+}
+
 /// 灯带初值:今日 token/费用累计(此后的增量走 TurnEvent::Usage)。
 #[tauri::command]
 pub fn usage_today(state: State<'_, AppState>) -> Result<DayUsage, AppError> {
@@ -153,6 +189,15 @@ pub fn conversation_stats(
     conv_id: i64,
 ) -> Result<Vec<MsgStats>, AppError> {
     state.engine.conversation_stats(conv_id)
+}
+
+/// 历史回放的「想了想」轨迹(PLAN §9 思考漏出):load 会话后回填到代表气泡。
+#[tauri::command]
+pub fn conversation_trace(
+    state: State<'_, AppState>,
+    conv_id: i64,
+) -> Result<Vec<larkwing_core::engine::TurnTrace>, AppError> {
+    state.engine.conversation_trace(conv_id)
 }
 
 /// 悬浮窗待机轮播数据(PLAN §12):下个提醒 + 最近一句(只读;余额/今日花费复用现成命令)。
@@ -247,6 +292,26 @@ pub fn voice_wake_suspend(state: State<'_, AppState>, on: bool) -> Result<(), Ap
     Ok(())
 }
 
+/// 录音标定唤醒(PLAN §11 后续):立即返回,录音/计算进展走 app_event 的 voice 车道
+/// (CalibProgress / State / CalibResult);首次会触发 KWS/ASR/VAD 模型用时下载。
+#[tauri::command]
+pub fn voice_calibrate_wake(state: State<'_, AppState>) -> Result<(), AppError> {
+    let voice = state.voice.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = voice.calibrate_wake().await {
+            tracing::error!(err = %format!("{e:#}"), "唤醒标定失败");
+        }
+    });
+    Ok(())
+}
+
+/// 取消进行中的唤醒标定(幂等)。
+#[tauri::command]
+pub fn voice_calibrate_cancel(state: State<'_, AppState>) -> Result<(), AppError> {
+    state.voice.calibrate_cancel();
+    Ok(())
+}
+
 // ---- 家人 / 声纹(PLAN §11 D;多用户落地) ----
 
 /// 家人列表(含"是否已录声纹"标记)。
@@ -298,6 +363,69 @@ pub async fn voice_preview(
 ) -> Result<String, AppError> {
     let path = state.voice.preview(&speaker, &text).await.map_err(AppError::internal)?;
     state.media.file_url(path).await.map_err(AppError::internal)
+}
+
+// ---- 音色克隆(PLAN §11 D-clone) ----
+
+/// `voice_clone_record` 的返回:录完待确认的草稿(尚未落库)。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloneDraft {
+    pub clone_id: String,
+    pub transcript: String,
+}
+
+/// 列出克隆音色(内置预置 + 用户自录,混在音色列表)。
+#[tauri::command]
+pub fn list_voice_clones(state: State<'_, AppState>) -> Result<Vec<ClonedVoice>, AppError> {
+    state.voice.list_clones().map_err(AppError::internal)
+}
+
+/// 录一段参考音 → 自动转写,返回 (clone_id, 文字稿) 供前端过目/修改;**此刻不写库**。
+/// 录音/电平进展走 voice 车道事件(Listening→Idle);命令 await 到录完+转写才返回。
+#[tauri::command]
+pub async fn voice_clone_record(state: State<'_, AppState>) -> Result<CloneDraft, AppError> {
+    let (clone_id, transcript) =
+        state.voice.clone_record().await.map_err(AppError::internal)?;
+    Ok(CloneDraft { clone_id, transcript })
+}
+
+/// 导入本地音频文件(前端解码/重采样成 16k 单声道 wav 的 base64)→ 转写,返回草稿(未落库)。
+#[tauri::command]
+pub async fn voice_clone_import(
+    state: State<'_, AppState>,
+    wav_base64: String,
+) -> Result<CloneDraft, AppError> {
+    let (clone_id, transcript) =
+        state.voice.clone_import(&wav_base64).await.map_err(AppError::internal)?;
+    Ok(CloneDraft { clone_id, transcript })
+}
+
+/// 确认录入:用(可能改过的)文字稿 + 名字落库,返回新音色。
+#[tauri::command]
+pub fn voice_clone_save(
+    state: State<'_, AppState>,
+    clone_id: String,
+    name: String,
+    transcript: String,
+) -> Result<ClonedVoice, AppError> {
+    state.voice.clone_save(&clone_id, &name, &transcript).map_err(AppError::internal)
+}
+
+/// 重命名克隆音色。
+#[tauri::command]
+pub fn rename_voice_clone(
+    state: State<'_, AppState>,
+    clone_id: String,
+    name: String,
+) -> Result<(), AppError> {
+    state.voice.rename_clone(&clone_id, &name).map_err(AppError::internal)
+}
+
+/// 删除克隆音色(内置不可删,连参考音一并删)。
+#[tauri::command]
+pub fn delete_voice_clone(state: State<'_, AppState>, clone_id: String) -> Result<(), AppError> {
+    state.voice.delete_clone(&clone_id).map_err(AppError::internal)
 }
 
 /// 扫码登录:开一扇加载站点登录页的窗口,轮询原生 CookieManager(SESSDATA 是

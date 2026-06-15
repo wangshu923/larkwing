@@ -55,6 +55,37 @@ export interface Briefing {
   updated_at: number
 }
 
+/** 一批文件操作(操作记录页,PLAN §9 文件能力)。功能性历史,非安全承诺。
+ *  kind: move|copy|mkdir|trash|write|append|edit;state: 'applied'(已生效)|'undone'(已撤销,可重做);
+ *  ops = FsOpItem[] 的 JSON 串(前端不解析,只用 kind/n 展示)。 */
+export interface FsOp {
+  id: number
+  user_id: number
+  kind: string
+  ops: string
+  n: number
+  state: string
+  created_at: number
+  updated_at: number
+}
+
+/** 一条提醒(提醒页,jobs 域)。模型把自然语言翻成绝对时刻 + repeat 枚举,用户永不见 cron。
+ *  repeat: once|daily|weekdays|weekly;status 待触发恒为 'pending'(列表只取 pending)。 */
+export interface Reminder {
+  id: number
+  user_id: number
+  conv_id: number
+  content: string
+  /** unix 毫秒(本地时区换算后的绝对时刻)。 */
+  due_at: number
+  repeat: string
+  status: string
+  /** time(到点)| cond(条件触发);cond 的 due_at 是「下次检查时刻」,不当时间显示。 */
+  kind: string
+  created_at: number
+  updated_at: number
+}
+
 export interface BootSnapshot {
   user: User
   conversation: Conversation
@@ -149,6 +180,28 @@ export interface MsgStats {
   cost_usd: number | null
 }
 
+/** 「想了想」轨迹的一步(展开层):一次工具调用的技术细节。 */
+export interface TraceStep {
+  /** 工具名(原始,技术向)。 */
+  name: string
+  /** 人格化键(折叠摘要兜底)。 */
+  ui_key: string
+  /** 入参 JSON(原样)。 */
+  args: string
+  /** 结果(tool 行内容)。 */
+  result: string
+  /** ok|error|timeout|cancelled。 */
+  status: string
+}
+
+/** 一回合的「想了想」轨迹(PLAN §9 思考漏出):展开层给好奇/专业用户看的技术细节
+ *  (工具名/入参/结果 + CoT 原文)。load 会话后(及 trace-y 回合落库后)回填到代表气泡。 */
+export interface TurnTrace {
+  message_id: number
+  steps: TraceStep[]
+  reasoning?: string | null
+}
+
 /** 账户余额(供应商支持才有);amount 是供应商原文字符串,只展示不算术。 */
 export interface AccountBalance {
   currency: string
@@ -239,6 +292,19 @@ export type VoiceEvent =
           | string
       }
     }
+  // 唤醒录音标定:正在录第 step/total 段(step 从 1 计;total 含末尾 1 段底噪)
+  | { type: 'calib_progress'; data: { step: number; total: number } }
+  // 唤醒标定收尾:verdict = good|noisy|hard|cancelled|error(前端字典渲染文案)
+  | {
+      type: 'calib_result'
+      data: {
+        ok: boolean
+        sensitivity: number
+        recall: number
+        adopted_spelling: boolean
+        verdict: string
+      }
+    }
 
 /** 设置页「语音组件」状态行 + 麦克风设备列表 + 音色目录 + 唤醒状态。 */
 export interface VoiceStatus {
@@ -249,7 +315,8 @@ export interface VoiceStatus {
   wakeRunning: boolean
   keywords: string[]
   devices: string[]
-  speakers: { id: string; name: string }[]
+  /** 音色列表:内置在线音色 + 克隆(含内置 BT 预置);id 克隆为 "clone:<id>"。 */
+  speakers: { id: string; name: string; isClone?: boolean; builtin?: boolean }[]
 }
 
 /** 输入形态(语音会话模式,PLAN §11):发送瞬间物化,真相在库。省略 = 打字默认形。 */
@@ -258,6 +325,23 @@ export interface UserMeta {
   speak: boolean
   /** 声纹识别出的家人(D 期):本回合记忆归 TA。省略 = 走会话用户。 */
   speaker_user?: number
+  /** 本回合带过的附件小票(媒体输入 PLAN §9):随 user 行 payload 回来,UI 显历史。 */
+  attachments?: AttachmentRef[]
+}
+
+/** 入站附件(媒体输入 PLAN §9):前端把图/文档读成 base64,随消息送上 core 当轮处理。 */
+export interface OutAttachment {
+  name: string
+  mime: string
+  /** 原始字节 base64(无 data: 前缀)。 */
+  data: string
+}
+
+/** 持久小票(历史里标这条带过图/文档);附件本体当轮注入 LLM 后不留存。 */
+export interface AttachmentRef {
+  kind: 'image' | 'doc' | string
+  name: string
+  mime?: string
 }
 
 /** 家人(设置·家人 tab,D 期):用户字段 + 是否已录声纹。 */
@@ -321,6 +405,9 @@ export const win = {
   },
   isFullscreen: (): Promise<boolean> =>
     isTauri() ? getCurrentWindow().isFullscreen() : Promise.resolve(false),
+  /** 当前窗口是否藏着(托盘 hide)。视频起播前读一次,停时据此决定要不要再藏回去。 */
+  isHidden: async (): Promise<boolean> =>
+    isTauri() ? !(await getCurrentWindow().isVisible()) : false,
   /** 把当前窗口叫到最前:显示 + 取消最小化 + 聚焦。视频起播用 —— 否则窗口藏在托盘/
    *  别的窗后面时,视频在后台播,用户"只闻其声"(实测)。已在前台则全是 no-op,不闪。 */
   bringToFront: async () => {
@@ -472,10 +559,16 @@ export const api = {
   boot: () => invoke<BootSnapshot>('boot'),
 
   /** command 立即返回;事件经 Channel 持续推送直到 done/failed/cancelled。 */
-  sendMessage(convId: number, text: string, meta: UserMeta | null, onEvent: (ev: TurnEvent) => void) {
+  sendMessage(
+    convId: number,
+    text: string,
+    meta: UserMeta | null,
+    attachments: OutAttachment[],
+    onEvent: (ev: TurnEvent) => void,
+  ) {
     const channel = new Channel<TurnEvent>()
     channel.onmessage = onEvent
-    return invoke<void>('send_message', { convId, text, meta, onEvent: channel })
+    return invoke<void>('send_message', { convId, text, meta, attachments, onEvent: channel })
   },
 
   cancelGeneration: (convId: number) => invoke<void>('cancel_generation', { convId }),
@@ -483,6 +576,8 @@ export const api = {
   usageConversation: (convId: number) => invoke<UsageTotals>('usage_conversation', { convId }),
   /** 历史/提醒气泡读数(load 会话后回填,让自启回合也能 hover 看时间/token)。 */
   conversationStats: (convId: number) => invoke<MsgStats[]>('conversation_stats', { convId }),
+  /** 历史回放的「想了想」轨迹(load 会话后回填到代表气泡)。 */
+  conversationTrace: (convId: number) => invoke<TurnTrace[]>('conversation_trace', { convId }),
   llmBalance: () => invoke<AccountBalance | null>('llm_balance'),
   /** 悬浮窗待机轮播:下个提醒 + 最近一句(余额/今日花费复用 llmBalance/usageToday)。 */
   floatIdle: () => invoke<FloatIdle>('float_idle'),
@@ -513,6 +608,10 @@ export const api = {
   voiceWakeResume: () => invoke<void>('voice_wake_resume'),
   /** TTS 在念(含重听)时唤醒循环丢帧(自激防护)。 */
   voiceWakeSuspend: (on: boolean) => invoke<void>('voice_wake_suspend', { on }),
+  /** 录音标定唤醒:立即返回,进展走 voice 车道(calib_progress/state/calib_result)。 */
+  voiceCalibrateWake: () => invoke<void>('voice_calibrate_wake'),
+  /** 取消进行中的唤醒标定(幂等)。 */
+  voiceCalibrateCancel: () => invoke<void>('voice_calibrate_cancel'),
   /** 家人列表(含已录声纹标记)。 */
   listFamily: () => invoke<FamilyMember[]>('list_family'),
   addFamily: (name: string) => invoke<{ id: number; name: string }>('add_family', { name }),
@@ -524,10 +623,36 @@ export const api = {
   /** 设置页音色试听(试听句出自字典——core 不产文案)。 */
   voicePreview: (speaker: string, text: string) =>
     invoke<string>('voice_preview', { speaker, text }),
+  /** 列出克隆音色(内置预置 + 用户自录)。 */
+  listVoiceClones: () =>
+    invoke<{ id: string; name: string; wavFile: string; transcript: string; lang: string; builtin: boolean; createdAt: number }[]>(
+      'list_voice_clones',
+    ),
+  /** 录一段参考音 → 自动转写,返回草稿(未落库);进展走 voice 事件。 */
+  voiceCloneRecord: () =>
+    invoke<{ cloneId: string; transcript: string }>('voice_clone_record'),
+  /** 导入本地音频文件(前端已解码/重采样成 16k 单声道 wav 的 base64)→ 转写,返回草稿(未落库)。 */
+  voiceCloneImport: (wavBase64: string) =>
+    invoke<{ cloneId: string; transcript: string }>('voice_clone_import', { wavBase64 }),
+  /** 确认录入:用(可能改过的)文字稿 + 名字落库。 */
+  voiceCloneSave: (cloneId: string, name: string, transcript: string) =>
+    invoke<{ id: string; name: string }>('voice_clone_save', { cloneId, name, transcript }),
+  /** 重命名克隆音色。 */
+  renameVoiceClone: (cloneId: string, name: string) =>
+    invoke<void>('rename_voice_clone', { cloneId, name }),
+  /** 删除克隆音色(内置不可删)。 */
+  deleteVoiceClone: (cloneId: string) => invoke<void>('delete_voice_clone', { cloneId }),
   listMemories: () => invoke<Memory[]>('list_memories'),
   deleteMemory: (id: number) => invoke<void>('delete_memory', { id }),
   listBriefings: () => invoke<Briefing[]>('list_briefings'),
   deleteBriefing: (id: number) => invoke<void>('delete_briefing', { id }),
+  /** 提醒页:当前用户待触发的提醒 + 取消(jobs 域,按时间升序)。 */
+  listReminders: () => invoke<Reminder[]>('list_reminders'),
+  cancelReminder: (id: number) => invoke<void>('cancel_reminder', { id }),
+  /** 操作记录页(文件能力):最近的文件操作批次 + 撤销/重做(功能性,非安全承诺)。 */
+  listFsops: () => invoke<FsOp[]>('list_fsops'),
+  fsopsUndo: (id: number) => invoke<void>('fsops_undo', { id }),
+  fsopsRedo: (id: number) => invoke<void>('fsops_redo', { id }),
   /** 开机自启(PLAN §12):OS 是真相源,不进 DB。 */
   autostartEnabled: () => invoke<boolean>('autostart_enabled'),
   setAutostart: (on: boolean) => invoke<void>('set_autostart', { on }),

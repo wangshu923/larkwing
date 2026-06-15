@@ -4,6 +4,7 @@
 //! 管线参数 = robot Windows 真机实调终值,锁死进代码,不暴露设置(PLAN §11)。
 
 mod asr;
+mod calib;
 mod models;
 mod prompts;
 mod speaker;
@@ -21,6 +22,7 @@ pub struct FamilyMember {
     pub enrolled: bool,
 }
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -43,6 +45,8 @@ const MIN_SPEECH_S: f32 = 0.5; // 反幻觉第一道闸:更短的段不算话
 const MAX_SPEECH_S: f32 = 12.0;
 const START_TIMEOUT: Duration = Duration::from_secs(6); // 开听后多久没人开口就放弃
 const LEVEL_EVERY_WINDOWS: u32 = 3; // 电平事件节流:每 3 窗 ≈ 96ms ≈ 10Hz
+const CALIB_TAKES: u8 = 5; // 唤醒标定:录几遍正样本(+1 段底噪/负样本)
+const CALIB_AMBIENT_SECS: f32 = 4.0; // 标定底噪/负样本采集时长
 
 /// 「听我说话的耐心」三档(voice.patience,user 级)→ VAD hangover(静音多久算说完)。
 fn hangover_secs(patience: &str) -> f32 {
@@ -81,8 +85,14 @@ struct Inner {
     /// TTS 引擎(trait 接缝;在线默认 EdgeTts)与句级缓存目录。
     tts: Arc<dyn tts::TtsEngine>,
     tts_dir: PathBuf,
+    /// 非可重入 TTS 引擎(sherpa OfflineTts:melo/克隆)的串行锁——并发 generate 会原生崩溃。
+    tts_lock: tokio::sync::Mutex<()>,
     /// 离线 TTS(melo-vits,163M):按需加载一次进 OnceCell(voice.tts_backend=offline)。
     tts_offline: tokio::sync::OnceCell<Arc<tts::SherpaVits>>,
+    /// 本地音色克隆(ZipVoice):选了 clone:<id> 音色时按需加载一次(PLAN §11 D-clone)。
+    tts_clone: tokio::sync::OnceCell<Arc<tts::ZipVoiceTts>>,
+    /// 克隆参考音目录(`数据目录/voice/clones/<wav_file>`)。
+    clones_dir: PathBuf,
     /// 声纹提取器(CAM++ 26MB):有家人注册声纹时才加载(PLAN §11 D)。
     speaker: tokio::sync::OnceCell<Arc<speaker::SpeakerId>>,
     /// 唤醒循环(开关 = voice.wake.enabled;同时只有一个)。
@@ -92,6 +102,19 @@ struct Inner {
 #[derive(Clone)]
 pub struct VoiceRuntime {
     inner: Arc<Inner>,
+}
+
+/// 音色列表项(内置在线音色 + 用户/内置克隆,混在一个列表给前端;PLAN §11 D-clone)。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceOption {
+    /// 选择值(直接进 voice.speaker):内置 = edge id;克隆 = "clone:<id>"。
+    pub id: String,
+    pub name: String,
+    /// 克隆音色(可试听)。
+    pub is_clone: bool,
+    /// 内置预置(随包/下载):不可删。
+    pub builtin: bool,
 }
 
 /// 设置页「语音组件」状态行(不触发下载)+ 声音设置的数据源。
@@ -108,7 +131,7 @@ pub struct VoiceStatus {
     /// 麦克风设备名列表(设置下拉的数据源)。
     pub devices: Vec<String>,
     /// 音色目录(当前语言行;目录 = 数据)。
-    pub speakers: Vec<Speaker>,
+    pub speakers: Vec<VoiceOption>,
 }
 
 impl VoiceRuntime {
@@ -126,7 +149,10 @@ impl VoiceRuntime {
                 gen: AtomicU64::new(0),
                 tts: Arc::new(tts::EdgeTts),
                 tts_dir: dir.join("tts"),
+                tts_lock: tokio::sync::Mutex::new(()),
                 tts_offline: tokio::sync::OnceCell::new(),
+                tts_clone: tokio::sync::OnceCell::new(),
+                clones_dir: dir.join("clones"),
                 speaker: tokio::sync::OnceCell::new(),
                 wake: std::sync::Mutex::new(None),
             }),
@@ -140,12 +166,17 @@ impl VoiceRuntime {
         let text = text.trim();
         anyhow::ensure!(!text.is_empty(), "空文本不合成");
         let rate = tts::rate_pct(&self.user_setting("voice.rate", "standard"));
+        let speaker = self.user_setting("voice.speaker", tts::DEFAULT_SPEAKER);
+        // 克隆音色(clone:<id>)优先于在线/离线 toggle —— 选了克隆就是要这把嗓子。
+        if speaker.starts_with("clone:") {
+            let engine: Arc<dyn tts::TtsEngine> = self.ensure_clone_tts().await?;
+            return self.synth_cached(text, &speaker, rate, engine).await;
+        }
         if self.tts_offline_selected() {
             let engine: Arc<dyn tts::TtsEngine> = self.ensure_offline_tts().await?;
             // 离线单说话人:用固定 voice 标识区分缓存(与在线音色分开)
             return self.synth_cached(text, "vits-melo", rate, engine).await;
         }
-        let speaker = self.user_setting("voice.speaker", tts::DEFAULT_SPEAKER);
         self.synth_cached(text, &speaker, rate, self.inner.tts.clone()).await
     }
 
@@ -154,6 +185,11 @@ impl VoiceRuntime {
     pub async fn preview(&self, speaker: &str, text: &str) -> Result<PathBuf> {
         let text = text.trim();
         anyhow::ensure!(!text.is_empty(), "空文本不合成");
+        // 克隆音色试听也走 ZipVoice(否则会拿 clone:<id> 当 edge 音色名用,必失败)。
+        if speaker.starts_with("clone:") {
+            let engine: Arc<dyn tts::TtsEngine> = self.ensure_clone_tts().await?;
+            return self.synth_cached(text, speaker, 0, engine).await;
+        }
         self.synth_cached(text, speaker, 0, self.inner.tts.clone()).await
     }
 
@@ -176,6 +212,172 @@ impl VoiceRuntime {
             .cloned()
     }
 
+    /// 选了 clone:<id> 音色时:确保 ZipVoice 模型就绪并加载一次。解析闭包现查 cloned_voices
+    /// 库拿 (参考音 wav, 文字稿) —— 单一真相源,重录/删改即时生效,引擎不持镜像状态。
+    async fn ensure_clone_tts(&self) -> Result<Arc<tts::ZipVoiceTts>> {
+        let mirrors = self.mirrors();
+        let dir = self.inner.models.ensure_tar_tree(&models::TTS_ZIPVOICE, &mirrors).await?;
+        let store = self.inner.store.clone();
+        let clones_dir = self.inner.clones_dir.clone();
+        self.inner
+            .tts_clone
+            .get_or_try_init(|| async move {
+                let resolve: tts::CloneResolver = Arc::new(move |id: &str| {
+                    let cv = store
+                        .cloned_voices
+                        .get(id)?
+                        .ok_or_else(|| anyhow!("克隆音色 {id} 不存在"))?;
+                    Ok((clones_dir.join(&cv.wav_file), cv.transcript))
+                });
+                tokio::task::spawn_blocking(move || tts::ZipVoiceTts::load(&dir, resolve).map(Arc::new))
+                    .await
+                    .context("音色克隆加载任务挂了")?
+            })
+            .await
+            .cloned()
+    }
+
+    // ---- 音色克隆录入与管理(PLAN §11 D-clone) ----
+
+    /// 列出所有克隆音色(内置预置 + 用户自录,混在同一音色列表)。
+    pub fn list_clones(&self) -> Result<Vec<crate::store::ClonedVoice>> {
+        self.inner.store.cloned_voices.list()
+    }
+
+    /// 重命名克隆音色(只改显示名;id 不可变)。
+    pub fn rename_clone(&self, id: &str, name: &str) -> Result<()> {
+        anyhow::ensure!(!name.trim().is_empty(), "名字不能为空");
+        self.inner.store.cloned_voices.rename(id, name.trim())
+    }
+
+    /// 删除克隆音色(内置不可删);连参考音 wav 一并删。
+    pub fn delete_clone(&self, id: &str) -> Result<()> {
+        if let Some(wav) = self.inner.store.cloned_voices.delete(id)? {
+            std::fs::remove_file(self.inner.clones_dir.join(wav)).ok();
+        }
+        Ok(())
+    }
+
+    /// 录一段参考音(复用听写采集:VAD 切一句)→ ASR 自动转写 → 落盘 wav。
+    /// 返回 (clone_id, 转写稿) 供前端给用户过目/修改;**此刻不写库**,确认时才落库
+    /// (`clone_save`)——参考音以不可变 id 落盘,避免内存里悬 PCM,也避免未确认就生成的脏缓存。
+    pub async fn clone_record(&self) -> Result<(String, String)> {
+        let (vad_model, asr) = self.ensure_engines().await?;
+        self.wake_suspend(true);
+        let rt = self.clone();
+        let joined = tokio::task::spawn_blocking(move || -> Result<(Vec<f32>, String)> {
+            let hangover = hangover_secs(&rt.patience());
+            let vad = new_vad(&vad_model, hangover)?;
+            let pipe = open_capture(rt.input_device())?;
+            rt.publish(VoiceEvent::State { phase: VoicePhase::Listening });
+            let out = collect_utterance(&pipe, &vad, &rt, None, START_TIMEOUT, hangover)?;
+            drop(pipe);
+            let mut pcm = match out {
+                CaptureOut::Utterance(p) => p,
+                _ => anyhow::bail!("没有录到声音"),
+            };
+            anyhow::ensure!(
+                (pcm.len() as f32) >= 3.0 * TARGET_RATE as f32,
+                "录音太短,至少 3 秒"
+            );
+            peak_normalize(&mut pcm);
+            // 文字稿白送:复用 ASR 转写参考音(听错可在前端改后再 clone_save)
+            let transcript = asr.transcribe(&pcm)?;
+            Ok((pcm, transcript))
+        })
+        .await;
+        // 正常出错或 panic(JoinError)都先复位唤醒/状态,再传播错误(否则唤醒循环可能永久挂起)。
+        self.publish(VoiceEvent::State { phase: VoicePhase::Idle });
+        self.wake_suspend(false);
+        let (pcm, transcript) = joined.context("录音任务挂了")??;
+        // id 不可变(uuid 形,时间戳即足够:录入是人手逐次操作);重录 = 新条目。
+        let id = format!(
+            "v{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        );
+        tokio::fs::create_dir_all(&self.inner.clones_dir).await?;
+        let wav = tts::pcm_f32_to_wav(&pcm, TARGET_RATE);
+        tokio::fs::write(self.inner.clones_dir.join(format!("{id}.wav")), &wav).await?;
+        Ok((id, transcript))
+    }
+
+    /// 导入本地音频文件:前端已用 WebView 解码/重采样成 16k 单声道 wav 并 base64 编码。
+    /// 落盘 + ASR 转写出文字稿(草稿),不写库(clone_save 确认时才写)——与 clone_record 同形。
+    pub async fn clone_import(&self, wav_base64: &str) -> Result<(String, String)> {
+        use base64::Engine;
+        let wav = base64::engine::general_purpose::STANDARD
+            .decode(wav_base64.trim())
+            .context("音频 base64 解码失败")?;
+        anyhow::ensure!(wav.len() > 44, "音频数据为空或过小");
+        let id = format!(
+            "v{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        );
+        tokio::fs::create_dir_all(&self.inner.clones_dir).await?;
+        let wav_path = self.inner.clones_dir.join(format!("{id}.wav"));
+        tokio::fs::write(&wav_path, &wav).await?;
+        // 读回 + ASR(同步、CPU 密集 → spawn_blocking);ASR 模型首次用时下载。
+        let (_vad, asr) = self.ensure_engines().await?;
+        let path = wav_path.clone();
+        let transcript = tokio::task::spawn_blocking(move || -> Result<String> {
+            let wave = sherpa_onnx::Wave::read(path.to_string_lossy().as_ref())
+                .ok_or_else(|| anyhow!("音频读取失败或格式不支持"))?;
+            anyhow::ensure!(!wave.samples().is_empty(), "音频数据为空");
+            asr.transcribe(wave.samples())
+        })
+        .await
+        .context("转写任务挂了")??;
+        Ok((id, transcript))
+    }
+
+    /// 确认录入:wav 已在盘上(`clone_record` 落的),用(可能改过的)文字稿 + 名字落库。
+    pub fn clone_save(
+        &self,
+        id: &str,
+        name: &str,
+        transcript: &str,
+    ) -> Result<crate::store::ClonedVoice> {
+        anyhow::ensure!(
+            !id.is_empty()
+                && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "音色 id 不合法"
+        );
+        anyhow::ensure!(!name.trim().is_empty(), "名字不能为空");
+        anyhow::ensure!(!transcript.trim().is_empty(), "文字稿不能为空");
+        // id 不可变:同 id 不允许二次落库(否则参考音/文字稿变更会让既有 clone:<id> 缓存语义错)。
+        anyhow::ensure!(self.inner.store.cloned_voices.get(id)?.is_none(), "音色已存在");
+        let wav_file = format!("{id}.wav");
+        anyhow::ensure!(
+            self.inner.clones_dir.join(&wav_file).is_file(),
+            "参考音文件缺失"
+        );
+        let lang = self
+            .inner
+            .store
+            .settings
+            .get(None, "voice.lang")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "zh".to_string());
+        let cv = crate::store::ClonedVoice {
+            id: id.to_string(),
+            name: name.trim().to_string(),
+            wav_file,
+            transcript: transcript.trim().to_string(),
+            lang,
+            builtin: false,
+            created_at: 0, // insert 时由 now_ms 钉上
+        };
+        self.inner.store.cloned_voices.insert(&cv)?;
+        Ok(self.inner.store.cloned_voices.get(id)?.unwrap_or(cv))
+    }
+
     async fn synth_cached(
         &self,
         text: &str,
@@ -191,6 +393,18 @@ impl VoiceRuntime {
             return Ok(path); // 宪法 §7:常用话不重复合成
         }
         tokio::fs::create_dir_all(&self.inner.tts_dir).await?;
+        // 非可重入引擎(sherpa OfflineTts:melo/克隆)串行化:并发 generate 会原生崩溃(整进程退出)。
+        // 顺带去重——拿到锁后再查一次缓存,等锁期间别人已合成的同一句直接秒回,不重复 generate
+        // (修复:克隆合成慢,用户连点几次 → 多个并发 generate → 崩;现在排队 + 命中缓存)。
+        let _guard = if engine.reentrant() {
+            None
+        } else {
+            let g = self.inner.tts_lock.lock().await;
+            if path.is_file() {
+                return Ok(path);
+            }
+            Some(g)
+        };
         let (text2, voice2) = (text.to_string(), voice.to_string());
         let bytes = tokio::task::spawn_blocking(move || engine.synthesize(&text2, &voice2, rate))
             .await
@@ -270,6 +484,160 @@ impl VoiceRuntime {
         Ok(())
     }
 
+    // ---- 唤醒录音标定(PLAN §11 后续):录几遍 → 一次扫描定拼写(B)+ 阈值(A)→ 写回 ----
+
+    /// 录 N 段唤醒词 + 1 段底噪 → calib 扫描 → 写回 voice.wake.sensitivity(+ 必要时 .spelling)。
+    /// 立即返回(壳层 fire-and-forget),进展走 Voice 车道(CalibProgress/State/CalibResult)。
+    /// 占听写会话槽(防并发开麦)+ 挂起唤醒循环;取消 = listen_stop(false)(复用 ctl)。
+    pub async fn calibrate_wake(&self) -> Result<()> {
+        let word = self
+            .wake_keywords()
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("没有唤醒词,先设一个再校准"))?;
+        let mirrors = self.mirrors();
+        let kws_dir = self.inner.models.ensure_tar(&models::KWS_ZIPFORMER_ZH, &mirrors).await?;
+        let (vad_model, asr) = self.ensure_engines().await?;
+
+        // 抢会话槽(与听写互斥,二者都开麦);失败 = 语音正忙
+        let (ctl, gen) = {
+            let mut slot = self.inner.session.lock().expect("voice session lock");
+            if slot.is_some() {
+                bail!("语音正忙,稍后再校准");
+            }
+            let ctl = Arc::new(AtomicU8::new(CTL_RUN));
+            let gen = self.inner.gen.fetch_add(1, Ordering::Relaxed) + 1;
+            *slot = Some(SessionCtl { ctl: ctl.clone(), gen });
+            (ctl, gen)
+        };
+        self.wake_suspend(true);
+
+        let rt = self.clone();
+        let word2 = word.clone();
+        let kws_dir2 = kws_dir.clone();
+        let joined = tokio::task::spawn_blocking(move || -> Result<calib::CalibOutcome> {
+            let vocab = wake::load_vocab(&kws_dir2.join("tokens.txt"))?;
+            let hangover = hangover_secs(&rt.patience());
+            let total = CALIB_TAKES + 1; // +1 末尾底噪段
+            let mut positives: Vec<Vec<f32>> = Vec::with_capacity(CALIB_TAKES as usize);
+            let mut take = 0u8;
+            let mut attempts = 0u8;
+            while take < CALIB_TAKES {
+                if ctl.load(Ordering::Relaxed) == CTL_CANCEL {
+                    bail!("__CANCELLED__");
+                }
+                attempts += 1;
+                if attempts > CALIB_TAKES * 3 {
+                    bail!("没听清你说的唤醒词,先到这"); // 防 ASR 一直不符卡死
+                }
+                rt.publish(VoiceEvent::CalibProgress { step: take + 1, total });
+                rt.publish(VoiceEvent::State { phase: VoicePhase::Listening });
+                let vad = new_vad(&vad_model, hangover)?;
+                let pipe = open_capture(rt.input_device())?;
+                let out = collect_utterance(&pipe, &vad, &rt, Some(&ctl), START_TIMEOUT, hangover)?;
+                drop(pipe);
+                rt.publish(VoiceEvent::State { phase: VoicePhase::Idle });
+                let pcm = match out {
+                    CaptureOut::Utterance(p) => p,
+                    CaptureOut::Cancelled => bail!("__CANCELLED__"),
+                    CaptureOut::Empty => continue, // 没开口:这遍重来(不计 take)
+                };
+                if (pcm.len() as f32) < MIN_SPEECH_S * TARGET_RATE as f32 {
+                    continue;
+                }
+                // ASR 确认这段确实是唤醒词(防把别的话当样本污染标定);用 AGC 后副本送识别
+                let mut chk = pcm.clone();
+                peak_normalize(&mut chk);
+                let heard = asr.transcribe(&chk).unwrap_or_default();
+                if !calib_text_matches(&heard, &word2) {
+                    tracing::info!(heard, want = %word2, "标定样本不符,重录这遍");
+                    continue;
+                }
+                positives.push(pcm); // RAW(未过 AGC):忠于生产 KWS 输入(wake 循环喂 raw)
+                take += 1;
+            }
+            // 末尾 1 段底噪/负样本(不要求说话):度量误触
+            if ctl.load(Ordering::Relaxed) == CTL_CANCEL {
+                bail!("__CANCELLED__");
+            }
+            rt.publish(VoiceEvent::CalibProgress { step: total, total });
+            rt.publish(VoiceEvent::State { phase: VoicePhase::Listening });
+            let negative = capture_ambient(&rt)?;
+            rt.publish(VoiceEvent::State { phase: VoicePhase::Idle });
+
+            calib::calibrate(&kws_dir2, &word2, &vocab, &positives, &negative)
+        })
+        .await;
+
+        // 收尾:清自己这代会话槽 + 恢复唤醒丢帧(无论成败)
+        {
+            let mut slot = self.inner.session.lock().expect("voice session lock");
+            if slot.as_ref().map(|s| s.gen) == Some(gen) {
+                *slot = None;
+            }
+        }
+        self.publish(VoiceEvent::State { phase: VoicePhase::Idle });
+        self.wake_suspend(false);
+
+        let result = match joined {
+            Ok(r) => r,
+            Err(e) => Err(anyhow!(e).context("唤醒标定任务挂了")),
+        };
+        match result {
+            Ok(o) => {
+                // 写回:阈值经灵敏度(滑块随之刷新);非 canonical 拼写落覆盖表
+                self.inner.store.settings.set(
+                    None,
+                    "voice.wake.sensitivity",
+                    &o.sensitivity.to_string(),
+                )?;
+                if let Some(line) = &o.spelling {
+                    let mut map = self.wake_spelling_overrides();
+                    map.insert(word.clone(), line.clone());
+                    if let Ok(json) = serde_json::to_string(&map) {
+                        self.inner.store.settings.set(None, "voice.wake.spelling", &json)?;
+                    }
+                }
+                // 在跑就重启循环吃新值(阈值/拼写都在建 spotter 时锁定)
+                if self.wake_running() {
+                    self.wake_stop();
+                    if let Err(e) = self.wake_start().await {
+                        tracing::error!(err = %format!("{e:#}"), "标定后重启唤醒失败");
+                    }
+                }
+                self.publish(VoiceEvent::CalibResult {
+                    ok: true,
+                    sensitivity: o.sensitivity,
+                    recall: o.recall,
+                    adopted_spelling: o.spelling.is_some(),
+                    verdict: o.verdict.into(),
+                });
+                Ok(())
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                let cancelled = msg.contains("__CANCELLED__");
+                self.publish(VoiceEvent::CalibResult {
+                    ok: false,
+                    sensitivity: 0,
+                    recall: 0.0,
+                    adopted_spelling: false,
+                    verdict: if cancelled { "cancelled".into() } else { "error".into() },
+                });
+                if cancelled {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// 取消进行中的标定(复用听写会话的 ctl;幂等)。
+    pub fn calibrate_cancel(&self) {
+        self.listen_stop(false);
+    }
+
     // ---- 免手唤醒(PLAN §11 C):语音交互唯一入口 ----
 
     /// 设置开关 + 起停一体(设置页开关的唯一入口;开机自启走 boot_wake_if_enabled)。
@@ -332,6 +700,21 @@ impl VoiceRuntime {
         }
     }
 
+    /// 标定产出的「拼写覆盖」(voice.wake.spelling,词→整行 token 行)。
+    /// 录音标定发现某词有更贴合用户发音的 token 拼法时写入;wake_start 据此覆盖 canonical 编码。
+    /// 坏 JSON / 缺失 → 空表(全走 canonical)。
+    fn wake_spelling_overrides(&self) -> HashMap<String, String> {
+        self.inner
+            .store
+            .settings
+            .get(None, "voice.wake.spelling")
+            .ok()
+            .flatten()
+            .filter(|s| !s.trim().is_empty())
+            .and_then(|json| serde_json::from_str::<HashMap<String, String>>(&json).ok())
+            .unwrap_or_default()
+    }
+
     /// 唤醒灵敏度(voice.wake.sensitivity 0~100,global)→ KWS threshold。
     /// 高灵敏 = 低阈值 = 容易被唤醒(也更易误触)。默认 50 → 0.2(对齐 robot 实战 8/10;
     /// 真机实测:口语「旺财」KWS 分数多落 ~0.3,旧默认 0.45 太严会大面积漏,0.2 才接得住)。
@@ -347,13 +730,7 @@ impl VoiceRuntime {
             .flatten()
             .and_then(|v| v.parse().ok())
             .unwrap_or(50.0);
-        let sens = sens.clamp(0.0, 100.0);
-        let thr = if sens >= 50.0 {
-            0.2 - (sens - 50.0) / 50.0 * 0.1 // 灵敏半区:0.2 → 0.1
-        } else {
-            0.5 - sens / 50.0 * 0.3 // 稳重半区:0.5 → 0.2
-        };
-        thr.clamp(0.1, 0.5)
+        calib::sensitivity_to_threshold(sens)
     }
 
     async fn wake_start(&self) -> Result<()> {
@@ -364,11 +741,17 @@ impl VoiceRuntime {
         let kws_dir = self.inner.models.ensure_tar(&models::KWS_ZIPFORMER_ZH, &mirrors).await?;
         let (vad_model, asr) = self.ensure_engines().await?;
         let speaker = self.ensure_speaker_if_enrolled().await; // 有家人录声纹才认人
-        // 唤醒词编码:模型词表本身裁决切分(绕开拼音 strict 歧义);全军覆没 = 开不了
+        // 唤醒词编码:模型词表本身裁决切分(绕开拼音 strict 歧义);全军覆没 = 开不了。
+        // 标定产出的拼写覆盖(voice.wake.spelling)优先,否则 canonical。
         let vocab = wake::load_vocab(&kws_dir.join("tokens.txt"))?;
-        let (keywords_buf, dropped) = wake::encode_keywords(&self.wake_keywords(), &vocab);
+        let overrides = self.wake_spelling_overrides();
+        let (keywords_buf, dropped) =
+            wake::build_keywords_buf(&self.wake_keywords(), &overrides, &vocab);
         if !dropped.is_empty() {
             tracing::warn!(?dropped, "部分唤醒词编码不进模型词表,已忽略");
+        }
+        if !overrides.is_empty() {
+            tracing::info!(words = ?overrides.keys().collect::<Vec<_>>(), "应用标定拼写覆盖");
         }
         anyhow::ensure!(!keywords_buf.is_empty(), "唤醒词一个都编不出来(只支持中文词)");
         // 短句银行(人格数据,场景给话术):断网 best-effort,空类目降级无声
@@ -452,8 +835,30 @@ impl VoiceRuntime {
             wake_running: self.wake_running(),
             keywords: self.wake_keywords(),
             devices: list_input_devices(),
-            speakers: SPEAKERS_ZH.to_vec(),
+            speakers: self.voice_options(),
         }
+    }
+
+    /// 音色列表 = 内置在线音色 + 用户/内置克隆(混排;前端据 isClone/builtin 加 badge/删除)。
+    fn voice_options(&self) -> Vec<VoiceOption> {
+        let mut out: Vec<VoiceOption> = SPEAKERS_ZH
+            .iter()
+            .map(|s| VoiceOption {
+                id: s.id.to_string(),
+                name: s.name.to_string(),
+                is_clone: false,
+                builtin: false,
+            })
+            .collect();
+        for c in self.inner.store.cloned_voices.list().unwrap_or_default() {
+            out.push(VoiceOption {
+                id: format!("clone:{}", c.id),
+                name: c.name,
+                is_clone: true,
+                builtin: c.builtin,
+            });
+        }
+        out
     }
 
     /// 开一个听写会话:已在听 = 幂等 no-op。模型缺失先用时下载(HUD 进度),
@@ -887,6 +1292,45 @@ fn peak_normalize(pcm: &mut [f32]) {
             *s = (*s * gain).clamp(-1.0, 1.0);
         }
     }
+}
+
+/// 标定样本校验:ASR 转写是否就是/含唤醒词(宽松,容 ASR 听岔一两字)。
+/// 去标点/空白后:互含即过;否则字重叠 ≥ 唤醒词一半也过。空 = 不过。
+fn calib_text_matches(heard: &str, word: &str) -> bool {
+    let strip = |s: &str| -> String {
+        s.chars()
+            .filter(|c| !c.is_whitespace() && !c.is_ascii_punctuation())
+            .filter(|c| !matches!(c, '，' | '。' | '、' | '!' | '?' | ';' | ':' | '~' | '…'))
+            .collect()
+    };
+    let h = strip(heard);
+    let w = strip(word);
+    if h.is_empty() || w.is_empty() {
+        return false;
+    }
+    if h.contains(&w) || w.contains(&h) {
+        return true;
+    }
+    let wset: std::collections::HashSet<char> = w.chars().collect();
+    let overlap = h.chars().filter(|c| wset.contains(c)).count();
+    overlap * 2 >= w.chars().count()
+}
+
+/// 录一段定长底噪/负样本(不靠 VAD,原样收 16k);标定用它度量误触。
+fn capture_ambient(rt: &VoiceRuntime) -> Result<Vec<f32>> {
+    let pipe = open_capture(rt.input_device())?;
+    let mut buf = Vec::new();
+    let started = Instant::now();
+    let want = Duration::from_secs_f32(CALIB_AMBIENT_SECS);
+    while started.elapsed() < want {
+        match pipe.rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => buf.extend_from_slice(&pipe.to_16k(&chunk)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    drop(pipe);
+    Ok(buf)
 }
 
 #[cfg(test)]

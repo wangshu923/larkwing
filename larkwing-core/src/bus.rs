@@ -115,6 +115,18 @@ pub enum VoiceEvent {
     /// | no_speech_retry(唤醒首轮没听清,追问后再听)| farewell(两轮没听到,有声告退)
     /// | follow_up_idle(跟进窗口安静结束)| wake_done(回合周期收尾兜底)。
     ListenEnded { reason: String },
+    /// 唤醒录音标定:正在录第 step/total 段(step 从 1 计;total 含末尾 1 段底噪)。
+    CalibProgress { step: u8, total: u8 },
+    /// 唤醒标定收尾:ok=成功落定;sensitivity=落定灵敏度(滑块应刷新);recall=该档召回(0..1);
+    /// adopted_spelling=是否采用了更贴发音的异读拼写;verdict=结论 key
+    /// (good | noisy | hard | cancelled | error,前端字典渲染文案,core 不产文案)。
+    CalibResult {
+        ok: bool,
+        sensitivity: u32,
+        recall: f32,
+        adopted_spelling: bool,
+        verdict: String,
+    },
 }
 
 /// 对话回合此刻"在干嘛"(PLAN §12 修订:原 v1 头像不镜像思考/说话,现上总线 ——

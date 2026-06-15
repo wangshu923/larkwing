@@ -107,6 +107,46 @@ pub const KWS_ZIPFORMER_ZH: TarModelSpec = TarModelSpec {
     ],
 };
 
+/// 目录保留式整包模型(ZipVoice 需要 `espeak-ng-data` 子目录,扁平抽取放不下;PLAN §11 D-clone)。
+/// 解包 = strip-components=1(剥掉包顶层目录)+ 跳过 `skip` 子目录(test_wavs 类大样本省空间)。
+pub struct TreeModelSpec {
+    pub id: &'static str,
+    pub label_key: &'static str,
+    pub url: &'static str,
+    /// 解包后用于就绪判定的相对路径(文件或目录均可)。
+    pub ready: &'static [&'static str],
+    /// 解包时跳过的(strip 后)顶层子目录名(省空间)。
+    pub skip: &'static [&'static str],
+    /// 包外单文件(不在 tar 里,如 vocos 声码器走 vocoder-models release):解包后单独拉进 dir。
+    pub extra: &'static [ModelFile],
+}
+
+/// 零样本音色克隆:ZipVoice distill int8 中英双语(PLAN §11 D-clone)。跨语种零样本
+/// (英文参考音说中文)亦可。vocoder = vocos_24khz;num_steps=4 distill 档。
+/// **真机 watch-item**:下载 URL 实测 / vocos 是否在包内 / espeak-ng-data 随包 / 总体积。
+pub const TTS_ZIPVOICE: TreeModelSpec = TreeModelSpec {
+    id: "zipvoice-distill-int8-zh-en",
+    label_key: "task.download.voice_tts_clone",
+    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/sherpa-onnx-zipvoice-distill-int8-zh-en-emilia.tar.bz2",
+    ready: &[
+        "encoder.int8.onnx",
+        "decoder.int8.onnx",
+        "vocos_24khz.onnx",
+        "tokens.txt",
+        "lexicon.txt",
+        "espeak-ng-data",
+    ],
+    skip: &["test_wavs"],
+    // vocos 声码器不在模型 tar 里(实测:tar 仅含 encoder/decoder/tokens/lexicon/espeak-ng-data),
+    // 单独从 vocoder-models release 拉(~54MB)。
+    extra: &[ModelFile {
+        name: "vocos_24khz.onnx",
+        urls: &[
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/vocoder-models/vocos_24khz.onnx",
+        ],
+    }],
+};
+
 pub struct VoiceModels {
     dir: PathBuf,
     tasks: Tasks,
@@ -224,6 +264,110 @@ impl VoiceModels {
         Ok(())
     }
 
+    pub fn is_tree_ready(&self, spec: &TreeModelSpec) -> bool {
+        let dir = self.dir.join(spec.id);
+        spec.ready.iter().all(|f| dir.join(f).exists())
+    }
+
+    /// 目录保留式整包就绪:下载(gh 镜像候选)→ strip-components=1 解包(跳过 skip 子目录)
+    /// → 就绪校验。与 `ensure_tar` 同结构,差别只在解包保留目录层级(espeak-ng-data)。
+    pub async fn ensure_tar_tree(
+        &self,
+        spec: &TreeModelSpec,
+        mirrors: &[String],
+    ) -> Result<PathBuf> {
+        let dir = self.dir.join(spec.id);
+        if self.is_tree_ready(spec) {
+            return Ok(dir);
+        }
+        let _guard = self.lock.lock().await;
+        if self.is_tree_ready(spec) {
+            return Ok(dir);
+        }
+        let task = self.tasks.start("download", Text::new(spec.label_key));
+        match self.download_tar_tree(spec, &dir, mirrors, &task).await {
+            Ok(()) => {
+                task.done();
+                Ok(dir)
+            }
+            Err(e) => {
+                task.fail("task.err.download", serde_json::Value::Null);
+                Err(e)
+            }
+        }
+    }
+
+    async fn download_tar_tree(
+        &self,
+        spec: &TreeModelSpec,
+        dir: &Path,
+        mirrors: &[String],
+        task: &TaskHandle,
+    ) -> Result<()> {
+        tokio::fs::create_dir_all(dir).await?;
+        let tarball = dir.join("model.tar.bz2.part");
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut ok = false;
+        for url in candidates(spec.url, mirrors) {
+            let host = url.split('/').nth(2).unwrap_or("?").to_string();
+            task.step("step.connect", serde_json::json!({ "host": host }));
+            match fetch_url_to(&self.http, &url, &tarball, task).await {
+                Ok(()) => {
+                    ok = true;
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(url, err = %format!("{e:#}"), "模型包下载失败,换下一个源");
+                    last_err = Some(e);
+                }
+            }
+        }
+        if !ok {
+            return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("没有可用下载源")))
+                .with_context(|| format!("下载 {} 失败", spec.id));
+        }
+        task.step("step.extract", serde_json::Value::Null);
+        let (tar2, dir2) = (tarball.clone(), dir.to_path_buf());
+        let skip: Vec<&'static str> = spec.skip.to_vec();
+        tokio::task::spawn_blocking(move || extract_tar_bz2_tree(&tar2, &dir2, &skip))
+            .await
+            .context("解包任务挂了")??;
+        tokio::fs::remove_file(&tarball).await.ok();
+        // 包外单文件(如 vocos 声码器):解包后单独拉进同一 model 目录。
+        for file in spec.extra {
+            let dest = dir.join(file.name);
+            if dest.is_file() {
+                continue;
+            }
+            let part = dir.join(format!("{}.part", file.name));
+            let mut ok = false;
+            let mut last_err: Option<anyhow::Error> = None;
+            for url in file.urls.iter().flat_map(|u| candidates(u, mirrors)) {
+                let host = url.split('/').nth(2).unwrap_or("?").to_string();
+                task.step("step.connect", serde_json::json!({ "host": host }));
+                match fetch_url_to(&self.http, &url, &part, task).await {
+                    Ok(()) => {
+                        ok = true;
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(url, err = %format!("{e:#}"), "附件下载失败,换下一个源");
+                        last_err = Some(e);
+                    }
+                }
+            }
+            if !ok {
+                return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("没有可用下载源")))
+                    .with_context(|| format!("下载 {}/{} 失败", spec.id, file.name));
+            }
+            tokio::fs::rename(&part, &dest).await?;
+        }
+        for f in spec.ready {
+            anyhow::ensure!(dir.join(f).exists(), "包里没找到 {f}");
+        }
+        Ok(())
+    }
+
     fn all_present(&self, spec: &ModelSpec, dir: &Path) -> bool {
         spec.files.iter().all(|f| dir.join(f.name).is_file())
     }
@@ -286,6 +430,55 @@ fn extract_tar_bz2(tarball: &Path, dir: &Path, wanted: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// 解 tar.bz2,strip-components=1(剥掉包顶层目录)保留子目录结构落盘;
+/// 跳过 `skip` 列出的(strip 后)顶层子目录名(省空间,如 test_wavs)。
+fn extract_tar_bz2_tree(tarball: &Path, dir: &Path, skip: &[&str]) -> Result<()> {
+    let file = std::fs::File::open(tarball)?;
+    let mut archive = tar::Archive::new(bzip2::read::BzDecoder::new(file));
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let is_dir = entry.header().entry_type().is_dir();
+        let path = entry.path()?.into_owned();
+        // strip-components=1:丢掉包顶层目录那一段
+        let rel: PathBuf = path.components().skip(1).collect();
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let top = rel.components().next().and_then(|c| c.as_os_str().to_str()).unwrap_or("");
+        if skip.contains(&top) {
+            continue;
+        }
+        // 纵深防御(tar-slip):拒绝含 .. / 绝对路径成分的 entry,防解包逃逸出 model 目录。
+        if !rel_is_safe(&rel) {
+            tracing::warn!(path = %rel.display(), "跳过危险 tar 路径");
+            continue;
+        }
+        let out = dir.join(&rel);
+        if is_dir {
+            std::fs::create_dir_all(&out)?;
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut f = std::fs::File::create(&out)?;
+        std::io::copy(&mut entry, &mut f)?;
+    }
+    Ok(())
+}
+
+/// tar entry(strip 后)相对路径是否安全:不含 .. / 绝对路径成分,防 tar-slip 逃逸。
+fn rel_is_safe(rel: &Path) -> bool {
+    !rel.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +528,48 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("enc.int8.onnx")).unwrap(), b"BIN", "嵌套目录被压平");
         assert!(!dir.join("skip.onnx").exists(), "不在 wanted 里的不抽");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tree_extraction_strips_top_dir_skips_and_blocks_traversal() {
+        use std::io::Write;
+        let base = std::env::temp_dir().join(format!("lw-tree-test-{}", std::process::id()));
+        let dir = base.join("model");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tarball = base.join("m.tar.bz2");
+        {
+            let f = std::fs::File::create(&tarball).unwrap();
+            let enc = bzip2::write::BzEncoder::new(f, bzip2::Compression::fast());
+            let mut tb = tar::Builder::new(enc);
+            let mut header = tar::Header::new_gnu();
+            let put = |tb: &mut tar::Builder<_>, header: &mut tar::Header, path: &str, body: &[u8]| {
+                header.set_size(body.len() as u64);
+                header.set_cksum();
+                tb.append_data(header, path, body).unwrap();
+            };
+            put(&mut tb, &mut header, "pkg/tokens.txt", b"a 1\n");
+            put(&mut tb, &mut header, "pkg/espeak-ng-data/phontab", b"PH");
+            put(&mut tb, &mut header, "pkg/test_wavs/ref.wav", b"WAV");
+            tb.into_inner().unwrap().finish().unwrap().flush().unwrap();
+        }
+        extract_tar_bz2_tree(&tarball, &dir, &["test_wavs"]).unwrap();
+        assert_eq!(std::fs::read(dir.join("tokens.txt")).unwrap(), b"a 1\n", "顶层目录被剥掉");
+        assert_eq!(
+            std::fs::read(dir.join("espeak-ng-data/phontab")).unwrap(),
+            b"PH",
+            "子目录结构保留"
+        );
+        assert!(!dir.join("test_wavs").exists(), "skip 的子目录不落盘");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn rel_safety_blocks_traversal() {
+        use std::path::Path;
+        assert!(rel_is_safe(Path::new("espeak-ng-data/phontab")));
+        assert!(rel_is_safe(Path::new("tokens.txt")));
+        assert!(!rel_is_safe(Path::new("../escape.txt")));
+        assert!(!rel_is_safe(Path::new("a/../../escape")));
+        assert!(!rel_is_safe(Path::new("/etc/passwd")));
     }
 }

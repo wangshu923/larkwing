@@ -7,6 +7,8 @@ rust-version = "1.77.2"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+# 媒体输入(PLAN §9):文档附件的 base64 解码(图片直接转 data URL,不在 core 解码)
+base64 = "0.22"
 # 影音转发服务(localhost 流中继):只开 http1+tokio+query,不带宏/多余中间件
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
 bytes = "1"
@@ -30,6 +32,8 @@ sherpa-onnx = "1.13.2"
 symphonia = { version = "0.5.5", default-features = false, features = ["mp3"] }
 tar = "0.4.46"
 thiserror = "1"
+# 文件能力 fs_trash:删除走系统回收站(Windows IFileOperation / 各平台原生),可还原
+trash = "5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "fs", "io-util"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tracing = "0.1"

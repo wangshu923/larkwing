@@ -32,8 +32,27 @@ impl OpenAiCompatProvider {
         messages.push(json!({ "role": "system", "content": req.system }));
         for msg in &req.messages {
             messages.push(match msg {
-                super::ChatMessage::User { content } => {
-                    json!({ "role": "user", "content": content })
+                super::ChatMessage::User { content, parts } => {
+                    if parts.is_empty() {
+                        // 纯文本:仍翻成字符串 content,字节稳定吃前缀缓存(只有带图那条才变数组)
+                        json!({ "role": "user", "content": content })
+                    } else {
+                        let mut blocks = Vec::with_capacity(parts.len() + 1);
+                        if !content.is_empty() {
+                            blocks.push(json!({ "type": "text", "text": content }));
+                        }
+                        for p in parts {
+                            blocks.push(match p {
+                                super::ContentPart::Text { text } => {
+                                    json!({ "type": "text", "text": text })
+                                }
+                                super::ContentPart::ImageUrl { url } => {
+                                    json!({ "type": "image_url", "image_url": { "url": url } })
+                                }
+                            });
+                        }
+                        json!({ "role": "user", "content": blocks })
+                    }
                 }
                 super::ChatMessage::Assistant { content, reasoning, tool_calls } => {
                     let mut m = json!({ "role": "assistant", "content": content });
@@ -459,6 +478,31 @@ mod tests {
         });
         assert!(plain["messages"][1].get("tool_calls").is_none());
         assert!(plain["messages"][1].get("reasoning_content").is_none());
+    }
+
+    // 媒体输入(PLAN §9):带图 user 出向成 content 数组(text 块 + image_url 块);
+    // 纯文本仍是字符串(前缀缓存不破)
+    #[test]
+    fn to_wire_user_with_image_becomes_content_array() {
+        use crate::llm::ContentPart;
+        let p = provider();
+        let wire = p.to_wire(&ChatRequest {
+            messages: vec![ChatMessage::user_with_parts(
+                "这是什么菜",
+                vec![ContentPart::ImageUrl { url: "data:image/png;base64,AAAA".into() }],
+            )],
+            ..Default::default()
+        });
+        let content = &wire["messages"][1]["content"];
+        assert!(content.is_array(), "带图 user content 应是数组");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "这是什么菜");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+        // 纯文本仍是字符串(吃前缀缓存)
+        let plain =
+            p.to_wire(&ChatRequest { messages: vec![ChatMessage::user("嗨")], ..Default::default() });
+        assert!(plain["messages"][1]["content"].is_string());
     }
 
     fn chunk(json: &str) -> Value {
