@@ -26,6 +26,10 @@ pub(super) struct PromptBank {
     rotor: AtomicUsize,
 }
 
+/// 可热替换的应答音银行(问题1-B):运行时换音色 → 后台 prepare 新银行整体替换;
+/// 唤醒线程每次取最新快照来播。KWS 检测与麦克风不受影响(不重启唤醒循环)。
+pub(super) type SharedPromptBank = Arc<std::sync::Mutex<Arc<PromptBank>>>;
+
 #[derive(Clone, Copy)]
 pub(super) enum PromptKind {
     Ack,

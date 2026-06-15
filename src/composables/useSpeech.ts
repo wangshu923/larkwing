@@ -102,6 +102,9 @@ export function speakable(raw: string): string {
   s = s.replace(/https?:\/\/\S+/g, ' ') // 裸 URL 不念
   s = s.replace(/[*_~#>`]+/g, '') // 强调/标题/引用记号剥掉
   s = s.replace(/^\s*[-·•]\s+/gm, '') // 列表点
+  // emoji 念不出(法条已禁〔语音〕回合用 emoji,这里兜模型漏网的);只剥图形符号/修饰符,
+  // 不碰数字/#/*(Extended_Pictographic 不含这些,中文与标点也不误伤)。
+  s = s.replace(/[\p{Extended_Pictographic}\u{1F3FB}-\u{1F3FF}\u{200D}\u{20E3}\u{FE0F}]/gu, '')
   return s.replace(/[ \t]+/g, ' ').replace(/\s*\n\s*/g, '\n').trim()
 }
 

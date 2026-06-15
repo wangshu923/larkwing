@@ -72,7 +72,7 @@ export default {
   },
   // 回忆页(小本本):看 7274 记住了什么,记错了点掉
   memory: {
-    title: '回忆',
+    title: '记忆',
     tagline: '我的小本本——你跟我说过的、值得记住的,都在这里。',
     back: '‹ 回去聊天',
     count: '{n} 条',
@@ -189,7 +189,7 @@ export default {
   nav: {
     chat: '对话',
     reminders: '提醒',
-    memory: '回忆',
+    memory: '记忆',
     ops: '记录',
     settings: '设置',
   },

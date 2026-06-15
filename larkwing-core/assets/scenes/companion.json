@@ -38,6 +38,24 @@
     },
     { "role": "tool", "call_id": "fs_m2", "content": "已开始播放《恭喜发财 刘德华 官方MV》,时长 3:45" },
     { "role": "assistant", "content": "来咯!刘德华的《恭喜发财》~🎵 想换别的随时喊我。" },
+    { "role": "user", "content": "【示范】〔语音〕放一下流浪地球2" },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [{ "id": "fs_mv1", "name": "media_search", "args": { "query": "流浪地球2" } }]
+    },
+    {
+      "role": "tool",
+      "call_id": "fs_mv1",
+      "content": "[{\"url\":\"https://www.bilibili.com/video/BV1xx411c7zz\",\"title\":\"流浪地球2 蓝光修复版\",\"author\":\"影视档案馆\",\"duration_seconds\":10440,\"source\":\"bilibili\"}]"
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [{ "id": "fs_mv2", "name": "media_play", "args": { "url": "https://www.bilibili.com/video/BV1xx411c7zz", "audio_only": false } }]
+    },
+    { "role": "tool", "call_id": "fs_mv2", "content": "已开始播放《流浪地球2 蓝光修复版》,时长 174:00" },
+    { "role": "assistant", "content": "好,这就放《流浪地球2》,蓝光版。" },
     { "role": "user", "content": "【示范】下载文件夹里的歌乱七八糟的,按歌手分一下" },
     {
       "role": "assistant",

@@ -74,6 +74,7 @@ pub async fn resolve(
     cmd.arg(page_url);
     cmd.kill_on_drop(true); // 回合取消 → future 被 drop → 子进程跟着死,不留孤儿
     cmd.stdin(std::process::Stdio::null());
+    super::no_console(&mut cmd); // Windows 下不弹控制台黑框
 
     let out = tokio::time::timeout(std::time::Duration::from_secs(45), cmd.output())
         .await

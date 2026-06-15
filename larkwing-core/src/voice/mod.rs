@@ -71,6 +71,8 @@ struct SessionCtl {
 /// 唤醒循环句柄(C 期):命令通道 + 线程在跑的事实。
 struct WakeHandle {
     cmd: std::sync::mpsc::Sender<wake::WakeCmd>,
+    /// 与唤醒线程共享的应答音银行;换音色时运行时后台重建后整体替换(问题1-B)。
+    prompts: prompts::SharedPromptBank,
 }
 
 struct Inner {
@@ -169,13 +171,29 @@ impl VoiceRuntime {
         let rate = tts::rate_pct(&self.user_setting("voice.rate", "standard"));
         let speaker = self.user_setting("voice.speaker", tts::DEFAULT_SPEAKER);
         // 克隆音色(clone:<id>)优先于在线/离线 toggle —— 选了克隆就是要这把嗓子。
-        if speaker.starts_with("clone:") {
+        let clone = speaker.starts_with("clone:");
+        let offline = !clone && self.tts_offline_selected();
+        // 缓存键与产物 ext 都不依赖引擎实例 → 先查盘,命中就直接返回,**不加载也不下载任何模型**
+        // (启动预合成应答音时,用过的音色全命中 → 零合成零加载;问题1-B)。ext 须与对应引擎 .ext() 一致。
+        let (cache_voice, ext) = if clone {
+            (speaker.as_str(), "wav") // ZipVoiceTts::ext()
+        } else if offline {
+            ("vits-melo", "wav") // SherpaVits::ext();离线单说话人用固定标识区分缓存
+        } else {
+            (speaker.as_str(), "mp3") // EdgeTts::ext()
+        };
+        // 文件名格式须与 synth_cached 一致(都是 cache_key + ext)
+        let path = self.inner.tts_dir.join(format!("{}.{ext}", tts::cache_key(cache_voice, rate, text)));
+        if path.is_file() {
+            return Ok(path);
+        }
+        // 缓存未命中,才加载对应引擎合成
+        if clone {
             let engine: Arc<dyn tts::TtsEngine> = self.ensure_clone_tts().await?;
             return self.synth_cached(text, &speaker, rate, engine).await;
         }
-        if self.tts_offline_selected() {
+        if offline {
             let engine: Arc<dyn tts::TtsEngine> = self.ensure_offline_tts().await?;
-            // 离线单说话人:用固定 voice 标识区分缓存(与在线音色分开)
             return self.synth_cached(text, "vits-melo", rate, engine).await;
         }
         self.synth_cached(text, &speaker, rate, self.inner.tts.clone()).await
@@ -789,7 +807,9 @@ impl VoiceRuntime {
         anyhow::ensure!(!keywords_buf.is_empty(), "唤醒词一个都编不出来(只支持中文词)");
         // 短句银行(人格数据,场景给话术):断网 best-effort,空类目降级无声
         let scene_voice = self.inner.scenes.default_scene().voice.clone();
-        let prompts = prompts::PromptBank::prepare(self, &scene_voice).await;
+        let bank = prompts::PromptBank::prepare(self, &scene_voice).await;
+        // 银行放进可热替换槽:换音色时后台重建并整体替换,KWS 检测与麦克风不动(问题1-B)。
+        let prompts: prompts::SharedPromptBank = Arc::new(std::sync::Mutex::new(Arc::new(bank)));
 
         let (tx, rx) = std::sync::mpsc::channel();
         {
@@ -797,7 +817,7 @@ impl VoiceRuntime {
             if slot.is_some() {
                 return Ok(()); // 并发开关:别人抢先了
             }
-            *slot = Some(WakeHandle { cmd: tx });
+            *slot = Some(WakeHandle { cmd: tx, prompts: prompts.clone() });
         }
         let deps = wake::WakeDeps {
             rt: self.clone(),
@@ -824,6 +844,20 @@ impl VoiceRuntime {
     pub fn wake_stop(&self) {
         self.wake_cmd(wake::WakeCmd::Stop);
         self.wake_cleanup(); // sender 一并丢弃,线程见 Disconnected 也会退
+    }
+
+    /// 换音色/语速/在线离线档后:若唤醒在跑,后台按新设置重建应答音银行并**热替换**——
+    /// KWS 检测与麦克风全程不动(不打断"竖着耳朵听"),命中缓存的音色秒回(问题1-B)。
+    /// 没开唤醒 = no-op(下次 wake_start 自然按新音色建)。
+    pub async fn refresh_prompts(&self) {
+        let slot = match self.inner.wake.lock().expect("wake lock").as_ref() {
+            Some(h) => h.prompts.clone(),
+            None => return,
+        };
+        let scene_voice = self.inner.scenes.default_scene().voice.clone();
+        let bank = prompts::PromptBank::prepare(self, &scene_voice).await;
+        *slot.lock().expect("prompts lock") = Arc::new(bank);
+        tracing::info!("唤醒应答音已按新音色重建(未重启唤醒循环)");
     }
 
     fn wake_cmd(&self, cmd: wake::WakeCmd) {

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 
 use super::asr::{Asr, SherpaAsr};
-use super::prompts::{PromptBank, PromptKind};
+use super::prompts::{PromptBank, PromptKind, SharedPromptBank};
 use super::speaker::SpeakerId;
 use super::{collect_utterance, hangover_secs, new_vad, open_capture, peak_normalize, CaptureOut};
 use crate::bus::{VoiceEvent, VoicePhase};
@@ -46,7 +46,8 @@ pub(super) struct WakeDeps {
     pub kws_dir: PathBuf,
     pub vad_model: PathBuf,
     pub asr: Arc<SherpaAsr>,
-    pub prompts: PromptBank,
+    /// 应答音银行(可热替换:运行时换音色后台重建,唤醒线程每轮取最新快照)。
+    pub prompts: SharedPromptBank,
     pub keywords_buf: String,
     /// KWS 触发阈值(唤醒灵敏度滑块映射而来;建 spotter 时锁定,改灵敏度需重启循环)。
     pub kws_threshold: f32,
@@ -356,8 +357,10 @@ fn on_wake(
     vad: &sherpa_onnx::VoiceActivityDetector,
     hangover: f32,
 ) -> Result<Phase> {
+    // 取当前应答音银行快照:运行时可能已按新音色热替换,本轮交互用这一份(下轮再取新的)。
+    let prompts = d.prompts.lock().expect("prompts lock").clone();
     d.rt.publish(VoiceEvent::WakeTriggered);
-    ack_and_drain(&d.prompts, pipe, PromptKind::Ack); // 边播应答音边清麦,播完即开录(0 间隙)
+    ack_and_drain(&prompts, pipe, PromptKind::Ack); // 边播应答音边清麦,播完即开录(0 间隙)
 
     for attempt in 0..2 {
         vad.reset();
@@ -371,11 +374,11 @@ fn on_wake(
         if attempt == 0 {
             // 第一次没听到/没听出字:出声追问,立即重听(绝不静默失败)
             d.rt.publish(VoiceEvent::ListenEnded { reason: "no_speech_retry".into() });
-            ack_and_drain(&d.prompts, pipe, PromptKind::Retry);
+            ack_and_drain(&prompts, pipe, PromptKind::Retry);
         }
     }
     // 两轮都空:有声告退(robot 是安静退,用户点名要出声)
-    d.prompts.play_blocking(PromptKind::Farewell);
+    prompts.play_blocking(PromptKind::Farewell);
     d.rt.publish(VoiceEvent::ListenEnded { reason: "farewell".into() });
     d.rt.publish(VoiceEvent::State { phase: VoicePhase::Idle });
     pipe.drain();

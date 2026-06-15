@@ -162,20 +162,22 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .m-group:first-of-type { margin-top: 0; }
 
 .mem-card {
-  display: flex; align-items: center; gap: 10px;
+  display: flex; align-items: flex-start; gap: 10px;
   border: 1px solid var(--line); border-radius: 12px; padding: 11px 14px; margin-bottom: 8px;
   background: rgba(95, 200, 255, 0.03); font-size: 13.5px;
   transition: border-color .15s;
 }
 .mem-card:hover { border-color: rgba(95, 200, 255, 0.4); }
-.mem-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--cy); box-shadow: 0 0 6px var(--cy); flex: none; opacity: .8; }
+/* flex-start 让点/标签/日期对齐多行内容的第一行,不再悬在垂直正中 */
+.mem-dot { width: 5px; height: 5px; margin-top: 7px; border-radius: 50%; background: var(--cy); box-shadow: 0 0 6px var(--cy); flex: none; opacity: .8; }
 .mem-chip {
-  flex: none; font: 10px/1 ui-monospace, "SF Mono", monospace; letter-spacing: 1px;
+  flex: none; margin-top: 1px; font: 10px/1 ui-monospace, "SF Mono", monospace; letter-spacing: 1px;
   color: var(--cy); border: 1px solid rgba(95, 200, 255, 0.35); border-radius: 6px;
   padding: 3px 7px; text-transform: uppercase;
 }
-.mem-text { flex: 1; min-width: 0; color: var(--txt); line-height: 1.5; word-break: break-word; }
-.mem-date { flex: none; font: 10.5px/1 ui-monospace, "SF Mono", monospace; letter-spacing: .5px; color: var(--txt2); }
+/* pre-line:保留内容里的真实换行(模型多行写入的事实/备忘),其余空白照常折叠、长行自动回绕 */
+.mem-text { flex: 1; min-width: 0; color: var(--txt); line-height: 1.5; word-break: break-word; white-space: pre-line; }
+.mem-date { flex: none; margin-top: 4px; font: 10.5px/1 ui-monospace, "SF Mono", monospace; letter-spacing: .5px; color: var(--txt2); }
 .mem-del {
   flex: none; background: none; border: 1px solid transparent; border-radius: 8px;
   color: var(--txt2); cursor: pointer; font-size: 11px; padding: 3px 8px;

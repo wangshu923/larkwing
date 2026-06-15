@@ -297,6 +297,7 @@ async fn remux(
         .stderr(std::process::Stdio::piped())
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
+    super::no_console(&mut cmd); // Windows 下不弹控制台黑框
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,

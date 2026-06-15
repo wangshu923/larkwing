@@ -291,6 +291,14 @@ pub fn voice_follow_up(state: State<'_, AppState>) -> Result<(), AppError> {
     Ok(())
 }
 
+/// 换音色/语速/在线离线档后调用:唤醒在跑就后台重建应答音银行并热替换(不重启唤醒/麦)。
+/// 问题1-B:让"它的声音"等设置对唤醒应答音也实时生效。没开唤醒则 no-op。
+#[tauri::command]
+pub async fn voice_refresh_prompts(state: State<'_, AppState>) -> Result<(), AppError> {
+    state.voice.refresh_prompts().await;
+    Ok(())
+}
+
 /// 前端编排指令:唤醒回合失败/取消/被忽略 → 直接回待唤醒。
 #[tauri::command]
 pub fn voice_wake_resume(state: State<'_, AppState>) -> Result<(), AppError> {

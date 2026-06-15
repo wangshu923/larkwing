@@ -174,10 +174,24 @@ const calibVerdict = computed(() =>
   calib.result ? t(`settings.voice.calibVerdict_${calib.result.verdict}`, { sens: calib.result.sensitivity }) : '',
 )
 
-// 语速/耐心 seg:语速是 TTS、下句即用,不必动唤醒;耐心改 VAD 静音容忍,得重启唤醒才换。
+// 影响唤醒应答音的设置(音色/语速/在线离线档):set 后让后端按新设置后台重建应答音银行
+// (唤醒在跑就热替换,KWS 检测/麦克风不动;没开唤醒则 no-op)。问题1-B:换这些不再要重启。
+function refreshAckPrompts() {
+  if (isTauri()) void api.voiceRefreshPrompts()
+}
+
+// 语速/耐心 seg:语速是 TTS,回复下句即用;但唤醒应答音是预合成的,得让它后台重建(B)。
+// 耐心改 VAD 静音容忍,捕获参数烤在唤醒循环里,只能重启唤醒才换。
 function onVoiceSeg(key: string, v: string) {
   void settings.set(key, v)
   if (key === 'voice.patience') void restartWakeIfRunning()
+  else if (key === 'voice.rate') refreshAckPrompts()
+}
+
+// 在线/离线 TTS 档:档变了应答音引擎也变(edge mp3 ↔ melo wav)→ 后台重建应答音(B)。
+function onTtsBackend(b: string) {
+  void settings.set('voice.tts_backend', b)
+  refreshAckPrompts()
 }
 
 // 自定义音色:选本地音频文件 → 前端解码/重采样成 16k → 后端转写出草稿 → 起名/改稿 → 保存。
@@ -247,6 +261,7 @@ const previewing = ref('')
 let previewAudio: HTMLAudioElement | null = null
 async function previewSpeaker(id: string) {
   settings.set('voice.speaker', id)
+  refreshAckPrompts() // 换音色 → 后台重建唤醒应答音(问题1-B,不重启唤醒)
   if (!isTauri()) return
   // 换试听:先停掉上一条。原来若上一条还在放就 `return` 吞掉本次点击 —— 表现成"有的音色
   // 点了不出声"(其实是被前一条挡住),连点几个时每隔一个就哑。改成"后点覆盖先点"。
@@ -825,7 +840,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               v-for="b in ['online', 'offline']"
               :key="b"
               :class="{ on: (settings.get('voice.tts_backend') || 'online') === b }"
-              @click="settings.set('voice.tts_backend', b)"
+              @click="onTtsBackend(b)"
             >{{ t(`settings.voice.tts_${b}`) }}</button>
           </span>
         </div>

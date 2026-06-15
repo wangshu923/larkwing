@@ -246,6 +246,7 @@ pub fn run() {
       commands::voice_status,
       commands::voice_wake_set,
       commands::voice_follow_up,
+      commands::voice_refresh_prompts,
       commands::voice_wake_resume,
       commands::voice_wake_suspend,
       commands::voice_calibrate_wake,

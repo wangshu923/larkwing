@@ -611,6 +611,8 @@ export const api = {
   voiceWakeSet: (enabled: boolean) => invoke<VoiceStatus>('voice_wake_set', { enabled }),
   /** 唤醒回合念完 → 开 6s 跟进窗(免唤醒接话)。 */
   voiceFollowUp: () => invoke<void>('voice_follow_up'),
+  /** 换音色/语速/在线离线档后:唤醒在跑则后台重建应答音(不重启唤醒/麦);没开唤醒则 no-op。 */
+  voiceRefreshPrompts: () => invoke<void>('voice_refresh_prompts'),
   /** 唤醒回合失败/取消/被忽略 → 直接回待唤醒。 */
   voiceWakeResume: () => invoke<void>('voice_wake_resume'),
   /** TTS 在念(含重听)时唤醒循环丢帧(自激防护)。 */

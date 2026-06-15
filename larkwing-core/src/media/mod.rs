@@ -23,6 +23,25 @@ use crate::components::{Component, Components, DEFAULT_GH_MIRRORS};
 use crate::store::Store;
 use crate::tasks::Tasks;
 
+/// Windows 下给子进程加 CREATE_NO_WINDOW:主进程是 GUI 子系统(windows_subsystem="windows"),
+/// 但它 spawn 的控制台程序(yt-dlp / ffmpeg)默认仍会弹一个黑框 —— 这里抑制掉。其它平台空操作。
+/// 出站只有 resolver(yt-dlp)和 relay(ffmpeg)两处 spawn,都必须走这里。
+fn no_console(cmd: &mut tokio::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // 注:CommandExt 作用于 std::process::Command,不是 tokio 的 ——
+        // 经 as_std_mut() 拿底层 std command 设标志,spawn 时会被沿用。
+        cmd.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    }
+    // macOS / Linux:GUI 进程 spawn 子进程不会凭空弹终端窗口,这里无事可做。
+    // 钩子留着 —— 将来若要做别的平台级子进程加固(进程组 / niceness / 句柄继承收口),
+    // 统一开在这个函数里,两处 spawn(resolver、relay)自动受益。
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
 // ---------- 源接缝 ----------
 
 /// 搜索命中(模型与播放卡片共用的形)。
