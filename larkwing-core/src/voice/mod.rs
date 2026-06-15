@@ -1350,8 +1350,14 @@ fn calib_text_matches(heard: &str, word: &str) -> bool {
 }
 
 /// 录一段定长底噪/负样本(不靠 VAD,原样收 16k);标定用它度量误触。
+/// 先丢 ~0.4s:跳过开流暂态 + 上一遍唤醒词的尾音/回声,免把它当成"底噪里有唤醒词"误触。
 fn capture_ambient(rt: &VoiceRuntime) -> Result<Vec<f32>> {
     let pipe = open_capture(rt.input_device())?;
+    let settle = Instant::now();
+    while settle.elapsed() < Duration::from_millis(400) {
+        let _ = pipe.rx.recv_timeout(Duration::from_millis(50));
+    }
+    pipe.drain(); // 清掉沉淀期积压,从此刻起才是"环境音"
     let mut buf = Vec::new();
     let started = Instant::now();
     let want = Duration::from_secs_f32(CALIB_AMBIENT_SECS);

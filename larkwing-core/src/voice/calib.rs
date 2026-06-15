@@ -25,6 +25,8 @@ use super::wake;
 pub(super) const GRID: [f32; 9] = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50];
 /// 召回达标线(n 条正样本里至少这个比例要触发)。
 const TARGET_RECALL: f32 = 0.8;
+/// 噪声/分不开时的偏召回折中档:GRID[3]=0.25 ≈ 灵敏度 40(偏灵敏但非极端;能叫醒、又留余地)。
+const NOISY_LEAN_IDX: usize = 3;
 /// 采纳异读拼写的门槛:它的「召回悬崖」要比 canonical 高至少这么多档,才值得换(防抖动)。
 const ADOPT_MARGIN: i32 = 1;
 /// 候选拼写上限(canonical + 异读;2 字唤醒词通常 1~4 个,封顶防多音字组合爆炸)。
@@ -247,8 +249,7 @@ struct VariantDecision {
     verdict: &'static str,
 }
 
-/// 单拼写的阈值决策。偏召回(用户痛点是叫不应):
-/// 取「负样本不误触的最宽松档」上方一档作余量,封顶在召回达标的最高档。
+/// 单拼写的阈值决策。**偏召回**(用户痛点是「叫不应」,真实使用比标定样本更远更轻 → 宁松勿严)。
 fn decide(recall: &[u32], fa: &[bool], n_pos: u32) -> VariantDecision {
     let n = GRID.len();
     let target = (TARGET_RECALL * n_pos as f32).ceil() as u32;
@@ -258,12 +259,12 @@ fn decide(recall: &[u32], fa: &[bool], n_pos: u32) -> VariantDecision {
     // 误触随阈值↑非增:i_fa = 不误触的最低档(它及以上都不误触)
     let i_fa = (0..n).find(|&i| !fa[i]);
     let (i_pick, verdict) = match (i_recall, i_fa) {
-        // 正常:窗口 [i_fa, i_recall] 非空 → 取 i_fa 上方一档(召回最优 + 一档误触余量)
+        // 干净可分:窗口 [i_fa, i_recall] 非空 → 取 i_fa 上方一档(召回最优 + 一档误触余量)
         (Some(ir), Some(ifa)) if ifa <= ir => (ifa.saturating_add(1).min(ir), "good"),
-        // 误触区与召回区重叠(吵/词易混):取召回达标最高档(此区内误触最少),警告
-        (Some(ir), Some(_)) => (ir, "noisy"),
-        // 负样本在每个阈值都误触(负样本里疑似混入了唤醒词/词太常见):同上,警告
-        (Some(ir), None) => (ir, "noisy"),
+        // 分不开(负样本在召回区也误触 / 处处误触:家里吵、电视、词太常见、底噪段混入人声):
+        // **绝不滑到最严**(那等于灵敏度≈0、几乎叫不应,正好打脸用户诉求)。一段 4s 底噪不足以
+        // 把阈值钉死到最严——偏召回取折中档(不超过召回悬崖),警告用户自行往「稳重」微调。
+        (Some(ir), _) => (NOISY_LEAN_IDX.min(ir), "noisy"),
         // 最宽松档都达不到召回(麦太弱/词太难听清):取最宽松,警告
         (None, _) => (0, "hard"),
     };
@@ -425,12 +426,24 @@ mod tests {
 
     #[test]
     fn decide_noisy_when_fa_overlaps_recall() {
-        // 召回只到 index1;误触到 index2(i_fa=3 > i_recall=1)→ noisy,取召回最高档
+        // 召回只到 index1;误触到 index2(i_fa=3 > i_recall=1)→ noisy。折中档 min(3, ir=1)=1。
         let recall = [5, 4, 3, 2, 1, 0, 0, 0, 0];
         let fa = [true, true, true, false, false, false, false, false, false];
         let d = decide(&recall, &fa, 5);
         assert_eq!(d.verdict, "noisy");
-        assert_eq!(d.i_pick, 1);
+        assert_eq!(d.i_pick, 1, "召回悬崖低于折中档时不超过它");
+    }
+
+    #[test]
+    fn decide_noisy_strong_voice_never_slams_to_zero_sensitivity() {
+        // 真机案例:正样本处处达标(声强,最严档也触发)+ 底噪段处处误触(家里吵)。
+        // 必须偏召回取折中档,绝不滑到最严(= 灵敏度 0,几乎叫不应,正好打脸用户诉求)。
+        let recall = [5, 5, 5, 5, 5, 5, 5, 5, 4];
+        let fa = [true; 9];
+        let d = decide(&recall, &fa, 5);
+        assert_eq!(d.verdict, "noisy");
+        assert_eq!(d.i_pick, NOISY_LEAN_IDX, "偏召回折中档,不滑到最严");
+        assert_ne!(threshold_to_sensitivity(GRID[d.i_pick]), 0, "灵敏度绝不为 0");
     }
 
     #[test]

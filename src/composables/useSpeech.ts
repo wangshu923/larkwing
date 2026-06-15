@@ -24,6 +24,9 @@ const STALL_MS = 1200 // LLM 停流多久算"卡住"
 const STALL_GRACE_MS = 1000 // 卡住后再宽限多久就全量硬切
 const INFLIGHT_MAX = 2 // 并行合成上限(顺序入队,完成乱序无妨)
 const SYNTH_TIMEOUT_MS = 12000 // 单句合成兜底:在线 TTS 偶发挂起会让队列卡死→playing 永真→唤醒被永久丢帧;超时即当失败跳过
+// 克隆音色走本地 ZipVoice,CPU 合成慢(冷启 ~17s、暖 6–8s),12s 会把每句都判超时→自定义音色"不应答"。
+// 选了 clone:<id> 时放宽到 45s(仍兜真挂起;串行锁下两句排队也容得下)。
+const SYNTH_TIMEOUT_CLONE_MS = 45000
 const PLAY_GRACE_MS = 5000 // 播放看门狗余量:真实时长 + 此值还没 ended 就强制推进
 
 const STRONG = new Set(['。', '!', '?', '…', ';', '\n', '!', '?', ';'])
@@ -187,11 +190,13 @@ function evaluate() {
  *  synth、队列永不空 → playing/busy 永真 → 唤醒循环被永久 suspend 丢帧。超时即拒绝,
  *  上游 catch 把这句标 failed 跳过,队列得以继续清空。 */
 function synthWithTimeout(text: string): Promise<string> {
+  // 克隆音色(本地 ZipVoice)合成慢,给足时间;其余(在线 edge / 离线 melo)照旧 12s。
+  const ms = settings.get('voice.speaker').startsWith('clone:')
+    ? SYNTH_TIMEOUT_CLONE_MS
+    : SYNTH_TIMEOUT_MS
   return Promise.race([
     api.ttsSynthesize(text),
-    new Promise<string>((_, reject) =>
-      setTimeout(() => reject(new Error('synth-timeout')), SYNTH_TIMEOUT_MS),
-    ),
+    new Promise<string>((_, reject) => setTimeout(() => reject(new Error('synth-timeout')), ms)),
   ])
 }
 
