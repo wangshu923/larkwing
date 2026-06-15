@@ -9,33 +9,37 @@ use serde_json::Value;
 
 use super::{normalize_city, DayForecast, Weather, WeatherSource, When};
 
-pub struct OpenMeteoSource {
-    http: reqwest::Client,
-}
+pub struct OpenMeteoSource;
 
 impl OpenMeteoSource {
-    pub fn new(http: reqwest::Client) -> Self {
-        Self { http }
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self
     }
 
     /// 城市名 → (纬度, 经度, 规范名)。先试原名,搜不到去行政尾缀重试(杭州市 → 杭州)。
-    async fn geocode(&self, city: &str) -> Result<(f64, f64, String)> {
+    async fn geocode(&self, net: &crate::net::Client, city: &str) -> Result<(f64, f64, String)> {
         let norm = normalize_city(city);
         let candidates: Vec<&str> = if norm == city { vec![city] } else { vec![city, norm] };
         for name in candidates {
-            if let Some(hit) = self.geocode_one(name).await? {
+            if let Some(hit) = self.geocode_one(net, name).await? {
                 return Ok(hit);
             }
         }
         bail!("找不到城市「{city}」的位置")
     }
 
-    async fn geocode_one(&self, name: &str) -> Result<Option<(f64, f64, String)>> {
-        let text = self
-            .http
-            .get("https://geocoding-api.open-meteo.com/v1/search")
-            .query(&[("name", name), ("count", "1"), ("language", "zh"), ("format", "json")])
-            .send()
+    async fn geocode_one(
+        &self,
+        net: &crate::net::Client,
+        name: &str,
+    ) -> Result<Option<(f64, f64, String)>> {
+        let url = "https://geocoding-api.open-meteo.com/v1/search";
+        let text = net
+            .send(url, |c| {
+                c.get(url)
+                    .query(&[("name", name), ("count", "1"), ("language", "zh"), ("format", "json")])
+            })
             .await?
             .error_for_status()?
             .text()
@@ -53,8 +57,8 @@ impl OpenMeteoSource {
 
 #[async_trait]
 impl WeatherSource for OpenMeteoSource {
-    async fn lookup(&self, city: &str, when: When) -> Result<Weather> {
-        let (lat, lon, name) = self.geocode(city).await?;
+    async fn lookup(&self, net: &crate::net::Client, city: &str, when: When) -> Result<Weather> {
+        let (lat, lon, name) = self.geocode(net, city).await?;
 
         let mut q: Vec<(&str, String)> = vec![
             ("latitude", lat.to_string()),
@@ -71,11 +75,9 @@ impl WeatherSource for OpenMeteoSource {
             q.push(("forecast_days", "3".into()));
         }
 
-        let text = self
-            .http
-            .get("https://api.open-meteo.com/v1/forecast")
-            .query(&q)
-            .send()
+        let url = "https://api.open-meteo.com/v1/forecast";
+        let text = net
+            .send(url, |c| c.get(url).query(&q))
             .await?
             .error_for_status()?
             .text()

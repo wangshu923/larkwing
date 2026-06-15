@@ -11,14 +11,13 @@ use serde_json::Value;
 use super::{DayForecast, Weather, WeatherSource, When};
 
 pub struct QWeatherSource {
-    http: reqwest::Client,
     key: String,
     host: Option<String>,
 }
 
 impl QWeatherSource {
-    pub fn new(http: reqwest::Client, key: String, host: Option<String>) -> Self {
-        Self { http, key, host }
+    pub fn new(key: String, host: Option<String>) -> Self {
+        Self { key, host }
     }
 
     /// (geo_host, api_host):专属 host 统一服务两者;否则历史免费版分离 host。
@@ -33,12 +32,17 @@ impl QWeatherSource {
     }
 
     /// 城市名 → (和风 LocationID, 规范城市名)。
-    async fn location_id(&self, geo_host: &str, city: &str) -> Result<(String, String)> {
-        let text = self
-            .http
-            .get(format!("{geo_host}/v2/city/lookup"))
-            .query(&[("location", city), ("key", self.key.as_str()), ("lang", "zh")])
-            .send()
+    async fn location_id(
+        &self,
+        net: &crate::net::Client,
+        geo_host: &str,
+        city: &str,
+    ) -> Result<(String, String)> {
+        let url = format!("{geo_host}/v2/city/lookup");
+        let text = net
+            .send(&url, |c| {
+                c.get(&url).query(&[("location", city), ("key", self.key.as_str()), ("lang", "zh")])
+            })
             .await?
             .error_for_status()?
             .text()
@@ -56,12 +60,17 @@ impl QWeatherSource {
     }
 
     /// 生活指数:穿衣(3)/紫外线(5)/舒适度(8) —— 和风独有,best-effort(失败不拖垮主结果)。
-    async fn indices(&self, api_host: &str, id: &str) -> Result<Vec<String>> {
-        let text = self
-            .http
-            .get(format!("{api_host}/v7/indices/1d"))
-            .query(&[("type", "3,5,8"), ("location", id), ("key", self.key.as_str())])
-            .send()
+    async fn indices(
+        &self,
+        net: &crate::net::Client,
+        api_host: &str,
+        id: &str,
+    ) -> Result<Vec<String>> {
+        let url = format!("{api_host}/v7/indices/1d");
+        let text = net
+            .send(&url, |c| {
+                c.get(&url).query(&[("type", "3,5,8"), ("location", id), ("key", self.key.as_str())])
+            })
             .await?
             .error_for_status()?
             .text()
@@ -86,16 +95,16 @@ impl QWeatherSource {
 
 #[async_trait]
 impl WeatherSource for QWeatherSource {
-    async fn lookup(&self, city: &str, when: When) -> Result<Weather> {
+    async fn lookup(&self, net: &crate::net::Client, city: &str, when: When) -> Result<Weather> {
         let (geo_host, api_host) = self.hosts();
-        let (id, name) = self.location_id(&geo_host, city).await?;
+        let (id, name) = self.location_id(net, &geo_host, city).await?;
 
         // 实况
-        let now_text = self
-            .http
-            .get(format!("{api_host}/v7/weather/now"))
-            .query(&[("location", id.as_str()), ("key", self.key.as_str())])
-            .send()
+        let now_url = format!("{api_host}/v7/weather/now");
+        let now_text = net
+            .send(&now_url, |c| {
+                c.get(&now_url).query(&[("location", id.as_str()), ("key", self.key.as_str())])
+            })
             .await?
             .error_for_status()?
             .text()
@@ -117,11 +126,11 @@ impl WeatherSource for QWeatherSource {
 
         // 预报(仅 Today/ThreeDay 拉)
         let days = if when.wants_forecast() {
-            let fc_text = self
-                .http
-                .get(format!("{api_host}/v7/weather/3d"))
-                .query(&[("location", id.as_str()), ("key", self.key.as_str())])
-                .send()
+            let fc_url = format!("{api_host}/v7/weather/3d");
+            let fc_text = net
+                .send(&fc_url, |c| {
+                    c.get(&fc_url).query(&[("location", id.as_str()), ("key", self.key.as_str())])
+                })
                 .await?
                 .error_for_status()?
                 .text()
@@ -133,7 +142,7 @@ impl WeatherSource for QWeatherSource {
             Vec::new()
         };
 
-        let tips = self.indices(&api_host, &id).await.unwrap_or_default();
+        let tips = self.indices(net, &api_host, &id).await.unwrap_or_default();
 
         Ok(Weather {
             city: name,

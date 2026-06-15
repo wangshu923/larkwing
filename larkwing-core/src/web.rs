@@ -25,7 +25,7 @@ pub struct SearchHit {
 }
 
 pub struct WebClient {
-    http: reqwest::Client,
+    net: crate::net::Client,
     cache: Mutex<HashMap<String, (Instant, String)>>,
 }
 
@@ -37,13 +37,10 @@ impl Default for WebClient {
 
 impl WebClient {
     pub fn new() -> WebClient {
-        let http = reqwest::Client::builder()
-            .user_agent(UA)
-            .connect_timeout(Duration::from_secs(8))
-            .timeout(Duration::from_secs(15))
-            .build()
-            .expect("reqwest client");
-        WebClient { http, cache: Mutex::new(HashMap::new()) }
+        let net = crate::net::Client::new(|b| {
+            b.user_agent(UA).connect_timeout(Duration::from_secs(8)).timeout(Duration::from_secs(15))
+        });
+        WebClient { net, cache: Mutex::new(HashMap::new()) }
     }
 
     /// 搜索:Bing(中文质量好)→ DDG html 版兜底。全军覆没才报错。
@@ -65,11 +62,10 @@ impl WebClient {
     }
 
     async fn search_bing(&self, query: &str, count: usize) -> Result<Vec<SearchHit>> {
+        let url = "https://www.bing.com/search";
         let html = self
-            .http
-            .get("https://www.bing.com/search")
-            .query(&[("q", query), ("setlang", "zh-hans"), ("count", "10")])
-            .send()
+            .net
+            .send(url, |c| c.get(url).query(&[("q", query), ("setlang", "zh-hans"), ("count", "10")]))
             .await?
             .error_for_status()?
             .text()
@@ -78,11 +74,10 @@ impl WebClient {
     }
 
     async fn search_ddg(&self, query: &str, count: usize) -> Result<Vec<SearchHit>> {
+        let url = "https://html.duckduckgo.com/html/";
         let html = self
-            .http
-            .get("https://html.duckduckgo.com/html/")
-            .query(&[("q", query)])
-            .send()
+            .net
+            .send(url, |c| c.get(url).query(&[("q", query)]))
             .await?
             .error_for_status()?
             .text()
@@ -96,7 +91,7 @@ impl WebClient {
             let (title, text) = split_cached(&hit);
             return Ok((title, text));
         }
-        let resp = self.http.get(url).send().await.context("页面请求失败")?;
+        let resp = self.net.send(url, |c| c.get(url)).await.context("页面请求失败")?;
         let status = resp.status();
         anyhow::ensure!(status.is_success(), "页面 HTTP {status}");
         // 体积闸:10MB 封顶,防超大页面拖死

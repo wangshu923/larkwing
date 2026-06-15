@@ -71,14 +71,15 @@ pub struct Weather {
 }
 
 /// 天气数据源(trait 接缝,源=数据)。按城市名查;城市→坐标/LocationID 各源内部解决。
+/// net 由调用方传入(直连优先、失败兜底走代理):Open-Meteo 境外靠它过墙,和风/cityjson 墙内直连。
 #[async_trait]
 pub trait WeatherSource: Send + Sync {
-    async fn lookup(&self, city: &str, when: When) -> Result<Weather>;
+    async fn lookup(&self, net: &crate::net::Client, city: &str, when: When) -> Result<Weather>;
 }
 
 /// app 级无归属资产(HTTP 连接池),住工具单例字段、不进 ToolCtx(同 web 的 WebClient)。
 pub struct WeatherClient {
-    http: reqwest::Client,
+    net: crate::net::Client,
 }
 
 impl Default for WeatherClient {
@@ -89,13 +90,10 @@ impl Default for WeatherClient {
 
 impl WeatherClient {
     pub fn new() -> WeatherClient {
-        let http = reqwest::Client::builder()
-            .user_agent(UA)
-            .connect_timeout(Duration::from_secs(8))
-            .timeout(Duration::from_secs(15))
-            .build()
-            .expect("reqwest client");
-        WeatherClient { http }
+        let net = crate::net::Client::new(|b| {
+            b.user_agent(UA).connect_timeout(Duration::from_secs(8)).timeout(Duration::from_secs(15))
+        });
+        WeatherClient { net }
     }
 
     /// 选源(按 key 有无)+ 查询。store 编排(读 key/host、定位记忆)在工具层走
@@ -112,21 +110,21 @@ impl WeatherClient {
                 let host = host
                     .map(|h| h.trim().trim_end_matches('/').to_string())
                     .filter(|h| !h.is_empty());
-                qweather::QWeatherSource::new(self.http.clone(), key.to_string(), host)
-                    .lookup(city, when)
+                qweather::QWeatherSource::new(key.to_string(), host)
+                    .lookup(&self.net, city, when)
                     .await
             }
-            None => open_meteo::OpenMeteoSource::new(self.http.clone()).lookup(city, when).await,
+            None => open_meteo::OpenMeteoSource::new().lookup(&self.net, city, when).await,
         }
     }
 
     /// 搜狐 cityjson:免 key、自动识别请求方公网 IP → 城市。
     /// 响应形如 `var returnCitySN = {"cip":"..","cid":"..","cname":"杭州市"};`。
     pub async fn locate_city(&self) -> Result<String> {
+        let url = "http://pv.sohu.com/cityjson?ie=utf-8";
         let bytes = self
-            .http
-            .get("http://pv.sohu.com/cityjson?ie=utf-8")
-            .send()
+            .net
+            .send(url, |c| c.get(url))
             .await?
             .error_for_status()?
             .bytes()
