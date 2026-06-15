@@ -30,16 +30,13 @@ fn anthropic_image_block(url: &str) -> Value {
 
 pub struct AnthropicCompatProvider {
     cfg: LlmConfig,
-    http: reqwest::Client,
+    net: crate::net::Client,
 }
 
 impl AnthropicCompatProvider {
     pub fn new(cfg: LlmConfig) -> Self {
-        let http = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("构建 HTTP client 失败");
-        Self { cfg, http }
+        let net = crate::net::Client::new(|b| b.connect_timeout(std::time::Duration::from_secs(10)));
+        Self { cfg, net }
     }
 
     /// 出向方言翻译:中立 ChatRequest → Messages API 请求体。
@@ -143,8 +140,8 @@ impl AnthropicCompatProvider {
         body
     }
 
-    fn request_builder(&self, url: &str) -> reqwest::RequestBuilder {
-        let mut builder = self.http.post(url).header("anthropic-version", "2023-06-01");
+    fn request_builder(&self, client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
+        let mut builder = client.post(url).header("anthropic-version", "2023-06-01");
         builder = match self.cfg.quirks.auth.unwrap_or(AuthStyle::XApiKey) {
             AuthStyle::Bearer => builder.bearer_auth(&self.cfg.api_key),
             AuthStyle::XApiKey => builder.header("x-api-key", &self.cfg.api_key),
@@ -289,10 +286,10 @@ impl LlmProvider for AnthropicCompatProvider {
             return Err(LlmError::NoApiKey);
         }
         let url = format!("{}/v1/messages", self.cfg.base_url.trim_end_matches('/'));
+        let body = self.to_wire(&req);
         let resp = self
-            .request_builder(&url)
-            .json(&self.to_wire(&req))
-            .send()
+            .net
+            .send(&url, |c| self.request_builder(c, &url).json(&body))
             .await
             .map_err(|e| LlmError::Network(e.to_string()))?;
 
@@ -497,8 +494,9 @@ mod tests {
 
     #[test]
     fn request_builder_defaults_to_x_api_key_with_version_header() {
-        let req = provider()
-            .request_builder("https://api.anthropic.com/v1/messages")
+        let p = provider();
+        let req = p
+            .request_builder(p.net.direct(), "https://api.anthropic.com/v1/messages")
             .build()
             .unwrap();
         assert_eq!(req.headers()["x-api-key"], "sk-ant-test");

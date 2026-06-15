@@ -20,7 +20,7 @@ futures-util = "0.3"
 glob = "0.3"
 msedge-tts = "0.4.0"
 pinyin = "0.11.0"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 # web 工具的 HTML 解析(搜索结果页 + 正文抽取)
 scraper = "0.23"

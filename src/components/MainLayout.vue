@@ -44,7 +44,7 @@ const petName = computed(() => settings.get('ui.pet_name') || t('pet.name'))
 const textScale = computed(() => (settings.get('ui.text_scale') === 'large' ? '16.5px' : '14px'))
 const activeRail = ref<'chat' | 'reminders' | 'memory' | 'ops' | 'settings'>('chat')
 
-const { state: chat, send: chatSend, cancel, selectConversation, newConversation, ensureVoiceConv, saveApiKey, dequeue } = useChat()
+const { state: chat, send: chatSend, cancel, selectConversation, newConversation, ensureVoiceConv, saveApiKey, dequeue, inject } = useChat()
 const messages = computed(() => chat.messages)
 
 const input = ref('')
@@ -569,7 +569,10 @@ onUnmounted(() => cancelAnimationFrame(raf))
         <PlayerBar />
         <!-- 排队区(Phase A):7274 还在说时你发的消息,攒这儿,说完一起发;可逐条划掉 -->
         <div v-if="chat.queue.length" class="queue">
-          <div class="q-head">{{ t('chat.queueHint') }}</div>
+          <div class="q-head">
+            <span>{{ t('chat.queueHint') }}</span>
+            <button class="q-jump" @click="inject" :title="t('chat.queueJumpTitle')">{{ t('chat.queueJump') }}</button>
+          </div>
           <div v-for="(q, i) in chat.queue" :key="i" class="q-item">
             <svg v-if="q.attachments.length" class="q-clip" viewBox="0 0 24 24"><path d="M8 12V7a4 4 0 0 1 8 0v9a6 6 0 0 1-12 0V8.5" /></svg>
             <span class="q-text">{{ q.text || t('chat.queueAtt') }}</span>
@@ -825,7 +828,13 @@ onUnmounted(() => cancelAnimationFrame(raf))
 
 /* 排队区(Phase A):7274 还在说时发的消息,攒这儿、整轮结束自动合并发 */
 .queue { display: flex; flex-direction: column; gap: 5px; padding: 2px 2px 0; }
-.q-head { font-size: 11px; letter-spacing: 1px; color: var(--txt2); }
+.q-head { display: flex; align-items: center; justify-content: space-between; font-size: 11px; letter-spacing: 1px; color: var(--txt2); }
+.q-jump {
+  cursor: pointer; background: rgba(95, 200, 255, 0.1); border: 1px solid rgba(95, 200, 255, 0.4);
+  border-radius: 999px; padding: 3px 11px; color: var(--cy); font-size: 11px; letter-spacing: .5px;
+  transition: background .15s, border-color .15s;
+}
+.q-jump:hover { background: rgba(95, 200, 255, 0.2); border-color: var(--cy); box-shadow: 0 0 10px rgba(95, 200, 255, 0.25); }
 .q-item {
   display: flex; align-items: center; gap: 7px;
   background: rgba(95, 200, 255, 0.05); border: 1px dashed var(--line); border-radius: 9px;

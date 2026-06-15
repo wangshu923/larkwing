@@ -226,6 +226,8 @@ export type TurnEvent =
   | { type: 'tool_use'; data: { label: string; state: 'started' | 'finished' } }
   // 记账灯带:本轮消耗 + 今日/会话累计快照(工具回合每轮一次;累计来自库,前端只展示)
   | { type: 'usage'; data: { round: UsageDigest; today: DayUsage; conv: UsageTotals } }
+  // 插队(PLAN §9 B):回合在飞时注入的 user 消息已落库,之后的回复另起一段
+  | { type: 'injected'; data: { message_id: number; text: string; attachments: AttachmentRef[] } }
   | { type: 'done'; data: { message_id: number } }
   | { type: 'failed'; data: AppError }
   | { type: 'cancelled' }
@@ -569,6 +571,11 @@ export const api = {
     const channel = new Channel<TurnEvent>()
     channel.onmessage = onEvent
     return invoke<void>('send_message', { convId, text, meta, attachments, onEvent: channel })
+  },
+
+  /** 插队(PLAN §9 B):塞进正在跑的回合,下一轮 LLM 带上。返回 false=没接住,改用 sendMessage。 */
+  injectMessage(convId: number, text: string, meta: UserMeta | null, attachments: OutAttachment[]) {
+    return invoke<boolean>('inject_message', { convId, text, meta, attachments })
   },
 
   cancelGeneration: (convId: number) => invoke<void>('cancel_generation', { convId }),

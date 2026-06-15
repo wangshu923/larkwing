@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::bus::Text;
-use crate::components::{candidates, fetch_url_to};
+use crate::components::{candidates, fetch_candidates};
 use crate::tasks::{TaskHandle, Tasks};
 
 /// 一个模型 = 一组文件;每个文件给多源候选(顺序即尝试顺序,github 的再按镜像展开)。
@@ -150,18 +150,15 @@ pub const TTS_ZIPVOICE: TreeModelSpec = TreeModelSpec {
 pub struct VoiceModels {
     dir: PathBuf,
     tasks: Tasks,
-    http: reqwest::Client,
+    net: crate::net::Client,
     /// 并发去重:同时只有一个模型下载在跑(后到的等同一份结果)。
     lock: tokio::sync::Mutex<()>,
 }
 
 impl VoiceModels {
     pub fn new(dir: PathBuf, tasks: Tasks) -> VoiceModels {
-        let http = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("reqwest client");
-        VoiceModels { dir, tasks, http, lock: tokio::sync::Mutex::new(()) }
+        let net = crate::net::Client::new(|b| b.connect_timeout(std::time::Duration::from_secs(10)));
+        VoiceModels { dir, tasks, net, lock: tokio::sync::Mutex::new(()) }
     }
 
     /// 模型就绪:全部文件在位即返回目录;缺则带 HUD 下载(.part 原子就位,
@@ -231,26 +228,9 @@ impl VoiceModels {
     ) -> Result<()> {
         tokio::fs::create_dir_all(dir).await?;
         let tarball = dir.join("model.tar.bz2.part");
-        let mut last_err: Option<anyhow::Error> = None;
-        let mut ok = false;
-        for url in candidates(spec.url, mirrors) {
-            let host = url.split('/').nth(2).unwrap_or("?").to_string();
-            task.step("step.connect", serde_json::json!({ "host": host }));
-            match fetch_url_to(&self.http, &url, &tarball, task).await {
-                Ok(()) => {
-                    ok = true;
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!(url, err = %format!("{e:#}"), "模型包下载失败,换下一个源");
-                    last_err = Some(e);
-                }
-            }
-        }
-        if !ok {
-            return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("没有可用下载源")))
-                .with_context(|| format!("下载 {} 失败", spec.id));
-        }
+        fetch_candidates(&self.net, &candidates(spec.url, mirrors), &tarball, task)
+            .await
+            .with_context(|| format!("下载 {} 失败", spec.id))?;
         task.step("step.extract", serde_json::Value::Null);
         let (tar2, dir2) = (tarball.clone(), dir.to_path_buf());
         let wanted: Vec<&'static str> = spec.files.to_vec();
@@ -306,26 +286,9 @@ impl VoiceModels {
     ) -> Result<()> {
         tokio::fs::create_dir_all(dir).await?;
         let tarball = dir.join("model.tar.bz2.part");
-        let mut last_err: Option<anyhow::Error> = None;
-        let mut ok = false;
-        for url in candidates(spec.url, mirrors) {
-            let host = url.split('/').nth(2).unwrap_or("?").to_string();
-            task.step("step.connect", serde_json::json!({ "host": host }));
-            match fetch_url_to(&self.http, &url, &tarball, task).await {
-                Ok(()) => {
-                    ok = true;
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!(url, err = %format!("{e:#}"), "模型包下载失败,换下一个源");
-                    last_err = Some(e);
-                }
-            }
-        }
-        if !ok {
-            return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("没有可用下载源")))
-                .with_context(|| format!("下载 {} 失败", spec.id));
-        }
+        fetch_candidates(&self.net, &candidates(spec.url, mirrors), &tarball, task)
+            .await
+            .with_context(|| format!("下载 {} 失败", spec.id))?;
         task.step("step.extract", serde_json::Value::Null);
         let (tar2, dir2) = (tarball.clone(), dir.to_path_buf());
         let skip: Vec<&'static str> = spec.skip.to_vec();
@@ -340,26 +303,10 @@ impl VoiceModels {
                 continue;
             }
             let part = dir.join(format!("{}.part", file.name));
-            let mut ok = false;
-            let mut last_err: Option<anyhow::Error> = None;
-            for url in file.urls.iter().flat_map(|u| candidates(u, mirrors)) {
-                let host = url.split('/').nth(2).unwrap_or("?").to_string();
-                task.step("step.connect", serde_json::json!({ "host": host }));
-                match fetch_url_to(&self.http, &url, &part, task).await {
-                    Ok(()) => {
-                        ok = true;
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::warn!(url, err = %format!("{e:#}"), "附件下载失败,换下一个源");
-                        last_err = Some(e);
-                    }
-                }
-            }
-            if !ok {
-                return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("没有可用下载源")))
-                    .with_context(|| format!("下载 {}/{} 失败", spec.id, file.name));
-            }
+            let urls: Vec<String> = file.urls.iter().flat_map(|u| candidates(u, mirrors)).collect();
+            fetch_candidates(&self.net, &urls, &part, task)
+                .await
+                .with_context(|| format!("下载 {}/{} 失败", spec.id, file.name))?;
             tokio::fs::rename(&part, &dest).await?;
         }
         for f in spec.ready {
@@ -386,26 +333,10 @@ impl VoiceModels {
                 continue;
             }
             let part = dir.join(format!("{}.part", file.name));
-            let mut last_err: Option<anyhow::Error> = None;
-            let mut ok = false;
-            for url in file.urls.iter().flat_map(|u| candidates(u, mirrors)) {
-                let host = url.split('/').nth(2).unwrap_or("?").to_string();
-                task.step("step.connect", serde_json::json!({ "host": host }));
-                match fetch_url_to(&self.http, &url, &part, task).await {
-                    Ok(()) => {
-                        ok = true;
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::warn!(url, err = %format!("{e:#}"), "模型文件下载失败,换下一个源");
-                        last_err = Some(e);
-                    }
-                }
-            }
-            if !ok {
-                return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("没有可用下载源")))
-                    .with_context(|| format!("下载 {}/{} 失败", spec.id, file.name));
-            }
+            let urls: Vec<String> = file.urls.iter().flat_map(|u| candidates(u, mirrors)).collect();
+            fetch_candidates(&self.net, &urls, &part, task)
+                .await
+                .with_context(|| format!("下载 {}/{} 失败", spec.id, file.name))?;
             tokio::fs::rename(&part, &dest).await?;
         }
         Ok(())

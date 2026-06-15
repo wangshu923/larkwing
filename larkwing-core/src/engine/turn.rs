@@ -3,7 +3,7 @@
 //! (每工具超时 + 取消级联)→ 落库 → 回填再开流;轮数到顶 tool_choice=none 强制收尾。
 //! turn 级状态 = 本文件里的局部变量,session 级在 SessionSlot,app 级在 Engine 字段(PLAN §4)。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -50,6 +50,8 @@ pub(super) struct Turn {
     pub media: crate::media::MediaRuntime,
     /// 第 1 轮已开的流(建连失败切换发生在 engine;Turn 内不再切换)。
     pub rx: mpsc::Receiver<ChatEvent>,
+    /// 插队队列(PLAN §9 B):与 engine.inject 命令共用;回合在轮间/收尾前排空它。
+    pub inject: Arc<Mutex<super::InjectState>>,
 }
 
 /// 一轮流式消费的结局。
@@ -82,12 +84,15 @@ impl Turn {
             tools,
             media,
             mut rx,
+            inject,
         } = self;
         // mood 上总线(PLAN §12 修订):悬浮窗据此显「正在想/正在说」;
         // Guard 在任一出口(done/failed/cancelled/落库失败/建连失败)收回 Idle。
         let bus = media.bus().clone();
         bus.publish(AppEvent::Mood(Mood::Thinking));
         let _mood = MoodGuard(bus.clone());
+        // 回合任一出口闸上注入队列(Failed/Cancelled 退出后别再往死队列里塞)
+        let _inject_guard = InjectGuard(inject.clone());
         let meta = usage::RoundMeta { user_id, conv_id, user_msg_id, provider_id, model };
         let mut round_start = first_round_start;
         let ctx = ToolCtx { user_id, conv_id, store: store.clone(), media };
@@ -99,7 +104,8 @@ impl Turn {
                 .unwrap_or_else(|| "tool.unknown".into())
         };
 
-        for round in 0..=MAX_TOOL_ROUNDS {
+        let mut round: usize = 0;
+        loop {
             let (text, reasoning, tool_calls) =
                 match drain(&token, &tx, &bus, rx, conv_id, round_start).await {
                     RoundEnd::Cancelled { partial } => {
@@ -131,26 +137,57 @@ impl Turn {
                     }
                 };
 
-            // 纯文本收尾 —— 或者端点无视 tool_choice=none 仍要调工具(防御):
-            // 都按终回处理,后者不落 tool_calls,绝不留孤儿配对。
-            if tool_calls.is_empty() || round == MAX_TOOL_ROUNDS {
+            // 纯文本收尾 —— 或端点无视 tool_choice=none 仍要调工具(防御):都按终回处理。
+            // 收尾前先看插队(PLAN §9 B):有就先落这段回复、把注入接上、重开流继续(不打断进度)。
+            if tool_calls.is_empty() || round >= MAX_TOOL_ROUNDS {
                 if !tool_calls.is_empty() {
                     tracing::warn!(conv = conv_id, "工具轮超限仍想调用,丢弃调用强制收尾");
                 }
-                match persist_row(&store, conv_id, "assistant", &text, None).await {
-                    Some(message_id) => {
-                        let _ = tx.send(TurnEvent::Done { message_id }).await;
+                // 收尾前看插队(原子):空 → 置 finishing 收尾;非空 → 取出注入(先落本段回复再 apply)
+                let pending = take_or_finish(&inject);
+                if pending.is_empty() {
+                    // 真收尾(take_or_finish 内已原子置 finishing,此后 inject 拒绝)
+                    match persist_row(&store, conv_id, "assistant", &text, None).await {
+                        Some(message_id) => {
+                            let _ = tx.send(TurnEvent::Done { message_id }).await;
+                        }
+                        None => {
+                            let _ = tx
+                                .send(TurnEvent::Failed {
+                                    kind: ErrorKind::Internal,
+                                    message: "回复落库失败".into(),
+                                })
+                                .await;
+                        }
                     }
-                    None => {
-                        let _ = tx
-                            .send(TurnEvent::Failed {
-                                kind: ErrorKind::Internal,
-                                message: "回复落库失败".into(),
-                            })
-                            .await;
+                    return;
+                }
+                // 用户在收尾前插了话:先把这段回复落库(它答上一段输入),保证历史顺序
+                // assistant(本段回复) 在 user(注入) 之前;再 apply 注入、重开流继续答。
+                if persist_row(&store, conv_id, "assistant", &text, None).await.is_none() {
+                    let _ = tx
+                        .send(TurnEvent::Failed {
+                            kind: ErrorKind::Internal,
+                            message: "回复落库失败".into(),
+                        })
+                        .await;
+                    return;
+                }
+                for it in pending {
+                    apply_injection(&store, conv_id, &tx, &mut request, it).await;
+                }
+                round = 0; // 新输入 → 新一轮工具预算
+                request.tool_choice = ToolChoice::Auto;
+                round_start = std::time::Instant::now();
+                match provider.chat_stream(request.clone()).await {
+                    Ok(next) => rx = next,
+                    Err(e) => {
+                        let app = AppError::from(e);
+                        let _ = tx.send(TurnEvent::Failed { kind: app.kind, message: app.message }).await;
+                        return;
                     }
                 }
-                return;
+                continue;
             }
 
             // ---- 工具轮 ----
@@ -218,8 +255,11 @@ impl Turn {
                 });
             }
 
+            // 插队(PLAN §9 B):轮间排空注入队列,append 进 request,下一轮 LLM 就带上
+            drain_injections(&store, conv_id, &tx, &inject, &mut request).await;
+            round += 1;
             // 末轮强制收尾:下一次开流禁用工具,模型只能用嘴说
-            if round + 1 == MAX_TOOL_ROUNDS {
+            if round >= MAX_TOOL_ROUNDS {
                 request.tool_choice = ToolChoice::None;
             }
 
@@ -235,6 +275,129 @@ impl Turn {
                 }
             }
         }
+    }
+}
+
+/// 回合任一出口闸上注入队列:此后 inject 命令一律拒绝(防往已死回合的队列里塞而丢消息)。
+struct InjectGuard(Arc<Mutex<super::InjectState>>);
+impl Drop for InjectGuard {
+    fn drop(&mut self) {
+        if let Ok(mut st) = self.0.lock() {
+            st.finishing = true;
+        }
+    }
+}
+
+/// 轮间排空注入队列:把排队插进来的 user 消息落库 + 发 Injected + append 进 request(下一轮带上)。
+async fn drain_injections(
+    store: &Store,
+    conv_id: i64,
+    tx: &mpsc::Sender<TurnEvent>,
+    inject: &Arc<Mutex<super::InjectState>>,
+    request: &mut ChatRequest,
+) {
+    let items = {
+        let mut st = inject.lock().expect("inject lock poisoned");
+        std::mem::take(&mut st.buffer)
+    };
+    for it in items {
+        apply_injection(store, conv_id, tx, request, it).await;
+    }
+}
+
+/// 收尾前原子检查:队列空 → 置 finishing 收尾(返回空);非空 → 取出注入交调用方
+/// (调用方落完本段回复后再 apply,保证 assistant(回复) 在 user(注入) 之前,历史顺序正确)。
+fn take_or_finish(inject: &Arc<Mutex<super::InjectState>>) -> Vec<super::InjectReady> {
+    let mut st = inject.lock().expect("inject lock poisoned");
+    if st.buffer.is_empty() {
+        st.finishing = true; // 原子闸上:此后 inject 命令一律拒绝(防丢)
+        Vec::new()
+    } else {
+        std::mem::take(&mut st.buffer)
+    }
+}
+
+/// 一条注入:落 user 行 → 发 Injected(带 id + 原话 + 小票)→ append 进 request(下一轮带上)。
+async fn apply_injection(
+    store: &Store,
+    conv_id: i64,
+    tx: &mpsc::Sender<TurnEvent>,
+    request: &mut ChatRequest,
+    it: super::InjectReady,
+) {
+    if let Some(id) = persist_row(store, conv_id, "user", &it.display, it.payload.as_deref()).await {
+        let _ = tx
+            .send(TurnEvent::Injected { message_id: id, text: it.display, attachments: it.refs })
+            .await;
+    }
+    request.messages.push(ChatMessage::user_with_parts(it.llm_content, it.parts));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{InjectReady, InjectState};
+
+    fn temp_store(name: &str) -> Store {
+        let p = std::env::temp_dir().join(format!("lw_turn_{}_{}.db", std::process::id(), name));
+        let _ = std::fs::remove_file(&p);
+        Store::open(&p).unwrap()
+    }
+    fn ready(text: &str) -> InjectReady {
+        InjectReady {
+            display: text.into(),
+            llm_content: text.into(),
+            parts: Vec::new(),
+            refs: Vec::new(),
+            payload: None,
+        }
+    }
+
+    // 插队应用:落 user 行 + 发 Injected + append 进 request(下一轮 LLM 就带上)
+    #[tokio::test]
+    async fn apply_injection_persists_emits_and_appends() {
+        let store = temp_store("apply");
+        let uid = store.users.ensure_default_user().unwrap().id;
+        let conv = store.chat.create_conversation(uid, "companion").unwrap();
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+        let mut request = ChatRequest::default();
+
+        apply_injection(&store, conv.id, &tx, &mut request, ready("插一句:主角叫小七")).await;
+
+        assert!(
+            matches!(request.messages.last(), Some(ChatMessage::User { content, .. }) if content == "插一句:主角叫小七"),
+            "注入的 user 消息要 append 进 request",
+        );
+        match rx.try_recv() {
+            Ok(TurnEvent::Injected { message_id, text, .. }) => {
+                assert!(message_id > 0);
+                assert_eq!(text, "插一句:主角叫小七");
+            }
+            other => panic!("应发 Injected,实际 {other:?}"),
+        }
+        let msgs = store.chat.recent_messages(conv.id, 10).unwrap();
+        assert!(msgs.iter().any(|m| m.role == "user" && m.content == "插一句:主角叫小七"), "落库一条 user 行");
+    }
+
+    // 收尾闸:空队列 → 置 finishing 收尾(原子防丢:此后 inject 命令一律拒绝)
+    #[test]
+    fn take_or_finish_sets_finishing_when_empty() {
+        let inject = Arc::new(Mutex::new(InjectState::default()));
+        let pending = take_or_finish(&inject);
+        assert!(pending.is_empty(), "空队列返回空");
+        assert!(inject.lock().unwrap().finishing, "收尾后闸应置位");
+    }
+
+    // 收尾前有插队 → 取出注入、不置 finishing、队列清空(交调用方落完本段回复后再 apply)
+    #[test]
+    fn take_or_finish_takes_items_without_finishing() {
+        let inject = Arc::new(Mutex::new(InjectState::default()));
+        inject.lock().unwrap().buffer.push(ready("等下,改成科幻风"));
+        let pending = take_or_finish(&inject);
+        assert_eq!(pending.len(), 1, "非空时取出注入");
+        assert_eq!(pending[0].display, "等下,改成科幻风");
+        assert!(!inject.lock().unwrap().finishing, "有插队时不置 finishing");
+        assert!(inject.lock().unwrap().buffer.is_empty(), "取出后队列清空");
     }
 }
 

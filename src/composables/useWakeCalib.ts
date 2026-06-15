@@ -15,10 +15,10 @@ export interface CalibResult {
 }
 
 const state = reactive({
-  /** 标定进行中(录音/计算);收尾(done/idle)= false。 */
+  /** 标定进行中(准备/录音/计算);收尾(done/idle)= false。 */
   running: false,
-  /** 阶段:idle 未开始 | recording 录样本 | computing 扫描中 | done 出结果。 */
-  phase: 'idle' as 'idle' | 'recording' | 'computing' | 'done',
+  /** 阶段:idle 未开始 | preparing 备模型 | recording 录样本 | computing 扫描中 | done 出结果。 */
+  phase: 'idle' as 'idle' | 'preparing' | 'recording' | 'computing' | 'done',
   /** 正在录第 step/total 段(step 从 1 计;最后一段 = 底噪/环境音)。 */
   step: 0,
   total: 0,
@@ -59,6 +59,12 @@ function wire() {
     }
     // 仅在标定进行中消费通用 state(否则会被听写/唤醒的 state 干扰)
     if (state.running && v.type === 'state') {
+      if (v.data.phase === 'preparing') {
+        // 备模型(首次可能要下个小模型):别让向导停在"第 0 遍"
+        state.phase = 'preparing'
+        state.listening = false
+        return
+      }
       state.listening = v.data.phase === 'listening'
       // 最后一段(底噪)录完回 idle → 进入"计算中"
       if (v.data.phase === 'idle' && state.total > 0 && state.step >= state.total) {
@@ -71,7 +77,7 @@ function wire() {
 function start() {
   if (state.running) return
   state.running = true
-  state.phase = 'recording'
+  state.phase = 'preparing' // 备模型可能要等(首次下小模型),先显"准备中"而非"第 0 遍"
   state.step = 0
   state.total = 0
   state.listening = false
@@ -139,7 +145,9 @@ function fakeRun() {
       fakeTimer = setTimeout(() => tick(step + 1), 350)
     }, 900)
   }
-  tick(1)
+  // 先 preparing 一小会儿(仿首次备模型),再进录音
+  state.phase = 'preparing'
+  fakeTimer = setTimeout(() => tick(1), 500)
 }
 
 export function useWakeCalib() {

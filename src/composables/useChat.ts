@@ -90,6 +90,8 @@ const state = reactive({
 let localId = -1 // 本地占位 id 用负数,与落库的正数 id 永不冲突
 let turnSeq = 0 // 回合序号:流中再发会开新回合,旧回合的迟到事件按此作废,不串台(并发发送防竞态)
 let turnInFlight = false // 回合是否在飞:打字发送遇它=进排队区(Phase A:整轮结束自动合并发)
+// 插队(PLAN §9 B):已 inject 出去、等 Injected 事件落地成气泡的展示态(带缩略图)。FIFO 与事件序对齐。
+let pendingInjects: { text: string; attachments: UiAttachment[] }[] = []
 let bootStarted = false
 let fakeTimer: ReturnType<typeof setTimeout> | undefined
 
@@ -449,6 +451,36 @@ function dequeue(i: number) {
   state.queue.splice(i, 1)
 }
 
+/** 插队(PLAN §9 B):把排队区合并成一条塞进正在跑的回合,下一轮 LLM 就带上(不打断)。
+ *  后端没接住(没在飞 / 回合正收尾)→ 退化为普通发送起新回合。 */
+function inject() {
+  if (!state.queue.length) return
+  const items = state.queue.splice(0, state.queue.length)
+  const text = items.map((it) => it.text).filter(Boolean).join('\n')
+  const attachments = items.flatMap((it) => it.attachments)
+  if (!state.inTauri) {
+    // 浏览器预览无真引擎/在飞回合:退化为普通发送(fakeStream 单轮,插队≈追加)
+    send(text, 'typed', undefined, attachments)
+    return
+  }
+  const out: OutAttachment[] = attachments
+    .filter((a) => a.base64)
+    .map((a) => ({ name: a.name, mime: a.mime || '', data: a.base64! }))
+  const stash = { text, attachments } // 展示态(带缩略图)暂存,等 Injected 事件落地成气泡
+  pendingInjects.push(stash)
+  const fallback = () => {
+    const i = pendingInjects.indexOf(stash)
+    if (i >= 0) pendingInjects.splice(i, 1) // 撤回暂存
+    send(text, 'typed', undefined, attachments) // 改普通发送起新回合
+  }
+  api
+    .injectMessage(state.convId, text, { input: 'typed', speak: false }, out)
+    .then((delivered) => {
+      if (!delivered) fallback()
+    })
+    .catch(fallback)
+}
+
 function send(
   text: string,
   source: 'typed' | 'mic' | 'wake' = 'typed',
@@ -516,7 +548,7 @@ function send(
   state.messages.push({ id: localId--, role: 'wang', text: '' })
   // 必须从 reactive 数组取回代理再改:reactive() 是惰性代理,push 存的是裸对象,
   // 直接改裸对象 Vue 不追踪 —— 流式逐字、deep watch、物理避让全都会失灵
-  const wang = state.messages[state.messages.length - 1]
+  let wang = state.messages[state.messages.length - 1] // 插队会令它重指到新回复气泡
   state.mood = 'thinking'
   state.usage.turn = null // 新回合,灯带"本轮"读数清零
   state.usage.turnStartedAt = Date.now() // 端到端计时:从用户按下发送起(体感真值)
@@ -556,6 +588,28 @@ function send(
           turnHadTrace = true
           state.mood = 'thinking'
           break
+        case 'injected': {
+          // 插队被回合接住(PLAN §9 B):收尾当前回复气泡 → 插用户气泡 → 开新回复气泡(后续 delta 进新泡)
+          twFlush() // 当前 wang 已收到的字放完(它答的是上一段输入)
+          const stash = pendingInjects.shift()
+          state.messages.push({
+            id: ev.data.message_id,
+            role: 'user',
+            text: ev.data.text,
+            at: Date.now(),
+            attachments:
+              stash && stash.attachments.length
+                ? stash.attachments.map((a) => ({ kind: a.kind, name: a.name, mime: a.mime, dataUrl: a.dataUrl }))
+                : undefined,
+          })
+          state.messages.push({ id: localId--, role: 'wang', text: '' })
+          wang = state.messages[state.messages.length - 1] // 重指到新回复气泡
+          twStart(wang)
+          fullText = '' // 新一段回复,__IGNORE__ 判定重置
+          turnHadTrace = false
+          state.mood = 'thinking'
+          break
+        }
         case 'usage':
           applyRound(ev.data.round)
           state.usage.today = ev.data.today // 后端账本快照,天然防双计/跨午夜
@@ -797,5 +851,5 @@ function fakeStream(msg: UiMessage, full: string, speak = false) {
 export function useChat() {
   void boot()
   wireVoiceActivity()
-  return { state, send, cancel, selectConversation, newConversation, ensureVoiceConv, saveApiKey, dequeue }
+  return { state, send, cancel, selectConversation, newConversation, ensureVoiceConv, saveApiKey, dequeue, inject }
 }

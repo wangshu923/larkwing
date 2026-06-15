@@ -167,6 +167,7 @@ watch(
   },
 )
 const calibStepLabel = computed(() => {
+  if (calib.phase === 'preparing') return t('settings.voice.calibPreparing')
   if (calib.phase === 'computing') return t('settings.voice.calibComputing')
   if (calib.total > 0 && calib.step >= calib.total) return t('settings.voice.calibAmbient')
   return t('settings.voice.calibRound', { n: calib.step, total: Math.max(calib.total - 1, 0) })
@@ -343,6 +344,10 @@ function clearWeatherKey() {
 }
 function setWeatherHost(ev: Event) {
   settings.set('weather.qweather.host', (ev.target as HTMLInputElement).value.trim())
+}
+// 全局代理(直连优先、失败兜底走代理;留空=关)。下载/LLM 现读即生效,无需重启。
+function setProxy(ev: Event) {
+  settings.set('net.proxy', (ev.target as HTMLInputElement).value.trim())
 }
 function openQWeatherSite() {
   window.open('https://dev.qweather.com/', '_blank', 'noopener')
@@ -923,6 +928,18 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           </span>
         </div>
         <p class="hint">{{ t('settings.system.floatHint') }}</p>
+
+        <p class="section">{{ t('settings.system.network') }}</p>
+        <div class="row">
+          <span class="label">{{ t('settings.system.proxy') }}</span>
+          <input
+            class="s-input s-mono-input"
+            :value="settings.get('net.proxy')"
+            :placeholder="t('settings.system.proxyPlaceholder')"
+            @change="setProxy"
+          />
+        </div>
+        <p class="hint">{{ t('settings.system.proxyHint') }}</p>
 
         <p class="section">{{ t('settings.system.about') }}</p>
         <div class="row">

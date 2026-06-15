@@ -36,6 +36,9 @@ const DEFAULTS: Record<string, string> = {
   // 天气(PLAN 天气块):key 是秘密 → 后端回掩码(····xxxx),空 = 用免 key Open-Meteo;host 非秘密专属接口地址
   'weather.qweather.key': '',
   'weather.qweather.host': '',
+  // 全局代理(传输层):空 = 关(直连);否则 http(s)://host:port / socks5(h):// / ${ENV}。
+  // 直连优先、连接失败兜底走代理(墙内源永不被代理);Rust 白名单 net.proxy 逐键对应。
+  'net.proxy': '',
   // 桌面悬浮窗(PLAN §12);ui.* 走 engine set_setting 的 ui. 分支自动放行(无需改 Rust 白名单)
   'ui.float.enabled': '1', // '1' 开 / '0' 关
   'ui.float.opacity': '0.8', // 0.4–1.0

@@ -111,18 +111,15 @@ pub(crate) fn candidates(url: &str, mirrors: &[String]) -> Vec<String> {
 pub struct Components {
     dir: PathBuf,
     tasks: Tasks,
-    http: reqwest::Client,
+    net: crate::net::Client,
     /// 并发去重:同一组件同时只有一个下载在跑(后到的等同一份结果)。
     locks: [tokio::sync::Mutex<()>; 2],
 }
 
 impl Components {
     pub fn new(dir: PathBuf, tasks: Tasks) -> Components {
-        let http = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("reqwest client");
-        Components { dir, tasks, http, locks: Default::default() }
+        let net = crate::net::Client::new(|b| b.connect_timeout(std::time::Duration::from_secs(10)));
+        Components { dir, tasks, net, locks: Default::default() }
     }
 
     /// 组件就绪:托管目录命中 → PATH 兜底(开发机)→ 用时下载(进度上 HUD)。
@@ -158,35 +155,19 @@ impl Components {
         tokio::fs::create_dir_all(&self.dir).await?;
         let part = self.dir.join(format!("{}.part", spec.bin_name));
 
-        // 1. 拉文件:镜像依次尝试,哪个先通用哪个
-        let mut fetched = None;
-        let mut last_err: Option<anyhow::Error> = None;
-        for url in candidates(spec.url, mirrors) {
-            let host = url.split('/').nth(2).unwrap_or("?").to_string();
-            task.step("step.connect", serde_json::json!({ "host": host }));
-            match self.fetch_to(&url, &part, task).await {
-                Ok(()) => {
-                    fetched = Some(url);
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!(url, err = %format!("{e:#}"), "下载失败,换下一个源");
-                    last_err = Some(e);
-                }
-            }
-        }
-        let used_url = match fetched {
-            Some(u) => u,
-            None => return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("没有可用下载源"))),
-        };
+        // 1. 拉文件:候选(镜像展开)先全直连一趟,全败且配了代理再全走代理一趟
+        let fetched =
+            fetch_candidates(&self.net, &candidates(spec.url, mirrors), &part, task).await?;
 
         // 2. 校验(发布方有 SUMS 才校;清单经同一镜像取,信任锚 = TLS + 镜像声誉)
         if let Some(sums_url) = spec.sums_url {
             task.step("step.verify", serde_json::Value::Null);
-            let mirror = used_url.strip_suffix(spec.url).unwrap_or("");
+            let mirror = fetched.url.strip_suffix(spec.url).unwrap_or("");
             let sums_full = format!("{mirror}{sums_url}");
-            let sums = self
-                .http
+            // SUMS 走与二进制相同的通道:代理趟下来的就也走代理,否则直连
+            let client = if fetched.via_proxy { self.net.proxy_client() } else { None }
+                .unwrap_or_else(|| self.net.direct().clone());
+            let sums = client
                 .get(&sums_full)
                 .send()
                 .await
@@ -225,10 +206,42 @@ impl Components {
         Ok(())
     }
 
-    /// 流式落盘 + 进度上报;见自由函数 `fetch_url_to`(voice 模型下载共用)。
-    async fn fetch_to(&self, url: &str, dest: &Path, task: &TaskHandle) -> Result<()> {
-        fetch_url_to(&self.http, url, dest, task).await
+}
+
+/// 一次成功的取数:用了哪个 URL + 是否经代理(供 SUMS 等后续请求走同一通道)。
+pub(crate) struct Fetched {
+    pub url: String,
+    pub via_proxy: bool,
+}
+
+/// 从候选 URL 列表下载到 dest:**先全直连一趟,全败且配了代理再全走代理一趟**
+/// (voice 模型下载共用)。任一候选成功即返回。代理关 ⇒ 只有直连一趟。
+pub(crate) async fn fetch_candidates(
+    net: &crate::net::Client,
+    urls: &[String],
+    dest: &Path,
+    task: &TaskHandle,
+) -> Result<Fetched> {
+    let proxy = net.proxy_client();
+    let mut passes: Vec<(&reqwest::Client, bool)> = vec![(net.direct(), false)];
+    if let Some(p) = proxy.as_ref() {
+        passes.push((p, true));
     }
+    let mut last_err: Option<anyhow::Error> = None;
+    for (client, via_proxy) in passes {
+        for url in urls {
+            let host = url.split('/').nth(2).unwrap_or("?").to_string();
+            task.step("step.connect", serde_json::json!({ "host": host, "proxy": via_proxy }));
+            match fetch_url_to(client, url, dest, task).await {
+                Ok(()) => return Ok(Fetched { url: url.clone(), via_proxy }),
+                Err(e) => {
+                    tracing::warn!(url, via_proxy, err = %format!("{e:#}"), "下载失败,换源/通道");
+                    last_err = Some(e);
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("没有可用下载源")))
 }
 
 /// 流式落盘 + 进度上报(≥1% 才报一次,别刷屏);单 chunk 30s 无数据判失败。

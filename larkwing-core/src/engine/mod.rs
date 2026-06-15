@@ -36,6 +36,9 @@ pub enum TurnEvent {
     /// 记账灯带:本轮消耗 + 今日/会话累计快照(工具回合每轮各发一次;累计直接来自库,
     /// 前端只展示不记账)。provider 没回 usage(严格端点/假流)就不发 —— 不点没数据的灯。
     Usage { round: UsageDigest, today: DayUsage, conv: crate::store::UsageTotals },
+    /// 插队(PLAN §9 B):回合在飞时注入的一条 user 消息已落库,之后的回复另起一段。
+    /// 前端据此:收尾当前回复气泡 → 插用户气泡 → 开新回复气泡。
+    Injected { message_id: i64, text: String, attachments: Vec<AttachmentRef> },
     /// 带落库 id:前端把流式文本与持久消息对账。
     Done { message_id: i64 },
     Failed { kind: ErrorKind, message: String },
@@ -200,6 +203,7 @@ const APP_SETTING_KEYS: &[&str] = &[
     "voice.wake.sensitivity",
     "voice.tts_backend",
     "weather.qweather.host",
+    "net.proxy",
 ];
 
 /// 语音的用户级设置(PLAN §11 逐键放行,不开 voice.* 通配——同前缀跨两个 scope)。
@@ -323,7 +327,70 @@ struct TurnHandle {
 #[derive(Default)]
 struct SessionSlot {
     inflight: Option<TurnHandle>,
+    /// 插队(PLAN §9 B):在飞回合的注入队列;回合在轮间/收尾前排空它。
+    inject: Option<Arc<Mutex<InjectState>>>,
     // 以后的会话级住户:工具已读标记、稳定前缀缓存、会话内统计(PLAN §4)
+}
+
+/// 插队队列状态:回合在飞时被注入的 user 消息缓冲 + 收尾闸(原子防丢)。
+#[derive(Default)]
+pub(crate) struct InjectState {
+    pub buffer: Vec<InjectReady>,
+    /// 回合已进入收尾(原子置位):此后 inject 一律拒绝,改由前端起新回合。
+    pub finishing: bool,
+}
+
+/// 一条注入消息的就绪形(命令侧已处理好附件):display 落库 / llm_content 进 request /
+/// parts 是图 / refs 给 Injected 事件 / payload 是落库 UserMeta JSON(默认形 None)。
+pub(crate) struct InjectReady {
+    pub display: String,
+    pub llm_content: String,
+    pub parts: Vec<crate::llm::ContentPart>,
+    pub refs: Vec<AttachmentRef>,
+    pub payload: Option<String>,
+}
+
+/// 入站附件 → (图 image_url parts, 文档抽出的文字, 落库小票)。send_message 与插队共用。
+fn process_attachments(
+    attachments: &[InAttachment],
+) -> (Vec<crate::llm::ContentPart>, String, Vec<AttachmentRef>) {
+    use base64::Engine as _;
+    let mut image_parts = Vec::new();
+    let mut doc_text = String::new();
+    let mut refs = Vec::new();
+    for a in attachments {
+        if crate::attach::is_image(&a.mime) {
+            image_parts.push(crate::llm::ContentPart::ImageUrl {
+                url: format!("data:{};base64,{}", a.mime, a.data),
+            });
+            refs.push(AttachmentRef { kind: "image".into(), name: a.name.clone(), mime: a.mime.clone() });
+            continue;
+        }
+        let extracted = base64::engine::general_purpose::STANDARD
+            .decode(a.data.as_bytes())
+            .ok()
+            .and_then(|bytes| crate::attach::extract_doc_text(&a.name, &a.mime, &bytes));
+        match extracted {
+            Some(t) => doc_text.push_str(&format!("\n\n〔附件:{}〕\n{t}", a.name)),
+            None => doc_text.push_str(&format!("\n\n〔附件:{}(暂时读不出内容)〕", a.name)),
+        }
+        refs.push(AttachmentRef { kind: "doc".into(), name: a.name.clone(), mime: a.mime.clone() });
+    }
+    (image_parts, doc_text, refs)
+}
+
+/// 命令侧构造一条注入的就绪形(处理附件 + 物化 meta + 拼 LLM 文本)。
+fn build_inject_ready(
+    text: String,
+    meta: Option<UserMeta>,
+    attachments: Vec<InAttachment>,
+) -> InjectReady {
+    let (parts, doc_text, refs) = process_attachments(&attachments);
+    let mut eff_meta = meta.unwrap_or_default();
+    eff_meta.attachments = refs.clone();
+    let payload = (!eff_meta.is_default()).then(|| serde_json::to_string(&eff_meta).ok()).flatten();
+    let llm_content = format!("{text}{doc_text}");
+    InjectReady { display: text, llm_content, parts, refs, payload }
 }
 
 // ---------- Engine ----------
@@ -361,6 +428,9 @@ impl Engine {
         for scene in scenes.all() {
             scene.validate(&tools).expect("内置场景未通过工具校验");
         }
+        // 代理总开关落全局(启动即生效;之后 set_setting 改了会刷新)。net 模块不碰
+        // store/llm,故解析(读设置 + ${ENV} + env 回落)的合流放在 engine——唯一合流点。
+        crate::net::set_proxy(Self::resolve_proxy(&store));
         let bus = media.bus().clone();
         Arc::new(Engine {
             store,
@@ -371,6 +441,19 @@ impl Engine {
             bus,
             sessions: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// 解析代理:`net.proxy`(过 `${ENV}`)优先,空则回落环境变量(net::env_proxy)。
+    /// net 模块刻意不碰 store/llm;此处是 store×llm 合流点,故解析放这。
+    fn resolve_proxy(store: &Store) -> Option<String> {
+        store
+            .settings
+            .get(None, "net.proxy")
+            .ok()
+            .flatten()
+            .map(|v| crate::llm::registry::resolve_env(&v).trim().to_string())
+            .filter(|v| !v.is_empty())
+            .or_else(crate::net::env_proxy)
     }
 
     /// 全局事件车道(测试/调度器观测用)。
@@ -674,6 +757,22 @@ impl Engine {
                     return Err(invalid("天气服务地址要以 http(s) 开头"));
                 }
                 self.store.settings.set(None, key, v)?;
+                Ok(())
+            }
+            // 全局代理(app 级,PLAN §代理):空 = 关(直连),否则 http(s)/socks5(h) 或 ${ENV};
+            // 写库后立即刷新全局 net(下载/LLM 现读即生效,无需重启)。
+            "net.proxy" => {
+                let v = value.trim();
+                let ok = v.is_empty()
+                    || v.contains("${")
+                    || ["http://", "https://", "socks5://", "socks5h://"]
+                        .iter()
+                        .any(|p| v.starts_with(p));
+                if !ok {
+                    return Err(invalid("代理地址要以 http(s):// 或 socks5(h):// 开头(或留空关闭)"));
+                }
+                self.store.settings.set(None, key, v)?;
+                crate::net::set_proxy(Self::resolve_proxy(&self.store));
                 Ok(())
             }
             _ => Err(invalid("不在设置白名单内")),
@@ -1099,35 +1198,9 @@ impl Engine {
         let conv_user = conversation.user_id;
         let (request, user_msg_id, mem_user) = tokio::task::spawn_blocking(
             move || -> anyhow::Result<(crate::llm::ChatRequest, i64, i64)> {
-            use base64::Engine as _;
             // 入站附件(媒体输入 PLAN §9):图 → image_url 当轮注入;文档 → 抽文字当轮注入;
-            // 只把小票(AttachmentRef)落 payload,附件本体不进持久前缀(省 token/体积)
-            let mut image_parts: Vec<crate::llm::ContentPart> = Vec::new();
-            let mut doc_text = String::new();
-            let mut att_refs: Vec<AttachmentRef> = Vec::new();
-            for a in &attachments {
-                if crate::attach::is_image(&a.mime) {
-                    // 图不在 core 解码,直接拼 data URL 交视觉模型
-                    image_parts.push(crate::llm::ContentPart::ImageUrl {
-                        url: format!("data:{};base64,{}", a.mime, a.data),
-                    });
-                    att_refs.push(AttachmentRef {
-                        kind: "image".into(), name: a.name.clone(), mime: a.mime.clone(),
-                    });
-                    continue;
-                }
-                let extracted = base64::engine::general_purpose::STANDARD
-                    .decode(a.data.as_bytes())
-                    .ok()
-                    .and_then(|bytes| crate::attach::extract_doc_text(&a.name, &a.mime, &bytes));
-                match extracted {
-                    Some(t) => doc_text.push_str(&format!("\n\n〔附件:{}〕\n{t}", a.name)),
-                    None => doc_text.push_str(&format!("\n\n〔附件:{}(暂时读不出内容)〕", a.name)),
-                }
-                att_refs.push(AttachmentRef {
-                    kind: "doc".into(), name: a.name.clone(), mime: a.mime.clone(),
-                });
-            }
+            // 只把小票(AttachmentRef)落 payload,附件本体不进持久前缀(省 token/体积)。与插队共用
+            let (image_parts, doc_text, att_refs) = process_attachments(&attachments);
 
             // 语音会话模式(PLAN §11)+ 附件小票:非默认形态物化进 payload(真相在库)
             let mut eff_meta = meta.unwrap_or_default();
@@ -1204,6 +1277,43 @@ impl Engine {
         self.launch(conv_id, mem_user, candidates, request, tool_subset, user_msg_id).await
     }
 
+    /// 插队(PLAN §9 B):把一条消息塞进**正在跑的回合**,它在下一次 LLM 调用就带上(不打断)。
+    /// 返回 false = 没有在飞回合 / 回合正收尾 —— 调用方(前端)改用普通发送起新回合。
+    pub async fn inject(
+        &self,
+        conv_id: i64,
+        text: String,
+        meta: Option<UserMeta>,
+        attachments: Vec<InAttachment>,
+    ) -> bool {
+        // 取在飞回合的注入句柄(锁内只 clone Arc)
+        let inject = {
+            let sessions = self.sessions.lock().expect("sessions lock poisoned");
+            sessions.get(&conv_id).and_then(|slot| slot.inject.clone())
+        };
+        let Some(inject) = inject else { return false };
+        // 提前拒:已在收尾就别处理了
+        if inject.lock().expect("inject lock poisoned").finishing {
+            return false;
+        }
+        // 处理附件(阻塞下沉线程池)→ 就绪形
+        let ready = match tokio::task::spawn_blocking(move || {
+            build_inject_ready(text, meta, attachments)
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+        // 入队(再查一次 finishing:处理期间回合可能已收尾,原子防丢)
+        let mut st = inject.lock().expect("inject lock poisoned");
+        if st.finishing {
+            return false;
+        }
+        st.buffer.push(ready);
+        true
+    }
+
     /// 共用尾段:开流(建连失败按候选顺序切换)→ spawn 回合 → 登记在飞。
     /// 全军覆没报主选的错误(最有代表性)。开流之后的失败不切换 —— 半截话已经
     /// 流向用户,静默换供应商重说会精神分裂,走既有 Failed 友好兜底。
@@ -1246,6 +1356,7 @@ impl Engine {
         // 记账用的模型 id:单轮覆盖优先,否则取选中 provider 的默认模型
         let model =
             request.options.model.clone().unwrap_or_else(|| provider.model_id().to_string());
+        let inject = Arc::new(Mutex::new(InjectState::default())); // 插队队列:Turn 与 inject 命令共用
         let join = tokio::spawn(
             turn::Turn {
                 store: self.store.clone(),
@@ -1262,15 +1373,16 @@ impl Engine {
                 tools: tool_subset,
                 media: self.media.clone(),
                 rx: rx_llm,
+                inject: inject.clone(),
             }
             .run(),
         );
-        self.sessions
-            .lock()
-            .expect("sessions lock poisoned")
-            .entry(conv_id)
-            .or_default()
-            .inflight = Some(TurnHandle { token, join });
+        {
+            let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+            let slot = sessions.entry(conv_id).or_default();
+            slot.inflight = Some(TurnHandle { token, join });
+            slot.inject = Some(inject);
+        }
         Ok(rx)
     }
 

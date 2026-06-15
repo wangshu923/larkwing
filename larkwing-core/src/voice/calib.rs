@@ -4,7 +4,8 @@
 //! - sherpa KWS **不暴露分数**,只给命中/不命中 → 标定 = 二值阈值扫描(非读连续分)。
 //! - **拼写轴(B)**:canonical 读音 + `to_pinyin_multi` 异读,经模型词表 split_syllable 编码、
 //!   去重;只采纳「比 canonical 在更严阈值上仍稳触发」的异读(≥1 档),否则留 canonical。
-//! - **阈值轴(A)**:对每个阈值建一个含全部候选拼写(@v{i} 标签)的 spotter,喂正/负样本,
+//! - **阈值轴(A)**:**只建一次** spotter(加载一次 onnx),逐阈值用 `create_stream_with_keywords`
+//!   + 每词内联 `#threshold` 注入关键词喂正/负样本(不重建模型——重建 9 次在 Windows 上会卡到分钟级);
 //!   得 recall[拼写][阈值] 与 false-accept[拼写][阈值];**偏召回**选阈(用户痛点是「叫不应」):
 //!   取「负样本不误触的最宽松档」上方一档作余量,封顶在召回悬崖。
 //! - 写回:阈值经 `threshold_to_sensitivity` 落到既有 `voice.wake.sensitivity`(滑块随之更新);
@@ -39,6 +40,8 @@ pub(super) struct Variant {
 /// 标定产出:落到设置的灵敏度 + 可选拼写覆盖行 + 该档召回 + 结论(key,非文案)。
 #[derive(Debug, Clone)]
 pub(super) struct CalibOutcome {
+    /// 标定的唤醒词(拼写覆盖按词键入用)。
+    pub word: String,
     pub sensitivity: u32,
     /// 非 canonical 被采纳时 = "tok… @词"整行;否则 None(用 canonical 编码即可)。
     pub spelling: Option<String>,
@@ -157,11 +160,13 @@ pub(super) fn candidate_spellings(word: &str, vocab: &HashSet<String>) -> Vec<Va
 // ---- 阈值轴(A):扫描 ----
 
 /// 喂一段音频(100ms 块 + 0.5s 静音尾 flush),返回命中的 @标签集合(如 {"v0","v2"})。
-fn detect(spotter: &sherpa_onnx::KeywordSpotter, samples: &[f32]) -> HashSet<String> {
+/// 关键词经 `create_stream_with_keywords` 按流注入(**不重建 spotter / 不重载模型**),
+/// 阈值走每词内联 `#threshold`(k2-fsa 关键词格式:`tok… :boost #threshold @词`)。
+fn detect(spotter: &sherpa_onnx::KeywordSpotter, keywords: &str, samples: &[f32]) -> HashSet<String> {
     let rate = super::TARGET_RATE as i32;
     let chunk = (super::TARGET_RATE as usize / 10).max(1);
     let tail = vec![0f32; super::TARGET_RATE as usize / 2];
-    let st = spotter.create_stream();
+    let st = spotter.create_stream_with_keywords(keywords);
     let mut hits = HashSet::new();
     for data in [samples, tail.as_slice()] {
         for c in data.chunks(chunk) {
@@ -180,9 +185,22 @@ fn detect(spotter: &sherpa_onnx::KeywordSpotter, samples: &[f32]) -> HashSet<Str
     hits
 }
 
-/// 扫描:每个阈值建一个含全部候选拼写(@v{i})的 spotter,喂全部正/负样本。
-/// 返回 (recall[拼写][阈值]=命中正样本数, fa[拼写][阈值]=负样本是否误触)。
-/// 一阈值一次建模(每档 spotter 复用于全部拼写+样本):9 次建模,KWS 模型小,秒级可接受。
+/// 一档阈值下,全部候选拼写的关键词串:`tok… :boost #threshold @v{i}`(顺序据 k2-fsa 文档,
+/// `:`/`#` 后紧跟浮点不留空格)。`@v{i}` 是回报命中用的标签。
+fn keywords_at(variants: &[Variant], thr: f32) -> String {
+    variants
+        .iter()
+        .enumerate()
+        .map(|(i, v)| format!("{} :{} #{} @v{i}", v.tokens, wake::KWS_SCORE, thr))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 扫描:**只建一次 spotter**(加载一次 onnx),逐阈值用 `create_stream_with_keywords` + 内联
+/// `#threshold` 注入关键词喂全部正/负样本。返回 (recall[拼写][阈值]=命中正样本数,
+/// fa[拼写][阈值]=负样本是否误触)。
+/// 旧法每阈值重建一次 spotter(9 次重载模型),Windows 上能卡到分钟级(见 examples/calib_perf);
+/// 改成"建一次、按流换词"后,扫描只剩纯解码,秒级。
 fn sweep(
     kws_dir: &Path,
     variants: &[Variant],
@@ -193,26 +211,22 @@ fn sweep(
     let n_thr = GRID.len();
     let mut recall = vec![vec![0u32; n_thr]; n_var];
     let mut fa = vec![vec![false; n_thr]; n_var];
-    let buf = variants
-        .iter()
-        .enumerate()
-        .map(|(i, v)| format!("{} @v{i}", v.tokens))
-        .collect::<Vec<_>>()
-        .join("\n");
+    // 默认词表随便给个有效的(逐流都会用 with_keywords 覆盖);全局阈值放最低不挡。
+    let cfg = wake::kws_config(kws_dir, &keywords_at(variants, GRID[0]), GRID[0], wake::KWS_SCORE);
+    let spotter = sherpa_onnx::KeywordSpotter::create(&cfg)
+        .ok_or_else(|| anyhow!("KWS 标定 spotter 创建失败"))?;
     let tag = |i: usize| format!("v{i}");
     for (ti, &thr) in GRID.iter().enumerate() {
-        let cfg = wake::kws_config(kws_dir, &buf, thr, wake::KWS_SCORE);
-        let spotter = sherpa_onnx::KeywordSpotter::create(&cfg)
-            .ok_or_else(|| anyhow!("KWS 标定 spotter 创建失败(thr={thr})"))?;
+        let kw = keywords_at(variants, thr);
         for utt in positives {
-            let fired = detect(&spotter, utt);
+            let fired = detect(&spotter, &kw, utt);
             for i in 0..n_var {
                 if fired.contains(&tag(i)) {
                     recall[i][ti] += 1;
                 }
             }
         }
-        let fired_neg = detect(&spotter, negative);
+        let fired_neg = detect(&spotter, &kw, negative);
         for i in 0..n_var {
             if fired_neg.contains(&tag(i)) {
                 fa[i][ti] = true;
@@ -292,6 +306,13 @@ pub(super) fn calibrate(
     if positives.is_empty() {
         bail!("没有可用的录音样本");
     }
+    tracing::info!(
+        word,
+        variants = variants.len(),
+        positives = positives.len(),
+        thresholds = GRID.len(),
+        "唤醒标定:扫描中(建一次 spotter,逐阈值换词)"
+    );
     let (recall, fa) = sweep(kws_dir, &variants, positives, negative)?;
     let n_pos = positives.len() as u32;
     let decisions: Vec<VariantDecision> =
@@ -313,6 +334,7 @@ pub(super) fn calibrate(
         "唤醒标定完成"
     );
     Ok(CalibOutcome {
+        word: word.to_string(),
         sensitivity: threshold_to_sensitivity(GRID[dec.i_pick]),
         spelling,
         recall: dec.recall_at_pick,

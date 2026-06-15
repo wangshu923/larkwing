@@ -47,6 +47,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(6); // 开听后多久没人
 const LEVEL_EVERY_WINDOWS: u32 = 3; // 电平事件节流:每 3 窗 ≈ 96ms ≈ 10Hz
 const CALIB_TAKES: u8 = 5; // 唤醒标定:录几遍正样本(+1 段底噪/负样本)
 const CALIB_AMBIENT_SECS: f32 = 4.0; // 标定底噪/负样本采集时长
+const CALIB_COMPUTE_SECS: u64 = 60; // 扫描计算超时兜底(正常 1~3s;超时=组件异常,报错不无限转)
 
 /// 「听我说话的耐心」三档(voice.patience,user 级)→ VAD hangover(静音多久算说完)。
 fn hangover_secs(patience: &str) -> f32 {
@@ -487,105 +488,14 @@ impl VoiceRuntime {
     // ---- 唤醒录音标定(PLAN §11 后续):录几遍 → 一次扫描定拼写(B)+ 阈值(A)→ 写回 ----
 
     /// 录 N 段唤醒词 + 1 段底噪 → calib 扫描 → 写回 voice.wake.sensitivity(+ 必要时 .spelling)。
-    /// 立即返回(壳层 fire-and-forget),进展走 Voice 车道(CalibProgress/State/CalibResult)。
-    /// 占听写会话槽(防并发开麦)+ 挂起唤醒循环;取消 = listen_stop(false)(复用 ctl)。
+    /// 立即返回(壳层 fire-and-forget),进展走 Voice 车道(Preparing/CalibProgress/State/CalibResult)。
+    /// **任何**早退(没词/下载失败/语音忙/采集错)都收尾成 CalibResult,绝不让向导永久转圈。
     pub async fn calibrate_wake(&self) -> Result<()> {
-        let word = self
-            .wake_keywords()
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("没有唤醒词,先设一个再校准"))?;
-        let mirrors = self.mirrors();
-        let kws_dir = self.inner.models.ensure_tar(&models::KWS_ZIPFORMER_ZH, &mirrors).await?;
-        let (vad_model, asr) = self.ensure_engines().await?;
-
-        // 抢会话槽(与听写互斥,二者都开麦);失败 = 语音正忙
-        let (ctl, gen) = {
-            let mut slot = self.inner.session.lock().expect("voice session lock");
-            if slot.is_some() {
-                bail!("语音正忙,稍后再校准");
-            }
-            let ctl = Arc::new(AtomicU8::new(CTL_RUN));
-            let gen = self.inner.gen.fetch_add(1, Ordering::Relaxed) + 1;
-            *slot = Some(SessionCtl { ctl: ctl.clone(), gen });
-            (ctl, gen)
-        };
-        self.wake_suspend(true);
-
-        let rt = self.clone();
-        let word2 = word.clone();
-        let kws_dir2 = kws_dir.clone();
-        let joined = tokio::task::spawn_blocking(move || -> Result<calib::CalibOutcome> {
-            let vocab = wake::load_vocab(&kws_dir2.join("tokens.txt"))?;
-            let hangover = hangover_secs(&rt.patience());
-            let total = CALIB_TAKES + 1; // +1 末尾底噪段
-            let mut positives: Vec<Vec<f32>> = Vec::with_capacity(CALIB_TAKES as usize);
-            let mut take = 0u8;
-            let mut attempts = 0u8;
-            while take < CALIB_TAKES {
-                if ctl.load(Ordering::Relaxed) == CTL_CANCEL {
-                    bail!("__CANCELLED__");
-                }
-                attempts += 1;
-                if attempts > CALIB_TAKES * 3 {
-                    bail!("没听清你说的唤醒词,先到这"); // 防 ASR 一直不符卡死
-                }
-                rt.publish(VoiceEvent::CalibProgress { step: take + 1, total });
-                rt.publish(VoiceEvent::State { phase: VoicePhase::Listening });
-                let vad = new_vad(&vad_model, hangover)?;
-                let pipe = open_capture(rt.input_device())?;
-                let out = collect_utterance(&pipe, &vad, &rt, Some(&ctl), START_TIMEOUT, hangover)?;
-                drop(pipe);
-                rt.publish(VoiceEvent::State { phase: VoicePhase::Idle });
-                let pcm = match out {
-                    CaptureOut::Utterance(p) => p,
-                    CaptureOut::Cancelled => bail!("__CANCELLED__"),
-                    CaptureOut::Empty => continue, // 没开口:这遍重来(不计 take)
-                };
-                if (pcm.len() as f32) < MIN_SPEECH_S * TARGET_RATE as f32 {
-                    continue;
-                }
-                // ASR 确认这段确实是唤醒词(防把别的话当样本污染标定);用 AGC 后副本送识别
-                let mut chk = pcm.clone();
-                peak_normalize(&mut chk);
-                let heard = asr.transcribe(&chk).unwrap_or_default();
-                if !calib_text_matches(&heard, &word2) {
-                    tracing::info!(heard, want = %word2, "标定样本不符,重录这遍");
-                    continue;
-                }
-                positives.push(pcm); // RAW(未过 AGC):忠于生产 KWS 输入(wake 循环喂 raw)
-                take += 1;
-            }
-            // 末尾 1 段底噪/负样本(不要求说话):度量误触
-            if ctl.load(Ordering::Relaxed) == CTL_CANCEL {
-                bail!("__CANCELLED__");
-            }
-            rt.publish(VoiceEvent::CalibProgress { step: total, total });
-            rt.publish(VoiceEvent::State { phase: VoicePhase::Listening });
-            let negative = capture_ambient(&rt)?;
-            rt.publish(VoiceEvent::State { phase: VoicePhase::Idle });
-
-            calib::calibrate(&kws_dir2, &word2, &vocab, &positives, &negative)
-        })
-        .await;
-
-        // 收尾:清自己这代会话槽 + 恢复唤醒丢帧(无论成败)
-        {
-            let mut slot = self.inner.session.lock().expect("voice session lock");
-            if slot.as_ref().map(|s| s.gen) == Some(gen) {
-                *slot = None;
-            }
-        }
-        self.publish(VoiceEvent::State { phase: VoicePhase::Idle });
-        self.wake_suspend(false);
-
-        let result = match joined {
-            Ok(r) => r,
-            Err(e) => Err(anyhow!(e).context("唤醒标定任务挂了")),
-        };
-        match result {
+        // 立刻给"准备中":KWS/VAD 首次要下个小模型(各几 MB,秒级),别让向导卡在"第 0 遍"
+        self.publish(VoiceEvent::State { phase: VoicePhase::Preparing });
+        match self.run_calibration().await {
             Ok(o) => {
-                // 写回:阈值经灵敏度(滑块随之刷新);非 canonical 拼写落覆盖表
+                // 写回:阈值经灵敏度(滑块随之刷新);非 canonical 拼写落覆盖表(按词键入)
                 self.inner.store.settings.set(
                     None,
                     "voice.wake.sensitivity",
@@ -593,7 +503,7 @@ impl VoiceRuntime {
                 )?;
                 if let Some(line) = &o.spelling {
                     let mut map = self.wake_spelling_overrides();
-                    map.insert(word.clone(), line.clone());
+                    map.insert(o.word.clone(), line.clone());
                     if let Ok(json) = serde_json::to_string(&map) {
                         self.inner.store.settings.set(None, "voice.wake.spelling", &json)?;
                     }
@@ -617,6 +527,8 @@ impl VoiceRuntime {
             Err(e) => {
                 let msg = format!("{e:#}");
                 let cancelled = msg.contains("__CANCELLED__");
+                tracing::warn!(err = %msg, "唤醒标定未完成");
+                self.publish(VoiceEvent::State { phase: VoicePhase::Idle });
                 self.publish(VoiceEvent::CalibResult {
                     ok: false,
                     sensitivity: 0,
@@ -624,12 +536,133 @@ impl VoiceRuntime {
                     adopted_spelling: false,
                     verdict: if cancelled { "cancelled".into() } else { "error".into() },
                 });
-                if cancelled {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
+                // 早退已被前端收尾,这里不再向上抛(命令层只会吞掉记日志)
+                Ok(())
             }
+        }
+    }
+
+    /// 标定主体:备模型(KWS+VAD 必需,ASR 可选)→ 占会话槽 → 录采 + 扫描。
+    /// 失败照常回错(由 calibrate_wake 统一收尾 CalibResult);会话槽/挂起态保证收尾还原。
+    async fn run_calibration(&self) -> Result<calib::CalibOutcome> {
+        let word = self
+            .wake_keywords()
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("没有唤醒词,先设一个再校准"))?;
+        let mirrors = self.mirrors();
+        // 标定硬依赖只有 KWS(~4MB)+ VAD(~2MB),秒级。**不**为标定单拉 230MB 的 ASR 大模型。
+        let kws_dir = self.inner.models.ensure_tar(&models::KWS_ZIPFORMER_ZH, &mirrors).await?;
+        let vad_model =
+            self.inner.models.ensure(&models::SILERO_VAD, &mirrors).await?.join("silero_vad.onnx");
+        // ASR 只用于"确认这段确实是唤醒词"——已下好才用(顺手把样本质量把一道关);
+        // 没下好就跳过这道关(靠 KWS 扫描天然容错:听岔的样本不命中 = 自动降权),不拖慢首次标定。
+        let asr: Option<Arc<SherpaAsr>> = if self.inner.models.is_ready(&models::ASR_SENSE_VOICE) {
+            self.ensure_engines().await.ok().map(|(_, a)| a)
+        } else {
+            None
+        };
+
+        // 抢会话槽(与听写互斥,二者都开麦);失败 = 语音正忙
+        let (ctl, gen) = {
+            let mut slot = self.inner.session.lock().expect("voice session lock");
+            if slot.is_some() {
+                bail!("语音正忙,稍后再校准");
+            }
+            let ctl = Arc::new(AtomicU8::new(CTL_RUN));
+            let gen = self.inner.gen.fetch_add(1, Ordering::Relaxed) + 1;
+            *slot = Some(SessionCtl { ctl: ctl.clone(), gen });
+            (ctl, gen)
+        };
+        self.wake_suspend(true);
+
+        // ---- 录音(用户节奏,不设硬超时;靠 START_TIMEOUT + 重试上限自然收敛)----
+        let rt = self.clone();
+        let word_cap = word.clone();
+        let captured = tokio::task::spawn_blocking(move || -> Result<(Vec<Vec<f32>>, Vec<f32>)> {
+            let hangover = hangover_secs(&rt.patience());
+            let total = CALIB_TAKES + 1; // +1 末尾底噪段
+            let mut positives: Vec<Vec<f32>> = Vec::with_capacity(CALIB_TAKES as usize);
+            let mut take = 0u8;
+            let mut attempts = 0u8;
+            while take < CALIB_TAKES {
+                if ctl.load(Ordering::Relaxed) == CTL_CANCEL {
+                    bail!("__CANCELLED__");
+                }
+                attempts += 1;
+                if attempts > CALIB_TAKES * 3 {
+                    bail!("没听清你说的唤醒词,先到这"); // 防一直没开口/不符卡死
+                }
+                rt.publish(VoiceEvent::CalibProgress { step: take + 1, total });
+                rt.publish(VoiceEvent::State { phase: VoicePhase::Listening });
+                let vad = new_vad(&vad_model, hangover)?;
+                let pipe = open_capture(rt.input_device())?;
+                let out = collect_utterance(&pipe, &vad, &rt, Some(&ctl), START_TIMEOUT, hangover)?;
+                drop(pipe);
+                rt.publish(VoiceEvent::State { phase: VoicePhase::Idle });
+                let pcm = match out {
+                    CaptureOut::Utterance(p) => p,
+                    CaptureOut::Cancelled => bail!("__CANCELLED__"),
+                    CaptureOut::Empty => continue, // 没开口:这遍重来(不计 take)
+                };
+                if (pcm.len() as f32) < MIN_SPEECH_S * TARGET_RATE as f32 {
+                    continue;
+                }
+                // 有 ASR 才确认(没下大模型就不卡这关);用 AGC 后副本送识别,样本仍存 RAW
+                if let Some(asr) = &asr {
+                    let mut chk = pcm.clone();
+                    peak_normalize(&mut chk);
+                    let heard = asr.transcribe(&chk).unwrap_or_default();
+                    if !calib_text_matches(&heard, &word_cap) {
+                        tracing::info!(heard, want = %word_cap, "标定样本不符,重录这遍");
+                        continue;
+                    }
+                }
+                positives.push(pcm); // RAW(未过 AGC):忠于生产 KWS 输入(wake 循环喂 raw)
+                take += 1;
+            }
+            // 末尾 1 段底噪/负样本(不要求说话):度量误触
+            if ctl.load(Ordering::Relaxed) == CTL_CANCEL {
+                bail!("__CANCELLED__");
+            }
+            rt.publish(VoiceEvent::CalibProgress { step: total, total });
+            rt.publish(VoiceEvent::State { phase: VoicePhase::Listening });
+            let negative = capture_ambient(&rt)?;
+            rt.publish(VoiceEvent::State { phase: VoicePhase::Idle });
+            Ok((positives, negative))
+        })
+        .await;
+
+        // 录音收尾:释放会话槽 + 恢复唤醒(计算不碰麦,先放开)
+        {
+            let mut slot = self.inner.session.lock().expect("voice session lock");
+            if slot.as_ref().map(|s| s.gen) == Some(gen) {
+                *slot = None;
+            }
+        }
+        self.wake_suspend(false);
+
+        let (positives, negative) = match captured {
+            Ok(Ok(x)) => x,
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(anyhow!(e).context("唤醒标定录音任务挂了")),
+        };
+
+        // ---- 扫描计算(有界;超时兜底,绝不无限转)----
+        let kws_dir2 = kws_dir.clone();
+        let word2 = word.clone();
+        let computed = tokio::time::timeout(
+            Duration::from_secs(CALIB_COMPUTE_SECS),
+            tokio::task::spawn_blocking(move || -> Result<calib::CalibOutcome> {
+                let vocab = wake::load_vocab(&kws_dir2.join("tokens.txt"))?;
+                calib::calibrate(&kws_dir2, &word2, &vocab, &positives, &negative)
+            }),
+        )
+        .await;
+        match computed {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => Err(anyhow!(e).context("唤醒标定计算任务挂了")),
+            Err(_) => bail!("标定计算超时(组件异常),先到这"),
         }
     }
 

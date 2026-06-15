@@ -56,6 +56,19 @@ pub async fn send_message(
     Ok(())
 }
 
+/// 插队(PLAN §9 B):把消息塞进正在跑的回合,下一轮 LLM 带上(不打断)。
+/// 返回 false = 没在飞 / 回合正收尾,前端改用普通 send 起新回合。
+#[tauri::command]
+pub async fn inject_message(
+    state: State<'_, AppState>,
+    conv_id: i64,
+    text: String,
+    meta: Option<larkwing_core::engine::UserMeta>,
+    attachments: Option<Vec<larkwing_core::engine::InAttachment>>,
+) -> Result<bool, AppError> {
+    Ok(state.engine.inject(conv_id, text, meta, attachments.unwrap_or_default()).await)
+}
+
 /// 停止按钮;幂等。
 #[tauri::command]
 pub async fn cancel_generation(state: State<'_, AppState>, conv_id: i64) -> Result<(), AppError> {

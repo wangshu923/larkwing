@@ -8,6 +8,7 @@ pub mod engine;
 pub mod files;
 pub mod llm;
 pub mod media;
+pub mod net;
 pub mod scenes;
 pub mod scheduler;
 pub mod store;

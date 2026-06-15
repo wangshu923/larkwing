@@ -13,16 +13,13 @@ const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub struct OpenAiCompatProvider {
     cfg: LlmConfig,
-    http: reqwest::Client,
+    net: crate::net::Client,
 }
 
 impl OpenAiCompatProvider {
     pub fn new(cfg: LlmConfig) -> Self {
-        let http = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("构建 HTTP client 失败");
-        Self { cfg, http }
+        let net = crate::net::Client::new(|b| b.connect_timeout(std::time::Duration::from_secs(10)));
+        Self { cfg, net }
     }
 
     /// 出向方言翻译:中立 ChatRequest → OpenAI 系请求体。
@@ -149,9 +146,9 @@ impl OpenAiCompatProvider {
         builder
     }
 
-    /// 独立成函数供测试检视。
-    fn request_builder(&self, url: &str) -> reqwest::RequestBuilder {
-        self.with_auth(self.http.post(url))
+    /// 独立成函数供测试检视;client 由调用方传入(net 选路:直连或代理)。
+    fn request_builder(&self, client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
+        self.with_auth(client.post(url))
     }
 }
 
@@ -297,9 +294,8 @@ impl LlmProvider for OpenAiCompatProvider {
         }
         let url = format!("{}/user/balance", self.cfg.base_url.trim_end_matches('/'));
         let resp = self
-            .with_auth(self.http.get(&url))
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
+            .net
+            .send(&url, |c| self.with_auth(c.get(&url)).timeout(std::time::Duration::from_secs(10)))
             .await
             .ok()?;
         if !resp.status().is_success() {
@@ -319,10 +315,10 @@ impl LlmProvider for OpenAiCompatProvider {
             return Err(LlmError::NoApiKey);
         }
         let url = format!("{}/chat/completions", self.cfg.base_url.trim_end_matches('/'));
+        let body = self.to_wire(&req);
         let resp = self
-            .request_builder(&url)
-            .json(&self.to_wire(&req))
-            .send()
+            .net
+            .send(&url, |c| self.request_builder(c, &url).json(&body))
             .await
             .map_err(|e| LlmError::Network(e.to_string()))?;
 
@@ -719,8 +715,8 @@ mod tests {
         let build = |quirks: crate::llm::Quirks| {
             let mut cfg = LlmConfig::deepseek("sk-test".into());
             cfg.quirks = quirks;
-            OpenAiCompatProvider::new(cfg)
-                .request_builder("https://example.com/v1/chat/completions")
+            let p = OpenAiCompatProvider::new(cfg);
+            p.request_builder(p.net.direct(), "https://example.com/v1/chat/completions")
                 .build()
                 .unwrap()
         };
