@@ -225,8 +225,6 @@ pub struct Speaker {
 pub const SPEAKERS_ZH: &[Speaker] = &[
     Speaker { id: "zh-CN-XiaoxiaoNeural", name: "晓晓 · 温柔" },
     Speaker { id: "zh-CN-XiaoyiNeural", name: "晓伊 · 可爱" },
-    Speaker { id: "zh-CN-XiaohanNeural", name: "晓涵 · 讲故事" },
-    Speaker { id: "zh-CN-XiaochenNeural", name: "晓辰 · 活泼" },
     Speaker { id: "zh-CN-YunxiNeural", name: "云希 · 少年" },
     Speaker { id: "zh-CN-YunjianNeural", name: "云健 · 沉稳" },
 ];

@@ -46,8 +46,6 @@ async function loadVoice() {
       speakers: [
         { id: 'zh-CN-XiaoxiaoNeural', name: '晓晓 · 温柔' },
         { id: 'zh-CN-XiaoyiNeural', name: '晓伊 · 可爱' },
-        { id: 'zh-CN-XiaohanNeural', name: '晓涵 · 讲故事' },
-        { id: 'zh-CN-XiaochenNeural', name: '晓辰 · 活泼' },
         { id: 'zh-CN-YunxiNeural', name: '云希 · 少年' },
         { id: 'zh-CN-YunjianNeural', name: '云健 · 沉稳' },
         { id: 'clone:demo', name: '我的声音(示例)', isClone: true, builtin: false },

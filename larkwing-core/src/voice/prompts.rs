@@ -63,9 +63,12 @@ impl PromptBank {
 
     async fn clip_for(rt: &super::VoiceRuntime, text: &str) -> Result<Clip> {
         let path = rt.tts_to_file(text).await?; // 进同一个 TTS 缓存,二次启动零合成
+        // 产物容器随音色引擎而变:在线 edge = mp3,离线 vits / 克隆音色 = wav。按扩展名选解码器,
+        // 别一律当 mp3——否则克隆/离线音色的 wav 解不开 → 短句银行空 → 唤醒「叫不应」一声不出。
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("mp3").to_ascii_lowercase();
         let bytes = tokio::fs::read(&path).await?;
         tokio::task::spawn_blocking(move || -> Result<Clip> {
-            let (pcm, rate) = decode_mp3(&bytes)?;
+            let (pcm, rate) = if ext == "wav" { decode_wav(&bytes)? } else { decode_mp3(&bytes)? };
             let samples = trim_silence(&pcm, rate);
             anyhow::ensure!(!samples.is_empty(), "解码出空音频");
             Ok(Clip { samples, rate })
@@ -178,6 +181,34 @@ fn decode_mp3(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
     Ok((out, rate))
 }
 
+/// wav → f32 mono PCM(离线 vits / 克隆音色的产物;`tts::pcm_f32_to_wav` 的逆)。自带解析,
+/// 免给 symphonia 加 wav/pcm 特性(本项目按 mp3-only 编)。逐子块扫到 data 读 16-bit PCM:
+/// 唤醒短句走 cpal 原生直出需先解成 PCM(`<audio>` 那条路浏览器自解,故仅此处要解 wav)。
+fn decode_wav(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
+    anyhow::ensure!(
+        bytes.len() >= 44 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
+        "不是 WAV(RIFF/WAVE 头缺失)"
+    );
+    let rate = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]); // fmt 子块固定在最前
+    let mut i = 12; // 跳过 RIFF 头,逐子块扫
+    while i + 8 <= bytes.len() {
+        let id = &bytes[i..i + 4];
+        let len =
+            u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]]) as usize;
+        let body = i + 8;
+        if id == b"data" {
+            let end = (body + len).min(bytes.len());
+            let pcm = bytes[body..end]
+                .chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+                .collect();
+            return Ok((pcm, rate));
+        }
+        i = body + len + (len & 1); // 子块按偶数字节对齐
+    }
+    bail!("WAV 没有 data 子块")
+}
+
 /// 裁首尾静音(robot 验证参数:幅值阈 0.015≈500/32768,留 30ms 余量)。
 pub(super) fn trim_silence(pcm: &[f32], rate: u32) -> Vec<f32> {
     const THRESHOLD: f32 = 0.015;
@@ -272,6 +303,19 @@ pub(super) fn play_pcm_blocking_signaled(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_wav_roundtrips_pcm_f32_to_wav() {
+        // 克隆/离线音色出 wav,唤醒短句要能解回 PCM(否则「叫不应」无声)。与 tts::pcm_f32_to_wav 对偶。
+        let samples = vec![0.0f32, 0.5, -0.5, 0.25, -0.25, 1.0, -1.0];
+        let wav = crate::voice::tts::pcm_f32_to_wav(&samples, 24_000);
+        let (pcm, rate) = decode_wav(&wav).expect("解码 wav");
+        assert_eq!(rate, 24_000);
+        assert_eq!(pcm.len(), samples.len());
+        for (a, b) in pcm.iter().zip(&samples) {
+            assert!((a - b).abs() < 1e-3, "{a} vs {b}"); // i16 量化误差
+        }
+    }
 
     #[test]
     fn trim_cuts_padding_but_keeps_margin() {
