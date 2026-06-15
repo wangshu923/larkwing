@@ -14,17 +14,16 @@ const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                   (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
 pub struct Bilibili {
-    http: reqwest::Client,
+    net: crate::net::Client,
 }
 
 impl Bilibili {
     pub fn new() -> Bilibili {
-        let http = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(15))
-            .build()
-            .expect("reqwest client");
-        Bilibili { http }
+        let net = crate::net::Client::new(|b| {
+            b.connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(15))
+        });
+        Bilibili { net }
     }
 }
 
@@ -56,21 +55,26 @@ impl MediaSource for Bilibili {
         if keyword.is_empty() {
             return Ok(Vec::new());
         }
-        let mut req = self
-            .http
-            .get(SEARCH_URL)
-            .query(&[
-                ("search_type", "video"),
-                ("keyword", keyword),
-                ("page", "1"),
-                ("order", "totalrank"),
-            ])
-            .header("User-Agent", UA)
-            .header("Referer", "https://www.bilibili.com/");
-        if let Some(cookie) = cookie_header {
-            req = req.header("Cookie", cookie);
-        }
-        let resp = req.send().await.map_err(|e| SearchError::Other(anyhow!("搜索请求失败: {e}")))?;
+        let resp = self
+            .net
+            .send(SEARCH_URL, |c| {
+                let req = c
+                    .get(SEARCH_URL)
+                    .query(&[
+                        ("search_type", "video"),
+                        ("keyword", keyword),
+                        ("page", "1"),
+                        ("order", "totalrank"),
+                    ])
+                    .header("User-Agent", UA)
+                    .header("Referer", "https://www.bilibili.com/");
+                match cookie_header {
+                    Some(cookie) => req.header("Cookie", cookie),
+                    None => req,
+                }
+            })
+            .await
+            .map_err(|e| SearchError::Other(anyhow!("搜索请求失败: {e}")))?;
         let status = resp.status().as_u16();
         if status == 412 || status == 403 {
             return Err(SearchError::RiskControl);

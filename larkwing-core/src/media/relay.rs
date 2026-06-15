@@ -32,7 +32,7 @@ enum Entry {
 struct Inner {
     port: u16,
     streams: Mutex<HashMap<String, Arc<Entry>>>,
-    http: reqwest::Client,
+    net: crate::net::Client,
     counter: AtomicU64,
 }
 
@@ -51,11 +51,9 @@ impl Relay {
         let inner = Arc::new(Inner {
             port,
             streams: Mutex::new(HashMap::new()),
-            // 上游是大文件流:只设建连超时,不设整体超时(空闲保护靠链路自身断流)
-            http: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .expect("reqwest client"),
+            // 上游是大文件流:只设建连超时,不设整体超时(空闲保护靠链路自身断流)。
+            // 走统一 net::Client(CLAUDE.md §5):墙内 CDN 直连优先永不代理,未来墙外源(YouTube 等)直连失败自动落代理。
+            net: crate::net::Client::new(|b| b.connect_timeout(std::time::Duration::from_secs(10))),
             counter: AtomicU64::new(1),
         });
         let app = Router::new()
@@ -173,14 +171,20 @@ async fn direct(
     let Some(entry) = lookup(&state, &token) else { return bad(StatusCode::NOT_FOUND) };
     let Entry::Direct(up) = entry.as_ref() else { return bad(StatusCode::NOT_FOUND) };
 
-    let mut req = state.http.get(&up.url);
-    for (k, v) in &up.headers {
-        req = req.header(k, v);
-    }
-    if let Some(range) = headers.get(axum::http::header::RANGE) {
-        req = req.header(axum::http::header::RANGE, range);
-    }
-    let upstream = match req.send().await {
+    let upstream = match state
+        .net
+        .send(&up.url, |c| {
+            let mut req = c.get(&up.url);
+            for (k, v) in &up.headers {
+                req = req.header(k, v);
+            }
+            if let Some(range) = headers.get(axum::http::header::RANGE) {
+                req = req.header(axum::http::header::RANGE, range);
+            }
+            req
+        })
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("上游拉流失败: {e}");
@@ -350,7 +354,7 @@ mod tests {
         let inner = Arc::new(Inner {
             port: 12345,
             streams: Mutex::new(HashMap::new()),
-            http: reqwest::Client::new(),
+            net: crate::net::Client::new(|b| b),
             counter: AtomicU64::new(1),
         });
         let relay = Relay { inner };
