@@ -51,8 +51,9 @@ impl BriefingWrite {
                 name: "briefing_write",
                 description: "把「这个家的环境信息」记进家庭备忘:资源放在哪(电影/动画片目录、\
                               NAS 路径)、设备位置、家里的惯例。按主题(domain)整存整取:同一主题\
-                              再次写入会**整体覆盖**旧内容,所以更新时要把该主题完整的最新状态\
-                              一次写全。关于「人」的事(名字/喜好/忌口)不用这个,用 remember。",
+                              再次写入会**整体覆盖**旧内容,所以不管是更正还是补充新信息,都要把\
+                              该主题已有内容连同新内容一起写全(只有旧信息确实作废了才整段替掉)。\
+                              关于「人」的事(名字/喜好/忌口)不用这个,用 remember。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -108,6 +109,9 @@ impl Tool for BriefingWrite {
                 .list_for(user_id)?
                 .into_iter()
                 .find(|b| b.scope == scope && b.domain == domain);
+            // 覆盖时回显旧内容:让模型(和回头看的用户)当场发现「该留的没带上」,
+            // 不静默吃数据(宪法 §3.5 不静默失败)。
+            let old_content = existing.as_ref().map(|b| b.content.clone());
             let old_chars = existing
                 .as_ref()
                 .filter(|b| b.resident)
@@ -117,12 +121,17 @@ impl Tool for BriefingWrite {
             let total = store.briefings.resident_chars(user_id)? - old_chars + new_chars;
             let resident = total <= RESIDENT_BUDGET_CHARS;
             store.briefings.upsert(&scope, &domain, &content, resident)?;
+            let verb = if old_content.is_some() { "已更新" } else { "已记入" };
+            let detail = match &old_content {
+                Some(old) => format!("。(此前记的是:{old})"),
+                None => String::new(),
+            };
             Ok(if resident {
-                format!("ok,已记入家庭备忘(主题: {domain})")
+                format!("ok,{verb}家庭备忘(主题: {domain}){detail}")
             } else {
                 format!(
-                    "已记入家庭备忘(主题: {domain}),但常驻区满了,这条记成了按需查询 —— \
-                     用的时候需要先查一下备忘"
+                    "{verb}家庭备忘(主题: {domain}),但常驻区满了,这条记成了按需查询 —— \
+                     用的时候需要先查一下备忘{detail}"
                 )
             })
         })
@@ -296,6 +305,26 @@ mod tests {
             .await
             .unwrap()
             .contains("没有"));
+    }
+
+    #[tokio::test]
+    async fn overwrite_echoes_old_content_not_silent() {
+        let ctx = ctx("echo");
+        let w = BriefingWrite::new();
+        // 首次写:报「已记入」,无旧内容可回显。
+        let first = w
+            .run(serde_json::json!({"domain": "media", "content": "动画片在 NAS 的 kids"}), &ctx)
+            .await
+            .unwrap();
+        assert!(first.starts_with("ok,已记入"), "首次=已记入: {first}");
+        assert!(!first.contains("此前记的是"), "首次无可回显的旧内容: {first}");
+        // 再写同主题:报「已更新」并回显被覆盖的旧内容 —— 不静默吃数据。
+        let second = w
+            .run(serde_json::json!({"domain": "media", "content": "电影在 D:\\Movies"}), &ctx)
+            .await
+            .unwrap();
+        assert!(second.starts_with("ok,已更新"), "再写=已更新: {second}");
+        assert!(second.contains("此前记的是:动画片在 NAS 的 kids"), "回显旧内容: {second}");
     }
 
     #[tokio::test]
