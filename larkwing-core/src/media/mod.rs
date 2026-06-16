@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::bus::{AppEvent, Bus, MediaEvent, Text};
+use crate::bus::{AppEvent, Bus, MediaEvent, TaskRetry, Text};
 use crate::components::{Component, Components, DEFAULT_GH_MIRRORS};
 use crate::store::Store;
 use crate::tasks::Tasks;
@@ -263,7 +263,12 @@ impl MediaRuntime {
                     anyhow::bail!("这个内容需要登录才能播放({detail})");
                 }
                 Err(e) => {
-                    task.fail("task.err.resolve", serde_json::Value::Null);
+                    // 解析失败多为网络/瞬时:给重放口(UI 显「重试」,点击直连重播同一 url)
+                    task.fail_retryable(
+                        "task.err.resolve",
+                        serde_json::Value::Null,
+                        TaskRetry::MediaPlay { page_url: page_url.to_string(), audio_only },
+                    );
                     anyhow::bail!("解析失败: {e}");
                 }
             };
@@ -281,7 +286,12 @@ impl MediaRuntime {
             let ffmpeg = match self.ensure_component(Component::Ffmpeg).await {
                 Ok(p) => p,
                 Err(e) => {
-                    task.fail("task.err.download", serde_json::Value::Null);
+                    // 组件(ffmpeg)下载失败同属可重试:同样给重放口
+                    task.fail_retryable(
+                        "task.err.download",
+                        serde_json::Value::Null,
+                        TaskRetry::MediaPlay { page_url: page_url.to_string(), audio_only },
+                    );
                     return Err(e);
                 }
             };

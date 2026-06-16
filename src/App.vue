@@ -15,6 +15,7 @@ import {
   api,
   isTauri,
   onOpenConversation,
+  onShowFloat,
   setFloatVisible,
   win,
   windowLabel,
@@ -37,7 +38,7 @@ const backdrop = computed(() => (settings.state.skin === 'warm' ? WarmBackdrop :
 
 // 主窗专属编排(PLAN §12):托盘菜单文案 + 悬浮窗显隐(enabled × 主窗是否在前)+ 通知跳会话。
 if (!isFloat && isTauri()) {
-  void api.setTrayMenu(t('tray.open'), t('tray.quit'))
+  void api.setTrayMenu(t('tray.open'), t('tray.showFloat'), t('tray.quit'))
   const floatOn = () => settings.get('ui.float.enabled') !== '0'
   // 显隐规则(§12 E 修订 2026-06-14):悬浮窗与主窗共存——master 开关 ui.float.enabled 开着就常驻,
   // 不再随主窗聚焦藏匿(用户:开了就一直有)。唯一例外:主窗全屏(沉浸观感,如看视频)时让位,退出即恢复
@@ -54,6 +55,12 @@ if (!isFloat && isTauri()) {
   win.onResized(syncFloat)
   // 悬浮窗点通知 → 主窗切到该会话
   onOpenConversation((convId) => useChat().selectConversation(convId))
+  // 托盘「显示悬浮窗」→ 重开:置 master 开关(持久化 + 广播)再显示;
+  // enabled=1 后续 syncFloat(全屏切换等)也维持显示,不会被策略重新藏掉。
+  onShowFloat(() => {
+    settings.set('ui.float.enabled', '1')
+    void setFloatVisible(true)
+  })
 }
 // 备选皮:HudBackdrop / StarfieldBackdrop / ScifiBackdrop / HologramBackdrop / ChatView。
 </script>

@@ -46,6 +46,7 @@ export default {
   // Task HUD: keys map 1:1 to core Text.key (bus.rs); named interpolation params
   task: {
     progress: '{n} in progress',
+    retry: 'Retry', // retry button on a failed task (currently media resolve / component download)
     unknown: 'Background task',
     resolve: 'Resolving the stream',
     download: {
@@ -227,6 +228,7 @@ export default {
   // System tray menu (injected into the shell via set_tray_menu; §6 text lives in the frontend dict)
   tray: {
     open: 'Open 7274',
+    showFloat: 'Show floating window',
     quit: 'Quit',
   },
   // Desktop floating window (PLAN §12 form C)
@@ -243,6 +245,9 @@ export default {
     balance: 'Balance {amount}',
     collapse: 'Collapse',
     close: 'Close the floating window',
+    pause: 'Pause', // mini media controls (forwarded to main)
+    resume: 'Resume',
+    stop: 'Stop',
   },
   settings: {
     title: 'Settings',

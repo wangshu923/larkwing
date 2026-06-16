@@ -17,7 +17,7 @@ import catIdle from '../assets/cat-idle.png'
 
 const { t, te } = useI18n()
 const settings = useSettings()
-const { state, running, nowPlaying, listening, level, wakeArmed, dismissNotice, openMain } = useFloat()
+const { state, running, nowPlaying, mediaPlaying, mediaToggle, mediaStop, listening, level, wakeArmed, dismissNotice, openMain } = useFloat()
 const mood = useAgentMood()
 const idle = useFloatIdle()
 
@@ -203,7 +203,12 @@ onUnmounted(() => stopMoved())
             <i>🎙</i><span class="ellip">{{ t('float.listening') }}</span>
             <span class="wave"><i v-for="(h, i) in waveBars" :key="i" :style="{ height: h + 'px' }" /></span>
           </div>
-          <div v-if="nowPlaying" class="status"><i>♪</i><span class="ellip">{{ nowPlaying.title }}</span></div>
+          <div v-if="nowPlaying" class="status">
+            <i>♪</i><span class="ellip">{{ nowPlaying.title }}</span>
+            <!-- 迷你播控:点击转发主窗(useMedia 按 isFloat 分流;悬浮窗自身不出声) -->
+            <button class="mctl" :title="mediaPlaying ? t('float.pause') : t('float.resume')" @click.stop="mediaToggle()">{{ mediaPlaying ? '⏸' : '▶' }}</button>
+            <button class="mctl" :title="t('float.stop')" @click.stop="mediaStop()">⏹</button>
+          </div>
           <div v-for="tk in running" :key="tk.task_id" class="status">
             <i>⬇</i><span class="ellip">{{ txt(tk.label) }}</span>
             <em v-if="tk.progress != null">{{ Math.round(tk.progress * 100) }}%</em>
@@ -454,5 +459,23 @@ onUnmounted(() => stopMoved())
   color: var(--f-cy);
   font-size: 11px;
 }
+/* 迷你播控钮:幽灵小钮,贴在"正在放"行尾(展开面板内,可点) */
+.mctl {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: rgba(var(--accent-rgb), 0.1);
+  color: var(--f-txt);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.mctl:hover { background: rgba(var(--accent-rgb), 0.22); color: var(--f-cy); }
 .empty { font-size: 11.5px; color: var(--f-txt2); text-align: center; padding: 18px 0; }
 </style>

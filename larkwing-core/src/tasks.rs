@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use crate::bus::{AppEvent, Bus, TaskState, TaskView, Text};
+use crate::bus::{AppEvent, Bus, TaskRetry, TaskState, TaskView, Text};
 
 #[derive(Clone)]
 pub struct Tasks {
@@ -29,6 +29,7 @@ impl Tasks {
             progress: None,
             step: None,
             error: None,
+            retry: None,
         };
         self.bus.publish(AppEvent::Task(view.clone()));
         TaskHandle { bus: self.bus.clone(), view: Mutex::new(view), finished: AtomicBool::new(false) }
@@ -81,6 +82,16 @@ impl TaskHandle {
         self.publish(|v| {
             v.state = TaskState::Failed;
             v.error = Some(Text::with(key, params));
+        });
+    }
+
+    /// 失败且可重放:同 `fail`,额外带上重放入参 → 前端据此显「重试」按钮(PLAN §10)。
+    pub fn fail_retryable(self, key: &str, params: serde_json::Value, retry: TaskRetry) {
+        self.finished.store(true, Ordering::Relaxed);
+        self.publish(|v| {
+            v.state = TaskState::Failed;
+            v.error = Some(Text::with(key, params));
+            v.retry = Some(retry);
         });
     }
 }

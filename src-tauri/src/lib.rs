@@ -196,6 +196,11 @@ pub fn run() {
         })
         .on_menu_event(|app, event| match event.id.as_ref() {
           "open" => show_window(app, "main"),
+          // 重开悬浮窗:交给主窗(它持 ui.float.enabled 真相 + 显隐策略),发事件让它置位 + show。
+          // 主窗哪怕藏在托盘里 JS 仍活着,收得到。
+          "show_float" => {
+            let _ = app.emit("lw:show-float", ());
+          }
           "quit" => app.exit(0),
           _ => {}
         })
@@ -249,6 +254,7 @@ pub fn run() {
       commands::save_provider,
       commands::remove_provider,
       commands::media_login,
+      commands::media_retry,
       commands::voice_listen_start,
       commands::voice_listen_stop,
       commands::voice_status,

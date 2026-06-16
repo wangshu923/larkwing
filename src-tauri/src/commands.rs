@@ -540,6 +540,25 @@ pub async fn media_login(
     Ok(())
 }
 
+/// 失败任务「重试」(PLAN §10):直连重放,不绕 LLM(同嘴控的按钮直连哲学 §7.1)。
+/// 当前唯一可重试 = 影音播放(解析 / 组件下载失败);重放走 media.play,进展 / 结果照常上事件车道
+/// (新任务卡 → running;再失败 → 新 failed 卡又带重试)。spawn 后秒回,UI 靠 app_event 追平。
+#[tauri::command]
+pub fn media_retry(
+    state: State<'_, AppState>,
+    page_url: String,
+    audio_only: bool,
+) -> Result<(), AppError> {
+    let media = state.media.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = media.play(&page_url, audio_only).await {
+            // 失败已由 play() 内部 task.fail_retryable 上报 HUD;这里只留日志
+            tracing::debug!("重试播放失败(已上报 HUD): {e:#}");
+        }
+    });
+    Ok(())
+}
+
 // ---- 开机启动 + 托盘菜单(PLAN §12 常驻临场) ----
 
 use tauri_plugin_autostart::ManagerExt;
@@ -558,15 +577,23 @@ pub fn set_autostart(app: tauri::AppHandle, on: bool) -> Result<(), AppError> {
 }
 
 /// 托盘菜单文案注入(§6 core 不产文案):前端 boot 后把字典文案传进来建菜单。
-/// setup 只建图标 + 左键唤主窗;菜单(打开 / 退出)等这里来。
+/// setup 只建图标 + 左键唤主窗;菜单(打开 / 显示悬浮窗 / 退出)等这里来。
+/// show_float = 重开被关掉的悬浮窗(✕ 关掉后比去设置页更顺手,PLAN §12 收口)。
 #[tauri::command]
-pub fn set_tray_menu(app: tauri::AppHandle, open: String, quit: String) -> Result<(), AppError> {
+pub fn set_tray_menu(
+    app: tauri::AppHandle,
+    open: String,
+    show_float: String,
+    quit: String,
+) -> Result<(), AppError> {
     use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
     let tray = app.tray_by_id("tray").ok_or_else(|| AppError::internal("托盘未就绪"))?;
     let menu = Menu::with_items(
         &app,
         &[
             &MenuItem::with_id(&app, "open", open, true, None::<&str>).map_err(AppError::internal)?,
+            &MenuItem::with_id(&app, "show_float", show_float, true, None::<&str>)
+                .map_err(AppError::internal)?,
             &PredefinedMenuItem::separator(&app).map_err(AppError::internal)?,
             &MenuItem::with_id(&app, "quit", quit, true, None::<&str>).map_err(AppError::internal)?,
         ],

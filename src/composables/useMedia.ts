@@ -5,9 +5,11 @@
 import { reactive } from 'vue'
 import {
   api,
+  emitMediaControl,
   emitNowPlaying,
   isTauri,
   onAppEvent,
+  onMediaControl,
   onNowPlaying,
   win,
   windowLabel,
@@ -41,6 +43,8 @@ let videoBase = 0
 /** 视频起播前主窗是否藏在托盘:停时据此藏回去(别看完视频凭空冒出主界面)。 */
 let videoWasHidden = false
 let wired = false
+/** 悬浮窗(独立 WebView):不出声、只镜像主窗;播控转发给主窗执行(窗口标签恒定,缓存一次)。 */
+const isFloat = windowLabel() === 'float'
 
 function ensureAudio(): HTMLAudioElement {
   if (!audio) {
@@ -53,9 +57,13 @@ function ensureAudio(): HTMLAudioElement {
         state.duration = audio!.duration
       }
     })
-    audio.addEventListener('playing', () => (state.status = 'playing'))
+    audio.addEventListener('playing', () => {
+      state.status = 'playing'
+      syncToPeers() // 状态变化也镜像给悬浮窗(迷你播控的播/暂停图标据此翻转)
+    })
     audio.addEventListener('pause', () => {
       if (state.status !== 'idle') state.status = 'paused'
+      syncToPeers()
     })
     audio.addEventListener('ended', stop)
     audio.addEventListener('error', () => {
@@ -83,9 +91,13 @@ export function registerVideoEl(el: HTMLVideoElement | null) {
   }
   el.addEventListener('loadedmetadata', syncDuration)
   el.addEventListener('durationchange', syncDuration)
-  el.addEventListener('playing', () => (state.status = 'playing'))
+  el.addEventListener('playing', () => {
+    state.status = 'playing'
+    syncToPeers()
+  })
   el.addEventListener('pause', () => {
     if (state.status !== 'idle') state.status = 'paused'
+    syncToPeers()
   })
   el.addEventListener('ended', stop)
   // 出错别卡在 loading(否则换台/混流 seek 失败时 spinner 转不停)
@@ -159,6 +171,8 @@ function resume() {
 }
 
 function toggle() {
+  // 悬浮窗:不出声,把播/暂停转发给主窗执行;按镜像来的状态判方向
+  if (isFloat) return emitMediaControl(state.status === 'playing' ? 'pause' : 'resume')
   state.status === 'playing' ? pause() : resume()
 }
 
@@ -179,7 +193,7 @@ function setRate(v: number) {
 /** 主窗(唯一真播放位)把 current 全量广播给悬浮窗(被动镜像)。绝对态快照 → 幂等;
  *  只主窗发、只悬浮窗收(见 wire),无回声环。悬浮窗自身调用是 no-op(它不该出声当真相源)。 */
 function syncToPeers() {
-  if (windowLabel() !== 'float') emitNowPlaying(state.current)
+  if (!isFloat) emitNowPlaying(state.current, state.status)
 }
 
 function stopElements() {
@@ -194,6 +208,7 @@ function stopElements() {
 }
 
 function stop() {
+  if (isFloat) return emitMediaControl('stop') // 悬浮窗转发,真停在主窗(它清完会广播 null 回来)
   stopElements()
   // 退出视频的窗口态:退全屏 + 撤置顶(✕/ended/模型 stop 都汇到这里)。float 不碰自身窗口
   // ——它的"播放"只是镜像,对悬浮窗做 setFullscreen/setAlwaysOnTop 会误伤它(它常驻置顶)。
@@ -244,20 +259,26 @@ function loginNow() {
   void api.mediaLogin(source, i18n.global.t('media.loginTitle'))
 }
 
+/** 执行一个播控动作(词表外忽略)。嘴控(core)与悬浮窗迷你播控的转发都汇到这里;
+ *  只在主窗(真播放位)调用 —— 此处 pause/resume/stop 等都是本地实控,不再转发。 */
+function applyControl(action: string, value?: number) {
+  if (action === 'pause') pause()
+  else if (action === 'resume') resume()
+  else if (action === 'stop') stop()
+  else if (action === 'louder') setVolume(state.volume + 0.2)
+  else if (action === 'softer') setVolume(state.volume - 0.2)
+  else if (action === 'speed' && value != null) setRate(value)
+  else if (action === 'seek' && value != null) seek(value)
+}
+
 function onMedia(ev: MediaEvent) {
   switch (ev.type) {
     case 'play':
       play(ev.data)
       break
     case 'control':
-      // 模型侧控制(用户用嘴说的);词表外的动作忽略。校验在 core,这里只执行
-      if (ev.data.action === 'pause') pause()
-      else if (ev.data.action === 'resume') resume()
-      else if (ev.data.action === 'stop') stop()
-      else if (ev.data.action === 'louder') setVolume(state.volume + 0.2)
-      else if (ev.data.action === 'softer') setVolume(state.volume - 0.2)
-      else if (ev.data.action === 'speed' && ev.data.value != null) setRate(ev.data.value)
-      else if (ev.data.action === 'seek' && ev.data.value != null) seek(ev.data.value)
+      // 嘴控(core 已校验);只主窗执行 —— 悬浮窗处理会再转发回主窗,徒增重复
+      if (!isFloat) applyControl(ev.data.action, ev.data.value)
       break
     case 'auth_required':
     case 'login_hint':
@@ -276,12 +297,15 @@ function wire() {
     onAppEvent((ev) => {
       if (ev.type === 'media') onMedia(ev.data)
     })
-    // 悬浮窗 = 主窗播放位的被动镜像:current 跟主窗广播走,主窗停了它才清得掉。
-    if (windowLabel() === 'float') {
-      onNowPlaying((np) => {
+    if (isFloat) {
+      // 悬浮窗 = 主窗播放位的被动镜像:current/status 跟主窗广播走(放/暂停/停都追平)
+      onNowPlaying((np, status) => {
         state.current = np
-        state.status = np ? 'playing' : 'idle'
+        state.status = (np ? status : 'idle') as PlayStatus
       })
+    } else {
+      // 主窗(唯一真播放位):收悬浮窗迷你播控的转发,与嘴控汇到同一执行口
+      onMediaControl((action, value) => applyControl(action, value))
     }
     return
   }

@@ -32,6 +32,16 @@ pub enum TaskState {
     Failed,
 }
 
+/// 失败任务的「重试」载体:带上重放这件事所需的最小入参。UI 据此显重试钮,点击直连重放
+/// (按钮直连、不绕 LLM,同嘴控哲学 §7.1)。无 JobRunner 时的轻量重放口(PLAN §10)。
+/// 没有此字段的失败 = 不可重放(被 drop / 需登录),不显重试钮。
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum TaskRetry {
+    /// 重放一次影音播放:入参 = 当初 media_play 的 page_url + audio_only。
+    MediaPlay { page_url: String, audio_only: bool },
+}
+
 /// 任务进度快照(HUD 的词汇):前端按 task_id upsert,每条事件都是全量快照,
 /// 不做增量补丁 —— 错过任意一条,下一条就把状态追平。
 #[derive(Debug, Clone, Serialize)]
@@ -50,6 +60,9 @@ pub struct TaskView {
     pub step: Option<Text>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<Text>,
+    /// 失败且可重放时带上(UI 显「重试」按钮);None = 不可重试。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry: Option<TaskRetry>,
 }
 
 /// 播放器车道。Play/Control 是 core → UI 的指令;UI 本地按钮直接操作播放元素,不绕这里。
@@ -202,6 +215,7 @@ mod tests {
             progress: Some(0.5),
             step: Some(Text::with("step.download", serde_json::json!({"done": 12, "total": 40}))),
             error: None,
+            retry: None,
         }));
         let ev = rx.recv().await.unwrap();
         let v = serde_json::to_value(&ev).unwrap();
@@ -210,5 +224,6 @@ mod tests {
         assert!(v["data"]["label"].get("params").is_none(), "null params 不序列化");
         assert_eq!(v["data"]["step"]["params"]["total"], 40);
         assert!(v["data"].get("error").is_none());
+        assert!(v["data"].get("retry").is_none(), "无 retry 不序列化");
     }
 }

@@ -245,6 +245,10 @@ export interface TextRef {
   params?: Record<string, unknown>
 }
 
+/** 失败任务的重放载体(tagged,镜像 Rust TaskRetry);只在可重试的 failed 任务上有。
+ *  点重试 → 按入参直连重放,不绕 LLM(§7.1 按钮直连哲学)。 */
+export type TaskRetry = { type: 'media_play'; data: { page_url: string; audio_only: boolean } }
+
 /** 任务进度快照:按 task_id upsert,每条都是全量,错过即追平。 */
 export interface TaskView {
   task_id: number
@@ -254,6 +258,8 @@ export interface TaskView {
   progress?: number
   step?: TextRef
   error?: TextRef
+  /** 失败且可重放时带上 → UI 显「重试」按钮;无 = 不可重试。 */
+  retry?: TaskRetry
 }
 
 export interface NowPlaying {
@@ -581,16 +587,30 @@ export function onSkinChanged(cb: (skin: string) => void): void {
   void listen<{ skin: string }>('lw:skin', (e) => cb(e.payload.skin))
 }
 
-/** 主窗是全 app 唯一真出声的播放位;current 一变(放 / 停 / 放完)就把全量快照广播给悬浮窗。
- *  悬浮窗(被动镜像、不出声)据此跟随。传整份 NowPlaying|null = 绝对态 → 幂等、不怕重放,
+/** 主窗是全 app 唯一真出声的播放位;current/status 一变(放 / 暂停 / 停 / 放完)就把全量快照广播给悬浮窗。
+ *  悬浮窗(被动镜像、不出声)据此跟随。传整份 NowPlaying|null + 当前播放态 = 绝对态 → 幂等、不怕重放,
  *  也不会像广播相对动作(louder/toggle)那样翻车。只主窗发、只悬浮窗收(见 useMedia.wire)→ 无回声环。
- *  补 core 事件的盲区:UI 点停止 / 自然播完不经 core,只有这条能让悬浮窗清掉"正在放"。 */
-export function emitNowPlaying(np: NowPlaying | null) {
-  if (isTauri()) void emit('lw:nowplaying', { np })
+ *  补 core 事件的盲区:UI 点停止 / 暂停 / 自然播完不经 core,只有这条能让悬浮窗追平"正在放/已暂停"。 */
+export function emitNowPlaying(np: NowPlaying | null, status: string) {
+  if (isTauri()) void emit('lw:nowplaying', { np, status })
 }
-export function onNowPlaying(cb: (np: NowPlaying | null) => void): void {
+export function onNowPlaying(cb: (np: NowPlaying | null, status: string) => void): void {
   if (!isTauri()) return
-  void listen<{ np: NowPlaying | null }>('lw:nowplaying', (e) => cb(e.payload.np))
+  void listen<{ np: NowPlaying | null; status: string }>('lw:nowplaying', (e) =>
+    cb(e.payload.np, e.payload.status),
+  )
+}
+
+/** 悬浮窗迷你播控 → 主窗(唯一真播放位)执行。只悬浮窗发、只主窗收(见 useMedia.wire)→ 无回声环;
+ *  与嘴控(core MediaEvent::Control)汇到同一 applyControl,动作词表一致(pause/resume/stop/…)。 */
+export function emitMediaControl(action: string, value?: number) {
+  if (isTauri()) void emit('lw:media-control', { action, value })
+}
+export function onMediaControl(cb: (action: string, value?: number) => void): void {
+  if (!isTauri()) return
+  void listen<{ action: string; value?: number }>('lw:media-control', (e) =>
+    cb(e.payload.action, e.payload.value),
+  )
 }
 
 export const api = {
@@ -641,6 +661,9 @@ export const api = {
   removeProvider: (id: string) => invoke<ProviderView[]>('remove_provider', { id }),
   /** 扫码登录窗口;title 从字典取(原生窗口标题没法事后翻译)。 */
   mediaLogin: (source: string, title: string) => invoke<void>('media_login', { source, title }),
+  /** 失败任务重试(目前仅影音):按 retry 载体直连重放,进展/结果照常走事件车道。 */
+  mediaRetry: (pageUrl: string, audioOnly: boolean) =>
+    invoke<void>('media_retry', { pageUrl, audioOnly }),
   /** 开听写:立即返回,进展走 app_event 的 voice 车道(首次会触发模型用时下载)。 */
   voiceListenStart: () => invoke<void>('voice_listen_start'),
   /** 停听写:accept = 立即定稿(已听到的送识别);false = 取消丢弃。幂等。 */
@@ -705,5 +728,12 @@ export const api = {
   autostartEnabled: () => invoke<boolean>('autostart_enabled'),
   setAutostart: (on: boolean) => invoke<void>('set_autostart', { on }),
   /** 托盘菜单文案注入(§6:文案在前端字典,boot 后传给壳层建菜单)。 */
-  setTrayMenu: (open: string, quit: string) => invoke<void>('set_tray_menu', { open, quit }),
+  setTrayMenu: (open: string, showFloat: string, quit: string) =>
+    invoke<void>('set_tray_menu', { open, showFloat, quit }),
+}
+
+/** 托盘点「显示悬浮窗」→ 壳层 emit,主窗据此重开悬浮窗(置 enabled + show)。 */
+export function onShowFloat(cb: () => void): void {
+  if (!isTauri()) return
+  void listen('lw:show-float', () => cb())
 }

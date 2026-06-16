@@ -1,5 +1,6 @@
 // 任务 HUD 的 VM:订阅全局事件车道,按 task_id upsert(事件是全量快照,错过即追平)。
-// 完成的淡出移除;失败的留着等用户点掉(重试 = 用户再喊一次,job 化之后再给按钮)。
+// 完成的淡出移除;失败的留着等用户点掉;带 retry 载体的失败(影音解析/组件下载)显「重试」钮,
+// 点击直连重放(TasksOverlay.retry → api.mediaRetry,不绕 LLM)。
 // 浏览器预览:?demo=tasks 注入假任务,纯看视觉(UI 优先工作流)。
 
 import { reactive } from 'vue'
@@ -61,6 +62,7 @@ function wire() {
       label: { key: 'task.resolve' },
       state: 'failed',
       error: { key: 'task.err.resolve' },
+      retry: { type: 'media_play', data: { page_url: 'https://www.bilibili.com/video/BV1xx', audio_only: false } },
     })
     let p = 0.34
     const timer = setInterval(() => {

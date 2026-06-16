@@ -45,6 +45,7 @@ export default {
   // 任务 HUD:key 与 core 的 Text.key 一一对应(bus.rs);params 命名插值
   task: {
     progress: '{n} 项进行中',
+    retry: '重试', // 失败任务的重试按钮(目前仅影音解析/组件下载)
     unknown: '后台小任务',
     resolve: '解析播放地址',
     download: {
@@ -226,6 +227,7 @@ export default {
   // 系统托盘菜单(经 set_tray_menu 注入壳层;§6 文案在前端字典)
   tray: {
     open: '打开旺财',
+    showFloat: '显示悬浮窗',
     quit: '退出',
   },
   // 桌面悬浮窗(PLAN §12 形态 C)
@@ -242,6 +244,9 @@ export default {
     balance: '余额 {amount}',
     collapse: '收起',
     close: '关掉悬浮窗',
+    pause: '暂停', // 迷你播控(转发主窗)
+    resume: '继续',
+    stop: '停止播放',
   },
   settings: {
     title: '设置',

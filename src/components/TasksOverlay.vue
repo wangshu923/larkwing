@@ -5,13 +5,21 @@ import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useTasks } from '../composables/useTasks'
 import { useMedia } from '../composables/useMedia'
-import type { TextRef } from '../lib/backend'
+import { api, type TaskView, type TextRef } from '../lib/backend'
 
 const { t, te } = useI18n()
 const { state, dismiss } = useTasks()
 const { state: media } = useMedia()
 
 const COLLAPSE_AT = 4
+
+// 重试失败任务:按 retry 载体直连重放(目前仅影音),旧失败卡撤掉(重放会冒新卡)。
+function retry(task: TaskView) {
+  if (task.retry?.type === 'media_play') {
+    void api.mediaRetry(task.retry.data.page_url, task.retry.data.audio_only)
+  }
+  dismiss(task.task_id)
+}
 
 const running = computed(() => state.tasks.filter(x => x.state === 'running').length)
 const collapsed = computed(
@@ -38,6 +46,11 @@ function txt(ref?: TextRef, fallback = 'task.unknown'): string {
       <div v-for="task in state.tasks" :key="task.task_id" class="card" :class="task.state">
         <div class="row">
           <span class="label">{{ txt(task.label) }}</span>
+          <button
+            v-if="task.state === 'failed' && task.retry"
+            class="retry"
+            @click="retry(task)"
+          >{{ t('task.retry') }}</button>
           <button
             v-if="task.state === 'failed'"
             class="x"
@@ -90,6 +103,13 @@ function txt(ref?: TextRef, fallback = 'task.unknown'): string {
   font-size: 11px; padding: 0 2px; line-height: 1;
 }
 .x:hover { color: var(--attn); }
+.retry {
+  flex: 0 0 auto; cursor: pointer; line-height: 1;
+  font-size: 10.5px; letter-spacing: .4px; color: var(--accent);
+  background: rgba(var(--accent-rgb), 0.1); border: 1px solid rgba(var(--accent-rgb), 0.3);
+  border-radius: 6px; padding: 2px 7px;
+}
+.retry:hover { background: rgba(var(--accent-rgb), 0.2); border-color: var(--accent); }
 
 .step {
   margin-top: 3px; font: 10.5px/1.4 ui-monospace, "SF Mono", monospace;

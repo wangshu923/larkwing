@@ -728,8 +728,8 @@ impl VoiceRuntime {
         self.inner.wake.lock().expect("wake lock").is_some()
     }
 
-    /// 当前唤醒词(settings 顿号/逗号/空格分隔)。默认「小七」= 产品定名前的暂定值
-    /// (PLAN §11 watch-item;唤醒词 = 用户数据,改设置即生效)。
+    /// 当前唤醒词(settings 顿号/逗号/空格分隔)。默认「小七」(2026-06-16 用户拍板定为正式默认;
+    /// 唤醒词 = 用户数据,改设置即生效)。
     pub fn wake_keywords(&self) -> Vec<String> {
         let raw = self
             .inner

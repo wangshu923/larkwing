@@ -74,6 +74,9 @@ export function useFloat() {
   // 进行中(钉住不滚):运行中的任务 + 正在播放 + 聆听态
   const running = computed(() => tasks.state.tasks.filter((t) => t.state === 'running'))
   const nowPlaying = computed(() => media.state.current)
+  const mediaPlaying = computed(() => media.state.status === 'playing') // 迷你播控:播/暂停图标
+  const mediaToggle = media.toggle // 悬浮窗里点 → 转发主窗暂停/继续(useMedia 内已按 isFloat 分流)
+  const mediaStop = media.stop
   const listening = computed(
     () => voice.state.phase === 'listening' || voice.state.phase === 'transcribing',
   )
@@ -81,5 +84,18 @@ export function useFloat() {
   const wakeArmed = computed(() => voice.state.wakeArmed) // 免手唤醒在跑(头像加"竖耳"环)
   const newCount = computed(() => state.notices.length)
   const openMain = () => void summonWindow('main')
-  return { state, running, nowPlaying, listening, level, wakeArmed, newCount, dismissNotice, openMain }
+  return {
+    state,
+    running,
+    nowPlaying,
+    mediaPlaying,
+    mediaToggle,
+    mediaStop,
+    listening,
+    level,
+    wakeArmed,
+    newCount,
+    dismissNotice,
+    openMain,
+  }
 }
