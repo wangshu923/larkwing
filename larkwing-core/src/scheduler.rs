@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::Engine;
 use crate::store::Job;
-use crate::weather::{Weather, WeatherClient, When, KEY_QWEATHER, KEY_QWEATHER_HOST};
+use crate::weather::{qweather_cfg, Weather, WeatherClient, When};
 
 const POLL: std::time::Duration = std::time::Duration::from_secs(30);
 /// 错过宽限:超过它的不补发 —— once 标 missed;重复型推进到未来最近一次。
@@ -190,14 +190,11 @@ async fn tick_cond(
         return Ok(());
     };
 
-    // 选源(同 weather 工具:settings 有和风 key → 和风,否则免 key Open-Meteo)
+    // 选源(同 weather 工具:和风 JWT 三件套齐备 → 和风,否则免 key Open-Meteo)
     let store = engine.store().clone();
-    let (key, host) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        Ok((store.settings.get(None, KEY_QWEATHER)?, store.settings.get(None, KEY_QWEATHER_HOST)?))
-    })
-    .await??;
+    let qw = tokio::task::spawn_blocking(move || qweather_cfg(&store.settings)).await??;
 
-    let w = weather.report_for(&city, key.as_deref(), host.as_deref(), When::Today).await?;
+    let w = weather.report_for(&city, qw, When::Today).await?;
     let (hit, reading) = cond.evaluate(&w);
     if !hit {
         advance(engine, job.id, now + CHECK_INTERVAL_MS).await?;

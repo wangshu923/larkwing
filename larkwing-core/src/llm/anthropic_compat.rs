@@ -464,6 +464,7 @@ mod tests {
                         args: serde_json::json!({ "fact": "对花生过敏" }),
                         is_incomplete: false,
                     }],
+                    reasoning_state: None,
                 },
                 ChatMessage::ToolResult { call_id: "call_1".into(), content: "ok".into() },
             ],

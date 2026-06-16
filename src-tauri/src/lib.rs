@@ -42,6 +42,9 @@ pub fn run() {
       tauri_plugin_autostart::MacosLauncher::LaunchAgent,
       Some(vec!["--autostart"]),
     ))
+    // 外部链接交系统浏览器:WebView 里 window.open 是 no-op(Win 真机尤甚),
+    // 统一走 opener 插件(前端经 backend.openExternal 调 plugin:opener|open_url)。
+    .plugin(tauri_plugin_opener::init())
     .on_window_event(|window, event| {
       // 关主窗 / 悬浮窗 = 隐藏到托盘,不退进程(PLAN §12;真退出走托盘菜单 quit)。
       // media-login 等其它窗口照常关闭。
@@ -179,7 +182,10 @@ pub fn run() {
       // ---- 系统托盘(PLAN §12 常驻锚点):左键唤主窗;菜单文案由前端 set_tray_menu
       //      注入(§6 core 不产文案),这里只建图标 + 交互 ----
       let tray = TrayIconBuilder::with_id("tray")
-        .icon(app.default_window_icon().expect("默认窗口图标缺失").clone())
+        // 托盘用专属单色字形(非整块应用图标);macOS 模板模式按菜单栏明暗自动染色,
+        // 与原生托盘观感一致。Windows/Linux 忽略模板,直接显示白色字形(深色托盘可见)。
+        .icon(tauri::include_image!("icons/tray.png"))
+        .icon_as_template(true)
         .tooltip("Larkwing")
         .show_menu_on_left_click(false)
         .on_tray_icon_event(|tray, event| {
@@ -234,8 +240,10 @@ pub fn run() {
       commands::float_idle,
       commands::llm_balance,
       commands::set_skin,
+      commands::skin,
       commands::list_settings,
       commands::set_setting,
+      commands::ensure_app_keypair,
       commands::rename_user,
       commands::list_providers,
       commands::save_provider,

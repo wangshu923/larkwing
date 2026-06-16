@@ -7,6 +7,8 @@
 //! 供应商本身 = 数据(registry::ProviderSpec),模型档位/价格 = 数据(catalog)。
 
 pub mod anthropic_compat;
+pub mod gemini;
+pub mod openai_responses;
 pub mod catalog;
 pub mod fake;
 pub mod openai_compat;
@@ -104,6 +106,11 @@ pub enum ChatMessage {
         reasoning: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ToolCall>,
+        /// 不透明 reasoning 状态(Gemini thought_signature / OpenAI reasoning items 等),
+        /// 各原生方言自管其形状,engine/store 当黑盒**逐字保真**往返(reasoning 保真铁律,宪法 §4);
+        /// 纯文本 reasoning(DeepSeek/Ollama)不用它。兼容方言 to_wire 忽略。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_state: Option<serde_json::Value>,
     },
     /// 工具结果。JSON tag 用 "tool",与 store 的 role 词表同字。
     #[serde(rename = "tool")]
@@ -128,6 +135,7 @@ impl ChatMessage {
             content: content.into(),
             reasoning: None,
             tool_calls: Vec::new(),
+            reasoning_state: None,
         }
     }
 }
@@ -216,6 +224,10 @@ pub enum ChatEvent {
     Delta(String),
     /// reasoning_content 增量。MVP 关思考不会出现,但解析层必须认识它(坑 #3)。
     Thinking(String),
+    /// 不透明 reasoning 状态(Gemini thought_signature / OpenAI reasoning items 等):
+    /// 原生方言在 Done 前发一次,turn 攒下挂到 assistant 行、下轮逐字回放(reasoning 保真铁律)。
+    /// 兼容 / 假流永不发 —— 纯文本 reasoning 走 Thinking + reasoning_content,无需此变体。
+    ReasoningState(serde_json::Value),
     /// stop_reason 已归一到中立词表:end_turn / tool_use / max_tokens,未知值透传(坑 #9)。
     /// max_tokens = 回复被长度上限拦腰截断,消费方必须可见,不许装正常。
     /// tool_calls = provider 按规范 #6 攒完整的调用(流中碎片不外漏);空 = 纯文本回合。
@@ -293,6 +305,55 @@ impl LlmConfig {
             quirks: Quirks::default(),
         }
     }
+
+    /// Google Gemini = **原生** generateContent 方言(`Protocol::Gemini`,非 OpenAI 兼容)。
+    /// 下楼写原生的理由(reasoning 保真铁律,宪法 §4):Gemini 的 thought_signature 不透明、
+    /// 必须逐字往返,兼容层无处安放 → 开思考会静默降质(2.5)或 400(3);原生经 reasoning_state 保真。
+    /// base_url 末尾不带版本后路径,由 gemini provider 拼 `/models/{model}:streamGenerateContent`。
+    pub fn gemini(api_key: String) -> Self {
+        LlmConfig {
+            base_url: "https://generativelanguage.googleapis.com/v1beta".into(),
+            api_key,
+            model: "gemini-2.5-flash".into(),
+            temperature: None,
+            thinking: Thinking::Off,
+            quirks: Quirks::default(),
+        }
+    }
+
+    /// Ollama 本地 = 走其 OpenAI 兼容端点(/v1)的一组配置(非原生 /api/chat)。
+    /// 走 /v1 反而**绕开** robot 那些原生坑(图片走 OpenAI data-url 而非顶层 base64、
+    /// SSE 流式而非 NDJSON、arguments 是字符串)。原生独有需求才下楼写逃生口,见 PLAN §3。
+    pub fn ollama(base_url: String) -> Self {
+        LlmConfig {
+            base_url: if base_url.trim().is_empty() {
+                "http://localhost:11434/v1".into()
+            } else {
+                base_url
+            },
+            // Ollama 不验钥匙,但 larkwing 的 usable() 要求非空 → 占位串让它进候选。
+            api_key: "ollama".into(),
+            model: "llama3.2".into(),
+            temperature: None,
+            thinking: Thinking::Off,
+            quirks: Quirks::default(),
+        }
+    }
+
+    /// OpenAI = **原生** Responses API 方言(`Protocol::OpenaiResponses`,非 Chat Completions)。
+    /// 下楼理由(reasoning 保真铁律,宪法 §4):推理模型的 reasoning 在 Chat Completions 无槽位、
+    /// 跨工具轮静默降质;Responses 的 encrypted_content 经 reasoning_state 逐字往返保真。
+    /// base_url 末尾不带 /responses,由 provider 拼。
+    pub fn openai(api_key: String) -> Self {
+        LlmConfig {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key,
+            model: "gpt-5".into(),
+            temperature: None,
+            thinking: Thinking::Off,
+            quirks: Quirks::default(),
+        }
+    }
 }
 
 #[async_trait]
@@ -321,6 +382,7 @@ pub trait LlmProvider: Send + Sync {
             match ev {
                 ChatEvent::Delta(t) => out.push_str(&t),
                 ChatEvent::Thinking(_) => {}
+                ChatEvent::ReasoningState(_) => {} // 文本便捷口忽略不透明 reasoning 状态
                 ChatEvent::Done { .. } => return Ok(out),
                 ChatEvent::Failed(e) => return Err(e),
             }

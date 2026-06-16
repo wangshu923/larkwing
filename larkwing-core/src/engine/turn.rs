@@ -1,8 +1,9 @@
 //! 通用回合循环(engine 私有):全系统唯一一份,不认识任何具体任务(宪法 §5)。
 //! 形状:开流 → 攒文本(照旧流 UI)/攒 tool_calls → 无调用则收尾 → 否则并发执行
-//! (每工具超时 + 取消级联)→ 落库 → 回填再开流;轮数到顶 tool_choice=none 强制收尾。
+//! (每工具超时 + 取消级联)→ 落库 → 回填再开流;空转 / 到顶 tool_choice=none 强制收尾,周期自检让模型自决。
 //! turn 级状态 = 本文件里的局部变量,session 级在 SessionSlot,app 级在 Engine 字段(PLAN §4)。
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
@@ -15,8 +16,16 @@ use crate::tools::{Tool, ToolCtx};
 
 use super::{usage, AppError, AssistantPayload, ErrorKind, ToolRowPayload, ToolUseState, TurnEvent};
 
-/// 工具轮上限(PLAN §8):防失控;到顶后强制用嘴收尾。
-const MAX_TOOL_ROUNDS: usize = 4;
+// 工具轮控制(PLAN §8):不是单个魔法数 —— 深度是任务属性,固定数调大放走失控、调小卡死深任务。
+// 拆成三层:模型自检(智能判官)+ 空转兜底网(自检失灵时)+ 硬上限(纯 backstop)。
+// 三个阈值眼下是常数;真做复杂桌面任务时按计划挪进 Scene.options 数据位、按场景调。
+/// 硬上限:纯失控 backstop,正常永远碰不到;到顶强制用嘴收尾。
+const MAX_TOOL_ROUNDS: usize = 200;
+/// 每隔几轮给模型插一句中立自检,让它自己评要不要继续 / 收尾(智能判官)。
+const SELF_CHECK_EVERY: usize = 10;
+/// 连续多少轮"全重复调用 / 全报错"(无新进展)即判空转、强制收尾;
+/// 接住"模型自欺、自检答继续"的洞 —— 真在干活每轮有新结果则清零,碰不到。
+const MAX_STALL_ROUNDS: usize = 5;
 
 /// 回合任一出口都把 mood 收回 Idle(悬浮窗 mood 灯熄):Drop 兜底覆盖所有 return 分支。
 struct MoodGuard(crate::bus::Bus);
@@ -60,6 +69,8 @@ enum RoundEnd {
         text: String,
         reasoning: Option<String>,
         tool_calls: Vec<ToolCall>,
+        /// 不透明 reasoning 状态(原生方言经 ChatEvent::ReasoningState 传出;兼容方言 None)。
+        reasoning_state: Option<serde_json::Value>,
         usage: Usage,
         timing: usage::RoundTiming,
     },
@@ -105,8 +116,10 @@ impl Turn {
         };
 
         let mut round: usize = 0;
+        let mut stall: usize = 0; // 连续无进展(全重复 / 全失败)轮数
+        let mut seen_calls: HashSet<String> = HashSet::new(); // 本回合已发过的工具调用指纹
         loop {
-            let (text, reasoning, tool_calls) =
+            let (text, reasoning, tool_calls, reasoning_state) =
                 match drain(&token, &tx, &bus, rx, conv_id, round_start).await {
                     RoundEnd::Cancelled { partial } => {
                         persist_partial(&store, conv_id, &partial).await;
@@ -118,7 +131,7 @@ impl Turn {
                         let _ = tx.send(TurnEvent::Failed { kind, message }).await;
                         return;
                     }
-                    RoundEnd::Finished { text, reasoning, tool_calls, usage, timing } => {
+                    RoundEnd::Finished { text, reasoning, tool_calls, reasoning_state, usage, timing } => {
                         // 记账 + 点灯:有 token 才记(严格端点/假流回 0,不点没数据的灯);
                         // 账本绝不打断回合 —— 记账线程挂了只丢这一笔
                         if usage.input_tokens + usage.output_tokens > 0 {
@@ -133,15 +146,15 @@ impl Turn {
                                     .await;
                             }
                         }
-                        (text, reasoning, tool_calls)
+                        (text, reasoning, tool_calls, reasoning_state)
                     }
                 };
 
             // 纯文本收尾 —— 或端点无视 tool_choice=none 仍要调工具(防御):都按终回处理。
             // 收尾前先看插队(PLAN §9 B):有就先落这段回复、把注入接上、重开流继续(不打断进度)。
-            if tool_calls.is_empty() || round >= MAX_TOOL_ROUNDS {
+            if tool_calls.is_empty() || round >= MAX_TOOL_ROUNDS || stall >= MAX_STALL_ROUNDS {
                 if !tool_calls.is_empty() {
-                    tracing::warn!(conv = conv_id, "工具轮超限仍想调用,丢弃调用强制收尾");
+                    tracing::warn!(conv = conv_id, "工具轮到顶 / 空转仍想调用,丢弃调用强制收尾");
                 }
                 // 收尾前看插队(原子):空 → 置 finishing 收尾;非空 → 取出注入(先落本段回复再 apply)
                 let pending = take_or_finish(&inject);
@@ -177,6 +190,8 @@ impl Turn {
                     apply_injection(&store, conv_id, &tx, &mut request, it).await;
                 }
                 round = 0; // 新输入 → 新一轮工具预算
+                stall = 0;
+                seen_calls.clear();
                 request.tool_choice = ToolChoice::Auto;
                 round_start = std::time::Instant::now();
                 match provider.chat_stream(request.clone()).await {
@@ -195,17 +210,26 @@ impl Turn {
             let payload = serde_json::to_string(&AssistantPayload {
                 tool_calls: tool_calls.clone(),
                 reasoning: reasoning.clone(),
+                reasoning_state: reasoning_state.clone(),
             })
             .ok();
-            if persist_row(&store, conv_id, "assistant", &text, payload.as_deref()).await.is_none()
-            {
-                let _ = tx
-                    .send(TurnEvent::Failed {
-                        kind: ErrorKind::Internal,
-                        message: "工具轮落库失败".into(),
-                    })
-                    .await;
-                return;
+            match persist_row(&store, conv_id, "assistant", &text, payload.as_deref()).await {
+                // 这一轮带了可见文字 + 还要继续调工具:它在落库里是独立 assistant 内容行,通知前端
+                // 封口当前气泡(钉 mid 供「想了想」回挂)、另起新泡接后续文字 —— 在飞结构对齐落库。
+                Some(mid) => {
+                    if !text.trim().is_empty() {
+                        let _ = tx.send(TurnEvent::Segment { message_id: mid }).await;
+                    }
+                }
+                None => {
+                    let _ = tx
+                        .send(TurnEvent::Failed {
+                            kind: ErrorKind::Internal,
+                            message: "工具轮落库失败".into(),
+                        })
+                        .await;
+                    return;
+                }
             }
             for call in &tool_calls {
                 let _ = tx
@@ -239,6 +263,7 @@ impl Turn {
                 content: text,
                 reasoning,
                 tool_calls: tool_calls.clone(),
+                reasoning_state,
             });
             for (call, status, content) in &results {
                 let p = tool_payload(call, status);
@@ -255,12 +280,37 @@ impl Turn {
                 });
             }
 
+            // 进展守卫:本轮是否有"新调用且成功"的结果。全重复 / 全失败 = 这轮没推进,计一次空转;
+            // 真在干活(每轮有新成功结果)则清零,深任务因此永远碰不到兜底网。先登记全部指纹再综合判。
+            let mut made_progress = false;
+            for (call, status, _) in &results {
+                let fresh = seen_calls.insert(call_fingerprint(call));
+                if fresh && status == "ok" {
+                    made_progress = true;
+                }
+            }
+            stall = if made_progress { 0 } else { stall + 1 };
+
             // 插队(PLAN §9 B):轮间排空注入队列,append 进 request,下一轮 LLM 就带上
             drain_injections(&store, conv_id, &tx, &inject, &mut request).await;
             round += 1;
-            // 末轮强制收尾:下一次开流禁用工具,模型只能用嘴说
-            if round >= MAX_TOOL_ROUNDS {
+            // 收尾闸:① 硬上限到顶(纯失控 backstop)② 连续空转到顶(自检失灵的兜底网)。
+            // 命中就禁用工具,下一次开流模型只能用嘴收尾;否则按周期插一句自检让模型自决。
+            if round >= MAX_TOOL_ROUNDS || stall >= MAX_STALL_ROUNDS {
                 request.tool_choice = ToolChoice::None;
+                if stall >= MAX_STALL_ROUNDS {
+                    tracing::warn!(conv = conv_id, round, stall, "连续多轮无新进展,判定空转,强制收尾");
+                }
+            } else if round % SELF_CHECK_EVERY == 0 {
+                // 软提示自检(PLAN §8):中立一句进 request 尾部 —— 不落库(不进历史 / 不重放)、
+                // 处于已变动的工具结果尾后(不破前缀缓存)。让当前模型自己评要不要继续:
+                // 智能判官在前,机械空转网只兜它"自欺答继续"的洞。
+                request.messages.push(ChatMessage::user(format!(
+                    "[system] You have made {round} consecutive rounds of tool calls. \
+                     Reassess now: if the task is complete, or cannot make progress right now, \
+                     stop calling tools and reply to the user directly in natural language. \
+                     Continue only if you are genuinely making progress."
+                )));
             }
 
             // 再开流,粘住同一 provider。此处建连失败不切换:半截对话已经发生,
@@ -413,6 +463,7 @@ async fn drain(
 ) -> RoundEnd {
     let mut buffer = String::new(); // turn 级状态:攒文本,流完一次落库(不逐 token 写)
     let mut reasoning = String::new(); // 坑 #4:工具轮的 reasoning 要回传,顺手攒下
+    let mut reasoning_state: Option<serde_json::Value> = None; // 不透明 reasoning 状态(原生方言发)
     let mut ttft_ms: Option<i64> = None; // 首个增量事件锁存(思考也算"开口"——用户看得见动静)
     let mut spoke = false; // 本轮首个 Delta → 广播 Speaking(只发一次,不每字刷总线)
     loop {
@@ -438,6 +489,10 @@ async fn drain(
                     reasoning.push_str(&t);
                     let _ = tx.send(TurnEvent::Thinking(t)).await;
                 }
+                Some(ChatEvent::ReasoningState(v)) => {
+                    // 不透明 reasoning 状态:攒下,Done 时随 Finished 带出(逐字保真,不解析)
+                    reasoning_state = Some(v);
+                }
                 Some(ChatEvent::Done { usage, stop_reason, tool_calls }) => {
                     if stop_reason.as_deref() == Some("max_tokens") {
                         // 截断不许装正常(robot 实战教训:静默截断 = 半截话当完整话)
@@ -462,6 +517,7 @@ async fn drain(
                         text: buffer,
                         reasoning: (!reasoning.is_empty()).then_some(reasoning),
                         tool_calls,
+                        reasoning_state,
                         usage,
                         timing,
                     };
@@ -528,6 +584,12 @@ fn tool_payload(call: &ToolCall, status: &str) -> Option<String> {
         status: status.into(),
     })
     .ok()
+}
+
+/// 工具调用指纹(进展守卫用):同名 + 同参 = 同一调用。args 的 Display 即紧凑 JSON,
+/// 模型重复调同一个工具会发出相同串 → 命中"重复",据此判空转。
+fn call_fingerprint(call: &ToolCall) -> String {
+    format!("{}:{}", call.name, call.args)
 }
 
 async fn persist_row(

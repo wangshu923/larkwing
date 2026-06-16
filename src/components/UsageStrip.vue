@@ -69,7 +69,7 @@ const balanceText = computed(() => {
   padding-top: 7px;
   font: 10.5px/1 ui-monospace, 'SF Mono', monospace;
   letter-spacing: 0.8px;
-  color: var(--txt2);
+  color: var(--text-dim);
   user-select: none;
 }
 .strip::before {
@@ -82,9 +82,9 @@ const balanceText = computed(() => {
   background: linear-gradient(
     90deg,
     transparent,
-    rgba(95, 200, 255, 0.32) 18%,
-    rgba(95, 200, 255, 0.55) 50%,
-    rgba(95, 200, 255, 0.32) 82%,
+    rgba(var(--accent-rgb), 0.32) 18%,
+    rgba(var(--accent-rgb), 0.55) 50%,
+    rgba(var(--accent-rgb), 0.32) 82%,
     transparent
   );
   background-size: 200% 100%;
@@ -104,8 +104,8 @@ const balanceText = computed(() => {
   width: 5px;
   height: 5px;
   border-radius: 50%;
-  background: var(--cy);
-  box-shadow: 0 0 7px var(--cy);
+  background: var(--accent);
+  box-shadow: 0 0 7px var(--accent);
   opacity: 0.7;
   animation: lampIdle 3.2s ease-in-out infinite;
   flex-shrink: 0;
@@ -119,11 +119,11 @@ const balanceText = computed(() => {
 .seg { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
 .seg b {
   font-weight: 500;
-  color: var(--cy);
-  text-shadow: 0 0 8px rgba(95, 200, 255, 0.35);
+  color: var(--accent);
+  text-shadow: 0 0 8px rgba(var(--accent-rgb), 0.35);
 }
 .arr { font-style: normal; opacity: 0.75; }
 .arr + b { margin-right: 6px; }
 .gap { flex: 1; }
-.bal b { color: #5fe0b0; text-shadow: 0 0 8px rgba(95, 224, 176, 0.35); }
+.bal b { color: var(--ok); text-shadow: 0 0 8px rgba(var(--ok-rgb), 0.35); }
 </style>

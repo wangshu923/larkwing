@@ -5,8 +5,10 @@ import { reactive } from 'vue'
 import {
   api,
   emitSettingChanged,
+  emitSkinChanged,
   isTauri,
   onSettingChanged,
+  onSkinChanged,
   type ProviderPatch,
   type ProviderView,
 } from '../lib/backend'
@@ -33,9 +35,11 @@ const DEFAULTS: Record<string, string> = {
   'voice.wake.sensitivity': '50', // 唤醒灵敏度 0~100(global)→ KWS 阈值;'50' = 经验折中
 
   'voice.tts_backend': 'online', // 在线 edge / 离线 vits(断网兜底,需下大模型)
-  // 天气(PLAN 天气块):key 是秘密 → 后端回掩码(····xxxx),空 = 用免 key Open-Meteo;host 非秘密专属接口地址
-  'weather.qweather.key': '',
+  // 天气(PLAN 天气块):和风 JWT 接入三件套(host + 项目 ID + 凭据 ID);齐备 + 全局公钥已生成 → 切和风,
+  // 否则免 key Open-Meteo。密钥对是全局的(crypto.ed25519.*,后端管),不在此前端默认表里。
   'weather.qweather.host': '',
+  'weather.qweather.project_id': '',
+  'weather.qweather.credential_id': '',
   // 全局代理(传输层):空 = 关(直连);否则 http(s)://host:port / socks5(h):// / ${ENV}。
   // 直连优先、连接失败兜底走代理(墙内源永不被代理);Rust 白名单 net.proxy 逐键对应。
   'net.proxy': '',
@@ -55,6 +59,7 @@ const FAKE_PROVIDERS: ProviderView[] = [
 const state = reactive({
   ready: false,
   userName: '我',
+  skin: 'scifi', // 用户级皮肤(users.skin_id);默认/兜底 = 科幻。boot 过桥应用,设置页可切
   values: { ...DEFAULTS } as Record<string, string>,
   providers: [] as ProviderView[],
 })
@@ -78,7 +83,9 @@ async function load() {
   onSettingChanged((key, value) => {
     if (key in DEFAULTS) state.values[key] = value
   })
+  onSkinChanged(applySkin) // 别的窗口换肤 → 跟随(主窗 ↔ 悬浮窗实时同步)
   try {
+    applySkin(await api.skin()) // 用户级皮肤 → <html data-skin>(主窗与悬浮窗都经此拉初值)
     for (const e of await api.listSettings()) {
       if (e.key in DEFAULTS) state.values[e.key] = e.value
     }
@@ -166,7 +173,30 @@ export function hydrateUserName(name: string) {
   state.userName = name
 }
 
+// 皮肤 = 用户级偏好(users.skin_id)。语义 token 在 style.css 按 <html data-skin> 生效;
+// 换皮只换观感、不改组件(宪法 §3.6/§5)。未知值一律回科幻,脏数据不黑屏。
+const SKINS = ['scifi', 'warm']
+function applySkin(id: string) {
+  const skin = SKINS.includes(id) ? id : 'scifi'
+  state.skin = skin
+  document.documentElement.dataset.skin = skin
+}
+
+/** 设置页换肤入口:乐观换观感 + 持久化(users.skin_id);失败回滚。 */
+async function setSkin(id: string) {
+  const prev = state.skin
+  applySkin(id)
+  if (!isTauri()) return
+  try {
+    await api.setSkin(id)
+    emitSkinChanged(id) // 实时同步给悬浮窗(另一个 WebView)
+  } catch (e) {
+    console.error('换肤保存失败', e)
+    applySkin(prev) // 回滚,UI 与库不分叉
+  }
+}
+
 export function useSettings() {
   void load()
-  return { state, get, set, rename, saveProvider, removeProvider }
+  return { state, get, set, rename, saveProvider, removeProvider, setSkin }
 }

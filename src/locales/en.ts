@@ -82,9 +82,9 @@ export default {
     groupYou: 'About you',
     groupHome: 'About home',
   },
-  // Activity log (file abilities): see which files 7274 touched; one-tap undo/redo (functional history, not a safety promise)
+  // Footprints (file abilities): see which files 7274 touched; one-tap undo/redo (functional history, not a safety promise)
   ops: {
-    title: 'Activity log',
+    title: 'Footprints',
     tagline: 'Every file I’ve touched for you is listed here — tap “Undo” to step back.',
     back: '‹ Back to chat',
     count: '{n} items',
@@ -191,7 +191,7 @@ export default {
     chat: 'Chat',
     reminders: 'Reminders',
     memory: 'Memories',
-    ops: 'Log',
+    ops: 'Footprints',
     settings: 'Settings',
   },
   recents: {
@@ -200,6 +200,11 @@ export default {
     expand: 'Expand',
     newTopic: '＋ New topic',
     untitled: 'New topic',
+  },
+  // conversation channel badge tooltips (ui = default, unbadged → no key); telegram/dingtalk/slack later
+  channel: {
+    voice: 'Voice',
+    system: 'System',
   },
   time: {
     justNow: 'just now',
@@ -230,8 +235,8 @@ export default {
     listening: 'Listening…',
     thinking: 'Thinking…',
     speaking: 'Speaking…',
-    idle: 'I’m here — just say the word', // idle greeting: channel-neutral; shown even when voice is off (wakeArmed is the voice state)
-    wakeArmed: '🎙 Waiting for “{kw}”', // idle ticker · mic waiting for the wake word (hands-free wake on)
+    idle: 'I’m around', // idle greeting: channel-neutral; shown even when voice is off (wakeArmed is the voice state)
+    wakeArmed: '🎙 Say “{kw}”', // idle ticker · mic waiting for the wake word (hands-free wake on)
     zoneNow: 'Now',
     zoneNews: 'Recent',
     todayCost: 'Today {amount}',
@@ -262,6 +267,9 @@ export default {
       char_titan: 'Mech',
       char_dog: 'Puppy',
       char_cat: 'Kitten',
+      skin: 'Skin',
+      skin_scifi: 'Sci-fi',
+      skin_warm: 'Cozy',
       bubble: 'Bubble shape',
       bubble_round: 'Rounded',
       bubble_cut: 'Clipped',
@@ -407,17 +415,25 @@ export default {
     // External services / integrations (weather source now; smart-home HA etc. join this tab later)
     services: {
       weather: 'Weather service',
-      weatherHint: 'Uses a free global source by default — works out of the box. For more reliable, more accurate weather in China (with clothing / UV tips), add a QWeather key.',
-      weatherKey: 'QWeather key',
-      weatherKeyPlaceholder: 'Paste the key, press Enter to save (leave blank = free source)',
+      weatherHint:
+        'Uses a free global source by default — works out of the box. For more reliable, more accurate weather in China (with clothing / UV tips), connect QWeather (JWT auth): copy the app public key below into the QWeather console, then paste the three identifiers back here.',
+      pubKey: 'App public key',
+      pubKeyCopy: 'Copy',
+      pubKeyCopied: 'Copied',
+      pubKeyPending: 'Preparing app public key…',
+      projectId: 'Project ID (JWT sub)',
+      projectIdPlaceholder: 'Project ID from the QWeather console · project management',
+      credentialId: 'Credential ID (JWT kid)',
+      credentialIdPlaceholder: 'Credential ID QWeather gives you after uploading the public key',
+      weatherHost: 'API Host',
+      weatherHostPlaceholder: 'Your dedicated host, e.g. abc1234.qweatherapi.com (https:// optional)',
       weatherSource: 'Current source',
       weatherSrcQweather: 'QWeather · stable in CN',
       weatherSrcFree: 'Free source (Open-Meteo)',
-      weatherKeyClear: 'Clear',
-      weatherHost: 'Dedicated API host (optional)',
-      weatherHostPlaceholder: 'Only if QWeather assigned you one, e.g. https://xxx.qweatherapi.com',
-      weatherLinkPre: 'No key?',
-      weatherLink: 'Get one free at QWeather →',
+      weatherSteps:
+        '① Copy the app public key above → ② In the QWeather console, create a project, create a JWT credential and paste the public key, get the Project ID and Credential ID → ③ Paste Project ID, Credential ID and API Host back here.',
+      weatherLinkPre: 'No QWeather account yet?',
+      weatherLink: 'Sign up free at QWeather →',
     },
   },
 }

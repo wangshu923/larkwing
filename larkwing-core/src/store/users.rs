@@ -4,16 +4,24 @@ use serde::Serialize;
 
 use super::db::{m, now_ms, Db, Migration};
 
-pub const MIGRATIONS: &[Migration] = &[m(
-    "0001_users_init",
-    "CREATE TABLE users (
+pub const MIGRATIONS: &[Migration] = &[
+    m(
+        "0001_users_init",
+        "CREATE TABLE users (
         id             INTEGER PRIMARY KEY,
         name           TEXT NOT NULL,
-        skin_id        TEXT NOT NULL DEFAULT 'warm',
+        skin_id        TEXT NOT NULL DEFAULT 'scifi',
         created_at     INTEGER NOT NULL,
         last_active_at INTEGER NOT NULL
     );",
-)];
+    ),
+    // 旧默认是 'warm'(sci-fi-default 决策前的遗留);此前并无换肤入口 → 库里所有 'warm' 都是陈旧默认,
+    // 一次性归位到真正的默认 'scifi'。此后用户经设置选的皮肤照常持久化(本迁移按 id 只跑一次)。
+    m(
+        "0002_default_skin_scifi",
+        "UPDATE users SET skin_id = 'scifi' WHERE skin_id = 'warm';",
+    ),
+];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct User {
@@ -51,13 +59,13 @@ impl UserRepo {
             let now = now_ms();
             c.execute(
                 "INSERT INTO users (name, skin_id, created_at, last_active_at)
-                 VALUES ('我', 'warm', ?1, ?1)",
+                 VALUES ('我', 'scifi', ?1, ?1)",
                 [now],
             )?;
             Ok(User {
                 id: c.last_insert_rowid(),
                 name: "我".into(),
-                skin_id: "warm".into(),
+                skin_id: "scifi".into(),
                 created_at: now,
                 last_active_at: now,
             })
@@ -70,13 +78,13 @@ impl UserRepo {
             let now = now_ms();
             c.execute(
                 "INSERT INTO users (name, skin_id, created_at, last_active_at)
-                 VALUES (?1, 'warm', ?2, ?2)",
+                 VALUES (?1, 'scifi', ?2, ?2)",
                 rusqlite::params![name, now],
             )?;
             Ok(User {
                 id: c.last_insert_rowid(),
                 name: name.into(),
-                skin_id: "warm".into(),
+                skin_id: "scifi".into(),
                 created_at: now,
                 last_active_at: now,
             })

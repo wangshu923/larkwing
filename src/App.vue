@@ -2,6 +2,7 @@
 import { computed, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import NeonBackdrop from './components/NeonBackdrop.vue'
+import WarmBackdrop from './components/WarmBackdrop.vue'
 import MainLayout from './components/MainLayout.vue'
 import TasksOverlay from './components/TasksOverlay.vue'
 import VideoOverlay from './components/VideoOverlay.vue'
@@ -29,9 +30,13 @@ const { phase, run, skip } = useBoot(1800)
 if (!isFloat) run()
 const booting = computed(() => !isFloat && phase.value === 'boot')
 
+// 皮肤驱动背景:语义 token 负责换色,背景组件按皮肤切(科幻=霓虹辉光,暖萌=柔光晕);
+// skin 由 boot 过桥设到 <html data-skin>,切换即时反映。
+const settings = useSettings()
+const backdrop = computed(() => (settings.state.skin === 'warm' ? WarmBackdrop : NeonBackdrop))
+
 // 主窗专属编排(PLAN §12):托盘菜单文案 + 悬浮窗显隐(enabled × 主窗是否在前)+ 通知跳会话。
 if (!isFloat && isTauri()) {
-  const settings = useSettings()
   void api.setTrayMenu(t('tray.open'), t('tray.quit'))
   const floatOn = () => settings.get('ui.float.enabled') !== '0'
   // 显隐规则(§12 E 修订 2026-06-14):悬浮窗与主窗共存——master 开关 ui.float.enabled 开着就常驻,
@@ -58,7 +63,7 @@ if (!isFloat && isTauri()) {
   <FloatWindow v-if="isFloat" />
   <template v-else>
     <div class="app-stage" :class="{ booting }">
-      <NeonBackdrop :booting="booting" />
+      <component :is="backdrop" :booting="booting" />
       <MainLayout :booting="booting" />
       <!-- 全局浮层:任务 HUD(右缘)+ 视频面板;聊天/设置切换不影响它们 -->
       <TasksOverlay />

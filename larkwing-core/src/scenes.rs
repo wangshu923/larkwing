@@ -189,6 +189,7 @@ mod tests {
                 args: serde_json::json!({}),
                 is_incomplete: false,
             }],
+            reasoning_state: None,
         }];
         assert!(s.validate(&registry).is_err(), "孤儿 tool_call 必须被拒");
 
@@ -203,6 +204,7 @@ mod tests {
                     args: serde_json::json!({}),
                     is_incomplete: false,
                 }],
+                reasoning_state: None,
             },
             ChatMessage::ToolResult { call_id: "fs_y".into(), content: "ok".into() },
         ];
@@ -219,6 +221,7 @@ mod tests {
                     args: serde_json::json!({}),
                     is_incomplete: false,
                 }],
+                reasoning_state: None,
             },
             ChatMessage::ToolResult { call_id: "call_1".into(), content: "ok".into() },
         ];

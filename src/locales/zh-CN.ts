@@ -81,9 +81,9 @@ export default {
     groupYou: '关于你',
     groupHome: '家里的事',
   },
-  // 操作记录页(文件能力):看 7274 动过哪些文件,可一键撤销/重做(功能性历史,非安全承诺)
+  // 足迹页(文件能力):看 7274 动过哪些文件,可一键撤销/重做(功能性历史,非安全承诺)
   ops: {
-    title: '操作记录',
+    title: '足迹',
     tagline: '我帮你动过的文件都列在这儿——想退回上一步,点「撤销」就行。',
     back: '‹ 回去聊天',
     count: '{n} 条',
@@ -190,7 +190,7 @@ export default {
     chat: '对话',
     reminders: '提醒',
     memory: '记忆',
-    ops: '记录',
+    ops: '足迹',
     settings: '设置',
   },
   recents: {
@@ -199,6 +199,11 @@ export default {
     expand: '展开',
     newTopic: '＋ 开个新话题',
     untitled: '新话题',
+  },
+  // 会话渠道标记 tooltip(界面=默认不标,故无 ui 文案);未来 telegram/钉钉/slack 在此补
+  channel: {
+    voice: '语音',
+    system: '系统提醒',
   },
   time: {
     justNow: '刚刚',
@@ -229,8 +234,8 @@ export default {
     listening: '在听你说…',
     thinking: '正在想…',
     speaking: '正在说…',
-    idle: '我在这儿,有事找我', // 待机问候:channel-neutral,不写"喊"(语音关着时也显示,见 wakeArmed 才是语音态)
-    wakeArmed: '🎙 等你喊「{kw}」', // 待机轮播·麦克风在等唤醒词(免手唤醒开着时)
+    idle: '我有空~', // 待机问候(胶囊条窄,短到不截断;长信息才走滚动/省略):channel-neutral,不写"喊"(语音关着时也显示,见 wakeArmed 才是语音态)
+    wakeArmed: '🎙 喊「{kw}」', // 待机轮播·麦克风在等唤醒词(免手唤醒开着时);框架词压短,留唤醒词本身
     zoneNow: '正在进行',
     zoneNews: '最近消息',
     todayCost: '今日 {amount}',
@@ -261,6 +266,9 @@ export default {
       char_titan: '小机甲',
       char_dog: '小狗',
       char_cat: '小猫',
+      skin: '皮肤',
+      skin_scifi: '科幻',
+      skin_warm: '暖萌',
       bubble: '气泡形状',
       bubble_round: '圆角',
       bubble_cut: '切角',
@@ -407,17 +415,25 @@ export default {
     // 服务/接入:外部数据源与设备接入(天气源;以后智能家居 HA 等进驻同一 tab)
     services: {
       weather: '天气服务',
-      weatherHint: '默认用免费的国际源,开箱即用;在国内想要更稳更准(还带穿衣 / 紫外线提示),可以填一个和风天气 key。',
-      weatherKey: '和风天气 key',
-      weatherKeyPlaceholder: '粘贴 key,回车保存(留空 = 用免费源)',
+      weatherHint:
+        '默认用免费的国际源,开箱即用。在国内想要更稳更准、还带穿衣 / 紫外线提示,可以接和风天气(JWT 认证):把下面的应用公钥复制到和风控制台,再把三个标识填回来。',
+      pubKey: '应用公钥',
+      pubKeyCopy: '复制',
+      pubKeyCopied: '已复制',
+      pubKeyPending: '正在准备应用公钥…',
+      projectId: '项目 ID(JWT 的 sub)',
+      projectIdPlaceholder: '和风控制台 · 项目管理里的项目 ID',
+      credentialId: '凭据 ID(JWT 的 kid)',
+      credentialIdPlaceholder: '上传公钥后,和风给的凭据 ID',
+      weatherHost: 'API Host',
+      weatherHostPlaceholder: '你的专属接口地址,如 abc1234.qweatherapi.com(可不带 https://)',
       weatherSource: '当前数据源',
       weatherSrcQweather: '和风天气 · 国内稳',
       weatherSrcFree: '免费源 Open-Meteo',
-      weatherKeyClear: '清空',
-      weatherHost: '专属接口地址(选填)',
-      weatherHostPlaceholder: '和风分配了专属 Host 才填,如 https://xxx.qweatherapi.com',
-      weatherLinkPre: '没有 key?',
-      weatherLink: '去和风天气免费申请 →',
+      weatherSteps:
+        '① 复制上方应用公钥 → ② 去和风控制台建项目、创建 JWT 凭据并粘贴公钥,拿到项目 ID 和凭据 ID → ③ 把项目 ID、凭据 ID、API Host 三个填回这里。',
+      weatherLinkPre: '还没有和风账号?',
+      weatherLink: '去和风天气免费注册 →',
     },
   },
 }

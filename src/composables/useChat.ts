@@ -350,8 +350,9 @@ async function boot() {
     state.hasApiKey = !new URLSearchParams(location.search).has('nokey')
     state.convId = 1
     state.conversations = [
-      { id: 1, user_id: 1, scene_id: 'companion', title: '今天的碎碎念', created_at: 0, updated_at: Date.now() },
-      { id: 2, user_id: 1, scene_id: 'companion', title: '周末去哪儿玩', created_at: 0, updated_at: Date.now() - 86400_000 },
+      { id: 1, user_id: 1, scene_id: 'companion', channel: 'ui', title: '今天的碎碎念', created_at: 0, updated_at: Date.now() },
+      { id: 2, user_id: 1, scene_id: 'companion', channel: 'voice', title: '周末去哪儿玩', created_at: 0, updated_at: Date.now() - 3600_000 },
+      { id: 3, user_id: 1, scene_id: 'companion', channel: 'system', title: '吃药提醒', created_at: 0, updated_at: Date.now() - 86400_000 },
     ]
     pushOpening()
     if (!state.hasApiKey) pushNoLlmHint()
@@ -402,6 +403,7 @@ async function boot() {
     const snap = await api.boot()
     applyLocale(snap.locale) // 用户级语言(与皮肤同款),core 只过桥不产文案
     hydrateUserName(snap.user.name) // 设置页"现在陪着"用,单向过桥
+    // 皮肤改由 useSettings.load() 经 api.skin() 拉取并应用(主窗 & 悬浮窗同一路径,不再走 boot 过桥)
     state.hasApiKey = snap.hasApiKey
     state.convId = snap.conversation.id
     state.messages = snap.messages.filter(visible).map(toUi)
@@ -581,11 +583,20 @@ function send(
           if (ev.data.state === 'started') {
             state.toolAction = ev.data.label
             turnHadTrace = true // 这回合有工具步骤 → done 后补拉 trace
+            // 工具步骤实时进「想了想」:默认折叠,只需「·N 步」当场涨;入参/结果故意不入流,
+            // done 时 hydrateTrace 用落库规范版(原始工具名 + args/result)整条覆盖归位。
+            if (!wang.trace) wang.trace = { steps: [], reasoning: '' }
+            wang.trace.steps.push({ name: t(ev.data.label), ui_key: ev.data.label, args: '', result: '', status: '' })
           }
           state.mood = 'thinking'
           break
         case 'thinking':
+          // CoT 实时漏出:思考增量直接累进当前气泡的 trace.reasoning(药丸默认折叠 → 不走打字机平滑,糊上即可)。
+          // 这也是「最终轮」CoT 的唯一来源:纯文本收尾轮 payload=None,done 时 hydrateTrace 取不到该气泡条目、
+          // 不覆盖,故在飞攒的留得住;工具轮的 reasoning + 步骤仍由 hydrateTrace 按 message_id 规范回挂。
           turnHadTrace = true
+          if (!wang.trace) wang.trace = { steps: [], reasoning: '' }
+          wang.trace.reasoning = (wang.trace.reasoning ?? '') + ev.data
           state.mood = 'thinking'
           break
         case 'injected': {
@@ -607,6 +618,20 @@ function send(
           twStart(wang)
           fullText = '' // 新一段回复,__IGNORE__ 判定重置
           turnHadTrace = false
+          state.mood = 'thinking'
+          break
+        }
+        case 'segment': {
+          // 带文字的工具轮(PLAN §9):这段回复在落库里是独立 assistant 行 —— 封口当前气泡
+          // (钉 message_id 供 done 后 hydrateTrace 把「想了想」挂上)、另起新泡接后续文字。
+          // 让在飞气泡结构 = 落库/重启结构(否则 trace 实时挂不上、重启才"多出一个气泡")。
+          // 不重置 turnHadTrace:整轮算一次,done 时一并补拉各段轨迹各就各位。
+          twFlush() // 当前段已收到的字立刻放完
+          wang.id = ev.data.message_id
+          state.messages.push({ id: localId--, role: 'wang', text: '' })
+          wang = state.messages[state.messages.length - 1] // 重指到新回复气泡
+          twStart(wang)
+          fullText = '' // 新段,__IGNORE__ 判定重置(同 injected)
           state.mood = 'thinking'
           break
         }
@@ -714,7 +739,7 @@ async function selectConversation(convId: number) {
   }
 }
 
-async function newConversation() {
+async function newConversation(channel?: string) {
   twFlush()
   state.queue.splice(0) // 新话题:排队区清空
   turnInFlight = false
@@ -725,7 +750,7 @@ async function newConversation() {
     return
   }
   try {
-    const conv = await api.newConversation()
+    const conv = await api.newConversation(channel)
     state.convId = conv.id
     state.messages = []
     pushOpening()
@@ -773,7 +798,7 @@ async function ensureVoiceConv() {
   if (alive) {
     if (state.convId !== voiceConvId) await selectConversation(voiceConvId!)
   } else {
-    await newConversation()
+    await newConversation('voice') // 语音专属会话:渠道=voice,列表带麦克风标
     voiceConvId = state.convId
   }
   lastVoiceActivity = Date.now()

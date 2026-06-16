@@ -177,8 +177,8 @@ onUnmounted(() => {
   display: flex; flex-direction: column;
   border-radius: 14px; overflow: hidden;
   background: rgba(8, 18, 36, 0.92);
-  border: 1px solid rgba(95, 200, 255, 0.22);
-  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55), 0 0 30px rgba(95, 200, 255, 0.08);
+  border: 1px solid rgba(var(--accent-rgb), 0.22);
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55), 0 0 30px rgba(var(--accent-rgb), 0.08);
 }
 /* 全屏 = 原生窗口全屏 + 这个类铺满(不再用 :fullscreen 伪类)。影院视图:画面铺满整屏(黑底、
    无边框无投影),控制条覆盖在画面上(不再夹小画面、不再露主窗一圈透明边框)。 */
@@ -207,8 +207,8 @@ onUnmounted(() => {
 .spinner {
   position: absolute; top: 50%; left: 50%; z-index: 1;
   width: 34px; height: 34px; margin: -17px 0 0 -17px;
-  border: 3px solid rgba(95, 200, 255, 0.22);
-  border-top-color: #5fd2ff; border-radius: 50%;
+  border: 3px solid rgba(var(--accent-rgb), 0.22);
+  border-top-color: var(--accent); border-radius: 50%;
   animation: lw-spin 0.8s linear infinite; pointer-events: none;
 }
 @keyframes lw-spin { to { transform: rotate(360deg); } }
@@ -219,35 +219,35 @@ onUnmounted(() => {
   color: #d4e6f7; font-size: 13px;
 }
 .title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; letter-spacing: .4px; }
-.clock { color: #85a4c0; font: 11px/1 ui-monospace, "SF Mono", monospace; letter-spacing: .5px; flex: none; }
+.clock { color: var(--text-dim); font: 11px/1 ui-monospace, "SF Mono", monospace; letter-spacing: .5px; flex: none; }
 
 .vbtn {
   width: 32px; height: 32px; flex: none;
-  border: 1px solid rgba(95, 200, 255, 0.18); border-radius: 9px; cursor: pointer;
-  background: rgba(95, 200, 255, 0.08); color: #5fd2ff; font-size: 13px;
+  border: 1px solid rgba(var(--accent-rgb), 0.18); border-radius: 9px; cursor: pointer;
+  background: rgba(var(--accent-rgb), 0.08); color: var(--accent); font-size: 13px;
 }
-.vbtn:hover { border-color: #5fd2ff; box-shadow: 0 0 12px rgba(95, 200, 255, 0.3); }
+.vbtn:hover { border-color: var(--accent); box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.3); }
 
 .slider {
   -webkit-appearance: none; appearance: none; flex: 1; height: 3px; border-radius: 2px;
-  background: linear-gradient(90deg, #5fd2ff var(--pct), rgba(95, 200, 255, 0.14) var(--pct));
+  background: linear-gradient(90deg, var(--accent) var(--pct), rgba(var(--accent-rgb), 0.14) var(--pct));
   outline: none; cursor: pointer;
 }
 .slider::-webkit-slider-thumb {
   -webkit-appearance: none; appearance: none;
   width: 11px; height: 11px; border-radius: 50%;
-  background: #5fd2ff; box-shadow: 0 0 8px rgba(95, 210, 255, 0.8);
+  background: var(--accent); box-shadow: 0 0 8px rgba(var(--accent-rgb), 0.8);
 }
 
 .vbtn.rate { width: auto; padding: 0 9px; font: 11px/1 ui-monospace, "SF Mono", monospace; }
 .vol-slider {
   -webkit-appearance: none; appearance: none; width: 70px; height: 3px; border-radius: 2px; flex: none;
-  background: linear-gradient(90deg, #5fd2ff var(--pct), rgba(95, 200, 255, 0.14) var(--pct));
+  background: linear-gradient(90deg, var(--accent) var(--pct), rgba(var(--accent-rgb), 0.14) var(--pct));
   outline: none; cursor: pointer;
 }
 .vol-slider::-webkit-slider-thumb {
   -webkit-appearance: none; appearance: none;
   width: 9px; height: 9px; border-radius: 50%;
-  background: #5fd2ff; box-shadow: 0 0 6px rgba(95, 210, 255, 0.8);
+  background: var(--accent); box-shadow: 0 0 6px rgba(var(--accent-rgb), 0.8);
 }
 </style>

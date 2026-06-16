@@ -95,77 +95,37 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 </script>
 
 <template>
-  <section class="rem">
-    <header class="r-head" data-tauri-drag-region>
-      <div class="r-title">
+  <section class="rem view-shell">
+    <header class="view-head sep" data-tauri-drag-region>
+      <div class="view-title">
         <b>{{ t('reminders.title') }}</b>
-        <span class="r-mono">7274 · REMINDERS</span>
+        <span class="view-mono">7274 · REMINDERS</span>
         <small>{{ t('reminders.tagline') }}</small>
       </div>
-      <button class="r-back" @click="emit('close')">{{ t('reminders.back') }}</button>
+      <button class="view-back" @click="emit('close')">{{ t('reminders.back') }}</button>
     </header>
 
-    <div class="r-body">
-      <p v-if="loaded && total" class="r-count">{{ t('reminders.count', { n: total }) }}</p>
+    <div class="view-scroll">
+      <p v-if="loaded && total" class="lp-count">{{ t('reminders.count', { n: total }) }}</p>
 
-      <TransitionGroup name="rem" tag="div">
-        <div v-for="r in items" :key="r.id" class="rem-card">
-          <span class="rem-dot" :class="{ due: isDue(r) }"></span>
-          <span class="rem-text">{{ r.content }}</span>
-          <span v-if="repeatLabel(r)" class="rem-badge">{{ repeatLabel(r) }}</span>
-          <span class="rem-when">{{ r.kind === 'cond' ? t('reminders.condition') : fmtDue(r.due_at) }}</span>
-          <button class="rem-act" :disabled="busy === r.id" @click="cancel(r)">
+      <TransitionGroup name="lp" tag="div">
+        <div v-for="r in items" :key="r.id" class="lp-card">
+          <span class="lp-dot" :class="{ warn: isDue(r) }"></span>
+          <span class="lp-text">{{ r.content }}</span>
+          <span v-if="repeatLabel(r)" class="lp-badge">{{ repeatLabel(r) }}</span>
+          <span class="lp-date">{{ r.kind === 'cond' ? t('reminders.condition') : fmtDue(r.due_at) }}</span>
+          <button class="lp-act attn" :disabled="busy === r.id" @click="cancel(r)">
             {{ t('reminders.cancel') }}
           </button>
         </div>
       </TransitionGroup>
 
-      <div v-if="loaded && !total" class="r-empty">
-        <span class="r-empty-icon">⏰</span>
+      <div v-if="loaded && !total" class="lp-empty">
+        <span class="lp-empty-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="13" r="8" /><path d="M12 9v4l2.5 1.5" /><path d="M5 4.5 8 7M19 4.5 16 7" /></svg></span>
         <p>{{ t('reminders.empty') }}</p>
       </div>
     </div>
   </section>
 </template>
 
-<style scoped>
-.rem { flex: 1; display: flex; flex-direction: column; min-width: 0; padding: 18px 26px; overflow-y: auto; }
-.r-head { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 14px; padding-right: 70px; }
-.r-title b { font-size: 16px; color: var(--txt); }
-.r-title small { display: block; margin-top: 3px; font-size: 12px; color: var(--txt2); }
-.r-mono { font-family: ui-monospace, "SF Mono", monospace; font-size: 10px; letter-spacing: 2px; color: var(--txt2); margin-left: 8px; }
-.r-back { background: none; border: 1px solid var(--line); border-radius: 9px; color: var(--txt2); cursor: pointer; padding: 5px 10px; font-size: 12px; }
-.r-back:hover { color: var(--cy); border-color: var(--cy); }
-
-.r-body { max-width: 640px; }
-.r-count { margin: 0 0 10px; font-size: 11.5px; letter-spacing: 2px; color: var(--txt2); }
-
-.rem-card {
-  display: flex; align-items: center; gap: 10px;
-  border: 1px solid var(--line); border-radius: 12px; padding: 11px 14px; margin-bottom: 8px;
-  background: rgba(95, 200, 255, 0.03); font-size: 13.5px;
-  transition: border-color .15s, opacity .15s;
-}
-.rem-card:hover { border-color: rgba(95, 200, 255, 0.4); }
-.rem-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--cy); box-shadow: 0 0 6px var(--cy); flex: none; opacity: .85; }
-.rem-dot.due { background: #ffb86b; box-shadow: 0 0 6px #ffb86b; }
-.rem-text { flex: 1; min-width: 0; color: var(--txt); line-height: 1.5; word-break: break-word; }
-.rem-badge {
-  flex: none; font: 10px/1 ui-monospace, "SF Mono", monospace; letter-spacing: 1px;
-  color: var(--txt2); border: 1px solid var(--line); border-radius: 6px; padding: 3px 7px;
-}
-.rem-when { flex: none; font: 10.5px/1 ui-monospace, "SF Mono", monospace; letter-spacing: .5px; color: var(--txt2); }
-.rem-act {
-  flex: none; background: none; border: 1px solid transparent; border-radius: 8px;
-  color: var(--txt2); cursor: pointer; font-size: 11.5px; padding: 4px 10px;
-  transition: opacity .15s, color .15s, border-color .15s;
-}
-.rem-card:hover .rem-act { color: #ffb86b; border-color: rgba(255, 184, 107, 0.45); }
-.rem-act:disabled { opacity: 0.4; cursor: default; }
-
-.r-empty { padding: 42px 0; text-align: center; color: var(--txt2); font-size: 13.5px; line-height: 1.8; }
-.r-empty-icon { font-size: 26px; display: block; margin-bottom: 8px; opacity: .7; }
-
-.rem-leave-to { opacity: 0; transform: translateX(12px); }
-.rem-leave-active { transition: all .22s ease; }
-</style>
+<!-- 外壳 / 卡片 / 空态样式全在 style.css 的 .view-* / .lp-* 共用类(回忆·记录·提醒同款) -->

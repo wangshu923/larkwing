@@ -19,10 +19,43 @@ use serde::Serialize;
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                   (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
-/// settings key(app 级):和风 key(填了即切和风源)、可选专属 host、记住的城市。
-pub const KEY_QWEATHER: &str = "weather.qweather.key";
+/// settings key(app 级):和风 JWT 接入三件套(专属 host + 项目 ID + 凭据 ID)、记住的城市。
+/// 私钥不在此 —— 它是**全局**的(见 [`crate::crypto`]),所有走 Ed25519-JWT 的服务共用一把。
 pub const KEY_QWEATHER_HOST: &str = "weather.qweather.host";
+pub const KEY_QWEATHER_PROJECT: &str = "weather.qweather.project_id";
+pub const KEY_QWEATHER_CREDENTIAL: &str = "weather.qweather.credential_id";
 pub const KEY_CITY: &str = "weather.city";
+
+/// 和风 JWT 接入配置:host(专属 API Host)+ project_id(JWT 的 `sub`)+ credential_id
+/// (JWT 的 `kid`)+ private_pem(全局私钥)。四者齐备才成立 —— 缺任一回落 Open-Meteo。
+#[derive(Debug, Clone)]
+pub struct QWeatherCfg {
+    pub host: String,
+    pub project_id: String,
+    pub credential_id: String,
+    pub private_pem: String,
+}
+
+/// 从 settings 读和风 JWT 配置(weather 工具 / scheduler 条件提醒两处共用):host/项目ID/凭据ID
+/// 任一为空,或全局私钥还没生成 → None(选源回落免 key 的 Open-Meteo)。同步 Repo,在 blocking 上下文调。
+pub fn qweather_cfg(settings: &crate::store::SettingsRepo) -> anyhow::Result<Option<QWeatherCfg>> {
+    let read = |k: &str| -> anyhow::Result<String> {
+        Ok(settings.get(None, k)?.map(|s| s.trim().to_string()).unwrap_or_default())
+    };
+    let host = read(KEY_QWEATHER_HOST)?;
+    let project_id = read(KEY_QWEATHER_PROJECT)?;
+    let credential_id = read(KEY_QWEATHER_CREDENTIAL)?;
+    let private_pem = read(crate::crypto::KEY_ED25519_PRIVATE)?;
+    if host.is_empty() || project_id.is_empty() || credential_id.is_empty() || private_pem.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(QWeatherCfg {
+        host: host.trim_end_matches('/').to_string(),
+        project_id,
+        credential_id,
+        private_pem,
+    }))
+}
 
 /// 查哪一段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,46 +124,61 @@ impl Default for WeatherClient {
 impl WeatherClient {
     pub fn new() -> WeatherClient {
         let net = crate::net::Client::new(|b| {
-            b.user_agent(UA).connect_timeout(Duration::from_secs(8)).timeout(Duration::from_secs(15))
+            // 和风 API 一律 gzip 压缩(文档示例都带 --compressed):不开自动解压,.text() 拿到的是压缩
+            // 字节,serde 当场炸「expected value at line 1 column 1」。开了 reqwest 据 Content-Encoding 透明解压。
+            b.user_agent(UA)
+                .gzip(true)
+                .connect_timeout(Duration::from_secs(8))
+                .timeout(Duration::from_secs(15))
         });
         WeatherClient { net }
     }
 
-    /// 选源(按 key 有无)+ 查询。store 编排(读 key/host、定位记忆)在工具层走
-    /// spawn_blocking,这里纯网络、无状态依赖 —— 好测、职责清(同 web 的 WebClient 不碰 store)。
+    /// 选源 + 查询:给了和风 JWT 配置 → 走和风(国内稳、生活指数);否则 Open-Meteo(免 key)。
+    /// store 编排(读配置、定位记忆)在工具层走 spawn_blocking,这里纯网络、无状态依赖 ——
+    /// 好测、职责清(同 web 的 WebClient 不碰 store)。
     pub async fn report_for(
         &self,
         city: &str,
-        key: Option<&str>,
-        host: Option<&str>,
+        qw: Option<QWeatherCfg>,
         when: When,
     ) -> Result<Weather> {
-        match key.map(str::trim).filter(|k| !k.is_empty()) {
-            Some(key) => {
-                let host = host
-                    .map(|h| h.trim().trim_end_matches('/').to_string())
-                    .filter(|h| !h.is_empty());
-                qweather::QWeatherSource::new(key.to_string(), host)
-                    .lookup(&self.net, city, when)
-                    .await
-            }
+        match qw {
+            Some(cfg) => qweather::QWeatherSource::new(cfg).lookup(&self.net, city, when).await,
             None => open_meteo::OpenMeteoSource::new().lookup(&self.net, city, when).await,
         }
     }
 
-    /// 搜狐 cityjson:免 key、自动识别请求方公网 IP → 城市。
-    /// 响应形如 `var returnCitySN = {"cip":"..","cid":"..","cname":"杭州市"};`。
+    /// 公网 IP → 城市(免 key)。**多源兜底**:依次试,首个拿到城市即用 —— 一个挂了/无果就换下一个
+    /// (单源挂掉就"老问在哪个城市")。不挑国家:出口在哪报哪城(海外出口报海外城也对,用户可显式
+    /// 说城市覆盖)。顺序 = 国内优先(搜狐,中文、快)→ ip-api(干净 JSON,境内外都通)→ ipip(国内兜底)。
     pub async fn locate_city(&self) -> Result<String> {
-        let url = "http://pv.sohu.com/cityjson?ie=utf-8";
-        let bytes = self
-            .net
-            .send(url, |c| c.get(url))
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await?;
+        type Parser = fn(&str) -> Option<String>;
+        const PROBES: &[(&str, Parser)] = &[
+            ("http://pv.sohu.com/cityjson?ie=utf-8", parse_cityjson),
+            ("http://ip-api.com/json/?lang=zh-CN&fields=status,city", parse_ipapi),
+            ("http://myip.ipip.net/", parse_ipip),
+        ];
+        let mut last_err: Option<anyhow::Error> = None;
+        for (url, parse) in PROBES {
+            match self.fetch_city(url, *parse).await {
+                Ok(city) => return Ok(city),
+                Err(e) => {
+                    tracing::debug!(url, error = %e, "定位源没拿到城市,换下一个");
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| anyhow::anyhow!("没有可用的定位源"))
+            .context("所有定位源都没拿到城市"))
+    }
+
+    /// 取一个定位源:GET → 文本 → 该源解析器抽城市。任一环节失败 = 这个源没拿到(换下一个)。
+    async fn fetch_city(&self, url: &str, parse: fn(&str) -> Option<String>) -> Result<String> {
+        let bytes = self.net.send(url, |c| c.get(url)).await?.error_for_status()?.bytes().await?;
         let body = String::from_utf8_lossy(&bytes);
-        parse_cityjson(&body).context("定位响应里没有城市名")
+        parse(&body).context("定位响应里没有城市名")
     }
 }
 
@@ -144,6 +192,29 @@ fn parse_cityjson(body: &str) -> Option<String> {
         return None;
     }
     Some(cname.to_string())
+}
+
+/// ip-api.com:`{"status":"success","city":"杭州"}`。status 非 success / city 空 → None。
+fn parse_ipapi(body: &str) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    if json.get("status").and_then(serde_json::Value::as_str) != Some("success") {
+        return None;
+    }
+    let city = json.get("city")?.as_str()?.trim();
+    (!city.is_empty()).then(|| city.to_string())
+}
+
+/// myip.ipip.net:纯文本 `当前 IP:1.2.3.4  来自于:中国 浙江 杭州 电信`。取"来自于"之后那串,
+/// 去掉末尾运营商,其后末个地名作城市(直辖市/海外同样适用)。拿不到 → None。
+fn parse_ipip(body: &str) -> Option<String> {
+    let geo = body
+        .split("来自于")
+        .nth(1)?
+        .trim_start_matches(|c: char| c == ':' || c == '：' || c == ' ');
+    let mut parts: Vec<&str> = geo.split_whitespace().collect();
+    parts.pop()?; // 末尾是运营商(电信/联通/starhub.com…)
+    let city = parts.pop()?.trim(); // 其后末个地名 = 城市
+    (!city.is_empty() && city != "未知").then(|| city.to_string())
 }
 
 /// 城市名归一:去行政尾缀(市/区/县/自治州…)给 geocoding 用 —— Open-Meteo 对
@@ -180,6 +251,34 @@ mod tests {
         let unknown = r#"var returnCitySN = {"cip": "127.0.0.1", "cid": "00", "cname": "未知"};"#;
         assert_eq!(parse_cityjson(unknown), None);
         assert_eq!(parse_cityjson("garbage"), None);
+    }
+
+    #[test]
+    fn ipapi_extracts_city_and_rejects_failure() {
+        assert_eq!(parse_ipapi(r#"{"status":"success","city":"杭州"}"#).as_deref(), Some("杭州"));
+        assert_eq!(parse_ipapi(r#"{"status":"fail","message":"private range"}"#), None);
+        assert_eq!(parse_ipapi(r#"{"status":"success","city":""}"#), None, "city 空算没拿到");
+        assert_eq!(parse_ipapi("not json"), None);
+    }
+
+    #[test]
+    fn ipip_parses_text_and_drops_isp() {
+        // 国 省 市 运营商
+        assert_eq!(
+            parse_ipip("当前 IP：1.2.3.4  来自于：中国 浙江 杭州 电信").as_deref(),
+            Some("杭州")
+        );
+        // 直辖市:国 市 市 运营商
+        assert_eq!(
+            parse_ipip("当前 IP：1.2.3.4  来自于：中国 北京 北京 联通").as_deref(),
+            Some("北京")
+        );
+        // 海外:国 城市 运营商(实测本机出口)
+        assert_eq!(
+            parse_ipip("当前 IP：203.116.182.37  来自于：新加坡 新加坡   starhub.com").as_deref(),
+            Some("新加坡")
+        );
+        assert_eq!(parse_ipip("乱码没有来自于"), None);
     }
 
     #[test]

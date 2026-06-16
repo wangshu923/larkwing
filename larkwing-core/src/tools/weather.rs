@@ -10,7 +10,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use async_trait::async_trait;
 
-use crate::weather::{Weather, WeatherClient, When, KEY_CITY, KEY_QWEATHER, KEY_QWEATHER_HOST};
+use crate::weather::{qweather_cfg, Weather, WeatherClient, When, KEY_CITY};
 
 use super::{Tool, ToolCtx, ToolSpec};
 
@@ -62,15 +62,13 @@ impl Tool for WeatherTool {
 
         let city = resolve_city(ctx, &self.weather, city_arg).await?;
 
-        // 选源用的 key/host(同步 Repo → spawn_blocking)
+        // 选源配置:和风 JWT 三件套 + 全局私钥齐备 → 走和风,否则 Open-Meteo(同步 Repo → spawn_blocking)
         let store = ctx.store.clone();
-        let (key, host) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            Ok((store.settings.get(None, KEY_QWEATHER)?, store.settings.get(None, KEY_QWEATHER_HOST)?))
-        })
-        .await
-        .context("读天气设置任务挂了")??;
+        let qw = tokio::task::spawn_blocking(move || qweather_cfg(&store.settings))
+            .await
+            .context("读天气设置任务挂了")??;
 
-        let report = self.weather.report_for(&city, key.as_deref(), host.as_deref(), when).await?;
+        let report = self.weather.report_for(&city, qw, when).await?;
         Ok(render(&report, when))
     }
 }

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 操作记录页(PLAN §9 文件能力):看 7274 动过哪些文件,按批次列 + 一键撤销/重做。
+// 足迹页(PLAN §9 文件能力):看 7274 动过哪些文件,按批次列 + 一键撤销/重做。
 // 定位 = 普通文件管理器的历史功能(功能性,**非安全承诺**);气质仿回忆页(MemoryView)。
 // 「审批」分区预留不显示(将来若启用执行前确认,审批历史落这里)。
 // 纯浏览器预览:假数据看视觉。
@@ -96,88 +96,45 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 </script>
 
 <template>
-  <section class="ops">
-    <header class="o-head" data-tauri-drag-region>
-      <div class="o-title">
+  <section class="ops view-shell">
+    <header class="view-head sep" data-tauri-drag-region>
+      <div class="view-title">
         <b>{{ t('ops.title') }}</b>
-        <span class="o-mono">7274 · FILES</span>
+        <span class="view-mono">7274 · FILES</span>
         <small>{{ t('ops.tagline') }}</small>
       </div>
-      <button class="o-back" @click="emit('close')">{{ t('ops.back') }}</button>
+      <button class="view-back" @click="emit('close')">{{ t('ops.back') }}</button>
     </header>
 
-    <div class="o-body">
-      <p v-if="loaded && total" class="o-count">{{ t('ops.count', { n: total }) }}</p>
+    <div class="view-scroll">
+      <p v-if="loaded && total" class="lp-count">{{ t('ops.count', { n: total }) }}</p>
 
-      <TransitionGroup name="op" tag="div">
-        <div v-for="o in ops" :key="o.id" class="op-card" :class="{ undone: o.state === 'undone' }">
-          <span class="op-dot" :class="dotClass(o)"></span>
-          <span class="op-text">{{ summary(o) }}</span>
-          <span v-if="o.state === 'undone'" class="op-badge">{{ t('ops.undone') }}</span>
-          <span class="op-date">{{ fmtDate(o.created_at) }}</span>
+      <TransitionGroup name="lp" tag="div">
+        <div v-for="o in ops" :key="o.id" class="lp-card" :class="{ muted: o.state === 'undone' }">
+          <span class="lp-dot" :class="dotClass(o)"></span>
+          <span class="lp-text">{{ summary(o) }}</span>
+          <span v-if="o.state === 'undone'" class="lp-badge">{{ t('ops.undone') }}</span>
+          <span class="lp-date">{{ fmtDate(o.created_at) }}</span>
           <button
             v-if="o.state === 'applied'"
-            class="op-act"
+            class="lp-act attn"
             :disabled="busy === o.id"
             @click="undo(o)"
           >
             {{ t('ops.undo') }}
           </button>
-          <button v-else class="op-act redo" :disabled="busy === o.id" @click="redo(o)">
+          <button v-else class="lp-act cy" :disabled="busy === o.id" @click="redo(o)">
             {{ t('ops.redo') }}
           </button>
         </div>
       </TransitionGroup>
 
-      <div v-if="loaded && !total" class="o-empty">
-        <span class="o-empty-icon">🗂</span>
+      <div v-if="loaded && !total" class="lp-empty">
+        <span class="lp-empty-icon"><svg viewBox="0 0 24 24"><g transform="translate(8 13.5) rotate(-16)"><ellipse cx="0" cy="-1.9" rx="2.1" ry="2.6" /><ellipse cx="-0.1" cy="2.5" rx="1.2" ry="1.5" /></g><g transform="translate(15.6 9) rotate(-16)"><ellipse cx="0" cy="-1.9" rx="2.1" ry="2.6" /><ellipse cx="-0.1" cy="2.5" rx="1.2" ry="1.5" /></g></svg></span>
         <p>{{ t('ops.empty') }}</p>
       </div>
     </div>
   </section>
 </template>
 
-<style scoped>
-.ops { flex: 1; display: flex; flex-direction: column; min-width: 0; padding: 18px 26px; overflow-y: auto; }
-.o-head { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 14px; padding-right: 70px; }
-.o-title b { font-size: 16px; color: var(--txt); }
-.o-title small { display: block; margin-top: 3px; font-size: 12px; color: var(--txt2); }
-.o-mono { font-family: ui-monospace, "SF Mono", monospace; font-size: 10px; letter-spacing: 2px; color: var(--txt2); margin-left: 8px; }
-.o-back { background: none; border: 1px solid var(--line); border-radius: 9px; color: var(--txt2); cursor: pointer; padding: 5px 10px; font-size: 12px; }
-.o-back:hover { color: var(--cy); border-color: var(--cy); }
-
-.o-body { max-width: 640px; }
-.o-count { margin: 0 0 10px; font-size: 11.5px; letter-spacing: 2px; color: var(--txt2); }
-
-.op-card {
-  display: flex; align-items: center; gap: 10px;
-  border: 1px solid var(--line); border-radius: 12px; padding: 11px 14px; margin-bottom: 8px;
-  background: rgba(95, 200, 255, 0.03); font-size: 13.5px;
-  transition: border-color .15s, opacity .15s;
-}
-.op-card:hover { border-color: rgba(95, 200, 255, 0.4); }
-.op-card.undone { opacity: 0.6; }
-.op-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--cy); box-shadow: 0 0 6px var(--cy); flex: none; opacity: .85; }
-.op-dot.warn { background: #ffb86b; box-shadow: 0 0 6px #ffb86b; }
-.op-text { flex: 1; min-width: 0; color: var(--txt); line-height: 1.5; word-break: break-word; }
-.op-badge {
-  flex: none; font: 10px/1 ui-monospace, "SF Mono", monospace; letter-spacing: 1px;
-  color: var(--txt2); border: 1px solid var(--line); border-radius: 6px; padding: 3px 7px;
-}
-.op-date { flex: none; font: 10.5px/1 ui-monospace, "SF Mono", monospace; letter-spacing: .5px; color: var(--txt2); }
-.op-act {
-  flex: none; background: none; border: 1px solid transparent; border-radius: 8px;
-  color: var(--txt2); cursor: pointer; font-size: 11.5px; padding: 4px 10px;
-  transition: opacity .15s, color .15s, border-color .15s;
-}
-.op-card:hover .op-act { color: #ffb86b; border-color: rgba(255, 184, 107, 0.45); }
-.op-act.redo { }
-.op-card:hover .op-act.redo { color: var(--cy); border-color: rgba(95, 200, 255, 0.45); }
-.op-act:disabled { opacity: 0.4; cursor: default; }
-
-.o-empty { padding: 42px 0; text-align: center; color: var(--txt2); font-size: 13.5px; line-height: 1.8; }
-.o-empty-icon { font-size: 26px; display: block; margin-bottom: 8px; opacity: .7; }
-
-.op-leave-to { opacity: 0; transform: translateX(12px); }
-.op-leave-active { transition: all .22s ease; }
-</style>
+<!-- 外壳 / 卡片 / 空态样式全在 style.css 的 .view-* / .lp-* 共用类(回忆·记录·提醒同款) -->

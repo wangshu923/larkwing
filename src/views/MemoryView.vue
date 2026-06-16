@@ -91,29 +91,29 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 </script>
 
 <template>
-  <section class="memory" @click.self="arming = null">
-    <header class="m-head" data-tauri-drag-region>
-      <div class="m-title">
+  <section class="memory view-shell" @click.self="arming = null">
+    <header class="view-head sep" data-tauri-drag-region>
+      <div class="view-title">
         <b>{{ t('memory.title') }}</b>
-        <span class="m-mono">7274 · MEMORY</span>
+        <span class="view-mono">7274 · MEMORY</span>
         <small>{{ t('memory.tagline') }}</small>
       </div>
-      <button class="m-back" @click="emit('close')">{{ t('memory.back') }}</button>
+      <button class="view-back" @click="emit('close')">{{ t('memory.back') }}</button>
     </header>
 
-    <div class="m-body">
-      <p v-if="loaded && total" class="m-count">{{ t('memory.count', { n: total }) }}</p>
+    <div class="view-scroll">
+      <p v-if="loaded && total" class="lp-count">{{ t('memory.count', { n: total }) }}</p>
 
       <!-- 关于你(小本本) -->
-      <p v-if="memories.length" class="m-group">{{ t('memory.groupYou') }}</p>
-      <TransitionGroup name="mem" tag="div">
-        <div v-for="m in memories" :key="`m-${m.id}`" class="mem-card">
-          <span class="mem-dot"></span>
-          <span class="mem-text">{{ m.content }}</span>
-          <span class="mem-date">{{ fmtDate(m.created_at) }}</span>
+      <p v-if="memories.length" class="lp-group">{{ t('memory.groupYou') }}</p>
+      <TransitionGroup name="lp" tag="div">
+        <div v-for="m in memories" :key="`m-${m.id}`" class="lp-card top">
+          <span class="lp-dot sm"></span>
+          <span class="lp-text multiline">{{ m.content }}</span>
+          <span class="lp-date top">{{ fmtDate(m.created_at) }}</span>
           <button
-            class="mem-del"
-            :class="{ arming: arming === `m-${m.id}` }"
+            class="lp-act hoveronly"
+            :class="{ armed: arming === `m-${m.id}` }"
             @click.stop="removeMemory(m)"
           >
             {{ arming === `m-${m.id}` ? t('memory.confirm') : '✕' }}
@@ -122,15 +122,15 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
       </TransitionGroup>
 
       <!-- 家里的事(家庭备忘) -->
-      <p v-if="briefings.length" class="m-group">{{ t('memory.groupHome') }}</p>
-      <TransitionGroup name="mem" tag="div">
-        <div v-for="b in briefings" :key="`b-${b.id}`" class="mem-card">
-          <span class="mem-chip">{{ b.domain }}</span>
-          <span class="mem-text">{{ b.content }}</span>
-          <span class="mem-date">{{ fmtDate(b.updated_at || b.created_at) }}</span>
+      <p v-if="briefings.length" class="lp-group">{{ t('memory.groupHome') }}</p>
+      <TransitionGroup name="lp" tag="div">
+        <div v-for="b in briefings" :key="`b-${b.id}`" class="lp-card top">
+          <span class="lp-chip">{{ b.domain }}</span>
+          <span class="lp-text multiline">{{ b.content }}</span>
+          <span class="lp-date top">{{ fmtDate(b.updated_at || b.created_at) }}</span>
           <button
-            class="mem-del"
-            :class="{ arming: arming === `b-${b.id}` }"
+            class="lp-act hoveronly"
+            :class="{ armed: arming === `b-${b.id}` }"
             @click.stop="removeBriefing(b)"
           >
             {{ arming === `b-${b.id}` ? t('memory.confirm') : '✕' }}
@@ -138,58 +138,13 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         </div>
       </TransitionGroup>
 
-      <div v-if="loaded && !total" class="m-empty">
-        <span class="m-empty-icon">📖</span>
+      <div v-if="loaded && !total" class="lp-empty">
+        <span class="lp-empty-icon"><svg viewBox="0 0 24 24"><path d="M7 4h10v16l-5-3-5 3z" /></svg></span>
         <p>{{ t('memory.empty') }}</p>
       </div>
     </div>
   </section>
 </template>
 
-<style scoped>
-.memory { flex: 1; display: flex; flex-direction: column; min-width: 0; padding: 18px 26px; overflow-y: auto; }
-/* padding-right 让「回去聊天」避开右上角窗控三键(二轮真机修复:不再重叠) */
-.m-head { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 14px; padding-right: 70px; }
-.m-title b { font-size: 16px; color: var(--txt); }
-.m-title small { display: block; margin-top: 3px; font-size: 12px; color: var(--txt2); }
-.m-mono { font-family: ui-monospace, "SF Mono", monospace; font-size: 10px; letter-spacing: 2px; color: var(--txt2); margin-left: 8px; }
-.m-back { background: none; border: 1px solid var(--line); border-radius: 9px; color: var(--txt2); cursor: pointer; padding: 5px 10px; font-size: 12px; }
-.m-back:hover { color: var(--cy); border-color: var(--cy); }
+<!-- 外壳 / 卡片 / 空态样式全在 style.css 的 .view-* / .lp-* 共用类(回忆·记录·提醒同款) -->
 
-.m-body { max-width: 640px; }
-.m-count { margin: 0 0 10px; font-size: 11.5px; letter-spacing: 2px; color: var(--txt2); }
-.m-group { margin: 16px 0 9px; font-size: 11.5px; letter-spacing: 2px; color: var(--txt2); }
-.m-group:first-of-type { margin-top: 0; }
-
-.mem-card {
-  display: flex; align-items: flex-start; gap: 10px;
-  border: 1px solid var(--line); border-radius: 12px; padding: 11px 14px; margin-bottom: 8px;
-  background: rgba(95, 200, 255, 0.03); font-size: 13.5px;
-  transition: border-color .15s;
-}
-.mem-card:hover { border-color: rgba(95, 200, 255, 0.4); }
-/* flex-start 让点/标签/日期对齐多行内容的第一行,不再悬在垂直正中 */
-.mem-dot { width: 5px; height: 5px; margin-top: 7px; border-radius: 50%; background: var(--cy); box-shadow: 0 0 6px var(--cy); flex: none; opacity: .8; }
-.mem-chip {
-  flex: none; margin-top: 1px; font: 10px/1 ui-monospace, "SF Mono", monospace; letter-spacing: 1px;
-  color: var(--cy); border: 1px solid rgba(95, 200, 255, 0.35); border-radius: 6px;
-  padding: 3px 7px; text-transform: uppercase;
-}
-/* pre-line:保留内容里的真实换行(模型多行写入的事实/备忘),其余空白照常折叠、长行自动回绕 */
-.mem-text { flex: 1; min-width: 0; color: var(--txt); line-height: 1.5; word-break: break-word; white-space: pre-line; }
-.mem-date { flex: none; margin-top: 4px; font: 10.5px/1 ui-monospace, "SF Mono", monospace; letter-spacing: .5px; color: var(--txt2); }
-.mem-del {
-  flex: none; background: none; border: 1px solid transparent; border-radius: 8px;
-  color: var(--txt2); cursor: pointer; font-size: 11px; padding: 3px 8px;
-  opacity: 0; transition: opacity .15s, color .15s, border-color .15s;
-}
-.mem-card:hover .mem-del, .mem-del.arming { opacity: 1; }
-.mem-del:hover { color: #ffb86b; }
-.mem-del.arming { color: #ffb86b; border-color: rgba(255, 184, 107, 0.45); }
-
-.m-empty { padding: 42px 0; text-align: center; color: var(--txt2); font-size: 13.5px; line-height: 1.8; }
-.m-empty-icon { font-size: 26px; display: block; margin-bottom: 8px; opacity: .7; }
-
-.mem-leave-to { opacity: 0; transform: translateX(12px); }
-.mem-leave-active { transition: all .22s ease; }
-</style>

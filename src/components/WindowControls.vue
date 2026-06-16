@@ -55,10 +55,10 @@ onUnmounted(() => stop())
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(95, 200, 255, 0.05);
-  border: 1px solid rgba(95, 200, 255, 0.16);
+  background: rgba(var(--accent-rgb), 0.05);
+  border: 1px solid rgba(var(--accent-rgb), 0.16);
   border-radius: 6px;
-  color: #85a4c0;
+  color: var(--text-dim);
   cursor: pointer;
   transition: color 0.15s, border-color 0.15s, background 0.15s;
 }
@@ -72,13 +72,13 @@ onUnmounted(() => stop())
   stroke-linejoin: round;
 }
 .wcb:hover {
-  color: #5fd2ff;
-  border-color: rgba(95, 200, 255, 0.45);
-  background: rgba(95, 200, 255, 0.14);
+  color: var(--accent);
+  border-color: rgba(var(--accent-rgb), 0.45);
+  background: rgba(var(--accent-rgb), 0.14);
 }
 .wcb.close:hover {
-  color: #ffb86b;
-  border-color: rgba(255, 184, 107, 0.5);
-  background: rgba(255, 184, 107, 0.14);
+  color: var(--attn);
+  border-color: rgba(var(--attn-rgb), 0.5);
+  background: rgba(var(--attn-rgb), 0.14);
 }
 </style>

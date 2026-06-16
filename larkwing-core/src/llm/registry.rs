@@ -17,6 +17,10 @@ use super::{LlmConfig, LlmProvider, Quirks, Thinking};
 pub enum Protocol {
     OpenaiCompat,
     AnthropicCompat,
+    /// Google Gemini 原生(generateContent):为 thought_signature 逐字保真而下楼(reasoning 保真铁律)。
+    Gemini,
+    /// OpenAI Responses API 原生:为 reasoning encrypted_content 逐字保真而下楼(同上铁律)。
+    OpenaiResponses,
 }
 
 impl Protocol {
@@ -24,6 +28,8 @@ impl Protocol {
         match self {
             Protocol::OpenaiCompat => "openai_compat",
             Protocol::AnthropicCompat => "anthropic_compat",
+            Protocol::Gemini => "gemini",
+            Protocol::OpenaiResponses => "openai_responses",
         }
     }
 
@@ -31,6 +37,8 @@ impl Protocol {
         match s {
             "openai_compat" => Some(Protocol::OpenaiCompat),
             "anthropic_compat" => Some(Protocol::AnthropicCompat),
+            "gemini" => Some(Protocol::Gemini),
+            "openai_responses" => Some(Protocol::OpenaiResponses),
             _ => None,
         }
     }
@@ -101,6 +109,51 @@ impl ProviderSpec {
         }
     }
 
+    /// Google Gemini 官方预设(**原生** generateContent:为 thought_signature 保真,宪法 §4 铁律)。
+    pub fn gemini(api_key: String) -> Self {
+        let cfg = LlmConfig::gemini(api_key);
+        ProviderSpec {
+            id: "gemini".into(),
+            name: "Google Gemini".into(),
+            protocol: Protocol::Gemini,
+            base_url: cfg.base_url,
+            api_key: cfg.api_key,
+            model: cfg.model,
+            quirks: cfg.quirks,
+            ..Default::default()
+        }
+    }
+
+    /// Ollama 本地预设(经 OpenAI 兼容端点 /v1)。base_url 空 → 默认 localhost。
+    pub fn ollama(base_url: String) -> Self {
+        let cfg = LlmConfig::ollama(base_url);
+        ProviderSpec {
+            id: "ollama".into(),
+            name: "Ollama".into(),
+            protocol: Protocol::OpenaiCompat,
+            base_url: cfg.base_url,
+            api_key: cfg.api_key,
+            model: cfg.model,
+            quirks: cfg.quirks,
+            ..Default::default()
+        }
+    }
+
+    /// OpenAI 官方预设(**原生** Responses API:为 reasoning encrypted_content 保真,宪法 §4 铁律)。
+    pub fn openai(api_key: String) -> Self {
+        let cfg = LlmConfig::openai(api_key);
+        ProviderSpec {
+            id: "openai".into(),
+            name: "OpenAI".into(),
+            protocol: Protocol::OpenaiResponses,
+            base_url: cfg.base_url,
+            api_key: cfg.api_key,
+            model: cfg.model,
+            quirks: cfg.quirks,
+            ..Default::default()
+        }
+    }
+
     /// 有钥匙且启用才参与选型。`${VAR}` 引用按解析后的值判断:
     /// 变量没设 = 没钥匙,该供应商安静退出候选,不报错(容错铁律)。
     pub fn usable(&self) -> bool {
@@ -135,6 +188,10 @@ impl ProviderSpec {
             }
             Protocol::AnthropicCompat => {
                 Arc::new(super::anthropic_compat::AnthropicCompatProvider::new(self.to_config()))
+            }
+            Protocol::Gemini => Arc::new(super::gemini::GeminiProvider::new(self.to_config())),
+            Protocol::OpenaiResponses => {
+                Arc::new(super::openai_responses::OpenAiResponsesProvider::new(self.to_config()))
             }
         }
     }
@@ -346,5 +403,25 @@ mod tests {
         let an = ProviderSpec::anthropic("k".into());
         assert_eq!(an.protocol, Protocol::AnthropicCompat);
         assert!(!an.quirks.thinking_field);
+    }
+
+    #[test]
+    fn gemini_native_and_ollama_compat_presets() {
+        // Gemini = 原生方言(为 thought_signature 保真,reasoning 保真铁律)
+        let g = ProviderSpec::gemini("k".into());
+        assert_eq!(g.protocol, Protocol::Gemini, "Gemini 走原生,不走兼容端点");
+        assert!(g.base_url.ends_with("/v1beta"), "base_url 末尾不带模型路径,由 provider 拼");
+        assert!(!g.base_url.contains("openai"), "原生路径不含 /openai");
+        assert!(g.usable(), "有钥匙即可用");
+
+        // Ollama = 兼容端点(纯文本 reasoning 无损,/v1 绕开原生坑)
+        let o = ProviderSpec::ollama(String::new());
+        assert_eq!(o.protocol, Protocol::OpenaiCompat);
+        assert_eq!(o.protocol, Protocol::OpenaiCompat);
+        assert_eq!(o.base_url, "http://localhost:11434/v1", "空 base_url → 默认 localhost");
+        assert!(o.usable(), "Ollama 占位钥匙让它进候选(本地不验钥匙,但 usable() 要非空)");
+        // 自定义远程 Ollama 实例
+        let o2 = ProviderSpec::ollama("http://192.168.1.9:11434/v1".into());
+        assert_eq!(o2.base_url, "http://192.168.1.9:11434/v1");
     }
 }

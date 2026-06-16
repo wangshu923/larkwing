@@ -27,7 +27,18 @@ pub const MIGRATIONS: &[Migration] = &[
     // 工具运行时(PLAN §8):assistant 行存 tool_calls+reasoning,'tool' 行存 call_id/name/status。
     // JSON 形状是 engine 的私有词汇,store 只存 TEXT。
     m("0005_messages_payload", "ALTER TABLE messages ADD COLUMN payload TEXT;"),
+    // 会话渠道(渠道=数据,宪法 §5/§9):语音/界面/系统/未来远程渠道,会话列表按此渲染小图标。
+    m(
+        "0006_conversations_channel",
+        "ALTER TABLE conversations ADD COLUMN channel TEXT NOT NULL DEFAULT 'ui';",
+    ),
 ];
+
+/// 会话渠道(渠道=数据):列保持开放 TEXT 让未来渠道当数据加,已知值给常量防拼错。
+/// `ui` = 默认/列表不渲染标记的基线;非界面渠道才标。与消息级 `via`(念不念)正交。
+pub const CHANNEL_UI: &str = "ui";
+pub const CHANNEL_VOICE: &str = "voice";
+pub const CHANNEL_SYSTEM: &str = "system";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Conversation {
@@ -35,6 +46,8 @@ pub struct Conversation {
     pub user_id: i64,
     pub scene_id: String,
     pub title: String,
+    /// 渠道(会话级,持久):ui/voice/system/…。列表按此渲染小图标。见 CHANNEL_* 常量。
+    pub channel: String,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -64,19 +77,30 @@ impl ChatRepo {
         Self { db }
     }
 
+    /// 默认渠道(界面)的便捷壳;非界面渠道走 create_conversation_full(仿 append_message/_full)。
     pub fn create_conversation(&self, user: i64, scene_id: &str) -> Result<Conversation> {
+        self.create_conversation_full(user, scene_id, CHANNEL_UI)
+    }
+
+    pub fn create_conversation_full(
+        &self,
+        user: i64,
+        scene_id: &str,
+        channel: &str,
+    ) -> Result<Conversation> {
         self.db.with(|c| {
             let now = now_ms();
             c.execute(
-                "INSERT INTO conversations (user_id, scene_id, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?3)",
-                rusqlite::params![user, scene_id, now],
+                "INSERT INTO conversations (user_id, scene_id, channel, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?4)",
+                rusqlite::params![user, scene_id, channel, now],
             )?;
             Ok(Conversation {
                 id: c.last_insert_rowid(),
                 user_id: user,
                 scene_id: scene_id.into(),
                 title: String::new(),
+                channel: channel.into(),
                 created_at: now,
                 updated_at: now,
             })
@@ -87,7 +111,7 @@ impl ChatRepo {
         self.db.with(|c| {
             let conv = c
                 .query_row(
-                    "SELECT id, user_id, scene_id, title, created_at, updated_at
+                    "SELECT id, user_id, scene_id, title, channel, created_at, updated_at
                      FROM conversations WHERE id = ?1",
                     [id],
                     row_to_conversation,
@@ -101,7 +125,7 @@ impl ChatRepo {
         self.db.with(|c| {
             let conv = c
                 .query_row(
-                    "SELECT id, user_id, scene_id, title, created_at, updated_at
+                    "SELECT id, user_id, scene_id, title, channel, created_at, updated_at
                      FROM conversations WHERE user_id = ?1
                      ORDER BY updated_at DESC LIMIT 1",
                     [user],
@@ -132,7 +156,7 @@ impl ChatRepo {
     pub fn list_conversations(&self, user: i64) -> Result<Vec<Conversation>> {
         self.db.with(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, user_id, scene_id, title, created_at, updated_at
+                "SELECT id, user_id, scene_id, title, channel, created_at, updated_at
                  FROM conversations WHERE user_id = ?1 ORDER BY updated_at DESC",
             )?;
             let list = stmt
@@ -260,8 +284,9 @@ fn row_to_conversation(r: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation> 
         user_id: r.get(1)?,
         scene_id: r.get(2)?,
         title: r.get(3)?,
-        created_at: r.get(4)?,
-        updated_at: r.get(5)?,
+        channel: r.get(4)?,
+        created_at: r.get(5)?,
+        updated_at: r.get(6)?,
     })
 }
 

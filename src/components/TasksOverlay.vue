@@ -63,10 +63,7 @@ function txt(ref?: TextRef, fallback = 'task.unknown'): string {
 
 <style scoped>
 .tasks {
-  --t-txt: #d4e6f7;
-  --t-txt2: #85a4c0;
-  --t-cy: #5fd2ff;
-  --t-line: rgba(95, 200, 255, 0.18);
+  /* 固定定位浮层,从 :root 继承科幻 token(原先自带一份 --t-* 副本,已删) */
   position: fixed; top: 74px; right: 14px; z-index: 40;
   font-family: -apple-system, "PingFang SC", "Segoe UI", sans-serif;
   pointer-events: none;
@@ -78,36 +75,36 @@ function txt(ref?: TextRef, fallback = 'task.unknown'): string {
 
 .card {
   padding: 9px 11px 10px; border-radius: 10px;
-  background: rgba(10, 24, 46, 0.72); border: 1px solid var(--t-line);
+  background: var(--surface); border: 1px solid var(--line);
   backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.3);
 }
-.card.failed { border-color: rgba(255, 184, 107, 0.5); }
-.card.done { border-color: rgba(95, 224, 176, 0.5); }
+.card.failed { border-color: rgba(var(--attn-rgb), 0.5); }
+.card.done { border-color: rgba(var(--ok-rgb), 0.5); }
 
 .row { display: flex; align-items: center; gap: 8px; }
-.label { flex: 1; font-size: 12px; color: var(--t-txt); letter-spacing: .5px; }
-.ok { color: #5fe0b0; font-size: 12px; text-shadow: 0 0 8px rgba(95, 224, 176, .6); }
+.label { flex: 1; font-size: 12px; color: var(--text); letter-spacing: .5px; }
+.ok { color: var(--ok); font-size: 12px; text-shadow: 0 0 8px rgba(var(--ok-rgb), .6); }
 .x {
-  background: none; border: none; cursor: pointer; color: var(--t-txt2);
+  background: none; border: none; cursor: pointer; color: var(--text-dim);
   font-size: 11px; padding: 0 2px; line-height: 1;
 }
-.x:hover { color: #ffb86b; }
+.x:hover { color: var(--attn); }
 
 .step {
   margin-top: 3px; font: 10.5px/1.4 ui-monospace, "SF Mono", monospace;
-  color: var(--t-txt2); letter-spacing: .4px;
+  color: var(--text-dim); letter-spacing: .4px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.step.err { color: #ffb86b; }
+.step.err { color: var(--attn); }
 
 .bar {
   margin-top: 7px; height: 3px; border-radius: 2px; overflow: hidden;
-  background: rgba(95, 200, 255, 0.12);
+  background: rgba(var(--accent-rgb), 0.12);
 }
 .fill {
-  height: 100%; border-radius: 2px; background: var(--t-cy);
-  box-shadow: 0 0 8px rgba(95, 210, 255, 0.7);
+  height: 100%; border-radius: 2px; background: var(--accent);
+  box-shadow: 0 0 8px rgba(var(--accent-rgb), 0.7);
   transition: width .4s ease;
 }
 .fill.indeterminate { width: 36%; animation: slide 1.3s ease-in-out infinite; }
@@ -119,14 +116,14 @@ function txt(ref?: TextRef, fallback = 'task.unknown'): string {
 .pill {
   display: flex; align-items: center; gap: 7px;
   padding: 7px 13px; border-radius: 999px; cursor: pointer;
-  font-size: 11.5px; letter-spacing: .8px; color: var(--t-txt);
-  background: rgba(10, 24, 46, 0.72); border: 1px solid var(--t-line);
+  font-size: 11.5px; letter-spacing: .8px; color: var(--text);
+  background: var(--surface); border: 1px solid var(--line);
   backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
 }
-.pill:hover { border-color: var(--t-cy); }
+.pill:hover { border-color: var(--accent); }
 .spin {
   width: 9px; height: 9px; border-radius: 50%;
-  border: 1.5px solid rgba(95, 210, 255, 0.25); border-top-color: var(--t-cy);
+  border: 1.5px solid rgba(var(--accent-rgb), 0.25); border-top-color: var(--accent);
   animation: rot 0.9s linear infinite;
 }
 @keyframes rot { to { transform: rotate(360deg); } }

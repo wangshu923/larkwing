@@ -130,7 +130,12 @@ impl Tool for ReminderSet {
         let job = tokio::task::spawn_blocking(move || -> anyhow::Result<crate::store::Job> {
             // mode 只活在此刻:翻译成 conv_id 落库,唤醒管线不认识 mode
             let conv_id = if task_mode {
-                let conv = store.chat.create_conversation(user_id, crate::scenes::DEFAULT_SCENE_ID)?;
+                // 任务模式 = 单独的任务对话(自启兑现) → 系统渠道,列表带系统标
+                let conv = store.chat.create_conversation_full(
+                    user_id,
+                    crate::scenes::DEFAULT_SCENE_ID,
+                    crate::store::chat::CHANNEL_SYSTEM,
+                )?;
                 let title: String = content2.chars().take(TASK_TITLE_MAX_CHARS).collect();
                 store.chat.set_title(conv.id, &title)?;
                 conv.id

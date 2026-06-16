@@ -3,7 +3,7 @@
 // 暗 tab 可点、进 teaser 页 —— 能点的必有反应(铁律3),绝不放灰掉的死控件。
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { api, emitWakeChanged, isTauri, setFloatVisible, type ProviderView, type VoiceStatus } from '../lib/backend'
+import { api, appVersion, emitWakeChanged, isTauri, openExternal, setFloatVisible, type ProviderView, type VoiceStatus } from '../lib/backend'
 import { applyLocale } from '../i18n'
 import { useChat } from '../composables/useChat'
 import { useSettings } from '../composables/useSettings'
@@ -27,11 +27,17 @@ const tabs: { id: TabId; future?: boolean }[] = [
 ]
 const tab = ref<TabId>('general')
 
+// 关于·版本:真身读 tauri.conf.json(x.y.z),只在系统 tab 拉一次
+const appVer = ref('')
+
 // —— 声音 tab(PLAN §11):第一层 音色+自动朗读;高级 语速/耐心/音量/麦克风/组件状态 ——
 const voiceInfo = ref<VoiceStatus | null>(null)
 watch(tab, (v) => {
   if (v === 'voice' && !voiceInfo.value) void loadVoice()
-  if (v === 'system') void loadAutostart()
+  if (v === 'system') {
+    void loadAutostart()
+    if (!appVer.value) void appVersion().then((x) => (appVer.value = x))
+  }
 })
 async function loadVoice() {
   if (!isTauri()) {
@@ -341,29 +347,38 @@ function toggleFloatUsage() {
   settings.set('ui.float.show_usage', floatShowUsage.value ? '0' : '1')
 }
 
-// 天气服务(PLAN 天气块):默认免 key Open-Meteo;填和风 key → 切国内稳源(后端按 key 有无选源)。
-// key 是秘密 → 后端只回掩码;草稿本地隔离、空草稿不覆盖(同供应商 saveKey 纪律,防掩码回存)。
-const weatherKeyDraft = ref('')
-const weatherKeyMasked = computed(() => settings.get('weather.qweather.key'))
-const weatherKeySet = computed(() => !!weatherKeyMasked.value)
-function saveWeatherKey() {
-  const k = weatherKeyDraft.value.trim()
-  if (!k) return
-  settings.set('weather.qweather.key', k)
-  weatherKeyDraft.value = ''
+// 天气服务(PLAN 天气块):默认免 key Open-Meteo;接和风走 JWT —— 复制全局应用公钥到和风控制台,
+// 把项目 ID / 凭据 ID / API Host 三件套填回来。后端三件套齐 + 全局私钥已生成即切和风源。
+const appPublicKey = ref('')
+const pubKeyCopied = ref(false)
+onMounted(async () => {
+  // 进设置即 ensure(幂等):服务页一直有公钥可复制。非 Tauri(纯浏览器预览)拿不到后端,留空。
+  if (isTauri()) appPublicKey.value = await api.ensureAppKeypair()
+})
+function copyPublicKey() {
+  const text = appPublicKey.value
+  if (!text || !navigator.clipboard?.writeText) return
+  navigator.clipboard.writeText(text).then(() => {
+    pubKeyCopied.value = true
+    window.setTimeout(() => (pubKeyCopied.value = false), 1500)
+  })
 }
-function clearWeatherKey() {
-  settings.set('weather.qweather.key', '')
-}
-function setWeatherHost(ev: Event) {
-  settings.set('weather.qweather.host', (ev.target as HTMLInputElement).value.trim())
+// 三件套都是非秘密标识符,直存(后端校验 host 要 http(s));齐备才视作"已接和风"。
+const weatherConfigured = computed(
+  () =>
+    !!settings.get('weather.qweather.host') &&
+    !!settings.get('weather.qweather.project_id') &&
+    !!settings.get('weather.qweather.credential_id'),
+)
+function setQWeather(key: string, ev: Event) {
+  settings.set(key, (ev.target as HTMLInputElement).value.trim())
 }
 // 全局代理(直连优先、失败兜底走代理;留空=关)。下载/LLM 现读即生效,无需重启。
 function setProxy(ev: Event) {
   settings.set('net.proxy', (ev.target as HTMLInputElement).value.trim())
 }
 function openQWeatherSite() {
-  window.open('https://dev.qweather.com/', '_blank', 'noopener')
+  void openExternal('https://dev.qweather.com/')
 }
 
 // 段选控件的数据驱动写法:一行配置 = 一个设置项
@@ -521,6 +536,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
       </button>
     </nav>
 
+    <!-- 表头 + tab 留在滚动区外,内容再长也不随之滚走;滚动条贴内容列(P0) -->
+    <div class="view-scroll">
     <div class="s-body">
       <!-- 常规 -->
       <div v-if="tab === 'general'">
@@ -544,6 +561,17 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             @blur="saveStyle"
             @keyup.enter="saveStyle"
           />
+        </div>
+        <div class="row">
+          <span class="label">{{ t('settings.general.skin') }}</span>
+          <span class="seg">
+            <button
+              v-for="s in ['scifi', 'warm']"
+              :key="s"
+              :class="{ on: settings.state.skin === s }"
+              @click="settings.setSkin(s)"
+            >{{ t(`settings.general.skin_${s}`) }}</button>
+          </span>
         </div>
         <div v-for="(seg, name) in { character: segs.character, bubble: segs.bubble, textScale: segs.textScale }" :key="name" class="row">
           <span class="label">{{ t(`settings.general.${name}`) }}</span>
@@ -861,41 +889,61 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         <p>{{ t('settings.remote.teaser') }}</p>
       </div>
 
-      <!-- 服务/接入:外部数据源与设备接入(天气源 key;以后智能家居 HA 等同构进驻) -->
+      <!-- 服务/接入:外部数据源与设备接入(天气走和风 JWT;以后智能家居 HA 等同构进驻) -->
       <div v-else-if="tab === 'services'">
         <p class="section">{{ t('settings.services.weather') }}</p>
         <p class="hint">{{ t('settings.services.weatherHint') }}</p>
+
+        <!-- 全局应用公钥:一直显示,复制到和风控制台创建 JWT 凭据(所有 Ed25519 服务共用这一把) -->
         <div class="row">
-          <span class="label">{{ t('settings.services.weatherKey') }}</span>
+          <span class="label">{{ t('settings.services.pubKey') }}</span>
+          <button class="link" :disabled="!appPublicKey" @click="copyPublicKey">
+            {{ pubKeyCopied ? t('settings.services.pubKeyCopied') : t('settings.services.pubKeyCopy') }}
+          </button>
+        </div>
+        <textarea
+          class="s-input s-mono-input pubkey-box"
+          readonly
+          rows="3"
+          :value="appPublicKey || t('settings.services.pubKeyPending')"
+        ></textarea>
+
+        <div class="row">
+          <span class="label">{{ t('settings.services.projectId') }}</span>
           <input
-            class="s-input"
-            type="password"
-            v-model="weatherKeyDraft"
-            :placeholder="weatherKeyMasked || t('settings.services.weatherKeyPlaceholder')"
-            @keyup.enter="saveWeatherKey"
-            @blur="saveWeatherKey"
+            class="s-input s-mono-input"
+            :value="settings.get('weather.qweather.project_id')"
+            :placeholder="t('settings.services.projectIdPlaceholder')"
+            @change="setQWeather('weather.qweather.project_id', $event)"
           />
         </div>
         <div class="row">
-          <span class="label">{{ t('settings.services.weatherSource') }}</span>
-          <span class="key-state">
-            <span class="chip" :class="{ on: weatherKeySet }">
-              {{ weatherKeySet ? t('settings.services.weatherSrcQweather') : t('settings.services.weatherSrcFree') }}
-            </span>
-            <button v-if="weatherKeySet" class="link" @click="clearWeatherKey">
-              {{ t('settings.services.weatherKeyClear') }}
-            </button>
-          </span>
+          <span class="label">{{ t('settings.services.credentialId') }}</span>
+          <input
+            class="s-input s-mono-input"
+            :value="settings.get('weather.qweather.credential_id')"
+            :placeholder="t('settings.services.credentialIdPlaceholder')"
+            @change="setQWeather('weather.qweather.credential_id', $event)"
+          />
         </div>
-        <div v-if="weatherKeySet" class="row">
+        <div class="row">
           <span class="label">{{ t('settings.services.weatherHost') }}</span>
           <input
             class="s-input s-mono-input"
             :value="settings.get('weather.qweather.host')"
             :placeholder="t('settings.services.weatherHostPlaceholder')"
-            @change="setWeatherHost"
+            @change="setQWeather('weather.qweather.host', $event)"
           />
         </div>
+
+        <div class="row">
+          <span class="label">{{ t('settings.services.weatherSource') }}</span>
+          <span class="chip" :class="{ on: weatherConfigured }">
+            {{ weatherConfigured ? t('settings.services.weatherSrcQweather') : t('settings.services.weatherSrcFree') }}
+          </span>
+        </div>
+
+        <p class="hint">{{ t('settings.services.weatherSteps') }}</p>
         <p class="hint">
           {{ t('settings.services.weatherLinkPre') }}
           <button class="link" @click="openQWeatherSite">{{ t('settings.services.weatherLink') }}</button>
@@ -957,132 +1005,136 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         <p class="section">{{ t('settings.system.about') }}</p>
         <div class="row">
           <span class="label">{{ t('settings.system.version') }}</span>
-          <span class="s-mono">v0.1 · {{ t('settings.system.selfId') }}</span>
+          <span class="s-mono">v{{ appVer || '0.1.0' }} · {{ t('settings.system.selfId') }}</span>
         </div>
       </div>
+    </div>
     </div>
   </section>
 </template>
 
 <style scoped>
-.settings { flex: 1; display: flex; flex-direction: column; min-width: 0; padding: 18px 26px; overflow-y: auto; }
+/* 滚动交给 .view-scroll(全局);.settings 只当竖向骨架,表头/tab 钉在滚动区外 */
+.settings { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 /* padding-right 让「回去聊天」避开右上角窗控三键(二轮真机修复:不再重叠) */
-.s-head { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 14px; padding-right: 70px; }
-.s-title b { font-size: 16px; color: var(--txt); }
-.s-title small { display: block; margin-top: 3px; font-size: 12px; color: var(--txt2); }
-.s-mono { font-family: ui-monospace, "SF Mono", monospace; font-size: 10px; letter-spacing: 2px; color: var(--txt2); margin-left: 8px; }
-.s-back { background: none; border: 1px solid var(--line); border-radius: 9px; color: var(--txt2); cursor: pointer; padding: 5px 10px; font-size: 12px; }
-.s-back:hover { color: var(--cy); border-color: var(--cy); }
+.s-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 16px 26px 12px; padding-right: 84px; }
+.s-title b { font-size: 16px; color: var(--text); }
+.s-title small { display: block; margin-top: 3px; font-size: 12px; color: var(--text-dim); }
+.s-mono { font-family: ui-monospace, "SF Mono", monospace; font-size: 10px; letter-spacing: 2px; color: var(--text-dim); margin-left: 8px; }
+.s-back { background: none; border: 1px solid var(--line); border-radius: 9px; color: var(--text-dim); cursor: pointer; padding: 5px 10px; font-size: 12px; }
+.s-back:hover { color: var(--accent); border-color: var(--accent); }
 
-.s-tabs { display: flex; gap: 7px; border-bottom: 1px solid var(--line); padding-bottom: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+.s-tabs { display: flex; gap: 7px; border-bottom: 1px solid var(--line); padding: 0 26px 10px; margin-bottom: 0; flex-wrap: wrap; }
 .s-tab {
-  position: relative; background: rgba(95, 200, 255, 0.04); border: 1px solid var(--line); border-radius: 10px;
-  color: var(--txt2); cursor: pointer; padding: 7px 14px; font-size: 13px;
+  position: relative; background: rgba(var(--accent-rgb), 0.04); border: 1px solid var(--line); border-radius: 10px;
+  color: var(--text-dim); cursor: pointer; padding: 7px 14px; font-size: 13px;
   display: inline-flex; align-items: center; gap: 6px; transition: color .15s, border-color .15s;
 }
-.s-tab:hover { color: var(--txt); border-color: rgba(95, 200, 255, 0.4); }
-.s-tab.on { color: var(--cy); border-color: rgba(95, 200, 255, 0.45); background: rgba(95, 200, 255, 0.1); }
+.s-tab:hover { color: var(--text); border-color: rgba(var(--accent-rgb), 0.4); }
+.s-tab.on { color: var(--accent); border-color: rgba(var(--accent-rgb), 0.45); background: rgba(var(--accent-rgb), 0.1); }
 .s-tab.future { opacity: .62; }
 .badge { margin-left: 0; letter-spacing: 1px; }
 
 /* 唯一脉冲:缺钥匙时全局唯一的光点 */
 .dot { width: 6px; height: 6px; border-radius: 50%; }
-.dot.amber { background: #ffc85f; box-shadow: 0 0 8px #ffc85f; animation: led 2.4s ease-in-out infinite; }
+.dot.amber { background: var(--warn); box-shadow: 0 0 8px var(--warn); animation: led 2.4s ease-in-out infinite; }
 @keyframes led { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
 
 .s-body { max-width: 640px; }
 /* flex-wrap:控件(尤其长英文段选)放不下时整组折到次行,而非压缩裁字或溢出 */
 .row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 14px; padding: 13px 0; border-bottom: 1px solid var(--line); font-size: 13.5px; }
-.label { color: var(--txt); flex: 0 0 auto; }
+.label { color: var(--text); flex: 0 0 auto; }
 
 /* flex: none —— 段选不被行压缩(否则 overflow:hidden 会裁掉按钮文字);宁可整组换行 */
 .seg { display: inline-flex; flex: none; max-width: 100%; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
-.seg button { background: none; border: none; color: var(--txt2); cursor: pointer; padding: 6px 13px; font-size: 12.5px; }
+.seg button { background: none; border: none; color: var(--text-dim); cursor: pointer; padding: 6px 13px; font-size: 12.5px; }
 .seg button + button { border-left: 1px solid var(--line); }
-.seg button.on { color: var(--cy); background: rgba(95, 200, 255, 0.12); }
+.seg button.on { color: var(--accent); background: rgba(var(--accent-rgb), 0.12); }
 
 .s-input {
-  background: rgba(8, 20, 38, 0.6); border: 1px solid var(--line); border-radius: 10px;
-  padding: 7px 11px; color: var(--txt); font-size: 13px; outline: none; min-width: 220px;
+  background: var(--surface-deep); border: 1px solid var(--line); border-radius: 10px;
+  padding: 7px 11px; color: var(--text); font-size: 13px; outline: none; min-width: 220px;
 }
-.s-input:focus { border-color: var(--cy); }
+.s-input:focus { border-color: var(--accent); }
 
 .key-state, .key-edit { display: inline-flex; align-items: center; gap: 10px; }
-.ok-text { color: #5fe0b0; font-size: 12.5px; }
-.amber-text { color: #ffc85f; font-size: 12.5px; }
-.link { background: none; border: none; color: var(--cy); cursor: pointer; font-size: 12.5px; padding: 0; }
+.ok-text { color: var(--ok); font-size: 12.5px; }
+.amber-text { color: var(--warn); font-size: 12.5px; }
+.link { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 12.5px; padding: 0; }
 .link:disabled { opacity: .4; cursor: default; }
 
-.chip { border: 1px solid var(--line); border-radius: 9px; padding: 4px 11px; font-size: 12.5px; color: var(--txt); }
-.chip.on { border-color: rgba(95, 200, 255, 0.45); color: var(--cy); }
-.chip.future { opacity: .62; color: var(--txt2); }
-.hint { font-size: 12px; color: var(--txt2); line-height: 1.7; display: flex; align-items: center; gap: 10px; padding-top: 13px; }
-.hint.err { color: #f09595; }
-.hint.warn { color: #ffc85f; }
-.s-input.bad { border-color: #f09595; }
+.chip { border: 1px solid var(--line); border-radius: 9px; padding: 4px 11px; font-size: 12.5px; color: var(--text); }
+.chip.on { border-color: rgba(var(--accent-rgb), 0.45); color: var(--accent); }
+.chip.future { opacity: .62; color: var(--text-dim); }
+.hint { font-size: 12px; color: var(--text-dim); line-height: 1.7; display: flex; align-items: center; gap: 10px; padding-top: 13px; }
+.hint.err { color: var(--danger); }
+.hint.warn { color: var(--warn); }
+.s-input.bad { border-color: var(--danger); }
 
-.teaser { padding: 26px 0; color: var(--txt2); font-size: 13.5px; }
+.teaser { padding: 26px 0; color: var(--text-dim); font-size: 13.5px; }
 .teaser p { margin: 10px 0 0; }
 
-.section { margin: 18px 0 9px; font-size: 11.5px; letter-spacing: 2px; color: var(--txt2); }
+.section { margin: 18px 0 9px; font-size: 11.5px; letter-spacing: 2px; color: var(--text-dim); }
 
 /* 供应商卡片 */
-.pcard { border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; margin-bottom: 10px; background: rgba(95, 200, 255, 0.03); }
+.pcard { border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; margin-bottom: 10px; background: rgba(var(--accent-rgb), 0.03); }
 .pcard.off { opacity: .55; }
 .p-head { display: flex; align-items: center; gap: 10px; font-size: 13.5px; flex-wrap: wrap; }
-.p-head b { color: var(--txt); }
+.p-head b { color: var(--text); }
 .proto { letter-spacing: 1px; border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; margin-left: 0; }
 .p-head .ok-text, .p-head .amber-text { font-size: 12px; }
 .p-actions { margin-left: auto; display: inline-flex; gap: 14px; }
 .p-grid { display: grid; grid-template-columns: 52px minmax(0, 1fr); gap: 8px 12px; align-items: center; margin-top: 11px; font-size: 12.5px; }
-.p-grid label { color: var(--txt2); }
+.p-grid label { color: var(--text-dim); }
 .p-grid .s-input { width: 100%; min-width: 0; }
 .s-mono-input { font-family: ui-monospace, "SF Mono", monospace; font-size: 12px; }
+/* 全局应用公钥框:多行 PEM,占满宽、不可拽缩、整段可读(给用户复制到服务控制台) */
+.pubkey-box { display: block; width: 100%; min-width: 0; resize: none; margin-top: 4px; line-height: 1.45; white-space: pre-wrap; word-break: break-all; color: var(--text-dim); }
 .p-foot { display: flex; gap: 16px; margin-top: 11px; }
-.danger { color: #f09595; }
-.dim { color: var(--txt2); }
-.add-card { width: 100%; padding: 10px; border: 1px dashed var(--line); border-radius: 12px; background: none; color: var(--txt2); cursor: pointer; font-size: 12.5px; margin-bottom: 12px; }
-.add-card:hover { color: var(--cy); border-color: var(--cy); }
+.danger { color: var(--danger); }
+.dim { color: var(--text-dim); }
+.add-card { width: 100%; padding: 10px; border: 1px dashed var(--line); border-radius: 12px; background: none; color: var(--text-dim); cursor: pointer; font-size: 12.5px; margin-bottom: 12px; }
+.add-card:hover { color: var(--accent); border-color: var(--accent); }
 
 /* —— 声音 tab —— */
 .v-speaker { align-items: flex-start; }
 .sp-list { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; max-width: 420px; }
 .chip.sp.custom { border-style: dashed; opacity: 0.75; }
 .chip.sp.custom:hover { opacity: 1; }
-.chip-del { border: none; background: transparent; color: #8aa3b5; cursor: pointer; font-size: 11px; padding: 0 2px; align-self: center; opacity: 0.55; }
-.chip-del:hover { color: #ff8a8a; opacity: 1; }
-.chip-del.armed { color: #ff8a8a; opacity: 1; font-weight: 600; }
+.chip-del { border: none; background: transparent; color: var(--text-dim); cursor: pointer; font-size: 11px; padding: 0 2px; align-self: center; opacity: 0.55; }
+.chip-del:hover { color: var(--danger); opacity: 1; }
+.chip-del.armed { color: var(--danger); opacity: 1; font-weight: 600; }
 .hidden-file { display: none; }
 .clone-edit { align-items: flex-start; }
 .clone-form { display: flex; flex-direction: column; gap: 6px; max-width: 420px; width: 100%; }
-.clone-input, .clone-text { background: rgba(255,255,255,0.04); border: 1px solid var(--line); border-radius: 8px; color: inherit; font: inherit; padding: 6px 9px; }
+.clone-input, .clone-text { background: var(--surface-deep); border: 1px solid var(--line); border-radius: 8px; color: inherit; font: inherit; padding: 6px 9px; }
 .clone-text { resize: vertical; min-height: 56px; }
 .clone-hint { font-size: 11.5px; opacity: 0.6; margin: 0; }
 .clone-actions { display: flex; gap: 8px; justify-content: flex-end; }
 /* 与音色 chip 同一套薄玻璃质感(否则 <button> 默认灰底会很出戏);保存走 .on 青色描边 */
-.clone-actions .chip { cursor: pointer; background: rgba(95, 200, 255, 0.04); transition: border-color .15s, color .15s, background .15s; }
-.clone-actions .chip:hover:not(:disabled) { border-color: rgba(95, 200, 255, 0.45); }
-.clone-actions .chip.on { border-color: rgba(95, 200, 255, 0.55); color: var(--cy); background: rgba(95, 200, 255, 0.1); }
+.clone-actions .chip { cursor: pointer; background: rgba(var(--accent-rgb), 0.04); transition: border-color .15s, color .15s, background .15s; }
+.clone-actions .chip:hover:not(:disabled) { border-color: rgba(var(--accent-rgb), 0.45); }
+.clone-actions .chip.on { border-color: rgba(var(--accent-rgb), 0.55); color: var(--accent); background: rgba(var(--accent-rgb), 0.1); }
 .clone-actions .chip:disabled { opacity: 0.4; cursor: default; }
-.clone-err { color: #ff9a9a; font-size: 12.5px; }
-.chip.sp { cursor: pointer; background: rgba(95, 200, 255, 0.04); transition: border-color .15s, color .15s; }
-.chip.sp:hover { border-color: rgba(95, 200, 255, 0.45); }
-.chip.sp.on { border-color: rgba(95, 200, 255, 0.55); color: var(--cy); background: rgba(95, 200, 255, 0.1); }
+.clone-err { color: var(--danger); font-size: 12.5px; }
+.chip.sp { cursor: pointer; background: rgba(var(--accent-rgb), 0.04); transition: border-color .15s, color .15s; }
+.chip.sp:hover { border-color: rgba(var(--accent-rgb), 0.45); }
+.chip.sp.on { border-color: rgba(var(--accent-rgb), 0.55); color: var(--accent); background: rgba(var(--accent-rgb), 0.1); }
 .chip.sp.busy { animation: led 1.2s ease-in-out infinite; }
-.v-vol { width: 220px; accent-color: var(--cy); }
+.v-vol { width: 220px; accent-color: var(--accent); }
 .sens { display: inline-flex; align-items: center; gap: 10px; }
-.sens small { color: var(--txt2); font-size: 12px; white-space: nowrap; }
+.sens small { color: var(--text-dim); font-size: 12px; white-space: nowrap; }
 .sens .v-vol { width: 150px; }
 .v-mic { max-width: 280px; }
-.comp { letter-spacing: 1px; color: var(--txt2); }
-.comp.ok { color: #5fe0b0; }
+.comp { letter-spacing: 1px; color: var(--text-dim); }
+.comp.ok { color: var(--ok); }
 
 /* 唤醒状态:纯文本(刻意不做成 chip/输入框样,免和下面「唤醒词」框混淆) */
-.wake-cur { color: var(--txt2); font-size: 12.5px; }
+.wake-cur { color: var(--text-dim); font-size: 12.5px; }
 
 /* 录音标定:进行中文本走辉光脉冲(复用 led),结果走成功绿/中性灰 */
-.calib-live { color: var(--cy); font-size: 12.5px; }
+.calib-live { color: var(--accent); font-size: 12.5px; }
 .calib-live.pulse { animation: led 1.2s ease-in-out infinite; }
-.calib-done { color: var(--txt2); font-size: 12.5px; }
-.calib-done.ok { color: #5fe0b0; }
+.calib-done { color: var(--text-dim); font-size: 12.5px; }
+.calib-done.ok { color: var(--ok); }
 </style>

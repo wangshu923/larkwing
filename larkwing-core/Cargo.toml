@@ -15,12 +15,17 @@ bytes = "1"
 bzip2 = "0.5.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 cpal = "0.17.1"
+# 全局 Ed25519 身份密钥(crypto.rs):和风 JWT 等服务的签名认证。私钥本地存、只产 token 不验,
+# JWT 手搓(base64 已在);pkcs8+pem 用于公钥导出 SPKI PEM 给用户复制到服务控制台。
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 futures-util = "0.3"
+# crypto 取随机种子生成密钥(直接填 32 字节种子 → SigningKey,省掉整个 rand 依赖)
+getrandom = "0.2"
 # fs_find 的 glob 匹配(只用 Pattern 匹配器,目录行走自己来——要管深度/隐藏/上限)
 glob = "0.3"
 msedge-tts = "0.4.0"
 pinyin = "0.11.0"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks", "gzip"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 # web 工具的 HTML 解析(搜索结果页 + 正文抽取)
 scraper = "0.23"

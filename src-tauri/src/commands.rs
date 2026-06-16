@@ -77,8 +77,13 @@ pub async fn cancel_generation(state: State<'_, AppState>, conv_id: i64) -> Resu
 }
 
 #[tauri::command]
-pub fn new_conversation(state: State<'_, AppState>) -> Result<Conversation, AppError> {
-    state.engine.new_conversation()
+pub fn new_conversation(
+    state: State<'_, AppState>,
+    channel: Option<String>,
+) -> Result<Conversation, AppError> {
+    state
+        .engine
+        .new_conversation(channel.as_deref().unwrap_or(larkwing_core::store::chat::CHANNEL_UI))
 }
 
 #[tauri::command]
@@ -114,6 +119,11 @@ pub fn set_skin(state: State<'_, AppState>, skin_id: String) -> Result<(), AppEr
 }
 
 #[tauri::command]
+pub fn skin(state: State<'_, AppState>) -> Result<String, AppError> {
+    state.engine.skin()
+}
+
+#[tauri::command]
 pub fn list_settings(state: State<'_, AppState>) -> Result<Vec<SettingEntry>, AppError> {
     state.engine.list_settings()
 }
@@ -121,6 +131,13 @@ pub fn list_settings(state: State<'_, AppState>) -> Result<Vec<SettingEntry>, Ap
 #[tauri::command]
 pub fn set_setting(state: State<'_, AppState>, key: String, value: String) -> Result<(), AppError> {
     state.engine.set_setting(&key, &value)
+}
+
+/// 全局应用公钥(Ed25519):没有就生成、有就回存量。前端在服务页展示给用户复制到服务控制台
+/// (和风 JWT 等)。私钥永不过桥。
+#[tauri::command]
+pub fn ensure_app_keypair(state: State<'_, AppState>) -> Result<String, AppError> {
+    state.engine.ensure_app_keypair()
 }
 
 #[tauri::command]

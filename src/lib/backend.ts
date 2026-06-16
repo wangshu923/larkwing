@@ -1,6 +1,7 @@
 // IPC 封装:类型与 commands 一一对应(契约见 PLAN §5)。
 // 这是前端唯一 import @tauri-apps/api 的地方。
 
+import { getVersion } from '@tauri-apps/api/app'
 import { Channel, invoke } from '@tauri-apps/api/core'
 import { emit, listen } from '@tauri-apps/api/event'
 import { currentMonitor, getCurrentWindow, LogicalPosition, LogicalSize, Window } from '@tauri-apps/api/window'
@@ -20,6 +21,8 @@ export interface Conversation {
   user_id: number
   scene_id: string
   title: string
+  /** 渠道(会话级):ui(默认/不标) | voice | system | 未来 telegram/dingtalk/slack。列表按此渲染小图标。 */
+  channel: string
   created_at: number
   updated_at: number
 }
@@ -228,6 +231,8 @@ export type TurnEvent =
   | { type: 'usage'; data: { round: UsageDigest; today: DayUsage; conv: UsageTotals } }
   // 插队(PLAN §9 B):回合在飞时注入的 user 消息已落库,之后的回复另起一段
   | { type: 'injected'; data: { message_id: number; text: string; attachments: AttachmentRef[] } }
+  // 带文字的工具轮:这段回复在落库里是独立 assistant 行;前端封口当前气泡、另起新泡(结构对齐落库)
+  | { type: 'segment'; data: { message_id: number } }
   | { type: 'done'; data: { message_id: number } }
   | { type: 'failed'; data: AppError }
   | { type: 'cancelled' }
@@ -376,7 +381,28 @@ export function isTauri(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 }
 
+/** 外部链接交系统浏览器。WebView 里 `window.open` 是 no-op(Win 真机尤甚)→ Tauri 下走 opener 插件;
+ *  浏览器预览(非 Tauri)兜底 window.open。只放行 http(s),best-effort、失败不打断。 */
+export async function openExternal(url: string): Promise<void> {
+  if (!/^https?:\/\//i.test(url)) return
+  if (!isTauri()) {
+    window.open(url, '_blank', 'noopener')
+    return
+  }
+  try {
+    await invoke('plugin:opener|open_url', { url })
+  } catch (e) {
+    console.warn('openExternal failed', e)
+  }
+}
+
 // ---- 窗口 / 托盘 / 开机启动(PLAN §12):全收口在此,守"前端唯一碰 @tauri-apps/api"纪律 ----
+
+/** App 版本号(x.y.z = 大版本.小版本.BUG修复)。唯一真相源 = tauri.conf.json,
+ *  靠 getVersion() 读真身、永不漂移;浏览器预览非 Tauri,给开发兜底串。 */
+export function appVersion(): Promise<string> {
+  return isTauri() ? getVersion() : Promise.resolve('0.1.0-dev')
+}
 
 /** 当前 WebView 窗口标签('main' | 'float');浏览器预览看 ?window= 兜底。 */
 export function windowLabel(): string {
@@ -545,6 +571,16 @@ export function onWakeChanged(cb: (running: boolean, keywords: string[]) => void
   )
 }
 
+/** 换肤 → 广播给悬浮窗(另一个 WebView):它据此把 <html data-skin> 同步过去,观感随主窗切。
+ *  开机自启那次由 float 自己 api.skin() 兜底拉初值(事件不缓存,先到先丢)。 */
+export function emitSkinChanged(skin: string) {
+  if (isTauri()) void emit('lw:skin', { skin })
+}
+export function onSkinChanged(cb: (skin: string) => void): void {
+  if (!isTauri()) return
+  void listen<{ skin: string }>('lw:skin', (e) => cb(e.payload.skin))
+}
+
 /** 主窗是全 app 唯一真出声的播放位;current 一变(放 / 停 / 放完)就把全量快照广播给悬浮窗。
  *  悬浮窗(被动镜像、不出声)据此跟随。传整份 NowPlaying|null = 绝对态 → 幂等、不怕重放,
  *  也不会像广播相对动作(louder/toggle)那样翻车。只主窗发、只悬浮窗收(见 useMedia.wire)→ 无回声环。
@@ -588,14 +624,17 @@ export const api = {
   llmBalance: () => invoke<AccountBalance | null>('llm_balance'),
   /** 悬浮窗待机轮播:下个提醒 + 最近一句(余额/今日花费复用 llmBalance/usageToday)。 */
   floatIdle: () => invoke<FloatIdle>('float_idle'),
-  newConversation: () => invoke<Conversation>('new_conversation'),
+  newConversation: (channel?: string) => invoke<Conversation>('new_conversation', { channel }),
   listConversations: () => invoke<Conversation[]>('list_conversations'),
   loadConversation: (convId: number) => invoke<Message[]>('load_conversation', { convId }),
   deleteConversation: (convId: number) => invoke<void>('delete_conversation', { convId }),
   setApiKey: (key: string) => invoke<void>('set_api_key', { key }),
   setSkin: (skinId: string) => invoke<void>('set_skin', { skinId }),
+  skin: () => invoke<string>('skin'),
   listSettings: () => invoke<SettingEntry[]>('list_settings'),
   setSetting: (key: string, value: string) => invoke<void>('set_setting', { key, value }),
+  /** 全局应用公钥(Ed25519,PEM):没有就生成、有就回存量;用户复制到服务控制台(和风 JWT 等)。 */
+  ensureAppKeypair: () => invoke<string>('ensure_app_keypair'),
   renameUser: (name: string) => invoke<User>('rename_user', { name }),
   listProviders: () => invoke<ProviderView[]>('list_providers'),
   saveProvider: (patch: ProviderPatch) => invoke<ProviderView[]>('save_provider', { patch }),

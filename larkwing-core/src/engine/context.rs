@@ -151,6 +151,7 @@ pub(super) fn build_context(
                     content: msg.content.clone(),
                     reasoning: payload.reasoning,
                     tool_calls: payload.tool_calls,
+                    reasoning_state: payload.reasoning_state,
                 });
             }
             "tool" => {

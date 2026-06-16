@@ -28,6 +28,7 @@ async fn main() -> anyhow::Result<()> {
             ChatEvent::Thinking(t) => {
                 eprint!("[思考:{t}]");
             }
+            ChatEvent::ReasoningState(_) => {}
             ChatEvent::Done { usage: u, stop_reason, .. } => println!(
                 "\n--- 完成 input={} output={} cache_hit={} stop={}",
                 u.input_tokens,

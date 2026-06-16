@@ -189,12 +189,15 @@ async fn tool_round_executes_persists_and_finishes() {
     assert!(parsed.get("now").is_some());
 }
 
-// 轮数护栏:连环要工具 → 第 4 轮后 tool_choice=none 强制收尾(FakeLlm 尊重它),
-// 绝不无限循环;每轮 1 个调用 → 恰好 4 条 tool 行。
+// 空转兜底网:模型连环调"同名同参"的工具(全无新进展)→ 连续 MAX_STALL_ROUNDS 轮后
+// tool_choice=none 强制收尾(FakeLlm 尊重它),绝不无限循环。首轮算进展(头回拿到结果),
+// 其后 5 次重复触发空转 → 恰好 1 + MAX_STALL_ROUNDS = 6 条 tool 行。
+// (硬上限 200 是纯失控 backstop:要 200+ 轮各不相同的成功调用才碰得到,不在单测里铺;
+//  自检软提示的"功效"也不在此测 —— FakeLlm 不读消息内容,要真模型才验得出,留给真机。)
 #[tokio::test(flavor = "multi_thread")]
-async fn tool_rounds_are_capped_and_forced_to_finish() {
-    let (store, engine, conv_id) = setup("toolcap", 1);
-    let turns: Vec<FakeTurn> = (0..6)
+async fn repeated_calls_trip_stall_net_and_force_finish() {
+    let (store, engine, conv_id) = setup("stallnet", 1);
+    let turns: Vec<FakeTurn> = (0..7)
         .map(|i| FakeTurn {
             text: format!("查{i}"),
             tool_calls: vec![call(&format!("call_{i}"), "now", serde_json::json!({}))],
@@ -210,13 +213,48 @@ async fn tool_rounds_are_capped_and_forced_to_finish() {
             done = true;
         }
     }
-    assert!(done, "轮数到顶必须正常收尾,不许挂死");
+    assert!(done, "空转到顶必须正常收尾,不许挂死");
 
     let msgs = store.chat.recent_messages(conv_id, 30).unwrap();
     let tool_rows = msgs.iter().filter(|m| m.role == "tool").count();
-    assert_eq!(tool_rows, 4, "MAX_TOOL_ROUNDS=4:恰好 4 轮工具执行");
+    assert_eq!(tool_rows, 6, "1 轮首次进展 + MAX_STALL_ROUNDS(5) 轮重复空转 = 6 条 tool 行");
     assert_eq!(msgs.last().unwrap().role, "assistant");
-    assert_eq!(msgs.last().unwrap().content, "查4", "末轮被 tool_choice=none 禁了工具,只剩嘴");
+    assert_eq!(msgs.last().unwrap().content, "查6", "末轮被 tool_choice=none 禁了工具,只剩嘴");
+}
+
+// 进展守卫不误杀:每轮都有"新且成功"的调用(真在干活)→ stall 始终清零,
+// 跑足 7 轮(> MAX_STALL_ROUNDS)也不被兜底网切断,直到模型自己收尾。
+// 这是"深任务不被卡死"的另一半保证 —— 调大上限之所以安全,正因为有它。
+#[tokio::test(flavor = "multi_thread")]
+async fn fresh_progress_keeps_stall_at_zero_so_deep_work_runs() {
+    let (store, engine, conv_id) = setup("deepwork", 1);
+    let mut turns: Vec<FakeTurn> = (0..7)
+        .map(|i| FakeTurn {
+            text: String::new(),
+            tool_calls: vec![call(
+                &format!("call_{i}"),
+                "remember",
+                serde_json::json!({ "fact": format!("第{i}条事实") }),
+            )],
+            ..Default::default()
+        })
+        .collect();
+    turns.push(FakeTurn { text: "都记下啦!".into(), ..Default::default() }); // 模型自然收尾
+    engine.set_provider(Some(Arc::new(FakeLlm::scripted(turns))));
+
+    let mut rx = engine.send_message(conv_id, "记一连串事实".into(), None, vec![]).await.unwrap();
+    let mut done = false;
+    while let Some(ev) = rx.recv().await {
+        if matches!(ev, TurnEvent::Done { .. }) {
+            done = true;
+        }
+    }
+    assert!(done);
+
+    let msgs = store.chat.recent_messages(conv_id, 40).unwrap();
+    let tool_rows = msgs.iter().filter(|m| m.role == "tool").count();
+    assert_eq!(tool_rows, 7, "7 轮都有新进展 → 超过 MAX_STALL_ROUNDS 也不被切断");
+    assert_eq!(msgs.last().unwrap().content, "都记下啦!", "由模型自己收尾,不是被强制");
 }
 
 // 白名单外/幻觉工具名:错误也是观察,变成结果喂回模型,回合不崩

@@ -240,12 +240,8 @@ onUnmounted(() => stopMoved())
 
 <style scoped>
 .float {
-  --f-txt: #d8e8f8;
-  --f-txt2: #8aa8c4;
-  --f-cy: #5fd2ff;
-  --f-solid: #284670; /* 不透明中蓝(比主界面观感淡些);圆 / 胶囊重叠不变深,整体 opacity 给半透 */
-  --f-glass: rgba(30, 52, 84, 0.82);
-  --f-line: rgba(95, 200, 255, 0.22);
+  /* --f-* 皮肤 token 在 style.css :root / [data-skin] 定义(随皮肤切);
+     悬浮窗经 useSettings.load() 拉 api.skin() 设 <html data-skin>,故无需本地定义。 */
   width: 100vw;
   height: 100vh;
   overflow: hidden;
@@ -304,16 +300,16 @@ onUnmounted(() => stopMoved())
 .orb img { width: 36px; height: 36px; object-fit: contain; pointer-events: none; }
 /* 头像状态灯:语音/mood 给圆头像加辉光环(box-shadow 严格贴圆,不用 drop-shadow 防 WKWebView 方块影) */
 .orb.listen { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 2px var(--f-cy); }
-.orb.think { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 2px rgba(95, 200, 255, 0.5); }
+.orb.think { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 2px rgba(var(--accent-rgb), 0.5); }
 /* 待机·麦克风在等唤醒:比 think 更轻的常亮细环,只透出"竖着耳朵"的存在感 */
-.orb.armed { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 1.5px rgba(95, 200, 255, 0.3); }
+.orb.armed { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 1.5px rgba(var(--accent-rgb), 0.3); }
 .orb.speak {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 2px var(--f-cy);
   animation: orbpulse 1.4s ease-in-out infinite;
 }
 @keyframes orbpulse {
   0%, 100% { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 2px var(--f-cy); }
-  50% { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 4px rgba(95, 200, 255, 0.32); }
+  50% { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 4px rgba(var(--accent-rgb), 0.32); }
 }
 .bar-text {
   flex: 1;
@@ -333,7 +329,7 @@ onUnmounted(() => stopMoved())
   height: 15px;
   padding: 0 4px;
   border-radius: 8px;
-  background: rgba(95, 200, 255, 0.22);
+  background: rgba(var(--accent-rgb), 0.22);
   color: var(--f-cy);
   font-size: 10px;
   display: flex;
@@ -375,7 +371,7 @@ onUnmounted(() => stopMoved())
 }
 .shell.up .body { margin: 10px 10px 0; } /* 向上展开:内容在上,顶部留边 */
 .body::-webkit-scrollbar { width: 6px; }
-.body::-webkit-scrollbar-thumb { background: rgba(95, 200, 255, 0.2); border-radius: 3px; }
+.body::-webkit-scrollbar-thumb { background: rgba(var(--accent-rgb), 0.2); border-radius: 3px; }
 
 /* 区小标题:正在进行 / 最近消息(多条时分得清) */
 .ptag {
@@ -406,7 +402,7 @@ onUnmounted(() => stopMoved())
   justify-content: center;
 }
 .ear.up { bottom: auto; top: 1px; } /* 向上展开:面板在上,耳朵挂右上外角 */
-.ear:hover { color: #ffb86b; border-color: #ffb86b; }
+.ear:hover { color: var(--attn); border-color: var(--attn); }
 
 .notice {
   display: flex;
@@ -414,12 +410,12 @@ onUnmounted(() => stopMoved())
   gap: 6px;
   padding: 7px 8px;
   border-radius: 9px;
-  background: rgba(95, 200, 255, 0.06);
+  background: rgba(var(--accent-rgb), 0.06);
   border: 1px solid var(--f-line);
   cursor: pointer;
   transition: border-color 0.15s, background 0.15s;
 }
-.notice:hover { border-color: var(--f-cy); background: rgba(95, 200, 255, 0.12); }
+.notice:hover { border-color: var(--f-cy); background: rgba(var(--accent-rgb), 0.12); }
 .n-text {
   flex: 1;
   font-size: 12.5px;
@@ -440,7 +436,7 @@ onUnmounted(() => stopMoved())
   padding: 1px 3px;
   line-height: 1;
 }
-.n-x:hover { color: #ffb86b; }
+.n-x:hover { color: var(--attn); }
 
 .status {
   display: flex;

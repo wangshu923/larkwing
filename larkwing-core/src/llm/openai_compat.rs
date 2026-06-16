@@ -51,7 +51,7 @@ impl OpenAiCompatProvider {
                         json!({ "role": "user", "content": blocks })
                     }
                 }
-                super::ChatMessage::Assistant { content, reasoning, tool_calls } => {
+                super::ChatMessage::Assistant { content, reasoning, tool_calls, .. } => {
                     let mut m = json!({ "role": "assistant", "content": content });
                     if !tool_calls.is_empty() {
                         // OpenAI 方言:arguments 是 JSON 编码后的字符串,不是对象
@@ -449,6 +449,7 @@ mod tests {
                         args: serde_json::json!({ "fact": "对花生过敏" }),
                         is_incomplete: false,
                     }],
+                    reasoning_state: None,
                 },
                 ChatMessage::ToolResult { call_id: "call_1".into(), content: "ok".into() },
             ],

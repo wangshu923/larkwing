@@ -55,6 +55,16 @@ const CATALOG: &[ModelInfo] = &[
     m("gpt-5", Tier::Smart, Some(1.25), Some(10.0)),
     m("kimi-k2", Tier::Balanced, None, None),
     m("qwen-max", Tier::Balanced, None, None),
+    // Google Gemini(经官方 OpenAI 兼容端点;牌价随版本浮动、存疑就不装懂 → 留 None 只报 token)。
+    // 特异在前、通配在后(子串匹配按顺序)。
+    m("gemini-2.5-flash", Tier::Light, None, None),
+    m("gemini-2.0-flash", Tier::Light, None, None),
+    m("gemini-flash", Tier::Light, None, None), // gemini-flash-latest 等
+    m("gemini-2.5-pro", Tier::Smart, None, None),
+    m("gemini-3", Tier::Smart, None, None), // gemini-3-pro 等
+    m("gemini", Tier::Balanced, None, None), // 通配兜底:未列出的 gemini 版本
+    // Ollama 本地模型(llama/qwen/mistral/…):名字千变万化且本地零计费,故意不列 ——
+    // 命中目录兜底规则(未知 → 均衡档 + 不报钱),正合"本地、免费"的语义。
 ];
 
 /// 模糊匹配:归一小写后,目录家族子串出现在模型 id 里即命中(吃掉中转前缀/版本后缀)。
@@ -116,5 +126,27 @@ mod tests {
     fn tier_ordering_supports_meets_need_comparison() {
         assert!(Tier::Smart > Tier::Balanced);
         assert!(Tier::Balanced > Tier::Light);
+    }
+
+    #[test]
+    fn gemini_tiers_by_variant_and_prices_stay_none() {
+        assert_eq!(tier_of("gemini-2.5-flash"), Tier::Light);
+        assert_eq!(tier_of("gemini-2.0-flash-001"), Tier::Light);
+        assert_eq!(tier_of("gemini-flash-latest"), Tier::Light);
+        assert_eq!(tier_of("gemini-2.5-pro"), Tier::Smart);
+        assert_eq!(tier_of("models/gemini-3-pro-preview"), Tier::Smart); // 带前缀
+        assert_eq!(tier_of("gemini-exp-1206"), Tier::Balanced); // 通配兜底
+        // Gemini 牌价存疑:只报 token 不报钱
+        let usage = Usage { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_hit_tokens: 0 };
+        assert!(est_cost_usd("gemini-2.5-flash", &usage).is_none());
+    }
+
+    #[test]
+    fn ollama_local_models_fall_to_balanced_and_free() {
+        // 本地模型名千变万化 → 命中兜底:均衡档 + 不报钱(本地免费,None 正确)
+        assert_eq!(tier_of("llama3.2"), Tier::Balanced);
+        assert_eq!(tier_of("qwen2.5-coder:7b"), Tier::Balanced);
+        let usage = Usage { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_hit_tokens: 0 };
+        assert!(est_cost_usd("llama3.2", &usage).is_none());
     }
 }

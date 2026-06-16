@@ -39,6 +39,10 @@ pub enum TurnEvent {
     /// 插队(PLAN §9 B):回合在飞时注入的一条 user 消息已落库,之后的回复另起一段。
     /// 前端据此:收尾当前回复气泡 → 插用户气泡 → 开新回复气泡。
     Injected { message_id: i64, text: String, attachments: Vec<AttachmentRef> },
+    /// 带文字的工具轮(PLAN §9):这一轮模型既说了话、又要继续调工具,它在落库里是一条独立
+    /// assistant 内容行。前端据此把当前回复气泡封口(钉上 message_id 供「想了想」轨迹回挂)、
+    /// 另起新泡接后续文字 —— 让在飞气泡结构 = 落库/重启结构(否则 trace 实时挂不上、重启才显)。
+    Segment { message_id: i64 },
     /// 带落库 id:前端把流式文本与持久消息对账。
     Done { message_id: i64 },
     Failed { kind: ErrorKind, message: String },
@@ -62,6 +66,9 @@ pub(crate) struct AssistantPayload {
     pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// 不透明 reasoning 状态(原生方言用,逐字保真往返;兼容方言无此项)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_state: Option<serde_json::Value>,
 }
 
 /// 'tool' 行:配对主键 + 执行结局。status: ok | error | timeout | cancelled。
@@ -203,6 +210,8 @@ const APP_SETTING_KEYS: &[&str] = &[
     "voice.wake.sensitivity",
     "voice.tts_backend",
     "weather.qweather.host",
+    "weather.qweather.project_id",
+    "weather.qweather.credential_id",
     "net.proxy",
 ];
 
@@ -594,9 +603,9 @@ impl Engine {
         Ok(FloatIdle { next_reminder, latest_line })
     }
 
-    pub fn new_conversation(&self) -> Result<Conversation, AppError> {
+    pub fn new_conversation(&self, channel: &str) -> Result<Conversation, AppError> {
         let user = self.store.users.ensure_default_user()?;
-        Ok(self.store.chat.create_conversation(user.id, DEFAULT_SCENE_ID)?)
+        Ok(self.store.chat.create_conversation_full(user.id, DEFAULT_SCENE_ID, channel)?)
     }
 
     pub fn list_conversations(&self) -> Result<Vec<Conversation>, AppError> {
@@ -622,6 +631,30 @@ impl Engine {
         Ok(())
     }
 
+    /// 当前用户皮肤。给无 boot 快照的窗口(悬浮窗)拉取初值用;主窗已从 boot 拿到。
+    pub fn skin(&self) -> Result<String, AppError> {
+        Ok(self.store.users.ensure_default_user()?.skin_id)
+    }
+
+    /// 确保**全局** Ed25519 身份密钥对存在(没有就生成并落库),返回公钥 PEM 给前端展示/复制。
+    /// 幂等:已有直接回存量公钥。私钥(`crypto.ed25519.private_key`)是秘密、永不过桥。所有走
+    /// Ed25519-JWT 的服务(和风是首个消费者)共用这一把 ——「整个程序对外一对」。
+    pub fn ensure_app_keypair(&self) -> Result<String, AppError> {
+        use crate::crypto::{generate_keypair, KEY_ED25519_PRIVATE, KEY_ED25519_PUBLIC};
+        if let Some(pubkey) = self.store.settings.get(None, KEY_ED25519_PUBLIC)? {
+            if !pubkey.trim().is_empty() {
+                return Ok(pubkey);
+            }
+        }
+        let (private_pem, public_pem) = generate_keypair().map_err(|e| AppError {
+            kind: ErrorKind::Internal,
+            message: format!("生成应用密钥失败:{e}"),
+        })?;
+        self.store.settings.set(None, KEY_ED25519_PRIVATE, &private_pem)?;
+        self.store.settings.set(None, KEY_ED25519_PUBLIC, &public_pem)?;
+        Ok(public_pem)
+    }
+
     /// 设置页快照:app 级只暴露白名单内的 key(llm.api_key / llm.providers
     /// 这类含钥匙的永不过桥),用户级只暴露 ui.* 前缀。
     pub fn list_settings(&self) -> Result<Vec<SettingEntry>, AppError> {
@@ -630,19 +663,6 @@ impl Engine {
         for (key, value) in self.store.settings.list(None)? {
             if APP_SETTING_KEYS.contains(&key.as_str()) {
                 out.push(SettingEntry { scope: "app".into(), key, value });
-            }
-        }
-        // 天气和风 key 是秘密 —— 不过桥明文,只回掩码供前端显示"已配置"(同 provider 纪律)
-        if let Some(raw) = self.store.settings.get(None, "weather.qweather.key")? {
-            let raw = raw.trim();
-            if !raw.is_empty() {
-                let tail: String =
-                    raw.chars().skip(raw.chars().count().saturating_sub(4)).collect();
-                out.push(SettingEntry {
-                    scope: "app".into(),
-                    key: "weather.qweather.key".into(),
-                    value: format!("····{tail}"),
-                });
             }
         }
         for (key, value) in self.store.settings.list(Some(user.id))? {
@@ -741,22 +761,23 @@ impl Engine {
                 self.store.settings.set(None, key, value)?;
                 Ok(())
             }
-            // 天气和风 key(app 级,秘密):填了即切和风源,空串 = 清空回落免 key 源;
-            // 掩码回显("····")不覆盖真值(同 provider 防误存)。下回合工具现读即生效。
-            "weather.qweather.key" => {
-                if value.contains('·') {
-                    return Ok(());
-                }
+            // 和风 JWT 接入(app 级,非秘密):项目 ID(JWT 的 sub)/凭据 ID(JWT 的 kid),空串 = 清空。
+            // 三件套(含 host)齐 + 全局私钥已生成 → 下回合工具现读即切和风源,否则回落 Open-Meteo。
+            "weather.qweather.project_id" | "weather.qweather.credential_id" => {
                 self.store.settings.set(None, key, value.trim())?;
                 Ok(())
             }
-            // 和风专属 API Host(app 级,非秘密):空 = 用默认免费版 host,否则要 http(s)。
+            // 和风专属 API Host(app 级,非秘密):空 = 不走和风(老公共域名已停服,无免 host 兜底)。
+            // 控制台给的是**裸域名**(xxx.qweatherapi.com),用户多半不带 scheme —— 缺 scheme 自动补
+            // https://(和风一律 https),绝不因「没写 http」就拒,否则乐观写回滚,用户「填不进去」。
             "weather.qweather.host" => {
                 let v = value.trim();
-                if !v.is_empty() && !v.starts_with("http") {
-                    return Err(invalid("天气服务地址要以 http(s) 开头"));
-                }
-                self.store.settings.set(None, key, v)?;
+                let v = if v.is_empty() || v.starts_with("http://") || v.starts_with("https://") {
+                    v.to_string()
+                } else {
+                    format!("https://{v}")
+                };
+                self.store.settings.set(None, key, &v)?;
                 Ok(())
             }
             // 全局代理(app 级,PLAN §代理):空 = 关(直连),否则 http(s)/socks5(h) 或 ${ENV};
@@ -1408,7 +1429,12 @@ impl Engine {
                 if let Some(c) = store.chat.latest_conversation(job_user)? {
                     return Ok(c);
                 }
-                Ok(store.chat.create_conversation(job_user, DEFAULT_SCENE_ID)?)
+                // 自启回合兜底新建 = 系统渠道(原会话被删、用户也无任何会话时才走到)
+                Ok(store.chat.create_conversation_full(
+                    job_user,
+                    DEFAULT_SCENE_ID,
+                    crate::store::chat::CHANNEL_SYSTEM,
+                )?)
             },
         )
         .await

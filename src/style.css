@@ -1,20 +1,87 @@
 :root {
-  /* 暖萌色板 —— 低饱和、柔对比,久看不累 */
+  /* 暖萌原始色板(暖萌皮的语义值引用它;旧 ChatView 原型也在用) —— 低饱和、柔对比 */
   --cream: #fffdf9;
   --cream-deep: #fff3e7;
   --peach: #ffe2c8;
-  --orange: #f2a65a;        /* 高饱和,只留给发送键等小面积强调 */
+  --orange: #f2a65a;
   --orange-deep: #e8884a;
-  --ink: #5b4636;           /* 暖棕文字,不用纯黑 */
+  --ink: #5b4636;
   --ink-soft: #a89683;
   --blush: #ffb1a0;
-  --user-bubble: #f8d3aa;   /* 用户气泡:柔奶橙,替代高饱和橙 */
-  --user-ink: #6b4f3a;      /* 用户气泡内的深暖字 */
+  --user-bubble: #f8d3aa;
+  --user-ink: #6b4f3a;
+
+  /* —— 语义 token:所有组件只引用这一层(组件不写死颜色,宪法 §3.6/§5)。
+     默认 = 科幻皮(2026-06-16);换皮 = 在下面 [data-skin] 块里 redefine 同一组名字,组件零改动。
+     半透色统一 rgba(var(--X-rgb), a)。 */
+  --bg: #071528;                       /* 底色(背景组件之下的兜底) */
+  --surface: rgba(10, 24, 46, 0.55);   /* 面板玻璃(导航栏 / 卡片) */
+  --surface-2: rgba(14, 32, 58, 0.45); /* 次面板 */
+  --surface-deep: rgba(8, 20, 38, 0.6);/* 输入框 / 代码块底 */
+  --line: rgba(var(--accent-rgb), 0.16);
+  --accent: #5fd2ff;                   /* 强调 / 图标 / 链接 */
+  --accent-rgb: 95, 200, 255;
+  --text: #d4e6f7;
+  --text-dim: #85a4c0;
+  --ok: #5fe0b0;       --ok-rgb: 95, 224, 176;
+  --warn: #ffc85f;     --warn-rgb: 255, 200, 95;
+  --attn: #ffb86b;     --attn-rgb: 255, 184, 107;
+  --danger: #f09595;   --danger-rgb: 240, 149, 149;
+  /* 气泡(科幻:深蓝玻璃 / 浅蓝) */
+  --bubble-them: rgba(20, 46, 78, 0.55);
+  --bubble-me: rgba(95, 175, 235, 0.22);
+  --bubble-me-line: rgba(120, 200, 255, 0.3);
+  --bubble-me-text: #eaf4ff;
+  --veil-top: rgba(6, 16, 34, 0.18);     /* 对话区氛围罩(顶→底渐深),科幻=暗蓝;换皮换它 */
+  --veil-bottom: rgba(6, 16, 34, 0.44);
+  /* 悬浮窗(独立 WebView,刻意比主界面更淡的一套):随皮肤切,故进 token 层 */
+  --f-txt: #d8e8f8;
+  --f-txt2: #8aa8c4;
+  --f-cy: var(--accent);
+  --f-solid: #284670;                    /* 不透明胶囊/圆底 */
+  --f-glass: rgba(30, 52, 84, 0.82);     /* 展开面板毛玻璃 */
+  --f-line: rgba(var(--accent-rgb), 0.22);
 
   font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
   color: var(--ink);
   -webkit-font-smoothing: antialiased;
 }
+
+/* —— 暖萌皮(旺财):同一套语义名,换一组值 —— 柔奶油面 / 暖橙强调 / 棕字 / 暖描边。
+   面做近不透明 → 玻璃模糊在其上几乎无效,自然呈"平面奶油"(不必逐处去 blur)。 */
+:root[data-skin="warm"] {
+  --bg: #fdf4e8;
+  --surface: rgba(255, 250, 244, 0.96);     /* 卡片/导航:近不透明,与浅奶油底同族、融成一片 */
+  --surface-2: rgba(252, 244, 233, 0.95);
+  --surface-deep: #f6ecdc;                   /* 输入框:略深奶油 → 读着像凹下去、看得见边界 */
+  --line: rgba(120, 92, 64, 0.24);           /* 描边加深:卡片/分隔不再在亮奶油里糊成一片 */
+  --accent: #e0904a;                          /* 比 #f2a65a 稍沉的暖橙:在浅底上更稳、不刺 */
+  --accent-rgb: 224, 144, 74;
+  --text: #4a3526;                            /* 主字加深:浅底上更扎实好读 */
+  --text-dim: #8a7058;                        /* 次字加深:时间/标签不再发虚 */
+  --ok: #5bbf8a;       --ok-rgb: 91, 191, 138;
+  --warn: #e8a13a;     --warn-rgb: 232, 161, 58;
+  --attn: var(--orange-deep);   --attn-rgb: 232, 136, 74;
+  --danger: #d98a8a;   --danger-rgb: 217, 138, 138;
+  --bubble-them: #fff6ec;
+  --bubble-me: var(--user-bubble);
+  --bubble-me-line: rgba(232, 136, 74, 0.32);
+  --bubble-me-text: var(--user-ink);
+  --veil-top: transparent;                /* 暖萌:几乎无罩,只底部一缕极淡暖纱 */
+  --veil-bottom: rgba(242, 166, 90, 0.06);
+  /* 悬浮窗暖萌档:暖奶油胶囊 + 棕字(--f-cy 继承 var(--accent) 自动转暖橙) */
+  --f-txt: #5b4636;
+  --f-txt2: #9a8472;
+  --f-solid: #ecd9bf;
+  --f-glass: rgba(255, 246, 235, 0.92);
+  --f-line: rgba(91, 70, 54, 0.2);
+}
+
+/* 暖萌皮:关掉科幻 HUD 花活(流光边线 / 轨道光点)。:root 前缀提高优先级,压过组件 scoped 规则
+   (二者基础特异度相同,靠 :root 取胜 —— 否则 scoped 规则后加载会赢)。 */
+:root[data-skin="warm"] .rail::after,
+:root[data-skin="warm"] .recents::after { display: none; }
+:root[data-skin="warm"] .rb.on::after { display: none; }
 
 * { box-sizing: border-box; }
 
@@ -38,12 +105,86 @@ input, textarea, [contenteditable="true"] {
 
 #app { width: 100%; height: 100%; }
 
-/* 全局滚动条:WebView2(Windows)默认是粗灰原生条,贴在窗口边很丑;统一成细玻璃风。
+/* 全局滚动条:WebView2(Windows)默认是粗灰原生条,贴在窗口边很丑;统一成细玻璃风、走 token。
    Mac WKWebView 本来就是 overlay 细条 —— 两端观感拉齐(webview2≠wkwebview 分叉一例)。
-   已自定义的 .stream/.body 选择器更具体,各按各的,不冲突。故意不设 scrollbar-width:
-   新版 Chromium 一旦设了它就会忽略 ::-webkit-scrollbar 的主题色,反而变回默认细条。 */
+   各滚动容器另加 scrollbar-gutter:stable 留稳定槽,数据撑满弹条时不再左移跳动(Mac 看不出)。
+   故意不设 scrollbar-width:新版 Chromium 一旦设了它就会忽略 ::-webkit-scrollbar 的主题色。 */
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: rgba(95, 200, 255, 0.2); border-radius: 4px; }
-::-webkit-scrollbar-thumb:hover { background: rgba(95, 200, 255, 0.34); }
+::-webkit-scrollbar-thumb { background: rgba(var(--accent-rgb), 0.2); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(var(--accent-rgb), 0.34); }
 ::-webkit-scrollbar-corner { background: transparent; }
+
+/* —— 视图外壳(设置 / 回忆 / 记录 / 提醒共用)——
+   表头(+设置 tab)放在滚动区**外**:内容再长,标题/返回键/可拖拽区/tab 都不随之滚走。
+   .view-scroll 收窄并留稳定槽:滚动条贴着内容列右沿,不再飘在最右窗沿与内容脱节(P0)。 */
+.view-shell { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.view-head {
+  flex: 0 0 auto;
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+  padding: 16px 26px 12px; padding-right: 84px;   /* 右留白避开右上角窗控三键 */
+}
+.view-head.sep { border-bottom: 1px solid var(--line); }
+.view-title b { font-size: 16px; color: var(--text); }
+.view-title small { display: block; margin-top: 3px; font-size: 12px; color: var(--text-dim); }
+.view-mono { font-family: ui-monospace, "SF Mono", monospace; font-size: 10px; letter-spacing: 2px; color: var(--text-dim); margin-left: 8px; }
+.view-back {
+  flex: 0 0 auto; background: none; border: 1px solid var(--line); border-radius: 9px;
+  color: var(--text-dim); cursor: pointer; padding: 5px 10px; font-size: 12px;
+  transition: color .15s, border-color .15s;
+}
+.view-back:hover { color: var(--accent); border-color: var(--accent); }
+.view-scroll {
+  flex: 1; min-height: 0; overflow-y: auto; scrollbar-gutter: stable;
+  width: 100%; max-width: 712px;            /* 内容列 ~640 + 边距 + 滚动槽 → 条贴内容 */
+  padding: 16px 26px 24px;
+}
+
+/* —— 列表页卡片(回忆 / 记录 / 提醒共用;原三页各抄一份近 80 行,合并到此) —— */
+.lp-count { margin: 0 0 10px; font-size: 11.5px; letter-spacing: 2px; color: var(--text-dim); }
+.lp-group { margin: 16px 0 9px; font-size: 11.5px; letter-spacing: 2px; color: var(--text-dim); }
+.lp-group:first-of-type { margin-top: 0; }
+.lp-card {
+  display: flex; align-items: center; gap: 10px;
+  border: 1px solid var(--line); border-radius: 12px; padding: 11px 14px; margin-bottom: 8px;
+  background: rgba(var(--accent-rgb), 0.03); font-size: 13.5px;
+  transition: border-color .15s, opacity .15s;
+}
+.lp-card.top { align-items: flex-start; }   /* 多行内容(记忆/备忘):点/标签/日期对齐第一行 */
+.lp-card.muted { opacity: 0.6; }            /* 已撤销 / 失效 */
+.lp-card:hover { border-color: rgba(var(--accent-rgb), 0.4); }
+.lp-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 6px var(--accent); flex: none; opacity: .85; }
+.lp-dot.sm { width: 5px; height: 5px; margin-top: 7px; opacity: .8; }
+.lp-dot.warn { background: var(--attn); box-shadow: 0 0 6px var(--attn); }
+.lp-chip {
+  flex: none; margin-top: 1px; font: 10px/1 ui-monospace, "SF Mono", monospace; letter-spacing: 1px;
+  color: var(--accent); border: 1px solid rgba(var(--accent-rgb), 0.35); border-radius: 6px;
+  padding: 3px 7px; text-transform: uppercase;
+}
+.lp-text { flex: 1; min-width: 0; color: var(--text); line-height: 1.5; word-break: break-word; }
+.lp-text.multiline { white-space: pre-line; }   /* 保留模型多行写入的换行 */
+.lp-badge {
+  flex: none; font: 10px/1 ui-monospace, "SF Mono", monospace; letter-spacing: 1px;
+  color: var(--text-dim); border: 1px solid var(--line); border-radius: 6px; padding: 3px 7px;
+}
+.lp-date { flex: none; font: 10.5px/1 ui-monospace, "SF Mono", monospace; letter-spacing: .5px; color: var(--text-dim); }
+.lp-date.top { margin-top: 4px; }
+.lp-act {
+  flex: none; background: none; border: 1px solid transparent; border-radius: 8px;
+  color: var(--text-dim); cursor: pointer; font-size: 11.5px; padding: 4px 10px;
+  transition: opacity .15s, color .15s, border-color .15s;
+}
+.lp-act:disabled { opacity: 0.4; cursor: default; }
+.lp-act.hoveronly { opacity: 0; font-size: 11px; padding: 3px 8px; }   /* 删除类:平时藏,卡 hover 才现(灰),自身 hover / armed 才转暖橙 */
+.lp-card:hover .lp-act.hoveronly, .lp-act.hoveronly.armed { opacity: 1; }
+.lp-act.hoveronly:hover, .lp-act.hoveronly.armed { color: var(--attn); border-color: rgba(var(--attn-rgb), 0.45); }
+/* attn(暖橙:撤销/取消/该响)与 cy(强调:重做):常驻可见,卡 hover 或自身 hover 点亮 */
+.lp-card:hover .lp-act.attn, .lp-act.attn:hover { color: var(--attn); border-color: rgba(var(--attn-rgb), 0.45); }
+.lp-card:hover .lp-act.cy, .lp-act.cy:hover { color: var(--accent); border-color: rgba(var(--accent-rgb), 0.45); }
+.lp-empty { padding: 42px 0; text-align: center; color: var(--text-dim); font-size: 13.5px; line-height: 1.8; }
+/* 空态图标:线描 SVG(复用 rail 同款图元),细描边 + 弱透明 → 像 HUD 里的虚影占位,
+   随皮肤的 --accent 走;不再用满色 emoji(在科幻/玻璃底上太跳)。 */
+.lp-empty-icon { display: block; width: 30px; height: 30px; margin: 0 auto 12px; }
+.lp-empty-icon svg { width: 100%; height: 100%; fill: none; stroke: var(--accent); stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; opacity: .5; }
+.lp-leave-to { opacity: 0; transform: translateX(12px); }
+.lp-leave-active { transition: all .22s ease; }

@@ -4,6 +4,7 @@
 pub mod attach;
 pub mod bus;
 pub mod components;
+pub mod crypto;
 pub mod engine;
 pub mod files;
 pub mod llm;

@@ -24,6 +24,7 @@ import { useSettings } from '../composables/useSettings'
 import { onTranscribed, useVoice } from '../composables/useVoice'
 import { useSpeech } from '../composables/useSpeech'
 import { fmtMs, fmtTokens, fmtUsd } from '../lib/fmt'
+import { openExternal } from '../lib/backend'
 import { renderMarkdown } from '../lib/md'
 import MemoryView from '../views/MemoryView.vue'
 import OpsView from '../views/OpsView.vue'
@@ -115,13 +116,12 @@ function replay(text: string) {
 }
 
 // 气泡里 markdown 链接:WebView 直接导航会把整个 app 顶走,一律拦下(preventDefault 保命);
-// http(s) 链接 best-effort 交外部打开(Windows 真机行为另验)
+// http(s) 链接交系统浏览器(openExternal:Tauri 走 opener 插件,只放行 http(s))
 function onStreamClick(e: MouseEvent) {
   const a = (e.target as HTMLElement | null)?.closest('a[href]') as HTMLAnchorElement | null
   if (!a) return
   e.preventDefault()
-  const href = a.getAttribute('href') || ''
-  if (/^https?:/i.test(href)) window.open(href, '_blank', 'noopener')
+  void openExternal(a.getAttribute('href') || '')
 }
 
 // 「想了想」漏出(PLAN §9):折叠药丸只露"想了想·N 步"(§3 干净默认);
@@ -443,7 +443,8 @@ onUnmounted(() => cancelAnimationFrame(raf))
           <span>{{ t('nav.memory') }}</span>
         </button>
         <button class="rb" :class="{ on: activeRail === 'ops' }" @click="activeRail = 'ops'" :title="t('nav.ops')">
-          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8" /><path d="M12 8v4l3 2" /></svg>
+          <!-- 足迹:两只脚印(斜向walk),不再用钟表——免与上面「提醒」的闹钟撞图 -->
+          <svg viewBox="0 0 24 24"><g transform="translate(8 13.5) rotate(-16)"><ellipse cx="0" cy="-1.9" rx="2.1" ry="2.6" /><ellipse cx="-0.1" cy="2.5" rx="1.2" ry="1.5" /></g><g transform="translate(15.6 9) rotate(-16)"><ellipse cx="0" cy="-1.9" rx="2.1" ry="2.6" /><ellipse cx="-0.1" cy="2.5" rx="1.2" ry="1.5" /></g></svg>
           <span>{{ t('nav.ops') }}</span>
         </button>
       </div>
@@ -469,10 +470,29 @@ onUnmounted(() => cancelAnimationFrame(raf))
           @click="selectConversation(s.id)"
         >
           <span class="rc-title">{{ s.title || t('recents.untitled') }}</span>
-          <span class="rc-time">{{ fmtTime(s.updated_at) }}</span>
+          <div class="rc-meta">
+            <span class="rc-time">{{ fmtTime(s.updated_at) }}</span>
+            <span
+              v-if="s.channel && s.channel !== 'ui'"
+              class="rc-chan"
+              :class="'rc-chan-' + s.channel"
+              :title="t('channel.' + s.channel)"
+            >
+              <svg v-if="s.channel === 'voice'" class="rc-chan-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="9" y="2.5" width="6" height="11" rx="3" />
+                <path d="M5.5 11a6.5 6.5 0 0 0 13 0" />
+                <path d="M12 17.5V21" />
+              </svg>
+              <svg v-else-if="s.channel === 'system'" class="rc-chan-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M6 9.5a6 6 0 0 1 12 0c0 4.4 1.8 5.5 1.8 5.5H4.2S6 13.9 6 9.5Z" />
+                <path d="M10.2 19a2 2 0 0 0 3.6 0" />
+              </svg>
+              <span v-else class="rc-chan-dot" />
+            </span>
+          </div>
         </li>
       </ul>
-      <button class="rc-new" @click="newConversation">{{ t('recents.newTopic') }}</button>
+      <button class="rc-new" @click="newConversation()">{{ t('recents.newTopic') }}</button>
     </aside>
 
     <!-- 设置台/回忆页:rail 目的地,整区接管(聊天 v-show 保活,状态无损) -->
@@ -634,16 +654,10 @@ onUnmounted(() => cancelAnimationFrame(raf))
 
 <style scoped>
 .layout {
-  --txt: #d4e6f7;
-  --txt2: #85a4c0;
-  --cy: #5fd2ff;
-  --glass: rgba(10, 24, 46, 0.55);
-  --glass-2: rgba(14, 32, 58, 0.45);
-  --line: rgba(95, 200, 255, 0.16);
-
+  /* 主题 token 全在 style.css :root(科幻皮唯一色源);此处只留布局 */
   position: fixed; inset: 0; z-index: 5;
   display: flex; gap: 0;
-  color: var(--txt);
+  color: var(--text);
   font-family: -apple-system, "PingFang SC", "Segoe UI", sans-serif;
   font-size: 14px;
 }
@@ -653,24 +667,24 @@ onUnmounted(() => cancelAnimationFrame(raf))
 /* —— 左图标栏 —— */
 .rail {
   flex: 0 0 72px; display: flex; flex-direction: column; justify-content: space-between;
-  padding: 16px 0; background: var(--glass);
+  padding: 16px 0; background: var(--surface);
   backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
   border-right: 1px solid var(--line);
 }
 .rail-top { display: flex; flex-direction: column; gap: 6px; }
 .rb {
-  background: rgba(95, 200, 255, 0.04); border: 1px solid var(--line); border-radius: 11px;
-  cursor: pointer; color: var(--txt2);
+  background: rgba(var(--accent-rgb), 0.04); border: 1px solid var(--line); border-radius: 11px;
+  cursor: pointer; color: var(--text-dim);
   display: flex; flex-direction: column; align-items: center; gap: 4px;
   width: 58px; margin: 0 auto; padding: 9px 0; font-size: 10px; letter-spacing: 1px;
   position: relative; transition: color .15s, border-color .15s, background .15s;
 }
 .rb svg { width: 21px; height: 21px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linejoin: round; }
-.rb:hover { color: var(--txt); border-color: rgba(95, 200, 255, 0.4); }
-.rb.on { color: var(--cy); border-color: rgba(95, 200, 255, 0.45); background: rgba(95, 200, 255, 0.1); }
+.rb:hover { color: var(--text); border-color: rgba(var(--accent-rgb), 0.4); }
+.rb.on { color: var(--accent); border-color: rgba(var(--accent-rgb), 0.45); background: rgba(var(--accent-rgb), 0.1); }
 .rb.on::after {
   content: ""; position: absolute; top: 0; left: 0; width: 5px; height: 5px; margin: -2.5px;
-  border-radius: 50%; background: var(--cy); box-shadow: 0 0 8px 1px var(--cy);
+  border-radius: 50%; background: var(--accent); box-shadow: 0 0 8px 1px var(--accent);
   animation: orbit 3s linear infinite;
 }
 @keyframes orbit {
@@ -680,53 +694,60 @@ onUnmounted(() => cancelAnimationFrame(raf))
 /* 唯一脉冲:缺钥匙时齿轮上的琥珀光点 */
 .gear-dot {
   position: absolute; top: 5px; right: 5px; width: 6px; height: 6px; border-radius: 50%;
-  background: #ffc85f; box-shadow: 0 0 8px #ffc85f; animation: led 2.4s ease-in-out infinite;
+  background: var(--warn); box-shadow: 0 0 8px var(--warn); animation: led 2.4s ease-in-out infinite;
 }
 
 /* —— 中:最近 —— */
 .recents {
-  flex: 0 0 216px; display: flex; flex-direction: column;
+  /* 大屏不再死守 216:随视口温和放大,小屏维持 216、约 1.8K 宽封顶 320,免得聊天区独吞剩余宽度显失衡 */
+  flex: 0 0 clamp(216px, 18vw, 320px); display: flex; flex-direction: column;
   background: transparent;
   border-right: 1px solid var(--line);
 }
-.rc-head { display: flex; align-items: center; justify-content: space-between; padding: 16px 16px 10px; font-size: 12px; letter-spacing: 2px; color: var(--txt2); }
-.collapse { background: none; border: none; color: var(--txt2); cursor: pointer; font-size: 18px; line-height: 1; }
-.collapse:hover { color: var(--cy); }
-.rc-list { list-style: none; margin: 0; padding: 0 8px; flex: 1; overflow-y: auto; }
+.rc-head { display: flex; align-items: center; justify-content: space-between; padding: 16px 16px 10px; font-size: 12px; letter-spacing: 2px; color: var(--text-dim); }
+.collapse { background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 18px; line-height: 1; }
+.collapse:hover { color: var(--accent); }
+.rc-list { list-style: none; margin: 0; padding: 0 8px; flex: 1; overflow-y: auto; scrollbar-gutter: stable; }
 .rc-list li {
   margin-bottom: 8px; padding: 10px 12px; border-radius: 10px; cursor: pointer;
   display: flex; flex-direction: column; gap: 3px;
-  background: rgba(14, 32, 58, 0.4); border: 1px solid var(--line);
+  background: var(--surface-2); border: 1px solid var(--line);
   backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
   transition: border-color .15s, background .15s;
 }
-.rc-list li:hover { border-color: rgba(95, 200, 255, 0.4); }
-.rc-list li.on { background: rgba(95, 200, 255, 0.12); border-color: rgba(95, 200, 255, 0.5); box-shadow: 0 0 12px rgba(95, 200, 255, 0.12); }
-.rc-title { font-size: 13px; color: var(--txt); }
-.rc-time { font-size: 11px; color: var(--txt2); }
-.rc-new { margin: 10px; padding: 9px; border-radius: 10px; background: none; border: 1px dashed var(--line); color: var(--txt2); cursor: pointer; font-size: 12.5px; }
-.rc-new:hover { color: var(--cy); border-color: var(--cy); }
+.rc-list li:hover { border-color: rgba(var(--accent-rgb), 0.4); }
+.rc-list li.on { background: rgba(var(--accent-rgb), 0.12); border-color: rgba(var(--accent-rgb), 0.5); box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.12); }
+.rc-title { font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 时间行:时间靠左,渠道图标靠右(右下角,与时间同一行) */
+.rc-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+/* 渠道小图标:界面=不渲染(基线);voice=强调色更显眼,system=克制 dim;未知渠道兜底小圆点 */
+.rc-chan { display: inline-flex; flex: none; align-items: center; color: var(--text-dim); }
+.rc-chan-ic { width: 11px; height: 11px; display: block; }
+.rc-chan-voice { color: var(--accent); }
+.rc-chan-system { color: var(--text-dim); }
+.rc-chan-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.rc-time { font-size: 11px; color: var(--text-dim); }
+.rc-new { margin: 10px; padding: 9px; border-radius: 10px; background: none; border: 1px dashed var(--line); color: var(--text-dim); cursor: pointer; font-size: 12.5px; }
+.rc-new:hover { color: var(--accent); border-color: var(--accent); }
 
 /* —— 右:对话 —— */
 .chat { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
 .chat > * { position: relative; z-index: 1; }
 .chat::before {
   content: ""; position: absolute; inset: 0; z-index: 0; pointer-events: none;
-  background: linear-gradient(180deg, rgba(6, 16, 34, 0.18), rgba(6, 16, 34, 0.44));
+  background: linear-gradient(180deg, var(--veil-top), var(--veil-bottom));
 }
 /* 右内边距留出右上角窗控三键的位置(无边框补窗控,PLAN §12) */
 .chat-head { display: flex; align-items: center; gap: 10px; padding: 14px 84px 14px 20px; border-bottom: 1px solid var(--line); }
 .head-av { transition: transform .15s; }
-.reopen { background: none; border: 1px solid var(--line); color: var(--txt2); cursor: pointer; border-radius: 8px; width: 26px; height: 26px; font-size: 16px; }
-.reopen:hover { color: var(--cy); border-color: var(--cy); }
+.reopen { background: none; border: 1px solid var(--line); color: var(--text-dim); cursor: pointer; border-radius: 8px; width: 26px; height: 26px; font-size: 16px; }
+.reopen:hover { color: var(--accent); border-color: var(--accent); }
 .who { display: flex; flex-direction: column; line-height: 1.25; }
-.who b { font-size: 15px; color: var(--txt); }
+.who b { font-size: 15px; color: var(--text); }
 
-.stream { flex: 1; overflow-y: auto; padding: 22px 26px; display: flex; flex-direction: column; gap: 13px; position: relative; }
+/* scrollbar-gutter:stable —— 内容撑满出现滚动条时不再左移跳动(全局 ::-webkit-scrollbar 已统一样式,不再各设一份) */
+.stream { flex: 1; overflow-y: auto; scrollbar-gutter: stable; padding: 22px 20px 22px 26px; display: flex; flex-direction: column; gap: 13px; position: relative; }
 .roamer { position: absolute; top: 0; left: 0; z-index: 6; pointer-events: none; will-change: transform; }
-.stream::-webkit-scrollbar { width: 8px; }
-.stream::-webkit-scrollbar-thumb { background: rgba(95, 200, 255, 0.18); border-radius: 4px; }
-.stream::-webkit-scrollbar-thumb:hover { background: rgba(95, 200, 255, 0.34); }
 .bubble {
   max-width: 70%; padding: 11px 15px; border-radius: 16px; font-size: 14px; line-height: 1.55;
   backdrop-filter: blur(9px); -webkit-backdrop-filter: blur(9px);
@@ -739,7 +760,7 @@ onUnmounted(() => cancelAnimationFrame(raf))
 .turn-meta {
   position: absolute; top: 100%; left: 13px; margin-top: 3px;
   font: 10px/1 ui-monospace, "SF Mono", monospace; letter-spacing: 0.6px;
-  color: var(--cy); text-shadow: 0 0 8px rgba(95, 200, 255, 0.3);
+  color: var(--accent); text-shadow: 0 0 8px rgba(var(--accent-rgb), 0.3);
   white-space: nowrap; pointer-events: none; user-select: none;
   opacity: 0; transform: translateY(-2px); transition: opacity .18s ease, transform .18s ease;
   z-index: 7;
@@ -749,12 +770,12 @@ onUnmounted(() => cancelAnimationFrame(raf))
 .turn-meta.live { transform: translateY(0); animation: metaLive 1.6s ease-in-out infinite; }
 @keyframes metaLive { 0%, 100% { opacity: 0.85; } 50% { opacity: 0.45; } }
 .bubble.wang {
-  align-self: flex-start; background: rgba(20, 46, 78, 0.55);
-  border: 1px solid var(--line); border-bottom-left-radius: 5px; color: var(--txt);
+  align-self: flex-start; background: var(--bubble-them);
+  border: 1px solid var(--line); border-bottom-left-radius: 5px; color: var(--text);
 }
 .bubble.user {
-  align-self: flex-end; background: rgba(95, 175, 235, 0.22);
-  border: 1px solid rgba(120, 200, 255, 0.3); border-bottom-right-radius: 5px; color: #eaf4ff;
+  align-self: flex-end; background: var(--bubble-me);
+  border: 1px solid var(--bubble-me-line); border-bottom-right-radius: 5px; color: var(--bubble-me-text);
 }
 
 /* —— 气泡富文本(markdown):wang 回复用,修掉逐字 span 吞换行的老问题 —— */
@@ -766,12 +787,12 @@ onUnmounted(() => cancelAnimationFrame(raf))
 .md li { margin: 2px 0; }
 .md h1, .md h2, .md h3, .md h4 { margin: 10px 0 6px; font-weight: 600; line-height: 1.3; }
 .md h1 { font-size: 1.3em; } .md h2 { font-size: 1.18em; } .md h3 { font-size: 1.06em; } .md h4 { font-size: 1em; }
-.md code { font-family: ui-monospace, "SF Mono", monospace; font-size: .9em; background: rgba(95, 200, 255, 0.12); padding: 1px 5px; border-radius: 5px; }
-.md pre { background: rgba(8, 20, 38, 0.7); border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; overflow-x: auto; margin: 8px 0; }
+.md code { font-family: ui-monospace, "SF Mono", monospace; font-size: .9em; background: rgba(var(--accent-rgb), 0.12); padding: 1px 5px; border-radius: 5px; }
+.md pre { background: var(--surface-deep); border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; overflow-x: auto; margin: 8px 0; }
 .md pre code { background: none; padding: 0; font-size: 12.5px; line-height: 1.5; }
-.md blockquote { margin: 8px 0; padding: 2px 0 2px 12px; border-left: 2px solid var(--line); color: var(--txt2); }
-.md a { color: var(--cy); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
-.md strong, .md b { font-weight: 600; color: #eaf6ff; }
+.md blockquote { margin: 8px 0; padding: 2px 0 2px 12px; border-left: 2px solid var(--line); color: var(--text-dim); }
+.md a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.md strong, .md b { font-weight: 600; color: var(--text); }
 .md hr { border: none; border-top: 1px solid var(--line); margin: 10px 0; }
 .md table { border-collapse: collapse; margin: 8px 0; font-size: .94em; }
 .md th, .md td { border: 1px solid var(--line); padding: 4px 8px; text-align: left; }
@@ -784,23 +805,23 @@ onUnmounted(() => cancelAnimationFrame(raf))
 .composer { padding: 12px 18px 16px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 9px; }
 .input-row { display: flex; gap: 9px; }
 .field {
-  flex: 1; background: rgba(8, 20, 38, 0.6); border: 1px solid var(--line); border-radius: 13px;
-  padding: 11px 15px; color: var(--txt); font-size: 14px; outline: none;
+  flex: 1; background: var(--surface-deep); border: 1px solid var(--line); border-radius: 13px;
+  padding: 11px 15px; color: var(--text); font-size: 14px; outline: none;
   backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
 }
-.field::placeholder { color: var(--txt2); }
-.field:focus { border-color: var(--cy); box-shadow: 0 0 0 2px rgba(95, 200, 255, 0.12); }
+.field::placeholder { color: var(--text-dim); }
+.field:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(var(--accent-rgb), 0.12); }
 .send {
   width: 46px; border: 1px solid var(--line); border-radius: 13px; cursor: pointer; font-size: 16px;
-  background: rgba(95, 200, 255, 0.1); color: var(--cy);
+  background: rgba(var(--accent-rgb), 0.1); color: var(--accent);
   backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
   transition: border-color .15s, background .15s, box-shadow .15s;
 }
-.send:hover:not(:disabled) { border-color: var(--cy); background: rgba(95, 200, 255, 0.2); box-shadow: 0 0 14px rgba(95, 200, 255, 0.3); }
+.send:hover:not(:disabled) { border-color: var(--accent); background: rgba(var(--accent-rgb), 0.2); box-shadow: 0 0 14px rgba(var(--accent-rgb), 0.3); }
 .send:disabled { opacity: 0.4; cursor: default; }
-.send.stop { color: #ffb86b; border-color: rgba(255, 184, 107, 0.4); }
-.send.stop:hover { border-color: #ffb86b; background: rgba(255, 184, 107, 0.15); box-shadow: 0 0 14px rgba(255, 184, 107, 0.3); }
-.key-row .field { border-color: rgba(255, 200, 95, 0.45); }
+.send.stop { color: var(--attn); border-color: rgba(var(--attn-rgb), 0.4); }
+.send.stop:hover { border-color: var(--attn); background: rgba(var(--attn-rgb), 0.15); box-shadow: 0 0 14px rgba(var(--attn-rgb), 0.3); }
+.key-row .field { border-color: rgba(var(--warn-rgb), 0.45); }
 
 /* 语音输入:输入框内右侧小话筒(轻量,不跟发送键并排抢戏;界面优先,语音只是输入之一) */
 .field-wrap { flex: 1; position: relative; display: flex; min-width: 0; }
@@ -808,10 +829,10 @@ onUnmounted(() => cancelAnimationFrame(raf))
 .mic-inline {
   position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
   width: 30px; height: 30px; padding: 0; border: none; background: none; cursor: pointer;
-  color: var(--txt2); display: flex; align-items: center; justify-content: center;
+  color: var(--text-dim); display: flex; align-items: center; justify-content: center;
   border-radius: 8px; transition: color .15s, background .15s;
 }
-.mic-inline:hover { color: var(--cy); background: rgba(95, 200, 255, 0.12); }
+.mic-inline:hover { color: var(--accent); background: rgba(var(--accent-rgb), 0.12); }
 .mic-inline svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; display: block; }
 
 /* —— 媒体附件(PLAN §9):加图/文件按钮 + 待发托盘 + 气泡里的图/小票 —— */
@@ -819,121 +840,121 @@ onUnmounted(() => cancelAnimationFrame(raf))
 /* 小图标按钮,无框贴左(界面优先,附件是轻量入口);留白给以后并排放更多功能键 */
 .attach-btn {
   flex: 0 0 auto; align-self: center; width: 32px; height: 32px; padding: 0;
-  border: none; background: none; cursor: pointer; color: var(--txt2);
+  border: none; background: none; cursor: pointer; color: var(--text-dim);
   display: flex; align-items: center; justify-content: center; border-radius: 9px;
   transition: color .15s, background .15s;
 }
-.attach-btn:hover { color: var(--cy); background: rgba(95, 200, 255, 0.12); }
+.attach-btn:hover { color: var(--accent); background: rgba(var(--accent-rgb), 0.12); }
 .attach-btn svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 
 /* 排队区(Phase A):7274 还在说时发的消息,攒这儿、整轮结束自动合并发 */
 .queue { display: flex; flex-direction: column; gap: 5px; padding: 2px 2px 0; }
-.q-head { display: flex; align-items: center; justify-content: space-between; font-size: 11px; letter-spacing: 1px; color: var(--txt2); }
+.q-head { display: flex; align-items: center; justify-content: space-between; font-size: 11px; letter-spacing: 1px; color: var(--text-dim); }
 .q-jump {
-  cursor: pointer; background: rgba(95, 200, 255, 0.1); border: 1px solid rgba(95, 200, 255, 0.4);
-  border-radius: 999px; padding: 3px 11px; color: var(--cy); font-size: 11px; letter-spacing: .5px;
+  cursor: pointer; background: rgba(var(--accent-rgb), 0.1); border: 1px solid rgba(var(--accent-rgb), 0.4);
+  border-radius: 999px; padding: 3px 11px; color: var(--accent); font-size: 11px; letter-spacing: .5px;
   transition: background .15s, border-color .15s;
 }
-.q-jump:hover { background: rgba(95, 200, 255, 0.2); border-color: var(--cy); box-shadow: 0 0 10px rgba(95, 200, 255, 0.25); }
+.q-jump:hover { background: rgba(var(--accent-rgb), 0.2); border-color: var(--accent); box-shadow: 0 0 10px rgba(var(--accent-rgb), 0.25); }
 .q-item {
   display: flex; align-items: center; gap: 7px;
-  background: rgba(95, 200, 255, 0.05); border: 1px dashed var(--line); border-radius: 9px;
-  padding: 5px 9px; font-size: 12.5px; color: var(--txt);
+  background: rgba(var(--accent-rgb), 0.05); border: 1px dashed var(--line); border-radius: 9px;
+  padding: 5px 9px; font-size: 12.5px; color: var(--text);
 }
-.q-clip { width: 13px; height: 13px; flex: 0 0 auto; fill: none; stroke: var(--cy); stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.q-clip { width: 13px; height: 13px; flex: 0 0 auto; fill: none; stroke: var(--accent); stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 .q-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.q-x { background: none; border: none; color: var(--txt2); cursor: pointer; font-size: 12px; line-height: 1; padding: 0 2px; flex: 0 0 auto; }
-.q-x:hover { color: #f09595; }
+.q-x { background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 12px; line-height: 1; padding: 0 2px; flex: 0 0 auto; }
+.q-x:hover { color: var(--danger); }
 .att-tray { display: flex; flex-wrap: wrap; gap: 8px; }
 .att-pill {
   display: flex; align-items: center; gap: 7px; max-width: 230px;
-  background: rgba(14, 32, 58, 0.6); border: 1px solid var(--line); border-radius: 10px; padding: 5px 8px;
-  font-size: 12px; color: var(--txt);
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; padding: 5px 8px;
+  font-size: 12px; color: var(--text);
 }
 .att-thumb { width: 30px; height: 30px; object-fit: cover; border-radius: 6px; flex: 0 0 auto; }
-.att-doc { width: 18px; height: 18px; flex: 0 0 auto; fill: none; stroke: var(--cy); stroke-width: 1.6; stroke-linejoin: round; }
+.att-doc { width: 18px; height: 18px; flex: 0 0 auto; fill: none; stroke: var(--accent); stroke-width: 1.6; stroke-linejoin: round; }
 .att-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.att-x { background: none; border: none; color: var(--txt2); cursor: pointer; font-size: 12px; line-height: 1; padding: 0 2px; flex: 0 0 auto; }
-.att-x:hover { color: #f09595; }
+.att-x { background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 12px; line-height: 1; padding: 0 2px; flex: 0 0 auto; }
+.att-x:hover { color: var(--danger); }
 
 .atts { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
 .att-img { max-width: 200px; max-height: 220px; border-radius: 10px; display: block; }
 .att-chip {
   display: inline-flex; align-items: center; gap: 6px;
-  background: rgba(8, 20, 38, 0.5); border: 1px solid var(--line); border-radius: 9px; padding: 5px 9px;
-  font-size: 12px; color: var(--txt);
+  background: var(--surface-deep); border: 1px solid var(--line); border-radius: 9px; padding: 5px 9px;
+  font-size: 12px; color: var(--text);
 }
-.att-chip svg { width: 15px; height: 15px; flex: 0 0 auto; fill: none; stroke: var(--cy); stroke-width: 1.6; stroke-linejoin: round; }
+.att-chip svg { width: 15px; height: 15px; flex: 0 0 auto; fill: none; stroke: var(--accent); stroke-width: 1.6; stroke-linejoin: round; }
 
 /* —— 「想了想」漏出(PLAN §9):折叠药丸 + 展开人格化步骤 —— */
 .think { margin-top: 7px; }
 .think-pill {
   display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
-  background: rgba(95, 200, 255, 0.06); border: 1px solid var(--line); border-radius: 999px;
-  padding: 4px 10px; color: var(--txt2); font-size: 12px;
+  background: rgba(var(--accent-rgb), 0.06); border: 1px solid var(--line); border-radius: 999px;
+  padding: 4px 10px; color: var(--text-dim); font-size: 12px;
   transition: color .15s, border-color .15s, background .15s;
 }
-.think-pill:hover { color: var(--cy); border-color: rgba(95, 200, 255, 0.4); }
-.think-i { width: 13px; height: 13px; flex: 0 0 auto; fill: none; stroke: var(--cy); stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.think-pill:hover { color: var(--accent); border-color: rgba(var(--accent-rgb), 0.4); }
+.think-i { width: 13px; height: 13px; flex: 0 0 auto; fill: none; stroke: var(--accent); stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
 .think-chev { width: 13px; height: 13px; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; transition: transform .18s ease; }
 .think-pill.open .think-chev { transform: rotate(180deg); }
 .think-detail {
   margin-top: 6px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 11px;
-  background: rgba(8, 20, 38, 0.6); display: flex; flex-direction: column; gap: 9px;
+  background: var(--surface-deep); display: flex; flex-direction: column; gap: 9px;
   animation: thinkIn .18s ease; max-width: 100%;
 }
 @keyframes thinkIn { from { opacity: 0; transform: translateY(-3px); } }
 .td-step { display: flex; flex-direction: column; gap: 3px; }
 .td-call { display: flex; flex-wrap: wrap; align-items: baseline; gap: 7px; font: 12px/1.45 ui-monospace, "SF Mono", monospace; }
-.td-name { color: var(--cy); }
-.td-args { color: var(--txt2); word-break: break-all; }
-.td-bad { color: #f09595; }
+.td-name { color: var(--accent); }
+.td-args { color: var(--text-dim); word-break: break-all; }
+.td-bad { color: var(--danger); }
 .td-result {
-  font: 11.5px/1.5 ui-monospace, "SF Mono", monospace; color: var(--txt2);
+  font: 11.5px/1.5 ui-monospace, "SF Mono", monospace; color: var(--text-dim);
   white-space: pre-wrap; word-break: break-word; max-height: 120px; overflow: auto;
   padding-left: 10px; border-left: 2px solid var(--line);
 }
 .td-cot { display: flex; flex-direction: column; gap: 4px; }
-.td-cot-h { font-size: 11px; letter-spacing: 1px; color: var(--txt2); }
+.td-cot-h { font-size: 11px; letter-spacing: 1px; color: var(--text-dim); }
 .td-cot-body {
-  margin: 0; font: 11.5px/1.6 ui-monospace, "SF Mono", monospace; color: var(--txt);
+  margin: 0; font: 11.5px/1.6 ui-monospace, "SF Mono", monospace; color: var(--text);
   white-space: pre-wrap; word-break: break-word; max-height: 200px; overflow: auto;
-  background: rgba(10, 24, 46, 0.5); border-radius: 8px; padding: 8px 10px;
+  background: var(--surface); border-radius: 8px; padding: 8px 10px;
 }
 
 /* —— 听写(PLAN §11):输入框位变波形,token 体系,无新布局结构 —— */
-.send.cancel-listen { color: #f09595; border-color: rgba(240, 149, 149, 0.4); }
-.send.cancel-listen:hover { border-color: #f09595; background: rgba(240, 149, 149, 0.12); box-shadow: 0 0 14px rgba(240, 149, 149, 0.25); }
+.send.cancel-listen { color: var(--danger); border-color: rgba(var(--danger-rgb), 0.4); }
+.send.cancel-listen:hover { border-color: var(--danger); background: rgba(var(--danger-rgb), 0.12); box-shadow: 0 0 14px rgba(var(--danger-rgb), 0.25); }
 .listen-field {
   display: flex; align-items: center; gap: 12px; cursor: pointer; user-select: none;
-  border-color: rgba(95, 200, 255, 0.5); box-shadow: 0 0 16px rgba(95, 200, 255, 0.16) inset, 0 0 10px rgba(95, 200, 255, 0.12);
+  border-color: rgba(var(--accent-rgb), 0.5); box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.16) inset, 0 0 10px rgba(var(--accent-rgb), 0.12);
 }
-.listen-field.heard { border-color: var(--cy); }
+.listen-field.heard { border-color: var(--accent); }
 .listen-field.preparing, .listen-field.transcribing { cursor: default; }
 .wave { display: flex; align-items: center; gap: 3px; height: 20px; flex: 0 0 auto; }
 .wave i {
-  width: 3px; min-height: 12%; background: var(--cy); border-radius: 2px;
-  transition: height .09s linear; box-shadow: 0 0 6px rgba(95, 200, 255, 0.45);
+  width: 3px; min-height: 12%; background: var(--accent); border-radius: 2px;
+  transition: height .09s linear; box-shadow: 0 0 6px rgba(var(--accent-rgb), 0.45);
 }
 /* 准备/识别中:电平没了,柱子改呼吸,别像死机 */
 .listen-field.preparing .wave i, .listen-field.transcribing .wave i { animation: wavePulse 1.1s ease-in-out infinite; }
 .listen-field.preparing .wave i:nth-child(odd), .listen-field.transcribing .wave i:nth-child(odd) { animation-delay: .25s; }
 @keyframes wavePulse { 0%, 100% { height: 14%; } 50% { height: 64%; } }
-.listen-hint { color: var(--txt2); font-size: 12.5px; }
-.listen-field.heard .listen-hint { color: var(--cy); }
+.listen-hint { color: var(--text-dim); font-size: 12.5px; }
+.listen-field.heard .listen-hint { color: var(--accent); }
 
 /* 再听一遍(耳机=重播):贴气泡右下,默认隐身 hover 浮现(与读数同款克制),小巧 */
 .replay {
   position: absolute; right: 8px; bottom: -22px; z-index: 7;
   width: 19px; height: 16px; padding: 0;
   display: flex; align-items: center; justify-content: center;
-  background: rgba(95, 200, 255, 0.08); color: var(--cy);
+  background: rgba(var(--accent-rgb), 0.08); color: var(--accent);
   border: 1px solid var(--line); border-radius: 5px; cursor: pointer;
   opacity: 0; transition: opacity .18s ease;
 }
 .replay svg { width: 11px; height: 11px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; display: block; }
 .bubble:hover .replay { opacity: 0.9; }
-.replay:hover { border-color: var(--cy); }
+.replay:hover { border-color: var(--accent); }
 
 /* 用户消息 hover:复制 + 时间(右下浮现,与读数/重听同款克制) */
 .user-meta {
@@ -943,20 +964,20 @@ onUnmounted(() => cancelAnimationFrame(raf))
   transition: opacity .18s ease, transform .18s ease;
 }
 .bubble.user:hover .user-meta { opacity: 0.95; transform: translateY(0); }
-.u-time { font: 10px/1 ui-monospace, "SF Mono", monospace; letter-spacing: .5px; color: var(--txt2); white-space: nowrap; user-select: none; }
+.u-time { font: 10px/1 ui-monospace, "SF Mono", monospace; letter-spacing: .5px; color: var(--text-dim); white-space: nowrap; user-select: none; }
 .copy-btn {
   width: 18px; height: 16px; padding: 0; display: flex; align-items: center; justify-content: center;
-  background: rgba(95, 200, 255, 0.08); color: var(--txt2);
+  background: rgba(var(--accent-rgb), 0.08); color: var(--text-dim);
   border: 1px solid var(--line); border-radius: 5px; cursor: pointer;
   transition: color .15s, border-color .15s;
 }
-.copy-btn:hover { color: var(--cy); border-color: var(--cy); }
-.copy-btn.done { color: #5fe0b0; border-color: rgba(95, 224, 176, 0.5); }
+.copy-btn:hover { color: var(--accent); border-color: var(--accent); }
+.copy-btn.done { color: var(--ok); border-color: rgba(var(--ok-rgb), 0.5); }
 .copy-btn svg { width: 11px; height: 11px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; display: block; }
 
 /* —— HUD 增强 —— */
-.who small { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--txt2); }
-.led { width: 6px; height: 6px; border-radius: 50%; background: #5fe0b0; box-shadow: 0 0 8px #5fe0b0; animation: led 2.4s ease-in-out infinite; }
+.who small { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--text-dim); }
+.led { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 8px var(--ok); animation: led 2.4s ease-in-out infinite; }
 @keyframes led { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
 
 .rc-head { letter-spacing: 1.5px; }
@@ -966,7 +987,7 @@ onUnmounted(() => cancelAnimationFrame(raf))
 
 .rail::after, .recents::after {
   content: ""; position: absolute; top: 0; right: -1px; width: 1px; height: 72px; pointer-events: none;
-  background: linear-gradient(180deg, transparent, var(--cy), transparent);
+  background: linear-gradient(180deg, transparent, var(--accent), transparent);
   opacity: .7; animation: flow 5.5s linear infinite;
 }
 @keyframes flow { 0% { transform: translateY(-72px); } 100% { transform: translateY(101vh); } }
