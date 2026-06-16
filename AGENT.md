@@ -272,6 +272,7 @@
 - **零新 core 事件**:悬浮窗只是「全局事件车道」(`app_event`)又一个消费者,复用同一份 Vue app / token / 形象 / composable;窗口管理与托盘进**壳层**。
 - 形态 = **C(混合可展开)**:收起 = 一体小挂件,展开 = 信息面板(进行中 / 通知两区);常驻锚点 = 系统托盘;开机自启 = `tauri-plugin-autostart`(OS 真相源)。
 - **关主窗 = 隐藏到托盘、不退进程**(✕ 首次点出友好气泡兜底);主窗无边框 → 自绘右上角三键。
+- **单实例 / 二次启动唤回**(2026-06-16):全程序只跑一个进程。已在运行时再点快捷方式 / 重复启动**不开新进程**——`tauri-plugin-single-instance`(**放最前注册**),OS 把第二个进程的命令行交给已运行实例的回调、第二个进程退出;回调复用 `show_window` 把主窗(可能藏托盘)唤到前台,沿用 `--autostart` 静默语义(自启触发不唤窗)。无 IPC 命令、不需 capability。**OS 转发 + 窗口前置待 Windows 真机验**(§8.1;若只闪任务栏不前置,加 always-on-top 翻转兜底,见 PLAN §12 watch-item)。
 - ⚠️ **悬浮窗 useMedia 只读不发声**(独立 WebView 复用播放 VM 会与主窗双播——多窗变体的双播坑,`play` 分支已堵)。**反向媒体控制已落地**(2026-06-16):悬浮窗迷你播控按钮**转发**给主窗执行(`emitMediaControl`→主窗 `onMediaControl`→`applyControl`,与嘴控汇同一执行口),float 仍不出声;播放态经 `emitNowPlaying(np,status)` 镜像回 float(播/暂停图标翻转)。跨窗联动 Mac/浏览器测不出,**待 Windows 真机验**(§8.1)。
 - **托盘「显示悬浮窗」**(2026-06-16):✕ 关掉悬浮窗后,托盘菜单一项重开(`show_float`→壳层 emit `lw:show-float`→主窗置 `ui.float.enabled='1'`+`setFloatVisible(true)`,持久化由主窗收口);比绕设置页顺手。
 - **失败任务「重试」已落地**(2026-06-16,轻量版、不等 JobRunner):仅影音解析/组件下载失败带 `TaskRetry::MediaPlay{page_url,audio_only}` 载体,UI 显「重试」直连重放(`media_retry` 命令→`media.play`,按钮不绕 LLM,§7.1 哲学);auth 失败不给盲目重试(走登录)。通用 JobRunner 重试仍后置。

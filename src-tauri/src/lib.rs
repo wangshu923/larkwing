@@ -38,6 +38,17 @@ pub fn run() {
   );
 
   tauri::Builder::default()
+    // 单实例(放最前,让二次启动尽早退出、不做多余装配):已在运行时再点快捷方式 /
+    // 重复启动,操作系统会把第二个进程的命令行交给"已在运行的那个实例"的这个回调,
+    // 然后第二个进程退出 —— 这里把已运行实例的主窗唤到前台,即"点一下就回到正在跑的程序"。
+    // 沿用 --autostart 静默语义(§12 开机自启不弹窗):若这次是自启触发,只确保进程在、
+    // 不打扰用户;其余(双击图标等)一律唤主窗。
+    .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+      if args.iter().any(|a| a == "--autostart") {
+        return;
+      }
+      show_window(app, "main");
+    }))
     .plugin(tauri_plugin_autostart::init(
       tauri_plugin_autostart::MacosLauncher::LaunchAgent,
       Some(vec!["--autostart"]),
@@ -181,11 +192,17 @@ pub fn run() {
 
       // ---- 系统托盘(PLAN §12 常驻锚点):左键唤主窗;菜单文案由前端 set_tray_menu
       //      注入(§6 core 不产文案),这里只建图标 + 交互 ----
+      // 托盘图标分平台(刻意区别):
+      //   macOS 菜单栏惯例 = 单色字形 + 模板模式(按明暗自动染色),tray.png 是白色字形;
+      //   Windows/Linux 通知区惯例 = 彩色小图标,用彩色翅膀 tray-color.png(更像"我们的 logo")。
+      #[cfg(target_os = "macos")]
       let tray = TrayIconBuilder::with_id("tray")
-        // 托盘用专属单色字形(非整块应用图标);macOS 模板模式按菜单栏明暗自动染色,
-        // 与原生托盘观感一致。Windows/Linux 忽略模板,直接显示白色字形(深色托盘可见)。
         .icon(tauri::include_image!("icons/tray.png"))
-        .icon_as_template(true)
+        .icon_as_template(true);
+      #[cfg(not(target_os = "macos"))]
+      let tray = TrayIconBuilder::with_id("tray")
+        .icon(tauri::include_image!("icons/tray-color.png"));
+      let tray = tray
         .tooltip("Larkwing")
         .show_menu_on_left_click(false)
         .on_tray_icon_event(|tray, event| {
