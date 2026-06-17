@@ -4,6 +4,7 @@
 mod db;
 
 pub mod briefings;
+pub mod channels;
 pub mod chat;
 pub mod cloned_voices;
 pub mod fsops;
@@ -15,6 +16,7 @@ pub mod users;
 pub mod voiceprints;
 
 pub use briefings::{Briefing, BriefingRepo};
+pub use channels::ChannelRepo;
 pub use chat::{ChatRepo, Conversation, Message};
 pub use cloned_voices::{ClonedVoice, ClonedVoiceRepo};
 pub use db::Db;
@@ -31,6 +33,7 @@ pub use voiceprints::VoiceprintRepo;
 pub struct Store {
     pub users: UserRepo,
     pub chat: ChatRepo,
+    pub channels: ChannelRepo,
     pub cloned_voices: ClonedVoiceRepo,
     pub memory: MemoryRepo,
     pub settings: SettingsRepo,
@@ -48,6 +51,7 @@ impl Store {
             users::MIGRATIONS,
             settings::MIGRATIONS,
             chat::MIGRATIONS,
+            channels::MIGRATIONS,
             cloned_voices::MIGRATIONS,
             memory::MIGRATIONS,
             usage::MIGRATIONS,
@@ -61,6 +65,7 @@ impl Store {
         Ok(Store {
             users: UserRepo::new(db.clone()),
             chat: ChatRepo::new(db.clone()),
+            channels: ChannelRepo::new(db.clone()),
             cloned_voices: ClonedVoiceRepo::new(db.clone()),
             memory: MemoryRepo::new(db.clone()),
             settings: SettingsRepo::new(db.clone()),
@@ -161,8 +166,8 @@ mod tests {
     fn memory_belongs_to_user() {
         let store = Store::open(&temp_db("memory")).unwrap();
         let user = store.users.ensure_default_user().unwrap();
-        store.memory.add(user.id, "profile", "喜欢喝美式").unwrap();
-        store.memory.add(user.id, "fact", "养了一只猫叫团子").unwrap();
+        store.memory.add(user.id, "profile", "喜欢喝美式", "explicit").unwrap();
+        store.memory.add(user.id, "fact", "养了一只猫叫团子", "explicit").unwrap();
         let memories = store.memory.list(user.id).unwrap();
         assert_eq!(memories.len(), 2);
         assert_eq!(memories[0].kind, "profile");

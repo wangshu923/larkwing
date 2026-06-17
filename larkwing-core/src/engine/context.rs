@@ -11,11 +11,16 @@ use crate::store::{Briefing, Memory, Message};
 
 use super::{AssistantPayload, ToolRowPayload, UserMeta};
 
-/// persona.style 的出厂默认句(用户没动过时生效;清空 = 纯出厂人设,不注入)。
-/// 它是出厂人设的一句话摘要 —— 让用户看见"可以这样改",兼作前缀里的人设锚点。
+/// persona.style 的出厂默认 = **空**:默认保持中性,不预设任何性格倾向(不萌也不酷,
+/// 连"不卖萌"这类否定式规定也不写——那本身就是一种倾向),让默认适配最多用户。
+/// 想要某种性格的用户自己在设置「我的性格」里一句话写(输入框占位符已给示例)。
+/// 空 = 不注入"性格设定"层,人设就是 companion.json 那段纯功能性中性底座。
 /// 与前端 useSettings DEFAULTS['persona.style'] 手工同步(两边各一行,改要一起改)。
-pub(super) const DEFAULT_PERSONA_STYLE: &str =
-    "暖心又好奇的小机灵,偶尔「滴——」一声卖萌,永远向着这个家";
+pub(super) const DEFAULT_PERSONA_STYLE: &str = "";
+
+/// 出厂默认助手名:填进 persona 的 `{name}` 占位(用户没在「叫我什么」改过时)。
+/// 与前端 pet.name(locales)、宪法 §4.1 默认名手工同步 —— 改默认名 = 改这三处。
+pub(super) const DEFAULT_NAME: &str = "7274";
 
 /// 运行时法条(PLAN §9 提示词蓝图):**人格中立底座**的一部分 —— 通用行为纪律,
 /// 与性格无关,住这里不住场景数据;第二个场景出现时自动继承。
@@ -28,7 +33,7 @@ pub(super) const LAWS: &str = "\
 - 情绪、闲聊、一次性安排 → 不记。拿不准就先不记:记错了用户能删,乱记很烦人。
 
 ## 用你知道的,别反问
-下方「你记得关于用户的这些事」和「任务需知」里写着的,就是你已经知道的,直接用——比如任务需知里有电影目录,用户说「放个电影」就直接去目录里找,绝不反问「电影放在哪」。像是家里登记过、但下方没写的,先用 briefing_lookup 查一遍,查不到再说不知道。
+下方「你记得关于用户的这些事」和「任务需知」里写着的,就是你已经知道的,直接用——比如任务需知里有电影目录,用户说「放个电影」就直接去目录里找,绝不反问「电影放在哪」。像是以前聊到过、但「你记得的事」里没写的(某个习惯、说过的偏好、家人或宠物),先用 recall 查一遍;像是家里登记过、但「任务需知」里没写的(资源/目录/设备),先用 briefing_lookup 查一遍;都查不到再说不知道。
 
 ## 说人话
 工具安静地用,结果自然织进话里,不念原始数据。记完用一句话确认你理解的内容,让用户有机会当场纠正。永远不向用户提「工具」「调用」「数据库」「需知」这些词;「小本本」可以说——那是用户看得见的本子。
@@ -70,6 +75,7 @@ pub(super) fn anchored_start(total: usize) -> usize {
 
 pub(super) fn build_context(
     scene: &Scene,
+    user_name: Option<&str>,
     user_style: Option<&str>,
     memories: &[Memory],
     briefings: &[Briefing],
@@ -79,12 +85,17 @@ pub(super) fn build_context(
     // 稳定层:persona(性格)→ 法条(底座纪律)→ 性格设定 → 记忆 → 任务需知
     // (按稳定度降序排,全部进缓存前缀)
     let mut system = String::with_capacity(scene.persona.len() + LAWS.len() + 256);
-    system.push_str(&scene.persona);
+    // 名字直接填进 persona 的「你是 {name}」占位(ui.pet_name;没改过 = 出厂默认名):
+    // 比"先写死代号再追加一句覆盖"直白 —— 模型只看到一个名字、不打架。
+    // 名字每用户稳定(与会话归属者绑定)→ 替换结果字节稳定吃前缀缓存;默认名 = 出厂 persona 原样。
+    let name = user_name.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(DEFAULT_NAME);
+    system.push_str(&scene.persona.replace("{name}", name));
     system.push_str("\n\n");
     system.push_str(LAWS);
-    // 用户的一句话性格设定:放在出厂人设之后 = 冲突时用户说了算(它是这家人的 7274)
+    // 用户的一句话性格设定:叠加在中性底座之上的性格/口吻层(底座不预设性格 → 加性、非覆盖;
+    // 它是这家人给 7274 挑的性格)。仍放在出厂人设之后:稳定层排序 + 与底座format(简短等)相左时按它来。
     if let Some(style) = user_style.map(str::trim).filter(|s| !s.is_empty()) {
-        system.push_str("\n\n## 这个家给你的性格设定(与上面冲突时,以这里为准)\n");
+        system.push_str("\n\n## 性格设定(就按这个性格和口吻说话)\n");
         system.push_str(style);
     }
     if !memories.is_empty() {
@@ -220,7 +231,7 @@ mod tests {
         let scene = scenes.default_scene();
         let briefs =
             vec![brief(1, "appliance", "路由器在电视柜"), brief(2, "media", "电影在 NAS")];
-        let req = build_context(scene, None, &[], &briefs, &[], &[]);
+        let req = build_context(scene, None,None, &[], &briefs, &[], &[]);
 
         // 法条紧跟 persona(底座纪律,人格中立)
         let laws_at = req.system.find("## 怎么记事").expect("法条必须进 system");
@@ -233,9 +244,9 @@ mod tests {
         assert!(req.system.find("## 任务需知").unwrap() < a && a < m);
 
         // 无需知 = 无该节,且前缀与再次构造字节级一致(golden)
-        let none = build_context(scene, None, &[], &[], &[], &[]);
+        let none = build_context(scene, None,None, &[], &[], &[], &[]);
         assert!(!none.system.contains("## 任务需知"));
-        assert_eq!(none.system, build_context(scene, None, &[], &[], &[], &[]).system);
+        assert_eq!(none.system, build_context(scene, None,None, &[], &[], &[], &[]).system);
     }
 
     #[test]
@@ -278,8 +289,8 @@ mod tests {
             msg(2, "alien", "{}", None),
             msg(3, "assistant", "汪!", None),
         ];
-        let a = build_context(scene, None, &memories, &[], &history, &[]);
-        let b = build_context(scene, None, &memories, &[], &history, &[]);
+        let a = build_context(scene, None,None, &memories, &[], &history, &[]);
+        let b = build_context(scene, None,None, &memories, &[], &history, &[]);
         assert_eq!(a.system, b.system, "同输入必须同前缀(golden)");
         let n_few = scene.few_shots.len();
         assert_eq!(a.messages.len(), n_few + 2, "未知角色被过滤,few-shot 打头");
@@ -294,22 +305,40 @@ mod tests {
         let scene = scenes.default_scene();
         let mem = crate::store::Memory {
             id: 1, user_id: 1, kind: "fact".into(), content: "对花生过敏".into(),
+            resident: true, salience: 1.0, source: "explicit".into(), last_used_at: None,
             created_at: 0, updated_at: 0,
         };
-        let req = build_context(scene, Some(" 贫嘴但靠谱,偶尔冒东北话 "), &[mem], &[], &[], &[]);
+        let req = build_context(scene, None,Some(" 贫嘴但靠谱,偶尔冒东北话 "), &[mem], &[], &[], &[]);
         let style_at = req.system.find("贫嘴但靠谱").expect("性格设定必须进 system");
         let mem_at = req.system.find("花生").expect("记忆必须进 system");
-        assert!(style_at > scene.persona.len(), "性格设定在出厂人设之后(冲突时用户优先)");
+        assert!(style_at > scene.persona.len(), "性格设定在出厂人设之后(叠加在中性底座上)");
         assert!(style_at < mem_at, "性格设定在记忆之前(按稳定度排序保前缀)");
         // 空白设定 = 不注入,前缀与无设定时字节级一致(用户清空 = 纯出厂人设)
-        let none = build_context(scene, None, &[], &[], &[], &[]);
-        let blank = build_context(scene, Some("   "), &[], &[], &[], &[]);
+        let none = build_context(scene, None,None, &[], &[], &[], &[]);
+        let blank = build_context(scene, None,Some("   "), &[], &[], &[], &[]);
         assert_eq!(none.system, blank.system);
 
-        // 出厂默认句:得在后端长度上限内,且注入后逐字出现
-        assert!(DEFAULT_PERSONA_STYLE.chars().count() <= 100, "默认句超 persona.style 上限");
-        let dflt = build_context(scene, Some(DEFAULT_PERSONA_STYLE), &[], &[], &[], &[]);
-        assert!(dflt.system.contains(DEFAULT_PERSONA_STYLE));
+        // 出厂默认 = 空:默认保持中性,不注入"性格设定"层 → 与无设定字节级一致
+        // (想要性格的用户自己在设置里写;留空是产品决策,见 DEFAULT_PERSONA_STYLE 注释)
+        assert!(DEFAULT_PERSONA_STYLE.trim().is_empty(), "默认人设保持中性:默认句留空,不预设性格倾向");
+        let dflt = build_context(scene, None,Some(DEFAULT_PERSONA_STYLE), &[], &[], &[], &[]);
+        assert_eq!(dflt.system, none.system, "默认句为空 = 纯出厂人设(不注入性格层)");
+    }
+
+    #[test]
+    fn user_name_fills_persona_placeholder() {
+        let scenes = Scenes::builtin();
+        let scene = scenes.default_scene();
+        // 设了名字 = 直接填进 persona 的「你是 {name}」身份句,逐字出现、无残留占位符
+        let named = build_context(scene, Some(" 小布 "), None, &[], &[], &[], &[]);
+        assert!(named.system.contains("你是 小布"), "名字直接进 persona 身份句");
+        assert!(!named.system.contains("{name}"), "占位符必须被替换干净");
+        // 没设/空白 = 回落出厂默认名,与显式传默认名字节级一致(前缀稳定、出厂 persona 原样)
+        let none = build_context(scene, None, None, &[], &[], &[], &[]);
+        let blank = build_context(scene, Some("   "), None, &[], &[], &[], &[]);
+        assert_eq!(none.system, blank.system, "空名回落默认,前缀字节稳定");
+        assert!(none.system.contains(&format!("你是 {DEFAULT_NAME}")), "默认名填入身份句");
+        assert!(!none.system.contains("{name}"), "默认也不留占位符");
     }
 
     /// 肉眼检查口:LLM 实际看到的全貌(system / few-shot+历史 / tools)。
@@ -323,6 +352,7 @@ mod tests {
         let defs: Vec<_> = tools.subset(&scene.tools).iter().map(|t| t.spec().def()).collect();
         let mem = |id: i64, content: &str| crate::store::Memory {
             id, user_id: 1, kind: "fact".into(), content: content.into(),
+            resident: true, salience: 1.0, source: "explicit".into(), last_used_at: None,
             created_at: 0, updated_at: 0,
         };
         let memories = vec![mem(1, "用户不吃香菜"), mem(2, "用户对花生过敏")];
@@ -331,7 +361,7 @@ mod tests {
             msg(1, "user", "今晚吃什么好", None),
             msg(2, "assistant", "番茄锅怎么样?不放香菜,蘸料也帮你避开花生~", None),
         ];
-        let req = build_context(scene, Some(DEFAULT_PERSONA_STYLE), &memories, &briefs, &history, &defs);
+        let req = build_context(scene, None,Some(DEFAULT_PERSONA_STYLE), &memories, &briefs, &history, &defs);
         println!("\n========== system(OpenAI 系翻成首条 system 消息) ==========\n{}", req.system);
         println!("\n========== messages = few-shot(稳定前缀) + 锚定窗口历史 ==========");
         for m in &req.messages {
@@ -350,13 +380,13 @@ mod tests {
             msg(2, "assistant", "三点一刻啦", None),
             msg(3, "user", "谢啦", None),
         ];
-        let req = build_context(scene, None, &[], &[], &history, &[]);
+        let req = build_context(scene, None,None, &[], &[], &history, &[]);
         let tail = &req.messages[scene.few_shots.len()..];
         assert_eq!(tail[0], ChatMessage::user("〔语音〕现在几点"), "speak 行加标记");
         assert_eq!(tail[2], ChatMessage::user("谢啦"), "无标记照旧,历史零膨胀");
         // 说话守则住底座 LAWS(静态):模式怎么翻转都不碰前缀
         assert!(req.system.contains("## 说话守则"));
-        let again = build_context(scene, None, &[], &[], &history, &[]);
+        let again = build_context(scene, None,None, &[], &[], &history, &[]);
         assert_eq!(req.messages, again.messages, "同输入同翻译(前缀稳定 golden)");
     }
 
@@ -377,7 +407,7 @@ mod tests {
             msg(4, "tool", r#"{"now":"2026-06-12 21:00"}"#, Some(r#"{"call_id":"call_a","name":"now","status":"ok"}"#)),
             msg(5, "assistant", "今天 6 月 12 号~", None),
         ];
-        let req = build_context(scene, None, &[], &[], &history, &[]);
+        let req = build_context(scene, None,None, &[], &[], &history, &[]);
         let tail = &req.messages[scene.few_shots.len()..];
         assert_eq!(tail.len(), 4, "孤儿 tool 行被吸附掉");
         assert_eq!(tail[0], ChatMessage::user("今天几号"));

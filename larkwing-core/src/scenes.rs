@@ -151,7 +151,7 @@ mod tests {
         let scenes = Scenes::builtin();
         let s = scenes.default_scene();
         assert_eq!(s.id, "companion");
-        assert!(s.persona.contains("7274"));
+        assert!(s.persona.contains("{name}"), "persona 用占位符留名,由 build_context 填入");
         assert!(!s.opening_line.is_empty());
         // remember/briefing 三件套是常驻基础工具,白名单只声明场景特有的
         assert_eq!(

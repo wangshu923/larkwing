@@ -1,5 +1,6 @@
 //! Core = 对话编排器(宪法 §5)。store 与 llm 的唯一合流点。
 
+mod consolidate;
 mod context;
 mod turn;
 mod usage;
@@ -514,7 +515,8 @@ impl Engine {
     }
 
     fn load_registry(&self) -> Result<ProviderRegistry, AppError> {
-        if let Some(json) = self.store.settings.get(None, "llm.providers")? {
+        // 秘密走 keyring(回落 settings),不落 SQLite 明文(§6.3)
+        if let Some(json) = crate::secrets::get(&self.store.settings, "llm.providers") {
             match ProviderRegistry::from_json(&json) {
                 Ok(reg) => return Ok(reg),
                 // 容错铁律:配置坏了降级跑,不让 7274 哑掉
@@ -523,10 +525,7 @@ impl Engine {
         }
         // 单 key 兜底:用户填过的钥匙优先;没填过则挂 ${DEEPSEEK_API_KEY} 引用 ——
         // env 兜底就此变成数据(resolve_env 取值时解析),落盘也不会泄明文。
-        let key = self
-            .store
-            .settings
-            .get(None, "llm.api_key")?
+        let key = crate::secrets::get(&self.store.settings, "llm.api_key")
             .filter(|k| !k.trim().is_empty())
             .unwrap_or_else(|| "${DEEPSEEK_API_KEY}".into());
         Ok(ProviderRegistry::deepseek_only(key))
@@ -539,8 +538,8 @@ impl Engine {
         if key.is_empty() {
             return Err(AppError { kind: ErrorKind::BadApiKey, message: "key 为空".into() });
         }
-        self.store.settings.set(None, "llm.api_key", key)?;
-        if let Some(json) = self.store.settings.get(None, "llm.providers")? {
+        crate::secrets::set(&self.store.settings, "llm.api_key", key).map_err(AppError::internal)?;
+        if let Some(json) = crate::secrets::get(&self.store.settings, "llm.providers") {
             if let Ok(reg) = ProviderRegistry::from_json(&json) {
                 let mut specs = reg.specs().to_vec();
                 match specs.iter_mut().find(|s| s.id == "deepseek") {
@@ -550,9 +549,12 @@ impl Engine {
                     }
                     None => specs.push(ProviderSpec::deepseek(key.to_string())),
                 }
-                self.store
-                    .settings
-                    .set(None, "llm.providers", &ProviderRegistry::new(specs).to_json())?;
+                crate::secrets::set(
+                    &self.store.settings,
+                    "llm.providers",
+                    &ProviderRegistry::new(specs).to_json(),
+                )
+                .map_err(AppError::internal)?;
             }
         }
         self.reload_providers()
@@ -650,7 +652,9 @@ impl Engine {
             kind: ErrorKind::Internal,
             message: format!("生成应用密钥失败:{e}"),
         })?;
-        self.store.settings.set(None, KEY_ED25519_PRIVATE, &private_pem)?;
+        // 私钥进 keyring(秘密、永不过桥);公钥留 settings(非秘密,给用户复制)
+        crate::secrets::set(&self.store.settings, KEY_ED25519_PRIVATE, &private_pem)
+            .map_err(AppError::internal)?;
         self.store.settings.set(None, KEY_ED25519_PUBLIC, &public_pem)?;
         Ok(public_pem)
     }
@@ -796,6 +800,22 @@ impl Engine {
                 crate::net::set_proxy(Self::resolve_proxy(&self.store));
                 Ok(())
             }
+            // 远程渠道配置(app 级,PLAN 远程渠道):enabled 校验 0/1;凭证/白名单原样写(trim)。
+            // token/app_secret 等**不进 APP_SETTING_KEYS** → 写得进、读不回(钥匙永不过桥,§4)。
+            // 改完由前端调 reload_channels 命令停旧起新(类比 provider 保存即重建)。
+            k if k.starts_with("remote.") => {
+                if k.ends_with(".enabled") && !["0", "1"].contains(&value) {
+                    return Err(invalid("开关需为 0 或 1"));
+                }
+                // token/app_secret 等是秘密 → keyring(写得进读不回);开关/白名单非秘密走 settings
+                if crate::secrets::is_secret(k) {
+                    crate::secrets::set(&self.store.settings, k, value.trim())
+                        .map_err(AppError::internal)?;
+                } else {
+                    self.store.settings.set(None, k, value.trim())?;
+                }
+                Ok(())
+            }
             _ => Err(invalid("不在设置白名单内")),
         }
     }
@@ -876,9 +896,12 @@ impl Engine {
     }
 
     fn persist_specs(&self, specs: &[ProviderSpec]) -> Result<(), AppError> {
-        self.store
-            .settings
-            .set(None, "llm.providers", &ProviderRegistry::new(specs.to_vec()).to_json())?;
+        crate::secrets::set(
+            &self.store.settings,
+            "llm.providers",
+            &ProviderRegistry::new(specs.to_vec()).to_json(),
+        )
+        .map_err(AppError::internal)?;
         self.reload_providers()
     }
 
@@ -926,6 +949,23 @@ impl Engine {
     pub fn list_memories(&self) -> Result<Vec<Memory>, AppError> {
         let user = self.store.users.ensure_default_user()?;
         Ok(self.store.memory.list(user.id)?)
+    }
+
+    /// 记忆提炼 / 反思(PLAN §13 Phase 3):把一段会话蒸馏成耐久记忆。**保守**——只增不删、
+    /// 提炼条目进按需层(不污染前缀)、近重复跳过(详见 `consolidate`)。后台尽力件:没配
+    /// provider / 会话不存在 = 返回 0,不报错。返回新增条数。
+    /// **不自动触发**(自动跑未经真模型验证的 LLM 环去改记忆,质量/成本须先验)—— 现作为
+    /// 可调用入口(会话收尾 / 每 N 轮 / 命令后续接,见 PLAN §13.6 Phase 3 待办)。
+    pub async fn consolidate_conversation(&self, conv_id: i64) -> Result<usize, AppError> {
+        // 锁内只取主选 provider 的 Arc 快照,await 在锁外(RwLock guard 不跨 await)
+        let provider = {
+            let candidates = self.llm.read().expect("llm lock poisoned");
+            candidates.first().map(|(_, p)| p.clone())
+        };
+        let Some(provider) = provider else { return Ok(0) };
+        let Some(conv) = self.store.chat.get_conversation(conv_id)? else { return Ok(0) };
+        let added = consolidate::run(&provider, &self.store, conv.user_id, conv_id, 50).await?;
+        Ok(added)
     }
 
     /// 记错了点掉(记忆卫生 = 信任感);按当前用户限定。
@@ -1238,7 +1278,17 @@ impl Engine {
                 _ => conv_user,
             };
             store.users.touch(mem_user)?;
-            let memories = store.memory.list(mem_user)?;
+            // 记忆只取常驻·画像层进前缀(§13.3 ②;按需层靠 recall 工具取),写时已执法预算
+            // → 前缀有界、字节稳定,记得再多也不胀前缀(修掉「全量进前缀」雷,§13.1)
+            let memories = store.memory.list_resident(mem_user)?;
+            // 观测:这回合带进前缀的常驻记忆(测「用到了记忆吗」—— recall 不一定触发,
+            // 大多数记忆是从这里被动进上下文的;§4.4 进库前的轻量日志版)
+            tracing::info!(
+                target: "larkwing::memory",
+                conv = conv_id, resident = memories.len(),
+                "turn ctx → {}",
+                memories.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join(" | ")
+            );
             // 任务需知:只有常驻条目进前缀(预算在写入时执法,这里无条件全装);
             // 非常驻的归 briefing_lookup 工具按需取
             let briefings: Vec<crate::store::Briefing> = store
@@ -1253,12 +1303,16 @@ impl Engine {
                 .settings
                 .get(Some(conv_user), "persona.style")?
                 .unwrap_or_else(|| context::DEFAULT_PERSONA_STYLE.into());
+            // 用户给助手起的名字(ui.pet_name):与性格设定同走会话归属者 → 前缀字节稳定;
+            // 没设过/空 = 出厂名,build_context 不注入
+            let pet_name = store.settings.get(Some(conv_user), "ui.pet_name")?;
             let total = store.chat.count_messages(conv_id)? as usize;
             let start = context::anchored_start(total);
             let history =
                 store.chat.messages_page(conv_id, start as i64, (total - start) as i64)?;
             let mut request = context::build_context(
                 &scene,
+                pet_name.as_deref(),
                 Some(&style),
                 &memories,
                 &briefings,
@@ -1464,7 +1518,8 @@ impl Engine {
         let (request, event_msg_id) = tokio::task::spawn_blocking(
             move || -> anyhow::Result<(crate::llm::ChatRequest, i64)> {
                 let event_msg = store.chat.append_message(conv_id, "event", &content)?;
-                let memories = store.memory.list(user_id)?;
+                // 只取常驻·画像层(§13.3 ②);任务回合与聊天回合共用同款前缀
+                let memories = store.memory.list_resident(user_id)?;
                 let briefings: Vec<crate::store::Briefing> = store
                     .briefings
                     .list_for(user_id)?
@@ -1475,9 +1530,11 @@ impl Engine {
                     .settings
                     .get(Some(user_id), "persona.style")?
                     .unwrap_or_else(|| context::DEFAULT_PERSONA_STYLE.into());
+                let pet_name = store.settings.get(Some(user_id), "ui.pet_name")?;
                 // 历史 = 空(新鲜上下文);注入消息与回放翻译同一字节形
                 let mut request = context::build_context(
                     &scene,
+                    pet_name.as_deref(),
                     Some(&style),
                     &memories,
                     &briefings,
@@ -1505,13 +1562,20 @@ impl Engine {
         let mut rx =
             self.launch(conv_id, user_id, candidates, request, tool_subset, event_msg_id).await?;
 
-        // 无人挂流:自己消费到收尾,然后经全局事件车道喊一声(UI 据此刷新)
+        // 无人挂流:自己消费到收尾,记下终态,然后经全局事件车道喊一声
+        // (UI 据此刷新列表;用户不在该会话时按 outcome 在列表项打标)
         let bus = self.bus.clone();
         tokio::spawn(async move {
-            while rx.recv().await.is_some() {}
+            let mut outcome = crate::bus::TurnOutcome::Done;
+            while let Some(ev) = rx.recv().await {
+                if matches!(ev, TurnEvent::Failed { .. }) {
+                    outcome = crate::bus::TurnOutcome::Failed;
+                }
+            }
             bus.publish(crate::bus::AppEvent::Conversation(crate::bus::ConversationActivity {
                 conv_id,
                 kind: "reminder".into(),
+                outcome,
             }));
         });
         Ok(true)

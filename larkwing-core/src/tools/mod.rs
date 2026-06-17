@@ -9,6 +9,7 @@ mod media_control;
 mod media_play;
 mod media_search;
 mod now;
+mod recall;
 mod remember;
 mod reminder;
 mod watch;
@@ -27,7 +28,7 @@ use crate::store::Store;
 /// 常驻基础工具(PLAN §9):信息纪律件套,**每个场景自动在场**,白名单无需声明 ——
 /// 运行时法条(engine/context::LAWS)点名了它们,法条全场景生效,工具就得全场景在。
 pub const BASE_TOOLS: &[&str] =
-    &["remember", "briefing_write", "briefing_lookup", "briefing_remove"];
+    &["remember", "recall", "briefing_write", "briefing_lookup", "briefing_remove"];
 
 /// 静态规格:给模型看的(name/description/parameters)+ 给运行时的(timeout)
 /// + 给 UI 的(ui_key,i18n 键 —— core 不产用户可见文案,文案在前端字典)。
@@ -93,6 +94,7 @@ impl Tools {
         let mut tools = Tools::default();
         tools.register(Arc::new(now::Now::new()));
         tools.register(Arc::new(remember::Remember::new()));
+        tools.register(Arc::new(recall::Recall::new()));
         tools.register(Arc::new(briefing::BriefingWrite::new()));
         tools.register(Arc::new(briefing::BriefingLookup::new()));
         tools.register(Arc::new(briefing::BriefingRemove::new()));
@@ -163,8 +165,8 @@ mod tests {
     #[test]
     fn builtin_registry_and_subset_base_first_scene_after() {
         let tools = Tools::builtin();
-        for name in ["now", "remember", "briefing_write", "briefing_lookup", "briefing_remove",
-                     "media_search", "media_play", "media_control"]
+        for name in ["now", "remember", "recall", "briefing_write", "briefing_lookup",
+                     "briefing_remove", "media_search", "media_play", "media_control"]
         {
             assert!(tools.get(name).is_some(), "{name} 必须已注册");
         }
@@ -175,7 +177,7 @@ mod tests {
         let names: Vec<&str> = subset.iter().map(|t| t.spec().name).collect();
         assert_eq!(
             names,
-            ["remember", "briefing_write", "briefing_lookup", "briefing_remove", "now"],
+            ["remember", "recall", "briefing_write", "briefing_lookup", "briefing_remove", "now"],
             "base 在前(声明里的 remember 被去重),场景序在后,ghost 被忽略"
         );
     }

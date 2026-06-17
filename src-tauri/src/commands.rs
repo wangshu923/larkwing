@@ -1,10 +1,13 @@
 //! 边界薄层:只做翻译和转发,不写业务(PLAN §5)。
 //! command 面就是前端能做的全集;错误统一 AppError { kind, message }。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tauri::ipc::Channel;
 use tauri::{Manager, State};
+use tokio_util::sync::CancellationToken;
+
+use larkwing_core::channels::{self, ChannelState, ChannelStatus};
 
 use larkwing_core::engine::{
     AppError, BootSnapshot, DayUsage, Engine, FloatIdle, MsgStats, ProviderPatch, ProviderView,
@@ -21,6 +24,46 @@ pub struct AppState {
     pub engine: Arc<Engine>,
     pub media: MediaRuntime,
     pub voice: VoiceRuntime,
+    pub channels: ChannelSup,
+}
+
+/// 远程渠道的 shell-side 监督器(§6.1:停旧起新的编排在壳层,顶层 spawn 用 tauri runtime;
+/// core 的 channels::run 不依赖 tauri)。boot 与"保存配置后"各 restart 一次。
+pub struct ChannelSup {
+    engine: Arc<Engine>,
+    status: ChannelStatus,
+    ct: Mutex<CancellationToken>,
+}
+
+impl ChannelSup {
+    pub fn new(engine: Arc<Engine>) -> ChannelSup {
+        ChannelSup {
+            engine,
+            status: ChannelStatus::default(),
+            ct: Mutex::new(CancellationToken::new()),
+        }
+    }
+
+    /// 取消当前所有渠道任务,按最新 settings 重新拉起(幂等)。
+    pub fn restart(&self) {
+        let new_ct = CancellationToken::new();
+        let old = {
+            let mut g = self.ct.lock().expect("channels ct lock");
+            std::mem::replace(&mut *g, new_ct.clone())
+        };
+        old.cancel();
+        if let Ok(mut m) = self.status.lock() {
+            m.clear();
+        }
+        let (engine, status) = (self.engine.clone(), self.status.clone());
+        tauri::async_runtime::spawn(async move {
+            channels::run(engine, status, new_ct).await;
+        });
+    }
+
+    fn status_snapshot(&self) -> std::collections::HashMap<String, ChannelState> {
+        self.status.lock().map(|m| m.clone()).unwrap_or_default()
+    }
 }
 
 /// §7「开窗秒显」:一个 IPC 来回画出首屏。
@@ -557,6 +600,67 @@ pub fn media_retry(
         }
     });
     Ok(())
+}
+
+// ---- 远程渠道(PLAN 远程渠道:Telegram / 钉钉 bot) ----
+
+/// 远程渠道设置页一行的视图:开关 / 是否已配凭证(**凭证本身永不过桥**,只报 bool)/ 白名单 / 连接态。
+#[derive(serde::Serialize)]
+pub struct RemoteChannelView {
+    pub id: String,
+    pub enabled: bool,
+    pub configured: bool,
+    pub allowed_chats: String,
+    pub running: bool,
+    pub last_error: Option<String>,
+}
+
+/// 远程渠道状态(设置页读):服务端读 settings + 实时连接态拼成视图,token/secret 不出 core。
+#[tauri::command]
+pub fn remote_status(state: State<'_, AppState>) -> Result<Vec<RemoteChannelView>, AppError> {
+    let s = &state.engine.store().settings;
+    let get = |k: &str| {
+        s.get(None, k)
+            .ok()
+            .flatten()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    // 凭证已迁 keyring(不在 settings 明文)→ configured 检查走 secrets,否则永远 false
+    let sec = |k: &str| larkwing_core::secrets::get(s, k).filter(|v| !v.trim().is_empty());
+    let live = state.channels.status_snapshot();
+    let view = |id: &str, enabled_k: &str, configured: bool, allowed: String| {
+        let st = live.get(id);
+        RemoteChannelView {
+            id: id.into(),
+            enabled: get(enabled_k).as_deref() == Some("1"),
+            configured,
+            allowed_chats: allowed,
+            running: st.map(|s| s.running).unwrap_or(false),
+            last_error: st.and_then(|s| s.last_error.clone()),
+        }
+    };
+    Ok(vec![
+        view(
+            "telegram",
+            "remote.telegram.enabled",
+            sec("remote.telegram.token").is_some(),
+            get("remote.telegram.allowed_chats").unwrap_or_default(),
+        ),
+        // 钉钉(Phase B):配置/状态先就位,适配器后接
+        view(
+            "dingtalk",
+            "remote.dingtalk.enabled",
+            sec("remote.dingtalk.app_key").is_some() && sec("remote.dingtalk.app_secret").is_some(),
+            String::new(),
+        ),
+    ])
+}
+
+/// 保存远程渠道配置后调:停旧起新(类比 provider 保存即重建)。
+#[tauri::command]
+pub fn reload_channels(state: State<'_, AppState>) {
+    state.channels.restart();
 }
 
 // ---- 开机启动 + 托盘菜单(PLAN §12 常驻临场) ----

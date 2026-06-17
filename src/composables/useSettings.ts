@@ -16,8 +16,8 @@ import {
 const DEFAULTS: Record<string, string> = {
   'ui.pet_name': '', // 空 = 用字典里的默认名(pet.name)
   // 一句话性格设定;与 Rust 侧 context::DEFAULT_PERSONA_STYLE 手工同步(改要一起改)。
-  // 没动过 = 这句默认;清空保存 = 纯出厂人设
-  'persona.style': '暖心又好奇的小机灵,偶尔「滴——」一声卖萌,永远向着这个家',
+  // 默认留空 = 中性人设(不预设性格倾向,适配最多用户);用户想要性格自己写,占位符给了示例
+  'persona.style': '',
   'ui.character': 'titan',
   'ui.bubble_shape': 'round',
   'ui.text_scale': 'standard',

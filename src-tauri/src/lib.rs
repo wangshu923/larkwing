@@ -96,6 +96,28 @@ pub fn run() {
 
       let store = Store::open(&data_dir.join("larkwing.db"))?;
       store.users.ensure_default_user()?; // 首启零配置
+      // 把 settings 里的 legacy 明文密钥迁到 keyring(§6.3;幂等,keyring 不可用则原地留 settings)
+      larkwing_core::secrets::migrate(&store.settings);
+
+      // 开机自启:正式版「首启默认开一次」(用户决策 2026-06-17;§7.6 常驻临场强默认)。
+      // 关闭入口走设置页开关(已有);这里只在「从未默认过」时落一次产品默认 = ON,之后全交用户。
+      // 用 auto-launch 自己的 enable() 写(而非装机时直接写注册表)——保证写入值的格式与
+      // is_enabled()/disable() 完全一致,零漂移(§6.8 薄封装防漂移);卸载时由 installer-hooks.nsh
+      // 删那两条键。dev 版不碰:自启会指向临时调试程序、连不上本地前端(前端开关同样 dev 禁用)。
+      // 仅 Windows 正式版真机能验(§8.1)。
+      if !cfg!(debug_assertions) {
+        use tauri_plugin_autostart::ManagerExt;
+        const AUTOSTART_DEFAULTED: &str = "system.autostart.defaulted";
+        let already = store.settings.get(None, AUTOSTART_DEFAULTED).ok().flatten();
+        if already.as_deref() != Some("1") {
+          match app.autolaunch().enable() {
+            Ok(()) => tracing::info!("首启:按产品默认开启开机自启"),
+            Err(e) => tracing::warn!("首启默认开启开机自启失败(忽略,不反复试): {e:#}"),
+          }
+          // 成败都落标记:避免每次启动重试,也不与用户日后手动关掉打架。
+          let _ = store.settings.set(None, AUTOSTART_DEFAULTED, "1");
+        }
+      }
 
       // 全局事件车道(PLAN §5 预留位启用):core 的 Bus → Tauri 全局事件 "app_event"。
       // 回合内事件仍走 send_message 的 Channel,互不相干。
@@ -129,7 +151,10 @@ pub fn run() {
       // 免手唤醒开机自启(设置开着才会真启动;失败只记日志不挡开机)
       let voice_boot = voice.clone();
       tauri::async_runtime::spawn(async move { voice_boot.boot_wake_if_enabled().await });
-      app.manage(AppState { engine, media, voice });
+      // 远程渠道(Telegram/钉钉):shell-side 监督器,boot 起启用项(读 settings 决定起哪些)
+      let channels = commands::ChannelSup::new(engine.clone());
+      channels.restart();
+      app.manage(AppState { engine, media, voice, channels });
 
       let forward = app.handle().clone();
       let mut bus_rx = bus.subscribe();
@@ -272,6 +297,8 @@ pub fn run() {
       commands::remove_provider,
       commands::media_login,
       commands::media_retry,
+      commands::remote_status,
+      commands::reload_channels,
       commands::voice_listen_start,
       commands::voice_listen_stop,
       commands::voice_status,

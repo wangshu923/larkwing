@@ -1,0 +1,46 @@
+# 多音字补丁词表(合并进下载的 ZipVoice lexicon)。
+# 起因:sherpa 中文前端是「贪婪最长匹配」,没有真正分词——例如「做好战斗」里
+# 「好战」会被整词匹配,把「好」读成四声(hào)。把正确的词加进词典、让它先吃掉
+# 「好」,即可纠正。加词 = 在此加一行:「词 <声母0 韵母调> …」(读音格式同 lexicon)。
+# 同名词覆盖下载词典、新词追加(见 tts.rs::merge_polyphone_lexicon)。
+# 注:此为常见场景的缓解,非根治——贪婪匹配的结构性误读(如「准备好战斗」)仍可能漏网。
+做好 z0 uo4 h0 ao3
+弄好 n0 ong4 h0 ao3
+办好 b0 an4 h0 ao3
+搞好 g0 ao3 h0 ao3
+修好 x0 iu1 h0 ao3
+写好 x0 ie3 h0 ao3
+记好 j0 i4 h0 ao3
+放好 f0 ang4 h0 ao3
+收好 sh0 ou1 h0 ao3
+备好 b0 ei4 h0 ao3
+学好 x0 ue2 h0 ao3
+用好 y0 ong4 h0 ao3
+干好 g0 an4 h0 ao3
+接好 j0 ie1 h0 ao3
+关好 g0 uan1 h0 ao3
+站好 zh0 an4 h0 ao3
+坐好 z0 uo4 h0 ao3
+拿好 n0 a2 h0 ao3
+想好 x0 iang3 h0 ao3
+看好 k0 an4 h0 ao3
+准备好 zh0 un3 b0 ei4 h0 ao3
+好的 h0 ao3 d0 e5
+好了 h0 ao3 l0 e5
+好吗 h0 ao3 m0 a5
+好呀 h0 ao3 y0 a5
+好啊 h0 ao3 a5
+好好 h0 ao3 h0 ao3
+好像 h0 ao3 x0 iang4
+好处 h0 ao3 ch0 u4
+好看 h0 ao3 k0 an4
+好听 h0 ao3 t0 ing1
+好玩 h0 ao3 w0 an2
+好人 h0 ao3 r0 en2
+好事 h0 ao3 sh0 i4
+好心 h0 ao3 x0 in1
+好意 h0 ao3 y0 i4
+好转 h0 ao3 zh0 uan3
+好评 h0 ao3 p0 ing2
+好受 h0 ao3 sh0 ou4
+好在 h0 ao3 z0 ai4

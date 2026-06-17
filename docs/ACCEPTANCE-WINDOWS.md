@@ -271,6 +271,46 @@
 
 ---
 
+## Phase 7 — 远程渠道：Telegram / 钉钉 bot（§14）📱 真 token / 真机才能验
+
+> 条件：Telegram 需 @BotFather 建的 bot token（+ 国内出口/代理）;钉钉需企业内部机器人 AppKey/AppSecret。没有就整 Phase 跳过、标「无凭证暂缓」。
+
+### G1 · Telegram 收发 + 续历史
+- **步骤**：设置·远程·Telegram 填 token、开启;手机给 bot 发一句 → 它回你的 chat id;把 id 填进白名单、保存;再发"在吗"。隔几条后发关联问题看是否记得上下文。
+- **通过**：能收到旺财回复;白名单生效(空时回 onboarding、填后正常);同一 chat 续上历史;长回复 4096 分片不报错。`PLAN:§14`
+- 结果：☐ 通过 ☐ 失败 ____________
+
+### G2 · Telegram 断网重连 + 代理兜底
+- **步骤**：拔网/断代理几十秒再恢复;国内出口下观察(api.telegram.org 多半需代理)。
+- **通过**：恢复后自动继续收(长轮询重连);直连失败 net 自动落代理(§4.6);状态行如实。
+- 结果：☐ 通过 ☐ 失败 ____________
+
+### G3 · 钉钉 Stream 连通（Windows rustls）★ 重点
+- **步骤**：设置·远程·钉钉填 AppKey/AppSecret、开启;钉钉里给机器人发消息。
+- **通过**：WS 在 **Windows** 连得上(rustls **aws-lc provider 不 panic** —— 本项目踩过的雷,重点看);ACK/ping 保活不掉线;sessionWebhook 回复到位;群聊 @机器人 被 strip、按发言人隔离。`PLAN:§14`
+- 结果：☐ 通过 ☐ 失败 ____________
+
+### G4 · 保存即生效 + 状态行不静默
+- **步骤**：改 token / 开关、保存(触发 `reload_channels`);填错凭证看状态。
+- **通过**：停旧起新即时生效(不重启 app);连不上显「出错」非静默(§3.5);凭证只显「已配置」不回显明文。
+- 结果：☐ 通过 ☐ 失败 ____________
+
+---
+
+## Phase 8 — 密钥落地 keyring（§6.3）🔑 真机看凭据管理器
+
+### K1 · 凭证进 Windows 凭据管理器、SQLite 无明文
+- **步骤**：填 LLM key + 远程 token/secret;关 app 重开看是否还在;开「凭据管理器 → Windows 凭据 / 通用凭据」找 `larkwing` 条目;用 SQLite 工具开 `%APPDATA%` 下 `larkwing.db` 的 settings 表。
+- **通过**：重启后 key/凭证仍生效(LLM 能连、远程 configured 仍显「已配置」);凭据管理器有 `larkwing` 条目;**settings 表里查不到 `llm.api_key`/`llm.providers`/`crypto.ed25519.private_key`/`remote.*` 的明文**(已迁 keyring)。`AGENT §6.3`
+- 结果：☐ 通过 ☐ 失败 ____________
+
+### K2 · keyring 不可用时不崩(降级)
+- **步骤**：(可选)在无凭据后端的环境(如某些精简环境)启动。
+- **通过**：keyring 不可用 → 回落 settings + 日志 warn,app 照常跑(不哑、不崩);`AGENT §6.3`
+- 结果：☐ 通过 ☐ 失败 ____________
+
+---
+
 ## 验收结论门槛
 
 - **必须全过才算 MVP 在 Windows 完成**：Phase 0 全部 + M1/M4（实锤过的 WebView2 坑）+ V4（唤醒是核心

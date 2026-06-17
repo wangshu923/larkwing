@@ -138,18 +138,56 @@ impl ZipVoiceTts {
         cfg.model.zipvoice.decoder = p("decoder.int8.onnx");
         cfg.model.zipvoice.vocoder = p("vocos_24khz.onnx");
         cfg.model.zipvoice.data_dir = p("espeak-ng-data");
-        cfg.model.zipvoice.lexicon = p("lexicon.txt");
+        // 多音字补丁:把内置补丁词表合并进下载的 lexicon,纠正「好战」类贪婪误读。
+        cfg.model.zipvoice.lexicon =
+            Some(merge_polyphone_lexicon(model_dir)?.to_string_lossy().into_owned());
         cfg.model.zipvoice.feat_scale = 0.1;
         cfg.model.zipvoice.t_shift = 0.5;
         cfg.model.zipvoice.target_rms = 0.1;
         cfg.model.zipvoice.guidance_scale = 1.0;
-        cfg.model.num_threads = 2;
+        // CPU 合成线程:克隆音色是本地 ZipVoice,合成耗时随线程数近线性下降;
+        // 2 太保守(实测 77 字 ~19s),提到 6(留核给 ASR/LLM/UI)。配短参考音一起降延迟。
+        cfg.model.num_threads = 6;
         let t0 = std::time::Instant::now();
         let tts =
             sherpa_onnx::OfflineTts::create(&cfg).ok_or_else(|| anyhow!("音色克隆模型加载失败"))?;
         tracing::info!(ms = t0.elapsed().as_millis() as u64, "音色克隆模型加载完成(zipvoice)");
         Ok(ZipVoiceTts { tts, resolve })
     }
+}
+
+/// 多音字补丁词表(随二进制内置)。sherpa 中文前端是贪婪最长匹配、无真正分词,
+/// 「好战」会把「做好战斗」的「好」抢成四声。加词 = 改 polyphone_supplement.txt 一行。
+const POLYPHONE_SUPPLEMENT: &str = include_str!("polyphone_supplement.txt");
+
+/// 把内置补丁词表合并进下载的 `lexicon.txt`:同名词覆盖、新词追加,保序写出
+/// `lexicon.merged.txt` 供合成用(`#`/空行跳过)。每次加载重算,补丁词表是唯一真相源,
+/// 模型重新下载也不丢。根治多音字需带分词的 G2P 前端(本前端结构所限,见补丁注释)。
+fn merge_polyphone_lexicon(model_dir: &Path) -> Result<std::path::PathBuf> {
+    let base_path = model_dir.join("lexicon.txt");
+    let base = std::fs::read_to_string(&base_path)
+        .with_context(|| format!("读取 lexicon 失败:{}", base_path.display()))?;
+    let mut order: Vec<String> = Vec::new();
+    let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for line in base.lines().chain(POLYPHONE_SUPPLEMENT.lines()) {
+        let line = line.trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let word = match line.split_once(' ') {
+            Some((w, _)) => w,
+            None => continue,
+        };
+        if !map.contains_key(word) {
+            order.push(word.to_string());
+        }
+        map.insert(word.to_string(), line.to_string());
+    }
+    let merged = order.iter().map(|w| map[w].as_str()).collect::<Vec<_>>().join("\n");
+    let out = model_dir.join("lexicon.merged.txt");
+    std::fs::write(&out, merged + "\n")
+        .with_context(|| format!("写合并 lexicon 失败:{}", out.display()))?;
+    Ok(out)
 }
 
 impl TtsEngine for ZipVoiceTts {

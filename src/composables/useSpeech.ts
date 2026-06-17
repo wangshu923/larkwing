@@ -378,10 +378,12 @@ function abort() {
   syncWakeSuspend()
 }
 
-/** 重听一条完整消息:整段单 chunk(回放不赶首声,缓存语义最稳)。 */
+/** 重听一条完整消息:复用流式切分管线(逐句合成播放),长文也能约 1.5s 起播,
+ *  不再整段单块干等(本地 ZipVoice 克隆音色尤其明显:整段 238 字曾要 12s)。
+ *  短答仍切成一两块,体感无差别;逐句缓存照样命中。 */
 function speakText(full: string) {
   beginTurn()
-  enqueue(full)
+  pushDelta(full)
   endTurn()
 }
 

@@ -300,6 +300,13 @@ impl VoiceRuntime {
                 "录音太短,至少 3 秒"
             );
             peak_normalize(&mut pcm);
+            // 参考音越长,ZipVoice 每次合成都整段重编码 → 越慢(21s 曾致单句 19s)。
+            // 录入即截到上限:让合成延迟与参考时长解耦;截断在 ASR 前 → 文字稿与音频同源。
+            const CLONE_REF_MAX_SECS: u32 = 8;
+            let max = (CLONE_REF_MAX_SECS * TARGET_RATE) as usize;
+            if pcm.len() > max {
+                pcm.truncate(max);
+            }
             // 文字稿白送:复用 ASR 转写参考音(听错可在前端改后再 clone_save)
             let transcript = asr.transcribe(&pcm)?;
             Ok((pcm, transcript))
@@ -348,7 +355,18 @@ impl VoiceRuntime {
             let wave = sherpa_onnx::Wave::read(path.to_string_lossy().as_ref())
                 .ok_or_else(|| anyhow!("音频读取失败或格式不支持"))?;
             anyhow::ensure!(!wave.samples().is_empty(), "音频数据为空");
-            asr.transcribe(wave.samples())
+            // 参考音越长,ZipVoice 每次合成都整段重编码 → 越慢。截到上限并覆盖回盘,
+            // 让存盘参考、合成输入、文字稿三者同源(合成延迟与参考时长解耦)。
+            const CLONE_REF_MAX_SECS: i32 = 8;
+            let sr = wave.sample_rate();
+            let max = (CLONE_REF_MAX_SECS * sr).max(0) as usize;
+            let all = wave.samples();
+            let capped: &[f32] = if all.len() > max { &all[..max] } else { all };
+            if capped.len() < all.len() {
+                let trimmed = tts::pcm_f32_to_wav(capped, sr as u32);
+                std::fs::write(&path, &trimmed)?;
+            }
+            asr.transcribe(capped)
         })
         .await
         .context("转写任务挂了")??;

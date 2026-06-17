@@ -72,6 +72,9 @@ const state = reactive({
   /** 排队区(Phase A):7274 还在回话时打字发的消息攒这儿,整轮结束自动合并成下一轮发出。 */
   queue: [] as { text: string; attachments: UiAttachment[] }[],
   conversations: [] as Conversation[],
+  /** 会话列表「有动静」标:用户不在该会话界面时,后台回合(提醒)结束、或发出后切走的回合收尾,
+   *  在此按终态打标(done=完成 / failed=失败);进入该会话即清。瞬态派生态,不进库、重启清零。 */
+  convBadges: {} as Record<number, 'done' | 'failed'>,
   openingLine: '', // 真值来自场景数据(boot);空时显示字典里的 fallback
   /** 记账灯带:本回合消耗(工具轮累加)/ 今日累计 / 账户余额;null = 还没数据。 */
   usage: {
@@ -376,7 +379,12 @@ async function boot() {
   onAppEvent((ev) => {
     if (ev.type !== 'conversation') return
     refreshConversations()
-    if (ev.data.conv_id === state.convId && state.mood === 'idle') {
+    // 不在该会话界面:列表项按终态打标(完成 / 失败),进入会话即清(selectConversation)
+    if (ev.data.conv_id !== state.convId) {
+      state.convBadges[ev.data.conv_id] = ev.data.outcome
+      return
+    }
+    if (state.mood === 'idle') {
       api
         .loadConversation(state.convId)
         .then((msgs) => {
@@ -569,6 +577,14 @@ function send(
     .map((a) => ({ name: a.name, mime: a.mime || '', data: a.base64! }))
   api
     .sendMessage(state.convId, content, { input: source, speak, speaker_user: speaker }, outAtts, (ev) => {
+      // 回合属于已切走的会话(发出后切到别的会话):绝不碰当前视图,只在收尾给列表打标。
+      // 放在 turnSeq 闸前 —— 切走后又在新会话发消息(turnSeq 已涨)时,旧回合的标也不漏。
+      if (sentConv !== state.convId) {
+        if (ev.type === 'done') state.convBadges[sentConv] = 'done'
+        else if (ev.type === 'failed') state.convBadges[sentConv] = 'failed'
+        if (ev.type === 'done' || ev.type === 'failed') refreshConversations()
+        return
+      }
       if (myTurn !== turnSeq) return // 旧回合的迟到事件:新回合已接管,丢弃不串台
       switch (ev.type) {
         case 'delta':
@@ -693,6 +709,12 @@ function send(
       }
     })
     .catch((e) => {
+      // 已切走会话的前置错误(没 key / 建连失败):只在列表打失败标,不碰当前视图
+      if (sentConv !== state.convId) {
+        state.convBadges[sentConv] = 'failed'
+        refreshConversations()
+        return
+      }
       if (myTurn !== turnSeq) return // 旧回合的迟到失败:新回合已接管,忽略
       // 前置错误(AppError):没 key / 会话不存在 / 建连失败
       speech.abort()
@@ -725,6 +747,7 @@ async function selectConversation(convId: number) {
   state.queue.splice(0) // 换话题:排队区清空(它属于旧会话的在飞流程)
   turnInFlight = false
   state.convId = convId
+  delete state.convBadges[convId] // 进入会话即清「有动静」标
   loadConvUsage(convId) // 灯带"话题"段跟着切
   if (!state.inTauri) return
   try {

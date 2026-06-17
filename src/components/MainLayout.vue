@@ -472,6 +472,13 @@ onUnmounted(() => cancelAnimationFrame(raf))
           <span class="rc-title">{{ s.title || t('recents.untitled') }}</span>
           <div class="rc-meta">
             <span class="rc-time">{{ fmtTime(s.updated_at) }}</span>
+            <!-- 有动静标:不在该会话时,后台/切走的回合收尾打标(done=完成 failed=失败),进入即清 -->
+            <span
+              v-if="chat.convBadges[s.id]"
+              class="rc-badge"
+              :class="'rc-badge-' + chat.convBadges[s.id]"
+              :title="t('recents.badge.' + chat.convBadges[s.id])"
+            />
             <span
               v-if="s.channel && s.channel !== 'ui'"
               class="rc-chan"
@@ -559,14 +566,14 @@ onUnmounted(() => cancelAnimationFrame(raf))
           <!-- 完成的回复:读数默认隐身,hover 浮现;在飞的回复:跳秒常驻,不用 hover -->
           <span v-if="m.stats" class="turn-meta">{{ fmtStats(m.stats) }}</span>
           <span v-else-if="isLiveBubble(m, mi)" class="turn-meta live">{{ liveLine }}</span>
-          <!-- 再听一遍(hover 浮现;缓存命中秒回) -->
+          <!-- 朗读(把这条回复念出来;hover 浮现,缓存命中秒回) -->
           <button
             v-if="m.role === 'wang' && m.text && chat.inTauri"
             class="replay"
             :title="t('chat.replay')"
             @click="replay(m.text)"
           >
-            <!-- 耳机:再听一遍 = 重播(听),与语音输入的话筒区分 -->
+            <!-- 耳机:朗读 = 把这条念出来(听),与语音输入的话筒区分;默认不念,所以不是「重播」 -->
             <svg viewBox="0 0 24 24"><path d="M4.5 14v-2a7.5 7.5 0 0 1 15 0v2" /><rect x="3" y="13.5" width="3.6" height="6.6" rx="1.8" /><rect x="17.4" y="13.5" width="3.6" height="6.6" rx="1.8" /></svg>
           </button>
         </div>
@@ -726,7 +733,11 @@ onUnmounted(() => cancelAnimationFrame(raf))
 .rc-chan-voice { color: var(--accent); }
 .rc-chan-system { color: var(--text-dim); }
 .rc-chan-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
-.rc-time { font-size: 11px; color: var(--text-dim); }
+.rc-time { font-size: 11px; color: var(--text-dim); margin-right: auto; } /* 时间靠左,标记/渠道图标归右侧成组 */
+/* 有动静标:发光小圆点(done=ok 青绿 / failed=danger 红),克制不抢标题;进入会话即清 */
+.rc-badge { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.rc-badge-done { background: var(--ok); box-shadow: 0 0 7px rgba(var(--ok-rgb), 0.85); }
+.rc-badge-failed { background: var(--danger); box-shadow: 0 0 7px rgba(var(--danger-rgb), 0.85); }
 .rc-new { margin: 10px; padding: 9px; border-radius: 10px; background: none; border: 1px dashed var(--line); color: var(--text-dim); cursor: pointer; font-size: 12.5px; }
 .rc-new:hover { color: var(--accent); border-color: var(--accent); }
 
@@ -943,7 +954,7 @@ onUnmounted(() => cancelAnimationFrame(raf))
 .listen-hint { color: var(--text-dim); font-size: 12.5px; }
 .listen-field.heard .listen-hint { color: var(--accent); }
 
-/* 再听一遍(耳机=重播):贴气泡右下,默认隐身 hover 浮现(与读数同款克制),小巧 */
+/* 朗读(耳机=念出来):贴气泡右下,默认隐身 hover 浮现(与读数同款克制),小巧 */
 .replay {
   position: absolute; right: 8px; bottom: -22px; z-index: 7;
   width: 19px; height: 16px; padding: 0;

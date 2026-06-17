@@ -66,4 +66,15 @@ impl SettingsRepo {
             Ok(())
         })
     }
+
+    /// 删一条(秘密迁 keyring 后清掉 SQLite 明文残留用,见 `secrets`)。
+    pub fn delete(&self, scope: Option<i64>, key: &str) -> Result<()> {
+        self.db.with(|c| {
+            c.execute(
+                "DELETE FROM settings WHERE scope = ?1 AND key = ?2",
+                rusqlite::params![scope_str(scope), key],
+            )?;
+            Ok(())
+        })
+    }
 }

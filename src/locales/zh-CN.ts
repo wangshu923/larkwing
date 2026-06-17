@@ -81,6 +81,12 @@ export default {
     empty: '小本本还空着。跟我聊聊你和家里人,值得记住的事我会悄悄记下来。',
     groupYou: '关于你',
     groupHome: '家里的事',
+    recalled: '想起 {n} 次 · 上次 {ago}',
+    neverRecalled: '还没被翻起过',
+    agoJustNow: '刚刚',
+    agoMin: '{n} 分钟前',
+    agoHour: '{n} 小时前',
+    agoDay: '{n} 天前',
   },
   // 足迹页(文件能力):看 7274 动过哪些文件,可一键撤销/重做(功能性历史,非安全承诺)
   ops: {
@@ -145,14 +151,14 @@ export default {
     queueAtt: '(附件)',
     queueJump: '插队',
     queueJumpTitle: '让它下一步就带上(不打断当前)',
-    replay: '再听一遍',
-    openingFallback: '滴——7274 在线!今天过得怎么样呀?',
+    replay: '朗读',
+    openingFallback: '你好,我在。今天过得怎么样?',
     interrupted: '(信号断了一下…要不再问我一次?)',
     noLlm: '我还没接上大脑,暂时开不了口——在下面贴一把 DeepSeek 钥匙,或者去「设置 → 大脑」接一个,接好我马上上线!',
   },
   // 「想了想」漏出(PLAN §9):折叠药丸干净默认,展开露技术细节(工具名/入参/结果 + CoT 原文)
   trace: {
-    title: '想了想',
+    title: '推理轨迹',
     steps: '{n} 步',
     reasoning: '原始思考',
   },
@@ -200,6 +206,11 @@ export default {
     expand: '展开',
     newTopic: '＋ 开个新话题',
     untitled: '新话题',
+    // 会话列表「有动静」标 tooltip(不在该会话时浮现;完成 / 失败)
+    badge: {
+      done: '有新回复',
+      failed: '出错了',
+    },
   },
   // 会话渠道标记 tooltip(界面=默认不标,故无 ui 文案);未来 telegram/钉钉/slack 在此补
   channel: {
@@ -267,6 +278,15 @@ export default {
       petNamePlaceholder: '给我起个家里人叫的名字也行',
       personaStyle: '我的性格',
       personaStylePlaceholder: '一句话设定我,比如:贫嘴但靠谱,偶尔冒句东北话',
+      personaQuick: '快捷选择',
+      personaPresets: {
+        neutral: '中性(默认)',
+        warm: { label: '暖萌', text: '暖心又好奇的小机灵,爱卖个萌,说话亲切' },
+        lively: { label: '活泼', text: '活泼开朗、爱说爱笑,常带点小俏皮' },
+        composed: { label: '沉稳', text: '冷静、客观，基于数据和逻辑进行分析，绝不情绪化；喜欢使用状态报告式的短语和战术、系统、协议、状态、概率、计算等词汇；完美、高效地执行用户的实际任务' },
+        gentle: { label: '温柔', text: '温柔耐心、慢声细语,很会安慰人' },
+        witty: { label: '贫嘴', text: '贫嘴但靠谱,时不时来句玩笑' },
+      },
       character: '我的形象',
       char_titan: '小机甲',
       char_dog: '小狗',
@@ -371,6 +391,7 @@ export default {
       calibVerdict_cancelled: '已取消',
       calibVerdict_error: '没录成 —— 看看麦克风权限,过会儿再试一次。',
       winDuckHint: 'Windows 上若开唤醒后其它声音变小:系统设置 → 声音 → 通信 → 选「不执行任何操作」。',
+      winMicHint: 'Windows 上听不到你说话:系统设置 → 隐私和安全性 → 麦克风 → 允许桌面应用访问麦克风。',
       advanced: '高级',
       rate: '语速',
       rate_slow: '舒缓',
@@ -391,8 +412,36 @@ export default {
       compMissing: '未下载 · 首次使用时自动准备',
     },
     remote: {
-      badge: 'REMOTE · 装载中',
-      teaser: '「同一个我,不止这块屏。线路铺设中。」',
+      enable: '启用',
+      status: '状态',
+      tokenSet: '已配置(留空不改)',
+      statusOn: '已连接',
+      statusOff: '已关闭',
+      statusStarting: '连接中…',
+      statusUnconfigured: '未配置',
+      statusError: '连接出错(看日志)',
+      telegram: {
+        title: 'Telegram',
+        // ⚠️ i18n 串里别写 @(vue-i18n 把 @ 当 linked-message 语法 → 编译错 → 整块 render 失败、tab 切不过去);
+        // "@BotFather" 这种字面 @ 放模板硬编码文案里,不进 t()。
+        hint: '在手机 Telegram 里跟旺财对话。找 BotFather 建个 bot 拿 token,填进来再加上你的 chat id 即可。',
+        token: 'Bot Token',
+        tokenPlaceholder: '粘贴 BotFather 给的 token',
+        allowed: '允许的 chat',
+        allowedPlaceholder: '你的 chat id(逗号分隔);先留空,bot 会告诉你',
+        steps: '开启后先在 Telegram 给 bot 发一句,它会回复你的 chat id;把 id 填进上面、保存即可对话。',
+        linkPre: '没有 bot?去',
+      },
+      dingtalk: {
+        title: '钉钉',
+        hint: '在钉钉里跟旺财对话。建个企业内部机器人(Stream 模式,免公网),把 AppKey/AppSecret 填进来。',
+        appKey: 'AppKey',
+        appKeyPlaceholder: '机器人的 AppKey(Client ID)',
+        appSecret: 'AppSecret',
+        appSecretPlaceholder: '机器人的 AppSecret(Client Secret)',
+        steps: '在钉钉开放平台建应用机器人、消息接收模式选 Stream,拿到 AppKey/AppSecret 填上、开启即可。',
+        linkPre: '去',
+      },
     },
     system: {
       desktop: '开机与桌面',

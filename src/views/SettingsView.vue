@@ -3,7 +3,7 @@
 // 暗 tab 可点、进 teaser 页 —— 能点的必有反应(铁律3),绝不放灰掉的死控件。
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { api, appVersion, emitWakeChanged, isTauri, openExternal, setFloatVisible, type ProviderView, type VoiceStatus } from '../lib/backend'
+import { api, appVersion, emitWakeChanged, isTauri, openExternal, setFloatVisible, type ProviderView, type RemoteChannelView, type VoiceStatus } from '../lib/backend'
 import { applyLocale } from '../i18n'
 import { useChat } from '../composables/useChat'
 import { useSettings } from '../composables/useSettings'
@@ -21,7 +21,7 @@ const tabs: { id: TabId; future?: boolean }[] = [
   { id: 'brain' },
   { id: 'voice' },
   { id: 'family' },
-  { id: 'remote', future: true },
+  { id: 'remote' },
   { id: 'services' },
   { id: 'system' },
 ]
@@ -381,6 +381,58 @@ function openQWeatherSite() {
   void openExternal('https://dev.qweather.com/')
 }
 
+// —— 远程渠道(Telegram/钉钉 bot,PLAN 远程渠道):自包含 tab(同 providers,不走 useSettings) ——
+// 凭证写得进读不回(同 provider key 的「空串视同不改」);状态读 remote_status,保存后 reload_channels。
+const remoteChannels = ref<RemoteChannelView[]>([])
+const tgToken = ref('') // 本地写入框,提交即清空(凭证永不回显)
+const dtKey = ref('')
+const dtSecret = ref('')
+const fallback = (id: string): RemoteChannelView => ({
+  id, enabled: false, configured: false, allowed_chats: '', running: false, last_error: null,
+})
+const tg = computed<RemoteChannelView>(
+  () => remoteChannels.value.find((c) => c.id === 'telegram') ?? fallback('telegram'),
+)
+const dt = computed<RemoteChannelView>(
+  () => remoteChannels.value.find((c) => c.id === 'dingtalk') ?? fallback('dingtalk'),
+)
+async function loadRemote() {
+  if (!isTauri()) return
+  remoteChannels.value = await api.remoteStatus().catch(() => [])
+}
+async function toggleRemote(id: string, on: boolean) {
+  await api.setSetting(`remote.${id}.enabled`, on ? '1' : '0')
+  await api.reloadChannels()
+  await loadRemote()
+}
+/** 写凭证:空 = 不改(读不回);写完清空输入框,再重启渠道。 */
+async function saveRemoteCred(key: string, val: string) {
+  const v = val.trim()
+  if (!v) return
+  await api.setSetting(key, v)
+  if (key.endsWith('.token')) tgToken.value = ''
+  if (key.endsWith('.app_key')) dtKey.value = ''
+  if (key.endsWith('.app_secret')) dtSecret.value = ''
+  await api.reloadChannels()
+  await loadRemote()
+}
+async function saveRemote(key: string, ev: Event) {
+  await api.setSetting(key, (ev.target as HTMLInputElement).value.trim())
+  await api.reloadChannels()
+  await loadRemote()
+}
+function remoteStatusText(c: RemoteChannelView): string {
+  if (c.last_error) return t('settings.remote.statusError')
+  if (c.running) return t('settings.remote.statusOn')
+  if (!c.enabled) return t('settings.remote.statusOff')
+  if (!c.configured) return t('settings.remote.statusUnconfigured')
+  return t('settings.remote.statusStarting')
+}
+// 切到远程 tab 时拉一次状态(切走不轮询)
+watch(tab, (v) => {
+  if (v === 'remote') void loadRemote()
+})
+
 // 段选控件的数据驱动写法:一行配置 = 一个设置项
 const segs = computed(() => ({
   character: {
@@ -452,6 +504,20 @@ function savePetName() {
 const styleDraft = ref(settings.get('persona.style'))
 function saveStyle() {
   settings.set('persona.style', styleDraft.value.trim())
+}
+// 性格快捷选择:一键填入预设(用户仍可在框里继续改);点「中性」= 清空回到默认中性底座。
+// 文案走 i18n → 英文用户点了存英文;命中哪个预设就高亮哪个(改成自定义文本则都不亮)。
+const PERSONA_PRESET_KEYS = ['warm', 'lively', 'composed', 'gentle', 'witty'] as const
+const personaPresets = computed(() =>
+  PERSONA_PRESET_KEYS.map((k) => ({
+    k,
+    label: t(`settings.general.personaPresets.${k}.label`),
+    text: t(`settings.general.personaPresets.${k}.text`),
+  })),
+)
+function applyPreset(text: string) {
+  styleDraft.value = text
+  saveStyle()
 }
 
 // 供应商卡片:预设全预填,用户按需改。钥匙草稿按卡隔离,回车/失焦保存,空草稿不动钥匙
@@ -561,6 +627,24 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             @blur="saveStyle"
             @keyup.enter="saveStyle"
           />
+        </div>
+        <div class="row persona-quick">
+          <span class="label">{{ t('settings.general.personaQuick') }}</span>
+          <span class="sp-list">
+            <button
+              class="chip preset"
+              :class="{ on: !styleDraft.trim() }"
+              @click="applyPreset('')"
+            >{{ t('settings.general.personaPresets.neutral') }}</button>
+            <button
+              v-for="p in personaPresets"
+              :key="p.k"
+              class="chip preset"
+              :class="{ on: styleDraft.trim() === p.text }"
+              :title="p.text"
+              @click="applyPreset(p.text)"
+            >{{ p.label }}</button>
+          </span>
         </div>
         <div class="row">
           <span class="label">{{ t('settings.general.skin') }}</span>
@@ -881,12 +965,86 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         <!-- Windows「通信活动自动压低」联动(robot 真机坑):常驻唤醒麦会让系统把
              其它声音压 80%,app 改不了,只能引导用户改系统设置 -->
         <p class="hint">{{ t('settings.voice.winDuckHint') }}</p>
+        <p class="hint">{{ t('settings.voice.winMicHint') }}</p>
       </div>
 
-      <!-- 远程:暗页 teaser,只预告不放假控件 -->
-      <div v-else-if="tab === 'remote'" class="teaser">
-        <span class="s-mono badge">{{ t('settings.remote.badge') }}</span>
-        <p>{{ t('settings.remote.teaser') }}</p>
+      <!-- 远程渠道:手机上跟旺财对话(Telegram/钉钉 bot)。凭证写得进读不回(同供应商 key) -->
+      <div v-else-if="tab === 'remote'">
+        <p class="section">{{ t('settings.remote.telegram.title') }}</p>
+        <p class="hint">{{ t('settings.remote.telegram.hint') }}</p>
+
+        <div class="row">
+          <span class="label">{{ t('settings.remote.enable') }}</span>
+          <span class="chip" :class="{ on: tg.enabled }">{{ tg.enabled ? t('settings.system.on') : t('settings.system.off') }}</span>
+          <button class="link" @click="toggleRemote('telegram', !tg.enabled)">
+            {{ tg.enabled ? t('settings.system.turnOff') : t('settings.system.turnOn') }}
+          </button>
+        </div>
+        <div class="row">
+          <span class="label">{{ t('settings.remote.telegram.token') }}</span>
+          <input
+            v-model="tgToken"
+            class="s-input s-mono-input"
+            :placeholder="tg.configured ? t('settings.remote.tokenSet') : t('settings.remote.telegram.tokenPlaceholder')"
+            @change="saveRemoteCred('remote.telegram.token', tgToken)"
+          />
+        </div>
+        <div class="row">
+          <span class="label">{{ t('settings.remote.telegram.allowed') }}</span>
+          <input
+            class="s-input s-mono-input"
+            :value="tg.allowed_chats"
+            :placeholder="t('settings.remote.telegram.allowedPlaceholder')"
+            @change="saveRemote('remote.telegram.allowed_chats', $event)"
+          />
+        </div>
+        <div class="row">
+          <span class="label">{{ t('settings.remote.status') }}</span>
+          <span class="chip" :class="{ on: tg.running, warn: !!tg.last_error }">{{ remoteStatusText(tg) }}</span>
+        </div>
+
+        <p class="hint">{{ t('settings.remote.telegram.steps') }}</p>
+        <p class="hint">
+          {{ t('settings.remote.telegram.linkPre') }}
+          <button class="link" @click="openExternal('https://t.me/botfather')">@BotFather</button>
+        </p>
+
+        <p class="section dt-sec">{{ t('settings.remote.dingtalk.title') }}</p>
+        <p class="hint">{{ t('settings.remote.dingtalk.hint') }}</p>
+        <div class="row">
+          <span class="label">{{ t('settings.remote.enable') }}</span>
+          <span class="chip" :class="{ on: dt.enabled }">{{ dt.enabled ? t('settings.system.on') : t('settings.system.off') }}</span>
+          <button class="link" @click="toggleRemote('dingtalk', !dt.enabled)">
+            {{ dt.enabled ? t('settings.system.turnOff') : t('settings.system.turnOn') }}
+          </button>
+        </div>
+        <div class="row">
+          <span class="label">{{ t('settings.remote.dingtalk.appKey') }}</span>
+          <input
+            v-model="dtKey"
+            class="s-input s-mono-input"
+            :placeholder="dt.configured ? t('settings.remote.tokenSet') : t('settings.remote.dingtalk.appKeyPlaceholder')"
+            @change="saveRemoteCred('remote.dingtalk.app_key', dtKey)"
+          />
+        </div>
+        <div class="row">
+          <span class="label">{{ t('settings.remote.dingtalk.appSecret') }}</span>
+          <input
+            v-model="dtSecret"
+            class="s-input s-mono-input"
+            :placeholder="dt.configured ? t('settings.remote.tokenSet') : t('settings.remote.dingtalk.appSecretPlaceholder')"
+            @change="saveRemoteCred('remote.dingtalk.app_secret', dtSecret)"
+          />
+        </div>
+        <div class="row">
+          <span class="label">{{ t('settings.remote.status') }}</span>
+          <span class="chip" :class="{ on: dt.running, warn: !!dt.last_error }">{{ remoteStatusText(dt) }}</span>
+        </div>
+        <p class="hint">{{ t('settings.remote.dingtalk.steps') }}</p>
+        <p class="hint">
+          {{ t('settings.remote.dingtalk.linkPre') }}
+          <button class="link" @click="openExternal('https://open-dev.dingtalk.com/')">open-dev.dingtalk.com</button>
+        </p>
       </div>
 
       <!-- 服务/接入:外部数据源与设备接入(天气走和风 JWT;以后智能家居 HA 等同构进驻) -->
@@ -1065,7 +1223,14 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 
 .chip { border: 1px solid var(--line); border-radius: 9px; padding: 4px 11px; font-size: 12.5px; color: var(--text); }
 .chip.on { border-color: rgba(var(--accent-rgb), 0.45); color: var(--accent); }
+.chip.warn { border-color: rgba(var(--attn-rgb), 0.5); color: var(--attn); }
+.section.dt-sec { margin-top: 20px; }
 .chip.future { opacity: .62; color: var(--text-dim); }
+/* 性格快捷选择:复用音色 chip 的薄玻璃质感 + 可点;行顶对齐,chip 折行时标签不被居中拉偏 */
+.persona-quick { align-items: flex-start; }
+.chip.preset { cursor: pointer; background: rgba(var(--accent-rgb), 0.04); transition: border-color .15s, color .15s, background .15s; }
+.chip.preset:hover { border-color: rgba(var(--accent-rgb), 0.45); }
+.chip.preset.on { border-color: rgba(var(--accent-rgb), 0.55); color: var(--accent); background: rgba(var(--accent-rgb), 0.1); }
 .hint { font-size: 12px; color: var(--text-dim); line-height: 1.7; display: flex; align-items: center; gap: 10px; padding-top: 13px; }
 .hint.err { color: var(--danger); }
 .hint.warn { color: var(--warn); }

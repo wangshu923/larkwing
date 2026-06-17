@@ -79,7 +79,9 @@
 
 ### 4.1 命名与调性 🔒
 - 项目英文名 **Larkwing**;面向用户中文名 **旺财**(暖萌皮);默认助手名 **7274**(科幻调性)。
-- **科幻优先**:当前默认观感 = 科幻(玻璃 / 辉光 / HUD),性格仍是亲和陪伴;暖萌 = 可选皮肤。
+  - **名字 = 用户数据,默认 = 产品决策**(同唤醒词模型,§8.2):用户在「叫我什么」(`ui.pet_name`)改名后,既进 UI(标题 / 输入框 / 悬浮窗),也进模型——persona 用 `{name}` 占位,`engine/context::build_context` 取 `ui.pet_name`(空 = 默认)填入「你是 {name},…」身份句,所以模型自称、被问名都跟随。开场白则**不带名字**(静态文案,避免与改后的名打架,2026-06-17)。
+  - **默认名「7274」三处手工同步**(改默认 = 改这三处):Rust `context::DEFAULT_NAME` · 前端 `pet.name`(`src/locales/*.ts`)· 本条。persona 已是占位符、不再硬编名字,故不在同步清单。
+- **科幻优先(观感)、性格中性(底座)**:当前默认观感 = 科幻(玻璃 / 辉光 / HUD);**默认性格保持中性 / 极简**(2026-06-17 用户拍板,原暖萌默认调子 → 中性):出厂人设只给功能性底座(语言跟随、自然简洁、记忆、诚实、不自称 AI + 放歌先本地后网络),**不预设任何性格倾向 —— 既不萌也不酷,连「不卖萌」这类否定式规定也不写**(那本身就是一种倾向);目的 = 默认适配最多用户。想要某种性格的人自己在设置「我的性格」(`persona.style`)一句话改;**出厂 `DEFAULT_PERSONA_STYLE` 留空**(= 不注入性格层),输入框用占位示例提示可改。落点:`companion.json` 的 persona / 开场白 / 语音应答词 + `DEFAULT_PERSONA_STYLE`(Rust 与 useSettings 两处镜像、值为空)+ few-shot 示范语气均保持平实中性。暖萌热络 = 可选皮肤,不进默认。
 - **已否决的名字**(别再提):`Tideripper`(太凶)、`Sunwing`(撞加航)、`Waterwing`(像泳圈)、`Emberwing`(撞游戏)。
 
 ### 4.2 产品定位 🔒
@@ -171,7 +173,8 @@
 - **参数无后门**:`ChatOptions` 不留无类型 `extra: Map`——加新旋钮 = 加一个 `Option` 字段(防御性收口)。
 - **绑机制不绑模型名**:前瞻模型名(`deepseek-v4-pro` / `gpt-5.5`)无法对官方核实 → 行为绑「文档化机制」,**绝不**硬编模型名分支。
 - **本地端点不拒空 key**:vLLM / Ollama 类只要求 Authorization 头存在 → `LlmConfig.api_key` 允许显式占位值(如 `"ollama"`),preflight 别一刀切拒空。
-- **key 装配纪律**:`DEEPSEEK_API_KEY` env 优先 → `settings`;改 key = **重建 provider 实例**(不热更新);MVP 明文存,**Windows 发布前换 `keyring`**(待办)。
+- **key 装配纪律**:`DEEPSEEK_API_KEY` env 优先 → `settings`;改 key = **重建 provider 实例**(不热更新)。
+- **密钥落 keyring 已落地**(2026-06-17,§6.3 原「发布前换 keyring」待办兑现):`secrets` 模块(`secrets.rs`)把秘密类 key 存系统密钥串,**不进 SQLite 明文**。**keyring 仅 Windows 启用**(目标平台,凭据管理器随登录会话解锁、不弹框);**mac / Linux 开发机回落 `settings`**(明文,dev 可接受 §4.9)——mac Keychain 对未签名/每次重编的 dev 二进制会弹「允许访问钥匙串」,太烦(2026-06-17 用户拍板去掉),gate 在 `secrets::entry()`(非 Windows 返回 None)。秘密清单 `SECRET_KEYS` = `llm.api_key` / `llm.providers`(整块,含各 provider key)/ `crypto.ed25519.private_key` / `remote.{telegram.token,dingtalk.app_key,dingtalk.app_secret}`;**Ed25519 公钥不在内**(非秘密、给用户复制)。读写一律走 `secrets::get/set`(engine 的 load_registry/set_api_key/persist_specs/ensure_app_keypair、weather 签 JWT、channels 凭证、set_setting 的 `remote.*` 秘密臂、`remote_status` 的 configured 检查全已路由)。**keyring 不可用(headless/dev/无后端)→ 回落 `settings` 并 warn,绝不让 app 哑掉**;存的是原文(literal 或 `${ENV}`),`resolve_env` 在取值时跑。boot 调 `secrets::migrate` 把 legacy 明文一次性迁入(幂等)。真机(尤其 Windows 凭据管理器、mac Keychain 签名/弹窗)待验,见验收单。
 - DeepSeek 坑清单(`thinking` 永远显式发、reasoning_content 随 tool_calls 翻转回传、流式碎片重组 / 截断检测 `is_incomplete` 拒执行半截参数、流中 error 帧、usage 三连、finish_reason 锁存)**见 PLAN §3,照抄别重踩**。
 
 ### 6.4 engine
@@ -197,7 +200,7 @@
 - **前端 = 文案唯一产地**:vue-i18n 单字典,`src/locales/en.ts` 是 `zh-CN.ts` 的精确镜像。加语言 = locales/ 加文件 + 注册一行 + 选择器;后端零改动。
 - **对话语言 = 模型跟随用户**,与 `ui.locale`(只管界面 chrome)**彻底解耦**;persona 语言中立(「用对方所用的语言回应」),不分叉 per-locale 人格。**开场白**是唯一 locale 触达人格数据处(scene 加 `openings` map)。
 - **同步纪律(易踩)**:`zh-CN.ts` 加 key **必须**同步 `en.ts`,否则英文模式静默回落中文。复核 = 两文件 flatten 后比 key 集 + 占位符集。
-- ⚠️ **花括号陷阱**:vue-i18n 把 `{xxx}` 当插值占位符。文案里写字面 `{` / `${...}` 会崩 render(`${中文}` → Message compilation error,整个组件渲染失败,**warn 级**难查——Vue 不把真实 Error 给 console,表现为「tab 点了切不过去」;`${ENV}` → 静默渲染成空)。要展示这类语法**用纯文本描述**(如「留空自动读 HTTPS_PROXY」),或用 vue-i18n 字面语法转义,别写裸花括号。抓这类 render 错最快路 = 设 Vue `app.config.errorHandler` 拦真实错误(比翻 console warn 强)。
+- ⚠️ **i18n 特殊字符陷阱**(`{ } @ |` 都中招):vue-i18n 消息串有自己的语法,字面写进文案就被当语法解析、编译失败 → 整组件 render 抛错 → 该 tab/视图渲染失败(Vue 保留旧 DOM,表现为「**tab 点了切不过去**」),且**warn 级**难查(Vue 不把真实 Error 给 console)。已踩:① `{ }` 插值——`${中文}` → Message compilation error,`${ENV}` → 静默渲染成空;② `@` linked-message——`@BotFather` 之类直接崩(2026-06 远程渠道 tab 实锤);③ `|` 复数分隔符。**对策**:i18n 文案不写字面 `{` `}` `@` `|`;要展示这类语法就纯文本描述,或把含特殊字符的字面量留模板硬编码、**不进 `t()`**(如 `<button>@BotFather</button>`)。抓这类 render 错最快路 = 设 Vue `app.config.errorHandler` 拦真实错误(比翻 console warn 强)。
 - **非字典硬编码中文也要同步**:协议徽章、星期数组(走 `toLocaleDateString`)、`persona.style` 默认值(需与 Rust `DEFAULT_PERSONA_STYLE` 手工同步)等不在字典里的中文,加语言时易漏。
 - **布局兜底**:英文比中文长 40–100%,定宽控件按 2 字中文做的会撑爆 → 砍装饰大字距 / 给弹性宽度 / 永远留 `flex-wrap` 折行 / ellipsis 截断。
 
@@ -271,12 +274,29 @@
 ### 7.6 常驻临场:开机自启 / 托盘 / 悬浮窗(PLAN §12)
 - **零新 core 事件**:悬浮窗只是「全局事件车道」(`app_event`)又一个消费者,复用同一份 Vue app / token / 形象 / composable;窗口管理与托盘进**壳层**。
 - 形态 = **C(混合可展开)**:收起 = 一体小挂件,展开 = 信息面板(进行中 / 通知两区);常驻锚点 = 系统托盘;开机自启 = `tauri-plugin-autostart`(OS 真相源)。
-- **关主窗 = 隐藏到托盘、不退进程**(✕ 首次点出友好气泡兜底);主窗无边框 → 自绘右上角三键。
+- **关主窗 = 隐藏到托盘、不退进程**(✕ 首次点出友好气泡兜底);主窗无边框(`decorations:false`)→ 自绘右上角三键。**mac 左上原生红绿灯 = 不做(2026-06-16 用户拍板)**:目标平台 Windows 没红绿灯、纯开发机便利;原生 Aqua 红绿灯系统锁死无法主题化(与科幻皮不搭),要它只能 mac 专属 `titleBarStyle:Overlay` 分叉窗形——不值,自绘三键跨平台一致 + 贴主题。
 - **单实例 / 二次启动唤回**(2026-06-16):全程序只跑一个进程。已在运行时再点快捷方式 / 重复启动**不开新进程**——`tauri-plugin-single-instance`(**放最前注册**),OS 把第二个进程的命令行交给已运行实例的回调、第二个进程退出;回调复用 `show_window` 把主窗(可能藏托盘)唤到前台,沿用 `--autostart` 静默语义(自启触发不唤窗)。无 IPC 命令、不需 capability。**OS 转发 + 窗口前置待 Windows 真机验**(§8.1;若只闪任务栏不前置,加 always-on-top 翻转兜底,见 PLAN §12 watch-item)。
 - ⚠️ **悬浮窗 useMedia 只读不发声**(独立 WebView 复用播放 VM 会与主窗双播——多窗变体的双播坑,`play` 分支已堵)。**反向媒体控制已落地**(2026-06-16):悬浮窗迷你播控按钮**转发**给主窗执行(`emitMediaControl`→主窗 `onMediaControl`→`applyControl`,与嘴控汇同一执行口),float 仍不出声;播放态经 `emitNowPlaying(np,status)` 镜像回 float(播/暂停图标翻转)。跨窗联动 Mac/浏览器测不出,**待 Windows 真机验**(§8.1)。
 - **托盘「显示悬浮窗」**(2026-06-16):✕ 关掉悬浮窗后,托盘菜单一项重开(`show_float`→壳层 emit `lw:show-float`→主窗置 `ui.float.enabled='1'`+`setFloatVisible(true)`,持久化由主窗收口);比绕设置页顺手。
 - **失败任务「重试」已落地**(2026-06-16,轻量版、不等 JobRunner):仅影音解析/组件下载失败带 `TaskRetry::MediaPlay{page_url,audio_only}` 载体,UI 显「重试」直连重放(`media_retry` 命令→`media.play`,按钮不绕 LLM,§7.1 哲学);auth 失败不给盲目重试(走登录)。通用 JobRunner 重试仍后置。
 - 排序立场:**不做优先级排序**(robot 配置病)——通知「最新优先 + 自动淡出」、进行中「钉住」。
+- **打包 / 卸载 / 默认自启**(2026-06-17,用户拍板):
+  - **Windows 只发 NSIS、不发 MSI**:`bundle.targets` 由 `"all"` 改成显式清单 `["app","dmg","deb","rpm","appimage","nsis"]`(= all 去 msi);Mac 仍 app+dmg、Linux 仍 deb/rpm/appimage,CI(release.yml 三平台)零改。NSIS 钩子灵活、官方推荐;MSI 卸载清理麻烦故弃。
+  - **卸载清自启残留**:开机自启的注册表项是 `tauri-plugin-autostart`(auto-launch 0.5.0)**运行时**写的、安装器不认 → 默认卸载会残留孤儿启动项。补 `src-tauri/installer-hooks.nsh`(`NSIS_HOOK_POSTUNINSTALL`)删 auto-launch 在 Windows 写的**两条**键(值名 = `package_info().name` = 产品名 `larkwing`):`…\CurrentVersion\Run`(启动项)+ `…\Explorer\StartupApproved\Run`(任务管理器「已启用」覆盖位)。`nsis.installMode=currentUser` 保证卸载器以当前用户身份跑、HKCU 命中正确。**改 `productName` 要同步改钩子里的值名**。
+  - **正式版默认开机自启**:首启在 `lib.rs` setup 里按产品默认 `enable()` **一次**(内部标记 `system.autostart.defaulted`,app 级、**不进 `APP_SETTING_KEYS`**、直接走 `store.settings`),之后全交设置页开关(关闭入口已有);用 auto-launch 自己的 `enable()`(而非装机写注册表)保证与 `is_enabled()`/`disable()` **零漂移**(§6.8)。**仅正式版生效**(`!cfg!(debug_assertions)`):dev 自启指向临时调试程序、连不上本地前端(前端开关同样 dev 禁用),日常 Mac 开发不被塞 LaunchAgent。标记落了不再自动开 → 不与用户日后手动关掉打架。
+  - **只能 Windows 正式版真机验**(§8.1,新增 watch-item):装 → 首开自动进自启 → 重启确认静默缩托盘 → 设置关 → 重启确认没起 → 卸载后 `reg query` 那两条键皆无。
+
+### 7.7 远程渠道:Telegram / 钉钉 bot(2026-06-17 落地;手机上跟旺财对话)
+- **物种 = 交互渠道(§5 species ②)**,不是工具:引擎边界适配器 + **复用 turn loop**,不碰 ToolCtx、不内嵌人格。core 新模块 `channels/`(`telegram.rs` / `dingtalk.rs` 一渠道一文件 + 监督器),**单 crate 不拆**;壳层只 `ChannelSup` 监督(boot 起 / `reload_channels` 停旧起新,顶层 spawn 用 tauri runtime——core 不依赖 tauri,§6.1)。
+- **复用现成,engine 零改**:入站文本 → `channels::drive_turn`(会话映射查 `store/channels` 域 → `inject`(在飞)或 `send_message`(空闲)→ 消费 `Receiver<TurnEvent>` 攒 Delta 到 Done)。inject-or-send 与桌面前端同语义;回访同一 chat 续历史(映射到固定 conv_id)。
+- **不流式、攒到 Done 一次发**(两家都不支持流式);长消息 `split_message`(Telegram 4096)。
+- **不按渠道注入 prompt**(破前缀缓存,§7.5 同理):MVP **纯文本**(Telegram 不带 parse_mode 绕开 MarkdownV2 转义坑;钉钉 text 类型)。富格式以后走输出后处理,不走 prompt。
+- **出站全走 `net::Client`**(§4.6):Telegram 全程 HTTP 长轮询(`getUpdates`/`sendMessage`,免公网免 SDK;国内需代理由 net 直连失败自动兜底);钉钉「开连接」+ 回复 `sessionWebhook` 走 net,**只有 WS 收消息用 `tokio-tungstenite`**(钉钉国内直连,WS 不经代理;TLS 走 rustls 复用进程级 aws-lc provider)。**别用 teloxide**(自带 reqwest 绕过 net)。
+- **钉钉 = 官方 Stream 模式**(WebSocket,免公网,robot 同款):WS 只收 + 回 ACK/pong;回复走 sessionWebhook(HTTP)→ 回合可异步 spawn、不阻塞收循环、不丢 ping。单聊按 conversationId 续接、群聊按 (conv, 发言人) 隔离 + strip @mention(robot 坑 #2/#7)。
+- **访问控制(非风控 §9)**:Telegram `allowed_chats` 白名单,空 = 不放行 + 回 onboarding 报 chat id(不静默吞,§3.5);钉钉靠应用可见范围。
+- **凭证不过桥**:token/app_secret 走 `set_setting` 的 `remote.*` 写入臂(**不进 `APP_SETTING_KEYS`** → 写得进读不回);设置页状态读 `remote_status`(只报 `configured` bool + 连接态);**凭证已与 LLM key 一并走 keyring**(§6.3,`SECRET_KEYS` 含 `remote.*` 三把)。
+- **微信暂不做**(2026-06-17):个人微信无官方 API、企业微信需公网回调,都不合「出站连接、免公网」的家用形态——承载方式想清再说。
+- **真机/真网验**:真 bot token / 真钉钉应用、手机收发、续历史、断网重连、钉钉 WS 在 Windows 连通——见 PLAN 远程渠道 watch-items。
 
 ---
 

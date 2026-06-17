@@ -20,8 +20,8 @@ const total = computed(() => memories.value.length + briefings.value.length)
 async function load() {
   if (!isTauri()) {
     memories.value = [
-      { id: 1, user_id: 1, kind: 'fact', content: '不吃香菜', created_at: Date.now() - 5 * 86400_000, updated_at: 0 },
-      { id: 2, user_id: 1, kind: 'fact', content: '对花生过敏', created_at: Date.now() - 2 * 86400_000, updated_at: 0 },
+      { id: 1, user_id: 1, kind: 'fact', content: '不吃香菜', resident: true, salience: 3, source: 'explicit', last_used_at: Date.now() - 12 * 60_000, created_at: Date.now() - 5 * 86400_000, updated_at: 0 },
+      { id: 2, user_id: 1, kind: 'fact', content: '对花生过敏', resident: true, salience: 1, source: 'explicit', last_used_at: null, created_at: Date.now() - 2 * 86400_000, updated_at: 0 },
     ]
     briefings.value = [
       { id: 1, domain: 'media', content: '电影在 \\\\nas\\film;动画片在 \\\\nas\\kids', scope: 'home', resident: true, created_at: Date.now() - 86400_000, updated_at: 0 },
@@ -80,6 +80,24 @@ function fmtDate(ts: number): string {
   return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`
 }
 
+/** 「上次想起」用相对时间(召回新鲜度才是重点,与创建日的绝对显示不同)。 */
+function fmtAgo(ts: number): string {
+  const sec = Math.max(0, (Date.now() - ts) / 1000)
+  if (sec < 60) return t('memory.agoJustNow')
+  if (sec < 3600) return t('memory.agoMin', { n: Math.floor(sec / 60) })
+  if (sec < 86400) return t('memory.agoHour', { n: Math.floor(sec / 3600) })
+  return t('memory.agoDay', { n: Math.floor(sec / 86400) })
+}
+
+/** 隐身观测(§4.4 hover 浮现):被 recall 工具想起的次数 + 上次几时。
+ *  salience = 1.0 + 召回次数(只有 recall 会 +1);last_used_at 在召回时刷新。 */
+function recallHint(m: Memory): string {
+  const n = Math.round(m.salience) - 1
+  return n >= 1 && m.last_used_at
+    ? t('memory.recalled', { n, ago: fmtAgo(m.last_used_at) })
+    : t('memory.neverRecalled')
+}
+
 function onKeydown(e: KeyboardEvent) {
   if (e.key === 'Escape') emit('close')
 }
@@ -107,7 +125,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
       <!-- 关于你(小本本) -->
       <p v-if="memories.length" class="lp-group">{{ t('memory.groupYou') }}</p>
       <TransitionGroup name="lp" tag="div">
-        <div v-for="m in memories" :key="`m-${m.id}`" class="lp-card top">
+        <div v-for="m in memories" :key="`m-${m.id}`" class="lp-card top" :title="recallHint(m)">
           <span class="lp-dot sm"></span>
           <span class="lp-text multiline">{{ m.content }}</span>
           <span class="lp-date top">{{ fmtDate(m.created_at) }}</span>

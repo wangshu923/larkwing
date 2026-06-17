@@ -92,6 +92,17 @@ pub struct ConversationActivity {
     pub conv_id: i64,
     /// reminder | …(将来:主动问候/任务完成回报,前端按 kind 选表现)
     pub kind: String,
+    /// 回合终态:用户不在该会话界面时,前端据此在列表项打彩色标(完成 / 失败)。
+    /// 「疑问 / 等用户回话」暂不做(系统当前无此语义,见会话列表 badge 决策)。
+    pub outcome: TurnOutcome,
+}
+
+/// 后台回合的终态(会话列表 badge 用)。done = 正常收尾;failed = 出错收尾。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOutcome {
+    Done,
+    Failed,
 }
 
 /// 听写会话阶段(PLAN §11):前端 mood/麦克风按钮据此切表现。

@@ -43,6 +43,14 @@ export interface Memory {
   user_id: number
   kind: string
   content: string
+  /** 是否进稳定前缀(画像·常驻层);false = 按需层,靠 recall 取。PLAN §13。 */
+  resident: boolean
+  /** 强化分:取用 +1。 */
+  salience: number
+  /** 出处:explicit / correction / distilled。 */
+  source: string
+  /** 上次取用/确认(unix ms);null = 自建后未再取用。 */
+  last_used_at: number | null
   created_at: number
   updated_at: number
 }
@@ -367,11 +375,22 @@ export interface FamilyMember {
   enrolled: boolean
 }
 
+/** 远程渠道一行(设置页,PLAN 远程渠道);**凭证本身永不过桥**,只报 configured(bool)。 */
+export interface RemoteChannelView {
+  id: string // 'telegram' | 'dingtalk'
+  enabled: boolean
+  configured: boolean
+  allowed_chats: string
+  running: boolean
+  last_error: string | null
+}
+
 export type AppEvent =
   | { type: 'task'; data: TaskView }
   | { type: 'media'; data: MediaEvent }
-  // 自启回合(提醒/定时)完成:某会话有动静,UI 刷新列表/重拉当前会话
-  | { type: 'conversation'; data: { conv_id: number; kind: string } }
+  // 自启回合(提醒/定时)完成:某会话有动静,UI 刷新列表/重拉当前会话。
+  // outcome = 回合终态(done/failed):用户不在该会话时,前端据此在列表项打彩色标。
+  | { type: 'conversation'; data: { conv_id: number; kind: string; outcome: 'done' | 'failed' } }
   | { type: 'voice'; data: VoiceEvent }
   // 回合 mood(PLAN §12 修订):悬浮窗显「正在想/正在说」;主窗用自己的 per-turn mood,忽略这条
   | { type: 'mood'; data: 'idle' | 'thinking' | 'speaking' }
@@ -664,6 +683,10 @@ export const api = {
   /** 失败任务重试(目前仅影音):按 retry 载体直连重放,进展/结果照常走事件车道。 */
   mediaRetry: (pageUrl: string, audioOnly: boolean) =>
     invoke<void>('media_retry', { pageUrl, audioOnly }),
+  /** 远程渠道状态(设置页):开关/已配凭证/白名单/连接态(凭证不过桥)。 */
+  remoteStatus: () => invoke<RemoteChannelView[]>('remote_status'),
+  /** 保存远程渠道配置后调:停旧起新(类比 provider 保存即重建)。 */
+  reloadChannels: () => invoke<void>('reload_channels'),
   /** 开听写:立即返回,进展走 app_event 的 voice 车道(首次会触发模型用时下载)。 */
   voiceListenStart: () => invoke<void>('voice_listen_start'),
   /** 停听写:accept = 立即定稿(已听到的送识别);false = 取消丢弃。幂等。 */

@@ -3,6 +3,7 @@
 
 pub mod attach;
 pub mod bus;
+pub mod channels;
 pub mod components;
 pub mod crypto;
 pub mod engine;
@@ -11,6 +12,7 @@ pub mod llm;
 pub mod media;
 pub mod net;
 pub mod scenes;
+pub mod secrets;
 pub mod scheduler;
 pub mod store;
 pub mod tasks;

@@ -45,7 +45,10 @@ pub fn qweather_cfg(settings: &crate::store::SettingsRepo) -> anyhow::Result<Opt
     let host = read(KEY_QWEATHER_HOST)?;
     let project_id = read(KEY_QWEATHER_PROJECT)?;
     let credential_id = read(KEY_QWEATHER_CREDENTIAL)?;
-    let private_pem = read(crate::crypto::KEY_ED25519_PRIVATE)?;
+    // 私钥是秘密:走 keyring(回落 settings),不从 SQLite 明文读(§6.3)
+    let private_pem = crate::secrets::get(settings, crate::crypto::KEY_ED25519_PRIVATE)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
     if host.is_empty() || project_id.is_empty() || credential_id.is_empty() || private_pem.is_empty() {
         return Ok(None);
     }
