@@ -63,6 +63,23 @@ jobs:
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
 
+      # 从 CHANGELOG.md 抽「本版本那一节」作为 Release 正文(以后发版自动带说明,不用手填)。
+      # 取 tag(v0.1.1)去掉 v → 0.1.1,匹配 `## 0.1.1 …` 到下一个 `## 数字` 之间的内容。
+      # shell: bash 让 mac/windows 同一套脚本;非 tag(手动触发)抽不到 → 兜底一句。
+      - name: 取本版本更新日志
+        id: notes
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          VER_RE="${VERSION//./\\.}"
+          BODY="$(awk -v ver="$VER_RE" '$0 ~ ("^## " ver "( |$)"){f=1;next} f&&/^## [0-9]/{exit} f{print}' CHANGELOG.md)"
+          if [ -z "$BODY" ]; then BODY="下载下方对应平台的安装包安装即可。"; fi
+          {
+            echo "body<<__LW_NOTES_EOF__"
+            echo "$BODY"
+            echo "__LW_NOTES_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
       # tauri-action 会:跑 beforeBuildCommand(pnpm build)→ cargo build → 打安装包。
       # 给了 --target,产物统一落在 target/<triple>/release/bundle/ 下,便于下面上传。
       # 打 tag 时(tagName 非空)顺带创建 draft Release 并上传安装包;非 tag 时 tagName 为空,只编译。
@@ -74,6 +91,8 @@ jobs:
         with:
           tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
           releaseName: Larkwing __VERSION__
+          # 正文取自上一步(CHANGELOG 本版本节);非 tag 触发时 tauri-action 不建 Release,此值被忽略
+          releaseBody: ${{ steps.notes.outputs.body }}
           releaseDraft: true
           prerelease: false
           args: --target ${{ matrix.target }}
