@@ -313,7 +313,8 @@
   - B 站视频只有声音(黑屏)——WebView2 解不了 HEVC/AV1;修 = `resolver.rs` 强制 `vcodec^=avc`。
   - 全屏闪烁 / 退出穿帮——HTML5 `requestFullscreen` 与 DWM 打架 + 透明窗放大穿帮;修 = 改走原生窗口全屏 `win.setFullscreen`。
   - 滚动条占布局宽度跳动(§6.7 `scrollbar-gutter`)、唤醒标定**性能**坑(`KeywordSpotter::create` Mac 264ms 不暴露、Windows 卡分钟级)。
-- **规则**:改**影音播放 / 窗口全屏 / 编解码 / WebView 渲染 / 媒体流 / 唤醒标定性能**类代码,默认假设 WebView2 更受限;**Mac 跑通 ≠ 验证通过**,这类**必须出 Windows 包真机验**;设计时主动选 WebView2 也支持的路径(avc、原生窗口全屏)。
+  - **藏托盘的主窗仍 60fps 空烧 CPU**(2026-06-17,Windows 实测 ~3.3%):关主窗 = `hide()` 进程不退(§7.6),而主窗 `transparent:true` 让 Chromium 遮挡检测失效(透明窗永不算"被挡")→ 隐藏后 RAF **不被自动节流**;加之动画循环本来没有可见性判断 → 背景 canvas + 遛弯 `roamFrame` 藏起来照样满帧空跑。修 = `usePageVisible`(`visibilitychange` + 壳层 `lw:win-visible` 事件**双触发**,后者只为 main 发否则关悬浮窗误停主窗)+ `useRafLoop`(不可见即 `cancelAnimationFrame`);所有 canvas 背景(Neon/Hologram/Hud/Starfield)与 `MainLayout.roamFrame` 都改走它。**新代码起 RAF 循环一律用 `useRafLoop`,别再裸 `requestAnimationFrame` 自调度。** 浏览器验过暂停逻辑(88→0→88 帧/秒);藏托盘后 CPU≈0 **待 Windows 真机验**。
+- **规则**:改**影音播放 / 窗口全屏 / 编解码 / WebView 渲染 / 媒体流 / 唤醒标定性能 / 动画循环**类代码,默认假设 WebView2 更受限;**Mac 跑通 ≠ 验证通过**,这类**必须出 Windows 包真机验**;设计时主动选 WebView2 也支持的路径(avc、原生窗口全屏)。
 
 ### 8.2 唤醒「叫不答应」根因与决策(2026-06-16 拍板:保持 KWS)
 - 已定案:**默认唤醒阈值 0.45 太严**(口语 / 偏小的「旺财」KWS 分数 ~0.3,robot 用 0.20 → 8/10,0.45 只接咬字清亮的 → 3/10)。已修(降阈 + 修灵敏度滑块落库)。

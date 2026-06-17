@@ -23,6 +23,7 @@ import { useChat, type TurnStats, type UiMessage, type UiAttachment } from '../c
 import { useSettings } from '../composables/useSettings'
 import { onTranscribed, useVoice } from '../composables/useVoice'
 import { useSpeech } from '../composables/useSpeech'
+import { useRafLoop } from '../composables/useRafLoop'
 import { fmtMs, fmtTokens, fmtUsd } from '../lib/fmt'
 import { openExternal } from '../lib/backend'
 import { renderMarkdown } from '../lib/md'
@@ -260,19 +261,19 @@ function copyMsg(m: UiMessage) {
   }
 }
 
-// —— 穿梭:旺财自由游走,经过的气泡被它撞开(物理避让),走了弹回 ——
+// —— 穿梭:旺财在聊天区自由游走(2026-06-17 砍掉「撞气泡」交互 —— 省去每帧 DOM 测量/重排,
+//    宠物每帧只挪自己一张图,开销近乎为零;背景见 AGENT §8.1 的动画暂停约定) ——
 const streamEl = ref<HTMLElement | null>(null)
+// roamFrame 的 RAF 调度归 useRafLoop(见文件底部),页面不可见时自动暂停省 CPU
 const roamer = ref<HTMLElement | null>(null)
-let raf = 0
 let dogX = 220, dogY = 150
 let tgtX = 220, tgtY = 150
 let pauseFrames = 0
 let facing = 1 // 1=朝右,-1=朝左
 let gaitTick = 0
 let gaitPhase = 0 // 步态相位:run 帧下标
-let crowd = 0 // 0=旷野 1=字堆里,平滑过渡
-let pushingN = 0 // 上一帧正在撞开的气泡数
 let legFrames = 0 // 本段航程已飞帧数(fly 角色起步姿态用)
+const ROAM_SPEED = 0.3 // 漫游速度系数(1=原速;越小越慢);同时缩放位移与步态,免"脚打滑"
 // 角色包规范见 scripts/make-roamer-frames.py:每角色 1 张 idle + 5 张 run(192 见方、
 // 体量归一、朝右),文件名顺序即步态环播放顺序;px 是体量对齐后的显示尺寸
 // idle 是数组:单帧=静止蹲坐;多帧(如悬浮机器人上浮/下沉两帧)=停驻时慢速循环
@@ -298,51 +299,18 @@ characters.forEach((c) => [...c.idle, ...c.run].forEach((u) => { const im = new 
 const roamerSrc = ref(titanIdle1)
 const roamerFlipped = ref(false)
 
-// 缓存每个气泡的中心位置 + 半宽高(相对 stream):旺财撞整段用
-let bubbleData: { el: HTMLElement; ox: number; oy: number; hw: number; hh: number }[] = []
-let layoutSig = '' // 布局签名:内容高/容器宽高,变了说明缓存坐标失效
-let charsDirty = false // 消息变更标脏;真正的测量合并到 roamFrame 里做(流式增量也不卡)
-function collectBubbles() {
-  const s = streamEl.value
-  // 面板隐藏时(尺寸全 0)别测,等可见了再说,否则所有坐标坍缩到一点
-  if (!s || !s.clientWidth) return
-  layoutSig = `${s.scrollHeight}x${s.clientWidth}x${s.clientHeight}`
-  bubbleData = (Array.from(s.querySelectorAll('.bubble')) as HTMLElement[]).map((el) => {
-    // offsetLeft/Top 链路是布局坐标,天然无视 transform —— 气泡正被撞开时也不会量到过渡中途位
-    const hw = el.offsetWidth / 2
-    const hh = el.offsetHeight / 2
-    let ox = hw
-    let oy = hh
-    let n: HTMLElement | null = el
-    while (n && n !== s) { ox += n.offsetLeft; oy += n.offsetTop; n = n.offsetParent as HTMLElement | null }
-    return { el, ox, oy, hw, hh }
-  })
-}
 function newTarget() {
   const s = streamEl.value
   if (!s) return
   legFrames = 0
-  // 自由游走为主,偶尔冲着某个气泡去 —— 经过就把那整段撞一下,走了弹回
-  if (bubbleData.length && Math.random() < 0.4) {
-    const b = bubbleData[Math.floor(Math.random() * bubbleData.length)]
-    tgtX = b.ox + (Math.random() - 0.5) * b.hw
-    tgtY = b.oy + (Math.random() - 0.5) * b.hh
-  } else {
-    tgtX = 50 + Math.random() * Math.max(80, s.clientWidth - 110)
-    tgtY = 40 + Math.random() * Math.max(80, s.clientHeight - 90)
-  }
+  // 自由游走:聊天区里随机挑个落点(不再瞄气泡)
+  tgtX = 50 + Math.random() * Math.max(80, s.clientWidth - 110)
+  tgtY = 40 + Math.random() * Math.max(80, s.clientHeight - 90)
 }
 function roamFrame() {
   // 设置/回忆页打开时聊天整列隐藏:跳过本帧所有测量/位移,空转等回来
   if (activeRail.value === 'settings' || activeRail.value === 'memory' || activeRail.value === 'ops') {
-    raf = requestAnimationFrame(roamFrame)
     return
-  }
-  // 布局漂移(图片加载/窗口缩放/内容回流)或消息变更(标脏)都会让缓存坐标失效,重测
-  const sEl = streamEl.value
-  if (sEl && (charsDirty || `${sEl.scrollHeight}x${sEl.clientWidth}x${sEl.clientHeight}` !== layoutSig)) {
-    collectBubbles()
-    charsDirty = false
   }
   const dx = tgtX - dogX
   const dy = tgtY - dogY
@@ -354,11 +322,8 @@ function roamFrame() {
     gaitTick = 0; gaitPhase = 0
     if (++pauseFrames > 45) { newTarget(); pauseFrames = 0 }
   } else {
-    // 字堆里费劲挤(慢)、旷野撒欢(快):crowd 随"正在挤开的字数"平滑过渡;
-    // 腿照常倒腾,慢速 + 快腿 = 挤过去的挣扎感
-    crowd += ((pushingN ? 1 : 0) - crowd) * 0.12
     const dist = Math.hypot(dx, dy)
-    const step = Math.min(dist * 0.04, 2.2 - 1.3 * crowd)
+    const step = Math.min(dist * 0.04, 2.2) * ROAM_SPEED
     dogX += (dx / dist) * step
     dogY += (dy / dist) * step
     if (Math.abs(dx) > 1) facing = dx >= 0 ? 1 : -1
@@ -370,51 +335,24 @@ function roamFrame() {
       if (dist < 70) { roamerSrc.value = cp.run[3] }
       else if (legFrames < 26) { roamerSrc.value = cp.run[0] }
       else {
-        if (++gaitTick >= 24) { gaitTick = 0; gaitPhase ^= 1 }
+        if (++gaitTick >= 24 / ROAM_SPEED) { gaitTick = 0; gaitPhase ^= 1 }
         roamerSrc.value = cp.run[1 + (gaitPhase & 1)]
       }
     } else {
-      if (++gaitTick >= cp.tick) { gaitTick = 0; gaitPhase = (gaitPhase + 1) % cp.run.length }
+      if (++gaitTick >= cp.tick / ROAM_SPEED) { gaitTick = 0; gaitPhase = (gaitPhase + 1) % cp.run.length }
       roamerSrc.value = cp.run[gaitPhase]
     }
     roamerFlipped.value = facing < 0
   }
   // 图片自身 -50% 居中,这里直接写中心点(蹲/跑画布不同大也不会跳位)
   if (roamer.value) roamer.value.style.transform = `translate(${dogX}px, ${dogY}px)`
-
-  // 整段避让:旺财贴近哪个气泡,就把那整段往外撞一点;走远了弹回(.bubble 的 transform 过渡)
-  const MARGIN = 30 // 触发范围:气泡矩形外扩这么多
-  const FORCE = 16 // 最大位移
-  let pn = 0
-  for (const b of bubbleData) {
-    const relX = dogX - b.ox // 气泡中心 → 旺财
-    const relY = dogY - b.oy
-    const clX = Math.max(-b.hw, Math.min(relX, b.hw))
-    const clY = Math.max(-b.hh, Math.min(relY, b.hh))
-    const ndx = relX - clX // 矩形最近点 → 旺财(旺财在矩形内时为 0)
-    const ndy = relY - clY
-    const d = Math.hypot(ndx, ndy)
-    if (d < MARGIN) {
-      pn++
-      const f = ((MARGIN - d) / MARGIN) * FORCE
-      // 推离旺财:贴边时沿"最近点→旺财"反向;整个钻进气泡里时沿中心反向
-      let dirX = -ndx, dirY = -ndy
-      if (d < 1) { dirX = -relX; dirY = -relY }
-      const dl = Math.hypot(dirX, dirY) || 1
-      b.el.style.transform = `translate(${(dirX / dl) * f}px, ${(dirY / dl) * f}px)`
-    } else if (b.el.style.transform) {
-      b.el.style.transform = ''
-    }
-  }
-  pushingN = pn
-  raf = requestAnimationFrame(roamFrame)
 }
-onMounted(() => nextTick(() => { collectBubbles(); newTarget(); raf = requestAnimationFrame(roamFrame) }))
+onMounted(() => nextTick(() => newTarget()))
+useRafLoop(roamFrame) // 页面不可见(藏托盘/最小化)时自动暂停遛弯循环
 onMounted(() => window.addEventListener('keydown', onVoiceKey))
 onUnmounted(() => window.removeEventListener('keydown', onVoiceKey))
 let lastLen = 0
 watch(messages, () => nextTick(() => {
-  charsDirty = true
   const s = streamEl.value
   if (!s) return
   // 新气泡无条件贴底;流式增量只在"本来就在底部附近"时跟随,不打断用户翻历史
@@ -422,7 +360,6 @@ watch(messages, () => nextTick(() => {
   lastLen = chat.messages.length
   if (newBubble || s.scrollHeight - s.scrollTop - s.clientHeight < 90) s.scrollTop = s.scrollHeight
 }), { deep: true })
-onUnmounted(() => cancelAnimationFrame(raf))
 </script>
 
 <template>

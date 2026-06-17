@@ -64,6 +64,11 @@ pub fn run() {
         if label == "main" || label == "float" {
           api.prevent_close();
           let _ = window.hide();
+          // 主窗藏托盘后通知前端暂停动画(透明窗 RAF 不会被自动节流,§8.1 / usePageVisible)。
+          // 只为 main 发:否则关悬浮窗会误停主窗动画。
+          if label == "main" {
+            let _ = window.emit("lw:win-visible", false);
+          }
         }
       }
     })
@@ -347,5 +352,9 @@ fn show_window(app: &tauri::AppHandle, label: &str) {
     let _ = win.show();
     let _ = win.unminimize();
     let _ = win.set_focus();
+    // 重新可见 → 通知前端恢复动画(与 CloseRequested 的暂停成对)
+    if label == "main" {
+      let _ = win.emit("lw:win-visible", true);
+    }
   }
 }

@@ -760,3 +760,10 @@ export function onShowFloat(cb: () => void): void {
   if (!isTauri()) return
   void listen('lw:show-float', () => cb())
 }
+
+/** 主窗 hide/show 时壳层发的可见性信号(只为 main 发):藏托盘后据此暂停动画省 CPU。
+ *  见 usePageVisible —— 透明窗的 RAF 不会被 Chromium 自动节流,得显式停。 */
+export function onWinVisible(cb: (visible: boolean) => void): void {
+  if (!isTauri()) return
+  void listen<boolean>('lw:win-visible', (e) => cb(e.payload))
+}

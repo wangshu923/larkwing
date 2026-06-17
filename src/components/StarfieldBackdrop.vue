@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { onMounted, onUnmounted, ref } from 'vue'
+import { useRafLoop } from '../composables/useRafLoop'
 
 // 「璀璨星河」背景:夜空渐变 + 星云/银河(CSS)+ 繁星闪烁 + 流星(canvas)。
 const cv = ref<HTMLCanvasElement | null>(null)
 let ctx: CanvasRenderingContext2D | null = null
-let raf = 0
 let w = 0, h = 0, dpr = 1
 let last = 0
 let meteorTimer = 1.5
@@ -103,8 +103,6 @@ function frame(ts: number) {
     ctx.beginPath(); ctx.arc(m.x, m.y, 1.7, 0, Math.PI * 2)
     ctx.fillStyle = `rgba(255,255,255,${alpha.toFixed(3)})`; ctx.fill()
   }
-
-  raf = requestAnimationFrame(frame)
 }
 
 onMounted(() => {
@@ -113,11 +111,10 @@ onMounted(() => {
   ctx = c.getContext('2d')
   resize()
   window.addEventListener('resize', resize)
-  raf = requestAnimationFrame(frame)
 })
+useRafLoop(frame, { fps: 30 }) // 不可见自动暂停 + 限 30fps
 
 onUnmounted(() => {
-  cancelAnimationFrame(raf)
   window.removeEventListener('resize', resize)
 })
 </script>

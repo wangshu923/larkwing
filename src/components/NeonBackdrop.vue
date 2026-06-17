@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { onMounted, onUnmounted, ref } from 'vue'
+import { useRafLoop } from '../composables/useRafLoop'
 
 // 深蓝霓虹辉光科幻背景:深蓝底 + 发光透视网格/地平线 + 饱和辉光光晕(CSS)
 //   + 发光数据粒子连线 + 右下角旋转霓虹弧(canvas)。中心留白,给旺财让位。
@@ -8,7 +9,6 @@ defineProps<{ booting?: boolean }>()
 const cv = ref<HTMLCanvasElement | null>(null)
 const root = ref<HTMLElement | null>(null)
 let ctx: CanvasRenderingContext2D | null = null
-let raf = 0
 let w = 0, h = 0, dpr = 1, last = 0, t = 0
 
 interface Node { x: number; y: number; vx: number; vy: number; c: string }
@@ -43,9 +43,7 @@ function frame(ts: number) {
   last = ts; t += dt
   ctx.clearRect(0, 0, w, h)
 
-  // 发光数据节点 + 连线
-  ctx.shadowBlur = 6
-  ctx.shadowColor = 'rgba(95,210,255,0.9)'
+  // 数据节点 + 连线(2026-06-17 去掉 shadowBlur 辉光:省 CPU;氛围靠 CSS 底光撑)
   for (const n of nodes) {
     n.x += n.vx * dt; n.y += n.vy * dt
     if (n.x < 0) n.x += w; if (n.x > w) n.x -= w
@@ -68,9 +66,8 @@ function frame(ts: number) {
     ctx.fillStyle = n.c + '0.9)'; ctx.fill()
   }
 
-  // 居中发光弧组(科技装饰,旋转)
+  // 居中弧组(科技装饰,旋转)
   const cx = w / 2, cy = h / 2
-  ctx.shadowBlur = 10
   for (let r = 0; r < 3; r++) {
     const rad = 70 + r * 26
     const a0 = t * (0.3 + r * 0.12) + r
@@ -79,9 +76,6 @@ function frame(ts: number) {
     ctx.strokeStyle = r === 1 ? 'rgba(180,120,245,0.55)' : 'rgba(95,210,255,0.5)'
     ctx.lineWidth = 1.6; ctx.stroke()
   }
-  ctx.shadowBlur = 0
-
-  raf = requestAnimationFrame(frame)
 }
 
 function onMove(e: MouseEvent) {
@@ -98,13 +92,12 @@ onMounted(() => {
   resize()
   window.addEventListener('resize', resize)
   window.addEventListener('mousemove', onMove)
-  raf = requestAnimationFrame(frame)
 })
 onUnmounted(() => {
-  cancelAnimationFrame(raf)
   window.removeEventListener('resize', resize)
   window.removeEventListener('mousemove', onMove)
 })
+useRafLoop(frame, { fps: 30 }) // 不可见自动暂停 + 限 30fps(氛围背景肉眼无差,绘制/续航砍半)
 </script>
 
 <template>

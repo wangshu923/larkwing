@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { onMounted, onUnmounted, ref } from 'vue'
+import { useRafLoop } from '../composables/useRafLoop'
 
 // 科幻 HUD 背景:透视网格(CSS) + 雷达环/扫描臂/数据节点(canvas) + 扫描线/角标(CSS)。
 const cv = ref<HTMLCanvasElement | null>(null)
 const root = ref<HTMLElement | null>(null)
 let ctx: CanvasRenderingContext2D | null = null
-let raf = 0
 let w = 0, h = 0, dpr = 1, last = 0, t = 0
 
 interface Node { x: number; y: number; vx: number; vy: number }
@@ -100,8 +100,6 @@ function frame(ts: number) {
   ctx.fillStyle = g; ctx.fill()
   ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + Math.cos(sweep) * R, cy + Math.sin(sweep) * R)
   ctx.strokeStyle = 'rgba(150,240,230,0.55)'; ctx.lineWidth = 1.5; ctx.stroke()
-
-  raf = requestAnimationFrame(frame)
 }
 
 function onMove(e: MouseEvent) {
@@ -118,11 +116,10 @@ onMounted(() => {
   resize()
   window.addEventListener('resize', resize)
   window.addEventListener('mousemove', onMove)
-  raf = requestAnimationFrame(frame)
 })
+useRafLoop(frame, { fps: 30 }) // 不可见自动暂停 + 限 30fps
 
 onUnmounted(() => {
-  cancelAnimationFrame(raf)
   window.removeEventListener('resize', resize)
   window.removeEventListener('mousemove', onMove)
 })

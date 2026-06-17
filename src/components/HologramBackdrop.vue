@@ -1,12 +1,12 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { onMounted, onUnmounted, ref } from 'vue'
+import { useRafLoop } from '../composables/useRafLoop'
 
 // 浅色全息玻璃背景:浅蓝灰通透底 + 柔彩光晕 + 磨砂玻璃面板(CSS)
 //   + 数据粒子连线 + 右下角小雷达(canvas)。中心留白,给旺财让位。
 const cv = ref<HTMLCanvasElement | null>(null)
 const root = ref<HTMLElement | null>(null)
 let ctx: CanvasRenderingContext2D | null = null
-let raf = 0
 let w = 0, h = 0, dpr = 1, last = 0, t = 0
 
 interface Node { x: number; y: number; vx: number; vy: number }
@@ -80,8 +80,6 @@ function frame(ts: number) {
   ctx.fillStyle = g; ctx.fill()
   ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + Math.cos(sweep) * R, cy + Math.sin(sweep) * R)
   ctx.strokeStyle = 'rgba(50,130,190,0.5)'; ctx.lineWidth = 1.2; ctx.stroke()
-
-  raf = requestAnimationFrame(frame)
 }
 
 function onMove(e: MouseEvent) {
@@ -98,13 +96,12 @@ onMounted(() => {
   resize()
   window.addEventListener('resize', resize)
   window.addEventListener('mousemove', onMove)
-  raf = requestAnimationFrame(frame)
 })
 onUnmounted(() => {
-  cancelAnimationFrame(raf)
   window.removeEventListener('resize', resize)
   window.removeEventListener('mousemove', onMove)
 })
+useRafLoop(frame, { fps: 30 }) // 不可见自动暂停 + 限 30fps
 </script>
 
 <template>
