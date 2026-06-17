@@ -285,6 +285,12 @@
   - **卸载清自启残留**:开机自启的注册表项是 `tauri-plugin-autostart`(auto-launch 0.5.0)**运行时**写的、安装器不认 → 默认卸载会残留孤儿启动项。补 `src-tauri/installer-hooks.nsh`(`NSIS_HOOK_POSTUNINSTALL`)删 auto-launch 在 Windows 写的**两条**键(值名 = `package_info().name` = 产品名 `larkwing`):`…\CurrentVersion\Run`(启动项)+ `…\Explorer\StartupApproved\Run`(任务管理器「已启用」覆盖位)。`nsis.installMode=currentUser` 保证卸载器以当前用户身份跑、HKCU 命中正确。**改 `productName` 要同步改钩子里的值名**。
   - **正式版默认开机自启**:首启在 `lib.rs` setup 里按产品默认 `enable()` **一次**(内部标记 `system.autostart.defaulted`,app 级、**不进 `APP_SETTING_KEYS`**、直接走 `store.settings`),之后全交设置页开关(关闭入口已有);用 auto-launch 自己的 `enable()`(而非装机写注册表)保证与 `is_enabled()`/`disable()` **零漂移**(§6.8)。**仅正式版生效**(`!cfg!(debug_assertions)`):dev 自启指向临时调试程序、连不上本地前端(前端开关同样 dev 禁用),日常 Mac 开发不被塞 LaunchAgent。标记落了不再自动开 → 不与用户日后手动关掉打架。
   - **只能 Windows 正式版真机验**(§8.1,新增 watch-item):装 → 首开自动进自启 → 重启确认静默缩托盘 → 设置关 → 重启确认没起 → 卸载后 `reg query` 那两条键皆无。
+- **发布流程 / 版本说明(「发布介绍」)**(2026-06-17 落地):
+  - **版本号 5 处手工同步**:`src-tauri/tauri.conf.json`(权威,Release 标题取它)· `src-tauri/Cargo.toml` · `larkwing-core/Cargo.toml` · `package.json` · `Cargo.lock`(改前四个后 `cargo check` 自动同步)。
+  - **「发布介绍」= CHANGELOG.md 驱动、CI 自动填**:`CHANGELOG.md` 每版一节 `## x.y.z — 日期`;release.yml 的「取本版本更新日志」步骤在打 tag 时抽「`## <tag 去 v>` 到下一个 `## 数字`」之间的内容,喂给 tauri-action 的 `releaseBody`(`shell:bash` 跨 mac/win;抽不到则兜底一句)。**发新版只需在 CHANGELOG 顶部加一节,Release 正文自动带上、不再手填**;tag 早于该机制的旧版本(如首个 0.1.1)其草稿正文为空,手贴 CHANGELOG 对应节即可。
+  - **触发 = push tag `v*`**:`git tag vX.Y.Z && git push origin main vX.Y.Z` → tauri-action(`releaseName: Larkwing __VERSION__` 自动取 tauri.conf 版本、`releaseDraft:true`、`prerelease:false`)建 **draft** Release 并挂安装包。**draft = 真机验收闸**:下 Windows 包验自启全链(见上条 watch-item)→ 验过再手动 **Publish**。
+  - **CI 平台 = mac + windows**(release.yml matrix,Linux/ubuntu 已砍)→ Release 只出 macOS `.dmg` + Windows `.exe`;`tauri.conf` 的 `bundle.targets` 仍留 `deb/rpm/appimage`,无 Linux runner 时空转无害、加回 Linux 即生效。
+  - **trunk-based**:代码 / tag 直接进 `main`(无 PR / 分支流);本机未装 `gh`,Release 走网页操作(SSH 推送,§见记忆 HTTPS 被代理挡)。
 
 ### 7.7 远程渠道:Telegram / 钉钉 bot(2026-06-17 落地;手机上跟旺财对话)
 - **物种 = 交互渠道(§5 species ②)**,不是工具:引擎边界适配器 + **复用 turn loop**,不碰 ToolCtx、不内嵌人格。core 新模块 `channels/`(`telegram.rs` / `dingtalk.rs` 一渠道一文件 + 监督器),**单 crate 不拆**;壳层只 `ChannelSup` 监督(boot 起 / `reload_channels` 停旧起新,顶层 spawn 用 tauri runtime——core 不依赖 tauri,§6.1)。
