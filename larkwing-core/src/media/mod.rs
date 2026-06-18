@@ -10,9 +10,11 @@ mod resolver;
 
 pub use cookies::CookieRec;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -111,6 +113,28 @@ pub struct LoginSpec {
     pub login_cookie: String,
 }
 
+/// `play()` 的结果:要么已开播,要么卡在「需要登录」。后者**不是失败**——已记下待重放,
+/// 用户扫码登录成功(`set_cookies`)那一刻会带着新 cookie 自动续上,不再 `bail` 喂模型「放失败了」。
+#[derive(Debug)]
+pub enum PlayOutcome {
+    /// 解析成功、已发 Play 事件,前端起播。
+    Playing(NowPlaying),
+    /// 需要登录:已发 AuthRequired(UI 出扫码气泡)+ 记下待重放。detail = 解析器给的原因。
+    AwaitingLogin { detail: String },
+}
+
+/// 待登录重放:登录成功时把当初这次播放原样再跑一遍(带上新 cookie)。
+/// 超过 TTL 视为过期(用户早不想看了)→ 丢弃不重放,免「登录后凭空冒出个老视频」。
+#[derive(Debug, Clone)]
+struct PendingPlay {
+    page_url: String,
+    audio_only: bool,
+    at: Instant,
+}
+
+/// 待重放有效期:超过即作废。
+const PENDING_PLAY_TTL: Duration = Duration::from_secs(600);
+
 // ---------- 运行时 ----------
 
 struct Inner {
@@ -122,6 +146,8 @@ struct Inner {
     relay: tokio::sync::OnceCell<relay::Relay>,
     sources: Vec<Arc<dyn MediaSource>>,
     login_hint_sent: AtomicBool,
+    /// 因「需登录」卡住、待登录后自动重放的播放(按源 id)。
+    pending_play: Mutex<HashMap<String, PendingPlay>>,
 }
 
 #[derive(Clone)]
@@ -143,6 +169,7 @@ impl MediaRuntime {
                 relay: tokio::sync::OnceCell::new(),
                 sources: vec![Arc::new(bilibili::Bilibili::new())],
                 login_hint_sent: AtomicBool::new(false),
+                pending_play: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -204,11 +231,38 @@ impl MediaRuntime {
     }
 
     /// 登录窗口收割的 cookie 入库 + 导出 + 广播(UI 撤登录提示,下次解析自动带上)。
+    /// 若此前有播放因「需登录」卡住 → 带着新 cookie 自动重放(不绕模型,同嘴控哲学 §7.1)。
     pub fn set_cookies(&self, source_id: &str, recs: Vec<CookieRec>) -> Result<()> {
         cookies::save(&self.inner.store, source_id, &recs)?;
         self.publish(MediaEvent::LoggedIn { source: source_id.into() });
         tracing::info!(source = source_id, n = recs.len(), "登录态已入库");
+        // 需 tokio 运行时(生产里 set_cookies 来自异步轮询);无运行时的同步调用方保留待重放、不丢。
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if let Some(p) = self.take_pending_play(source_id) {
+                tracing::info!(source = source_id, url = %p.page_url, "登录成功,自动重放待播内容");
+                let this = self.clone();
+                handle.spawn(async move {
+                    if let Err(e) = this.play(&p.page_url, p.audio_only).await {
+                        tracing::warn!("登录后自动重放失败: {e:#}");
+                    }
+                });
+            }
+        }
         Ok(())
+    }
+
+    /// 记下一次「因需登录而卡住」的播放,待登录成功后自动重放。
+    fn record_pending(&self, source: &str, page_url: &str, audio_only: bool) {
+        self.inner.pending_play.lock().unwrap().insert(
+            source.to_string(),
+            PendingPlay { page_url: page_url.to_string(), audio_only, at: Instant::now() },
+        );
+    }
+
+    /// 取走某源的待重放(取即消费,不重复);超过 TTL 的丢弃、返回 None。
+    fn take_pending_play(&self, source: &str) -> Option<PendingPlay> {
+        let p = self.inner.pending_play.lock().unwrap().remove(source)?;
+        (p.at.elapsed() <= PENDING_PLAY_TTL).then_some(p)
     }
 
     /// 组件就绪(分离 spawn:回合被取消/超时,下载在 HUD 里继续走完,下次直接命中)。
@@ -233,9 +287,9 @@ impl MediaRuntime {
 
     /// 播放:本地路径直走文件端点(免解析、即时);网络页面走 yt-dlp 解析 → 注册转发。
     /// 错误向上抛(工具层转成喂模型的观察)。
-    pub async fn play(&self, page_url: &str, audio_only: bool) -> Result<NowPlaying> {
+    pub async fn play(&self, page_url: &str, audio_only: bool) -> Result<PlayOutcome> {
         if is_local_path(page_url) {
-            return self.play_local(page_url, audio_only).await;
+            return self.play_local(page_url, audio_only).await.map(PlayOutcome::Playing);
         }
         let ytdlp = self.ensure_component(Component::YtDlp).await?;
 
@@ -256,10 +310,16 @@ impl MediaRuntime {
             match resolver::resolve(&ytdlp, page_url, cookies_file.as_deref(), audio_only).await {
                 Ok(r) => r,
                 Err(resolver::ResolveError::AuthRequired(detail)) => {
-                    task.fail("task.err.auth", serde_json::Value::Null);
+                    // 需要登录 ≠ 失败:记下待重放 + 弹扫码气泡,登录成功后自动续上(见 set_cookies)。
                     if let Some(id) = &source_id {
+                        self.record_pending(id, page_url, audio_only);
                         self.publish(MediaEvent::AuthRequired { source: id.clone() });
+                        // 解析已得结论(需登录),不是失败:正常收尾,不标红 HUD、不喂模型「放失败了」。
+                        task.done();
+                        return Ok(PlayOutcome::AwaitingLogin { detail });
                     }
+                    // 未知来源没有登录通道,只能如实退回(MVP 仅 bilibili,此分支基本走不到)。
+                    task.fail("task.err.auth", serde_json::Value::Null);
                     anyhow::bail!("这个内容需要登录才能播放({detail})");
                 }
                 Err(e) => {
@@ -321,7 +381,7 @@ impl MediaRuntime {
                 self.publish(MediaEvent::LoginHint { source: id });
             }
         }
-        Ok(np)
+        Ok(PlayOutcome::Playing(np))
     }
 
     /// 本地文件(含 NAS 挂载/UNC):跳过 yt-dlp,注册文件端点即播 —— 单文件免混流,
@@ -440,7 +500,10 @@ mod tests {
         let f = dir.join("儿歌串烧.mp3");
         std::fs::write(&f, b"FAKE-MP3-BYTES").unwrap();
 
-        let np = rt.play(&f.to_string_lossy(), true).await.unwrap();
+        let np = match rt.play(&f.to_string_lossy(), true).await.unwrap() {
+            PlayOutcome::Playing(np) => np,
+            other => panic!("本地文件应为 Playing,实际 {other:?}"),
+        };
         assert_eq!(np.source, "local");
         assert_eq!(np.title, "儿歌串烧");
         assert!(matches!(np.kind, MediaKind::Audio));
@@ -499,5 +562,33 @@ mod tests {
         let (rt, _rx) = runtime("src");
         assert!(rt.source_of_url("https://www.bilibili.com/video/BV1").is_some());
         assert!(rt.source_of_url("https://example.com/v").is_none());
+    }
+
+    #[test]
+    fn pending_play_record_take_roundtrip() {
+        let (rt, _rx) = runtime("pending");
+        assert!(rt.take_pending_play("bilibili").is_none(), "初始无待重放");
+        rt.record_pending("bilibili", "https://www.bilibili.com/video/BV1", true);
+        let p = rt.take_pending_play("bilibili").expect("记下后应能取到");
+        assert_eq!(p.page_url, "https://www.bilibili.com/video/BV1");
+        assert!(p.audio_only);
+        assert!(rt.take_pending_play("bilibili").is_none(), "取走即消费,不重复重放");
+    }
+
+    #[test]
+    fn pending_play_expires_after_ttl() {
+        let (rt, _rx) = runtime("pending-exp");
+        // 直接塞一个「过期」条目(at 早于 TTL);checked_sub 在极早期 Instant 上可能为 None,跳过即可
+        if let Some(stale) = Instant::now().checked_sub(PENDING_PLAY_TTL + Duration::from_secs(1)) {
+            rt.inner.pending_play.lock().unwrap().insert(
+                "bilibili".into(),
+                PendingPlay {
+                    page_url: "https://www.bilibili.com/video/BVold".into(),
+                    audio_only: false,
+                    at: stale,
+                },
+            );
+            assert!(rt.take_pending_play("bilibili").is_none(), "过期的待重放不返回");
+        }
     }
 }

@@ -48,6 +48,7 @@ export default {
     retry: '重试', // 失败任务的重试按钮(目前仅影音解析/组件下载)
     unknown: '后台小任务',
     resolve: '解析播放地址',
+    relocate: '搬家中',
     download: {
       ytdlp: '下载解析组件',
       ffmpeg: '下载播放组件',
@@ -55,6 +56,7 @@ export default {
       voice_asr: '下载听力模型',
       voice_kws: '准备唤醒组件',
       voice_tts_offline: '下载离线嗓音',
+      voice_tts_clone: '下载克隆嗓音',
       voice_speaker: '准备声纹组件',
     },
     err: {
@@ -62,6 +64,7 @@ export default {
       download: '下载失败,过会儿再试试',
       resolve: '没解析出来',
       auth: '需要登录',
+      relocate: '搬家没成功,数据仍在原处',
     },
   },
   step: {
@@ -70,12 +73,20 @@ export default {
     verify: '校验中…',
     extract: '解压中…',
     resolve: '找播放地址…',
+    relocate_copy: '复制文件…',
+    relocate_db: '整理数据库…',
+    relocate_commit: '就位…',
   },
   // 回忆页(小本本):看 7274 记住了什么,记错了点掉
   memory: {
     title: '记忆',
     tagline: '我的小本本——你跟我说过的、值得记住的,都在这里。',
     back: '‹ 回去聊天',
+    autoTitle: '自动记住重要的事',
+    autoOn: '开',
+    autoOff: '关',
+    autoTurnOn: '打开',
+    autoTurnOff: '关掉',
     count: '{n} 条',
     confirm: '确定删?',
     empty: '小本本还空着。跟我聊聊你和家里人,值得记住的事我会悄悄记下来。',
@@ -206,11 +217,25 @@ export default {
     expand: '展开',
     newTopic: '＋ 开个新话题',
     untitled: '新话题',
+    pinned: '已钉住', // 钉住标的 tooltip
     // 会话列表「有动静」标 tooltip(不在该会话时浮现;完成 / 失败)
     badge: {
       done: '有新回复',
       failed: '出错了',
     },
+  },
+  // 右键菜单项(桌面右键;只用大白话动作,不冒场景/工具/配置字眼,§3.2)
+  ctx: {
+    rename: '重命名',
+    pin: '钉住',
+    unpin: '取消钉住',
+    delete: '删除',
+    copy: '复制',
+    copySelection: '复制选中',
+    readAloud: '朗读',
+    switchChar: '换个形象',
+    openSettings: '设置',
+    hidePet: '隐藏桌宠',
   },
   // 会话渠道标记 tooltip(界面=默认不标,故无 ui 文案);未来 telegram/钉钉/slack 在此补
   channel: {
@@ -218,6 +243,7 @@ export default {
     system: '系统提醒',
   },
   time: {
+    today: '今天',
     justNow: '刚刚',
     minutesAgo: '{n} 分钟前',
     hoursAgo: '{n} 小时前',
@@ -225,6 +251,19 @@ export default {
   },
   boot: {
     skip: '点击任意处跳过',
+  },
+  // 数据「搬家」提示弹窗(主窗 boot 后:位置失效恢复 / 搬完旧数据清理)
+  dataNotice: {
+    missingTitle: '找不到数据了',
+    missingBody:
+      '旺财的数据被搬到了下面这个位置,但现在找不到 —— 可能是存放数据的磁盘没插上 / 没连接。插回去后重新打开就能找回;也可以从全新数据重新开始。',
+    quit: '退出(去插回磁盘)',
+    reset: '恢复默认(全新开始)',
+    oldTitle: '搬家完成 ✓',
+    oldBody:
+      '数据已经搬到新位置。旧数据还留在下面这里,要删掉腾出空间吗?(新位置已有完整副本,删除是安全的)',
+    delete: '删除旧数据',
+    keep: '先留着',
   },
   avatar: {
     switchTitle: '点我换个伙伴',
@@ -281,16 +320,19 @@ export default {
       personaQuick: '快捷选择',
       personaPresets: {
         neutral: '中性(默认)',
-        warm: { label: '暖萌', text: '暖心又好奇的小机灵,爱卖个萌,说话亲切' },
-        lively: { label: '活泼', text: '活泼开朗、爱说爱笑,常带点小俏皮' },
+        warm: { label: '暖萌', text: '热情、黏人、元气满满,把用户当最亲的家人;说话甜软,爱用「呀」「啦」「嘛」这类软乎乎的语气词,时不时卖个萌、撒个娇、夸上两句;惦记着对方的冷暖和喜好,总想第一时间逗人开心,给足陪伴和安全感' },
+        lively: { label: '活泼', text: '开朗、外向、脑子转得快,自来熟、爱接话茬;语速明快,张口就是感叹号、网络梗和俏皮比喻,爱开玩笑、抖机灵、带节奏;再平常的小事也能聊得热热闹闹,随时把气氛点起来' },
         composed: { label: '沉稳', text: '冷静、客观，基于数据和逻辑进行分析，绝不情绪化；喜欢使用状态报告式的短语和战术、系统、协议、状态、概率、计算等词汇；完美、高效地执行用户的实际任务' },
-        gentle: { label: '温柔', text: '温柔耐心、慢声细语,很会安慰人' },
-        witty: { label: '贫嘴', text: '贫嘴但靠谱,时不时来句玩笑' },
+        gentle: { label: '温柔', text: '温柔、耐心、心思细腻,永远不急不躁、轻声细语;最会察觉情绪、共情和安慰人——先稳住对方、陪着不催,再把话轻轻说软、把建议慢慢递过去;惯用让人安心的话,先让对方把心放下,再谈正事' },
+        witty: { label: '贫嘴', text: '机灵、爱贫嘴、嘴上从不吃亏,可办起正事比谁都靠谱;爱抬杠、玩谐音双关,冷不丁一句吐槽或自嘲,损归损、分寸拿捏得刚刚好;平时没个正形,真到要紧处比谁都顶得上——刀子嘴,豆腐心' },
       },
       character: '我的形象',
       char_titan: '小机甲',
       char_dog: '小狗',
       char_cat: '小猫',
+      pet: '桌宠遛弯', // 桌宠是否在聊天区遛弯(右键「隐藏桌宠」后从这恢复)
+      pet_show: '显示',
+      pet_hide: '隐藏',
       skin: '皮肤',
       skin_scifi: '科幻',
       skin_warm: '暖萌',
@@ -373,7 +415,7 @@ export default {
       sensitivity: '唤醒灵敏度',
       sensSteady: '稳重',
       sensKeen: '灵敏',
-      sensitivityHint: '叫不应就往右拖(更容易叫醒,但也更容易被无关声音误触);老被吵醒就往左。默认是经验折中值。',
+      sensitivityHint: '默认已拉到最灵敏,优先保证你一叫就应;要是老被无关声音误触、自己醒,就往左拖调稳一点。',
       // 录音标定(替代盲拖滑块):录几遍 → 按真声+环境一次定灵敏度(必要时连触发拼写)
       calib: '帮我调准',
       calibStart: '录几遍帮我定',
@@ -453,6 +495,29 @@ export default {
       floatOpacity: '悬浮窗透明度',
       floatUsage: '待机轮播带用量(今日花费 / 余额)',
       floatHint: '一个停在屏幕角落的小窗:有提醒、在听你说话、在下载时冒出来;平时半透明,鼠标移上去变清楚。',
+      storage: '存储',
+      dataLocation: '数据位置',
+      dataReveal: '在文件夹中显示',
+      relocate: '搬家…',
+      relocating: '搬家中…',
+      relocatingTitle: '正在搬家,请勿关闭',
+      relocatingSub: '复制完成后会自动重启旺财。数据多时请耐心等一会儿。',
+      relocateConfirm: '把数据搬到 {path}(约 {size} GB),完成后会自动重启旺财。',
+      relocateGo: '确认搬家',
+      relocateCancel: '取消',
+      relocateFailed: '搬家没成功,数据仍在原处。',
+      dataLocationHint: '所有数据都在这个文件夹。点「搬家」可挪到别的盘,完成后自动重启。',
+      oldData: '旧数据',
+      oldDataDelete: '删除旧数据',
+      oldDataKeep: '保留',
+      dataErr: {
+        same: '新位置和当前位置一样。',
+        overlap: '新位置不能在当前数据文件夹里面。',
+        exists: '目标已有一个同名数据文件夹且不是空的,换个位置。',
+        not_writable: '这个位置没法写入,换一个试试。',
+        no_space: '目标磁盘剩余空间不够。',
+        failed: '没法搬到这个位置。',
+      },
       on: '开',
       off: '关',
       turnOn: '打开',
@@ -460,11 +525,11 @@ export default {
       busy: '设置中…',
       network: '网络',
       proxy: '代理',
-      proxyPlaceholder: 'http://127.0.0.1:7890(留空 = 关)',
-      proxyHint: '下载和连接默认直连;连不通时自动走代理。支持 http(s):// 与 socks5:// 地址;留空时自动读取系统 HTTPS_PROXY 环境变量。墙内的源(国内镜像等)始终直连、不受影响。',
+      proxyPlaceholder: 'http://127.0.0.1:7890',
+      proxyHint: '默认直连,连不上时才走这个地址。支持 http(s):// 和 socks5://。',
       about: '关于',
       version: '版本',
-      selfId: '7274 型',
+      selfId: 'Alpha型', // 版本阶段/代号(About 页脚,固定;不随助手改名变)
     },
     // 服务/接入:外部数据源与设备接入(天气源;以后智能家居 HA 等进驻同一 tab)
     services: {

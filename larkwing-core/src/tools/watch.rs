@@ -84,15 +84,18 @@ impl Tool for WatchSet {
     }
 
     async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
-        let content: String = args
+        let content = args
             .get("content")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .context("缺少 content 参数")?
-            .chars()
-            .take(CONTENT_MAX_CHARS)
-            .collect();
+            .to_string();
+        // 超长不静默截断(§3.5):退回错误,让模型精简后重试。
+        let n = content.chars().count();
+        if n > CONTENT_MAX_CHARS {
+            anyhow::bail!("提醒内容 {n} 字,超过 {CONTENT_MAX_CHARS} 字上限,没有设。请精简后重试。");
+        }
         let metric = args.get("metric").and_then(serde_json::Value::as_str).unwrap_or("");
         if !["low_temp", "high_temp", "rain"].contains(&metric) {
             anyhow::bail!("未知 metric: {metric},可用 low_temp/high_temp/rain");
@@ -244,5 +247,20 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("有雨雪"));
+    }
+
+    #[tokio::test]
+    async fn watch_set_rejects_overlong_content() {
+        let ctx = ctx("overlong");
+        let tool = WatchSet::new(Arc::new(WeatherClient::new()));
+        let too_long = "九".repeat(CONTENT_MAX_CHARS + 50);
+        // 内容超长 → 退回错误,不静默截断(§3.5)
+        assert!(tool
+            .run(
+                serde_json::json!({"content": too_long, "metric": "rain", "op": "is", "city": "x"}),
+                &ctx
+            )
+            .await
+            .is_err());
     }
 }

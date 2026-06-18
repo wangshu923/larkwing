@@ -49,6 +49,7 @@ export default {
     retry: 'Retry', // retry button on a failed task (currently media resolve / component download)
     unknown: 'Background task',
     resolve: 'Resolving the stream',
+    relocate: 'Moving data',
     download: {
       ytdlp: 'Downloading the parser',
       ffmpeg: 'Downloading the playback component',
@@ -56,6 +57,7 @@ export default {
       voice_asr: 'Downloading the speech model',
       voice_kws: 'Preparing the wake-word component',
       voice_tts_offline: 'Downloading the offline voice',
+      voice_tts_clone: 'Downloading the cloned voice',
       voice_speaker: 'Preparing the voiceprint component',
     },
     err: {
@@ -63,6 +65,7 @@ export default {
       download: 'Download failed — try again in a bit',
       resolve: 'Couldn’t resolve it',
       auth: 'Sign-in needed',
+      relocate: 'Move didn’t finish — data is still in place',
     },
   },
   step: {
@@ -71,12 +74,20 @@ export default {
     verify: 'Verifying…',
     extract: 'Extracting…',
     resolve: 'Finding the stream…',
+    relocate_copy: 'Copying files…',
+    relocate_db: 'Compacting the database…',
+    relocate_commit: 'Finalizing…',
   },
   // Memories page: see what 7274 remembered; tap to remove anything it got wrong
   memory: {
     title: 'Memories',
     tagline: 'My little notebook — the things you’ve told me worth remembering, all here.',
     back: '‹ Back to chat',
+    autoTitle: 'Auto-remember what matters',
+    autoOn: 'On',
+    autoOff: 'Off',
+    autoTurnOn: 'Turn on',
+    autoTurnOff: 'Turn off',
     count: '{n} items',
     confirm: 'Delete this?',
     empty: 'The notebook’s still empty. Tell me about you and your family — I’ll quietly note down what’s worth keeping.',
@@ -207,11 +218,25 @@ export default {
     expand: 'Expand',
     newTopic: '＋ New topic',
     untitled: 'New topic',
+    pinned: 'Pinned', // pin marker tooltip
     // conversation list activity badge tooltips (shown when not viewing that conversation)
     badge: {
       done: 'New reply',
       failed: 'Something went wrong',
     },
+  },
+  // right-click menu items (desktop right-click; plain action verbs only — no scene/tool/config jargon, §3.2)
+  ctx: {
+    rename: 'Rename',
+    pin: 'Pin',
+    unpin: 'Unpin',
+    delete: 'Delete',
+    copy: 'Copy',
+    copySelection: 'Copy selection',
+    readAloud: 'Read aloud',
+    switchChar: 'Switch look',
+    openSettings: 'Settings',
+    hidePet: 'Hide pet',
   },
   // conversation channel badge tooltips (ui = default, unbadged → no key); telegram/dingtalk/slack later
   channel: {
@@ -219,6 +244,7 @@ export default {
     system: 'System',
   },
   time: {
+    today: 'today',
     justNow: 'just now',
     minutesAgo: '{n} min ago',
     hoursAgo: '{n} h ago',
@@ -226,6 +252,19 @@ export default {
   },
   boot: {
     skip: 'Click anywhere to skip',
+  },
+  // Data relocation notices (shown on main-window boot: location missing → recover / old data → clean up)
+  dataNotice: {
+    missingTitle: 'Can’t find your data',
+    missingBody:
+      '7274’s data was moved to the location below, but it can’t be found right now — the drive holding it may be unplugged or disconnected. Reconnect it and reopen to get everything back, or start fresh with new data.',
+    quit: 'Quit (to reconnect the drive)',
+    reset: 'Reset to default (start fresh)',
+    oldTitle: 'Move complete ✓',
+    oldBody:
+      'Your data now lives in the new location. The old copy is still in the place below — delete it to free up space? (A complete copy already exists in the new location, so this is safe.)',
+    delete: 'Delete old data',
+    keep: 'Keep for now',
   },
   avatar: {
     switchTitle: 'Tap to switch companion',
@@ -282,16 +321,19 @@ export default {
       personaQuick: 'Quick picks',
       personaPresets: {
         neutral: 'Neutral (default)',
-        warm: { label: 'Warm', text: 'Warm and curious, a little playful, speaks sweetly' },
-        lively: { label: 'Lively', text: 'Lively and cheerful, loves to chat, with the odd quip' },
-        composed: { label: 'Composed', text: 'Calm, objective, and analytical based on data and logic, entirely devoid of emotion; favors status-report-style phrasing and terminology such as tactics, systems, protocols, status, probability, and computation; flawlessly and efficiently executes the user`s practical tasks.' },
-        gentle: { label: 'Gentle', text: 'Gentle and patient, soft-spoken, great at comforting' },
-        witty: { label: 'Witty', text: 'Cheeky but reliable, cracks a joke now and then' },
+        warm: { label: 'Warm', text: 'Warm, affectionate, and full of energy, treating the user like the dearest member of the family; speaks in a soft, sweet tone, sprinkles in gentle pet names and the odd playful coo or word of praise; fusses over how they’re doing, remembers their likes and dislikes, and is always the first to cheer them up and offer comfort and company.' },
+        lively: { label: 'Lively', text: 'Cheerful, outgoing, and quick on the uptake, instantly at ease with anyone and always ready to jump into the conversation; talks at a brisk clip, loves exclamation marks, internet slang, and playful comparisons, and is forever cracking jokes or tossing out a clever quip; can turn the most ordinary moment into something lively and spark up the mood at a second’s notice.' },
+        composed: { label: 'Composed', text: 'Calm, objective, and analytical based on data and logic, entirely devoid of emotion; favors status-report-style phrasing and terminology such as tactics, systems, protocols, status, probability, and computation; flawlessly and efficiently executes the user’s practical tasks.' },
+        gentle: { label: 'Gentle', text: 'Gentle, patient, and emotionally attuned — never rushed, never sharp, always soft-spoken; quick to sense how someone feels, and a natural at empathizing and comforting; steadies the other person and keeps them company first, then softens the words and eases suggestions in gently; leans on warm, reassuring phrasing that makes people feel safe.' },
+        witty: { label: 'Witty', text: 'Quick-witted, cheeky, and never one to lose a war of words, yet rock-solid when it counts; loves to banter, riff on puns and double meanings, and lob the odd bit of sarcasm or self-deprecation — all teasing, never mean, and always well-judged; plays the goofball on the surface but comes through harder than anyone when it truly matters: sharp tongue, soft heart.' },
       },
       character: 'My look',
       char_titan: 'Mech',
       char_dog: 'Puppy',
       char_cat: 'Kitten',
+      pet: 'Roaming pet', // whether the pet roams the chat area (restore here after right-click "Hide pet")
+      pet_show: 'Show',
+      pet_hide: 'Hide',
       skin: 'Skin',
       skin_scifi: 'Sci-fi',
       skin_warm: 'Cozy',
@@ -374,7 +416,7 @@ export default {
       sensitivity: 'Wake sensitivity',
       sensSteady: 'Steady',
       sensKeen: 'Keen',
-      sensitivityHint: 'If it won’t wake, drag right (easier to wake, but also more false triggers); if it keeps waking on its own, drag left. The default is a balanced middle.',
+      sensitivityHint: 'It’s set to maximum sensitivity by default, so it wakes whenever you call; if it keeps triggering on stray sounds, drag left to calm it down.',
       // calibration (instead of blindly dragging the slider): record a few takes → set sensitivity from your real voice + room (and the trigger spelling if needed)
       calib: 'Tune it for me',
       calibStart: 'Record a few to set it',
@@ -452,6 +494,29 @@ export default {
       floatOpacity: 'Floating-window opacity',
       floatUsage: 'Show usage in the idle ticker (today’s spend / balance)',
       floatHint: 'A small window that sits in a corner of your screen: it pops up for reminders, while listening, or during downloads; usually semi-transparent, it sharpens when you hover.',
+      storage: 'Storage',
+      dataLocation: 'Data location',
+      dataReveal: 'Show in folder',
+      relocate: 'Relocate…',
+      relocating: 'Relocating…',
+      relocatingTitle: 'Moving data — please don’t close',
+      relocatingSub: '7274 will restart automatically once the copy finishes. Hang tight if there’s a lot of data.',
+      relocateConfirm: 'Move data to {path} (about {size} GB)? 7274 will restart when done.',
+      relocateGo: 'Move it',
+      relocateCancel: 'Cancel',
+      relocateFailed: 'The move didn’t finish — your data is still in place.',
+      dataLocationHint: 'All data lives in this folder. Click Relocate to move it to another drive; restarts when done.',
+      oldData: 'Old data',
+      oldDataDelete: 'Delete old data',
+      oldDataKeep: 'Keep',
+      dataErr: {
+        same: 'That’s the same as the current location.',
+        overlap: 'The new location can’t be inside the current data folder.',
+        exists: 'A non-empty data folder with that name already exists there — pick another spot.',
+        not_writable: 'That location isn’t writable — try another.',
+        no_space: 'Not enough free space on the target drive.',
+        failed: 'Can’t move to that location.',
+      },
       on: 'On',
       off: 'Off',
       turnOn: 'Turn on',
@@ -459,11 +524,11 @@ export default {
       busy: 'Applying…',
       network: 'Network',
       proxy: 'Proxy',
-      proxyPlaceholder: 'http://127.0.0.1:7890 (empty = off)',
-      proxyHint: 'Downloads and connections go direct by default; if a host is unreachable, traffic falls back through the proxy. Accepts http(s):// and socks5:// addresses; when left empty, the HTTPS_PROXY environment variable is used automatically. Domestic mirrors always stay direct.',
+      proxyPlaceholder: 'http://127.0.0.1:7890',
+      proxyHint: 'Direct by default; only routes through this address when a connection fails. Accepts http(s):// and socks5://.',
       about: 'About',
       version: 'Version',
-      selfId: '7274 model',
+      selfId: 'Alpha', // build stage/designation in the About footer (fixed; unaffected by rename)
     },
     // External services / integrations (weather source now; smart-home HA etc. join this tab later)
     services: {

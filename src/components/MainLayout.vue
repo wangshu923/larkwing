@@ -1,38 +1,23 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
-import dogIdle from '../assets/dog-idle.png'
-import dogRun1 from '../assets/dog-run-1.png'
-import dogRun2 from '../assets/dog-run-2.png'
-import dogRun3 from '../assets/dog-run-3.png'
-import dogRun4 from '../assets/dog-run-4.png'
-import dogRun5 from '../assets/dog-run-5.png'
-import catIdle from '../assets/cat-idle.png'
-import catRun1 from '../assets/cat-run-1.png'
-import catRun2 from '../assets/cat-run-2.png'
-import catRun3 from '../assets/cat-run-3.png'
-import catRun4 from '../assets/cat-run-4.png'
-import catRun5 from '../assets/cat-run-5.png'
-import titanIdle1 from '../assets/titan-idle-1.png'
-import titanIdle2 from '../assets/titan-idle-2.png'
-import titanRun1 from '../assets/titan-run-1.png'
-import titanRun2 from '../assets/titan-run-2.png'
-import titanRun3 from '../assets/titan-run-3.png'
-import titanRun4 from '../assets/titan-run-4.png'
 import { useI18n } from 'vue-i18n'
 import { useChat, type TurnStats, type UiMessage, type UiAttachment } from '../composables/useChat'
 import { useSettings } from '../composables/useSettings'
 import { onTranscribed, useVoice } from '../composables/useVoice'
 import { useSpeech } from '../composables/useSpeech'
-import { useRafLoop } from '../composables/useRafLoop'
+import { useContextMenu } from '../composables/useContextMenu'
+import { useCharacter } from '../composables/useCharacter'
 import { fmtMs, fmtTokens, fmtUsd } from '../lib/fmt'
 import { openExternal } from '../lib/backend'
 import { renderMarkdown } from '../lib/md'
+import { copyText } from '../lib/clipboard'
 import MemoryView from '../views/MemoryView.vue'
 import OpsView from '../views/OpsView.vue'
 import RemindersView from '../views/RemindersView.vue'
 import SettingsView from '../views/SettingsView.vue'
 import PlayerBar from './PlayerBar.vue'
 import UsageStrip from './UsageStrip.vue'
+import PetRoamer from './PetRoamer.vue'
 
 // 主界面骨架。数据源 = useChat(VM):Tauri 壳里走真 IPC,纯浏览器预览自动降级假数据。
 defineProps<{ booting?: boolean }>()
@@ -46,13 +31,98 @@ const petName = computed(() => settings.get('ui.pet_name') || t('pet.name'))
 const textScale = computed(() => (settings.get('ui.text_scale') === 'large' ? '16.5px' : '14px'))
 const activeRail = ref<'chat' | 'reminders' | 'memory' | 'ops' | 'settings'>('chat')
 
-const { state: chat, send: chatSend, cancel, selectConversation, newConversation, ensureVoiceConv, saveApiKey, dequeue, inject } = useChat()
+const { state: chat, send: chatSend, cancel, selectConversation, newConversation, ensureVoiceConv, saveApiKey, dequeue, inject, renameConversation, togglePinConversation, deleteConversation } = useChat()
 const messages = computed(() => chat.messages)
+
+// 日期分隔条文案:今天 / 昨天 / 月-日(跨年带年份)。core 不产文案,这里走 i18n。
+function dayLabel(ts: number): string {
+  const d = new Date(ts)
+  const now = new Date()
+  const yest = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1)
+  if (d.toDateString() === now.toDateString()) return t('time.today')
+  if (d.toDateString() === yest.toDateString()) return t('time.yesterday')
+  return d.getFullYear() === now.getFullYear()
+    ? `${d.getMonth() + 1}/${d.getDate()}`
+    : `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`
+}
+
+// 消息流布局派生(模板照旧 v-for messages,不改结构):① 跨天在该条前插日期分隔条;
+// ② 相邻同角色打 .cont(收紧间距,读出"一轮里连续几句")。都按 message id 索引。
+const streamLayout = computed(() => {
+  const sep: Record<number, string> = {}
+  const cont = new Set<number>()
+  let lastDay = ''
+  let lastRole = ''
+  for (const m of chat.messages) {
+    if (m.at) {
+      const day = new Date(m.at).toDateString()
+      if (day !== lastDay) {
+        // 顶部首条若就是"今天"不立分隔(免得每次打开都顶一条"今天");老会话/真跨天才立
+        if (lastDay !== '' || day !== new Date().toDateString()) {
+          sep[m.id] = dayLabel(m.at)
+          lastRole = '' // 分隔之后第一条不算同角色续接
+        }
+        lastDay = day
+      }
+    }
+    if (lastRole === m.role) cont.add(m.id)
+    lastRole = m.role
+  }
+  return { sep, cont }
+})
+
+// —— 会话列表右键菜单(桌面右键):重命名(行内改名)/ 钉住 / 删除 ——
+const { openMenu } = useContextMenu()
+const renamingId = ref<number | null>(null)
+const renameText = ref('')
+const renameInput = ref<HTMLInputElement | null>(null)
+
+function openConvMenu(e: MouseEvent, s: { id: number; title: string; pinned: boolean }) {
+  openMenu(e, [
+    { label: t('ctx.rename'), action: () => startRename(s) },
+    { label: s.pinned ? t('ctx.unpin') : t('ctx.pin'), action: () => togglePinConversation(s.id) },
+    { separator: true },
+    { label: t('ctx.delete'), danger: true, action: () => deleteConversation(s.id) },
+  ])
+}
+function startRename(s: { id: number; title: string }) {
+  renamingId.value = s.id
+  renameText.value = s.title || ''
+  nextTick(() => {
+    renameInput.value?.focus()
+    renameInput.value?.select()
+  })
+}
+function commitRename() {
+  if (renamingId.value == null) return
+  void renameConversation(renamingId.value, renameText.value)
+  renamingId.value = null
+}
+function cancelRename() {
+  renamingId.value = null
+}
 
 const input = ref('')
 const pending = ref<UiAttachment[]>([])
 const fileInput = ref<HTMLInputElement | null>(null)
+const inputEl = ref<HTMLTextAreaElement | null>(null) // 多行输入框:Enter 发送、Shift+Enter 换行、随内容长高
 const MAX_ATT = 12 * 1024 * 1024 // 单文件 12MB 上限,别把大文件灌进上下文
+
+// 输入框随内容自适应高度:先归零再按 scrollHeight 撑开,封顶 ~5 行后内部滚动(不顶走聊天区)
+const INPUT_MAX_H = 132
+function autoGrow() {
+  const el = inputEl.value
+  if (!el) return
+  el.style.height = 'auto'
+  el.style.height = Math.min(el.scrollHeight, INPUT_MAX_H) + 'px'
+}
+// 回车键位(纯打字便利,与语音二分无关):Enter 发送、Shift+Enter 换行;
+// 输入法选词中(isComposing / keyCode 229)绝不当发送 —— 否则中文用户每次选词回车都误发。
+function onInputKeydown(e: KeyboardEvent) {
+  if (e.key !== 'Enter' || e.shiftKey || e.isComposing || e.keyCode === 229) return
+  e.preventDefault()
+  send()
+}
 
 function send() {
   const text = input.value.trim()
@@ -60,6 +130,7 @@ function send() {
   chatSend(text, 'typed', undefined, pending.value) // 流中再发 = 自动取消旧回合(partial 先落库)
   input.value = ''
   pending.value = []
+  nextTick(autoGrow) // 清空后缩回单行高度
 }
 
 // 加图片/文件:选择器 / 粘贴 / 拖拽 三入口,统一读成 dataUrl(图预览)+ base64(出站)
@@ -232,123 +303,42 @@ function fmtClock(ts?: number): string {
 
 // 复制用户消息原文;成功闪一下 ✓。优先 async clipboard,失败(无焦点/旧环境)兜底 execCommand
 const copiedId = ref<number | null>(null)
+// 用户气泡 hover 的复制钮:复制整条 + 闪一下 ✓(copyText 抽到 lib/clipboard 共用)
 function copyMsg(m: UiMessage) {
-  const ok = () => {
+  copyText(m.text, () => {
     copiedId.value = m.id
     setTimeout(() => {
       if (copiedId.value === m.id) copiedId.value = null
     }, 1500)
-  }
-  const fallback = () => {
-    try {
-      const ta = document.createElement('textarea')
-      ta.value = m.text
-      ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0'
-      document.body.appendChild(ta)
-      ta.focus()
-      ta.select()
-      const done = document.execCommand('copy')
-      document.body.removeChild(ta)
-      if (done) ok()
-    } catch (e) {
-      console.error('复制失败', e)
-    }
-  }
-  if (navigator.clipboard?.writeText) {
-    navigator.clipboard.writeText(m.text).then(ok).catch(fallback)
-  } else {
-    fallback()
-  }
+  })
 }
 
-// —— 穿梭:旺财在聊天区自由游走(2026-06-17 砍掉「撞气泡」交互 —— 省去每帧 DOM 测量/重排,
-//    宠物每帧只挪自己一张图,开销近乎为零;背景见 AGENT §8.1 的动画暂停约定) ——
+// 气泡右键(双方):有选中文本则复制选中片段,否则整条;助手气泡再给「朗读」
+function openBubbleMenu(e: MouseEvent, m: UiMessage) {
+  const sel = window.getSelection()?.toString().trim() ?? ''
+  const items = [{ label: sel ? t('ctx.copySelection') : t('ctx.copy'), action: () => copyText(sel || m.text) }]
+  if (m.role === 'wang' && m.text && chat.inTauri) {
+    items.push({ label: t('ctx.readAloud'), action: () => replay(m.text) })
+  }
+  openMenu(e, items)
+}
+
+// —— 桌宠:漫游逻辑已抽到 ./PetRoamer.vue,形象态归 useCharacter(头像与桌宠共用)。
+//    这里只留聊天滚动容器引用(兼作桌宠漫游边界)+ 桌宠右键菜单 + 隐藏开关 ——
 const streamEl = ref<HTMLElement | null>(null)
-// roamFrame 的 RAF 调度归 useRafLoop(见文件底部),页面不可见时自动暂停省 CPU
-const roamer = ref<HTMLElement | null>(null)
-let dogX = 220, dogY = 150
-let tgtX = 220, tgtY = 150
-let pauseFrames = 0
-let facing = 1 // 1=朝右,-1=朝左
-let gaitTick = 0
-let gaitPhase = 0 // 步态相位:run 帧下标
-let legFrames = 0 // 本段航程已飞帧数(fly 角色起步姿态用)
-const ROAM_SPEED = 0.3 // 漫游速度系数(1=原速;越小越慢);同时缩放位移与步态,免"脚打滑"
-// 角色包规范见 scripts/make-roamer-frames.py:每角色 1 张 idle + 5 张 run(192 见方、
-// 体量归一、朝右),文件名顺序即步态环播放顺序;px 是体量对齐后的显示尺寸
-// idle 是数组:单帧=静止蹲坐;多帧(如悬浮机器人上浮/下沉两帧)=停驻时慢速循环
-// tick=换帧节拍(帧/步),越大步子越沉;fly 角色不用 tick,按航段选帧(run 约定 [前倾,巡航A,巡航B,收势])
-const characters = [
-  // 泰坦(默认):四帧双足循环 近腿落地→承重过腿→远腿落地→腾空换腿;
-  // idle 两帧=光学眼/散热栅呼吸;步频 9 走吨位感
-  { idle: [titanIdle1, titanIdle2], run: [titanRun1, titanRun2, titanRun3, titanRun4], px: 63, fly: false, tick: 12 },
-  { idle: [dogIdle], run: [dogRun1, dogRun2, dogRun3, dogRun4, dogRun5], px: 52, fly: false, tick: 4 },
-  { idle: [catIdle], run: [catRun1, catRun2, catRun3, catRun4, catRun5], px: 66, fly: false, tick: 4 },
-]
-// 形象选择 = 设置项 ui.character(每用户持久化);点头像轮换与设置页选择同一份状态
-const charIds = ['titan', 'dog', 'cat'] as const
-const charIdx = computed(() => Math.max(0, charIds.indexOf(settings.get('ui.character') as (typeof charIds)[number])))
-const pack = computed(() => characters[charIdx.value])
-function switchCharacter() {
-  settings.set('ui.character', charIds[(charIdx.value + 1) % charIds.length])
-  gaitTick = 0
-  gaitPhase = 0
-}
-// 预解码,避免换帧/换角色时盒子沿用旧图宽高比闪一下
-characters.forEach((c) => [...c.idle, ...c.run].forEach((u) => { const im = new Image(); im.src = u }))
-const roamerSrc = ref(titanIdle1)
-const roamerFlipped = ref(false)
+const { pack, switchCharacter } = useCharacter()
+const petHidden = computed(() => settings.get('ui.pet.hidden') === '1')
 
-function newTarget() {
-  const s = streamEl.value
-  if (!s) return
-  legFrames = 0
-  // 自由游走:聊天区里随机挑个落点(不再瞄气泡)
-  tgtX = 50 + Math.random() * Math.max(80, s.clientWidth - 110)
-  tgtY = 40 + Math.random() * Math.max(80, s.clientHeight - 90)
+// 桌宠 / 头像右键:换形象 / 打开设置 / 隐藏桌宠(隐藏=置 ui.pet.hidden,设置页可恢复)
+function openPetMenu(e: MouseEvent) {
+  openMenu(e, [
+    { label: t('ctx.switchChar'), action: switchCharacter },
+    { label: t('ctx.openSettings'), action: () => { activeRail.value = 'settings' } },
+    { separator: true },
+    { label: t('ctx.hidePet'), action: () => void settings.set('ui.pet.hidden', '1') },
+  ])
 }
-function roamFrame() {
-  // 设置/回忆页打开时聊天整列隐藏:跳过本帧所有测量/位移,空转等回来
-  if (activeRail.value === 'settings' || activeRail.value === 'memory' || activeRail.value === 'ops') {
-    return
-  }
-  const dx = tgtX - dogX
-  const dy = tgtY - dogY
-  if (Math.hypot(dx, dy) < 6) {
-    // 多帧 idle 慢速循环(每 20 帧换一帧,悬停浮动感);单帧角色等价于静止
-    const idles = pack.value.idle
-    roamerSrc.value = idles[Math.floor(pauseFrames / 20) % idles.length]
-    roamerFlipped.value = false
-    gaitTick = 0; gaitPhase = 0
-    if (++pauseFrames > 45) { newTarget(); pauseFrames = 0 }
-  } else {
-    const dist = Math.hypot(dx, dy)
-    const step = Math.min(dist * 0.04, 2.2) * ROAM_SPEED
-    dogX += (dx / dist) * step
-    dogY += (dy / dist) * step
-    if (Math.abs(dx) > 1) facing = dx >= 0 ? 1 : -1
-    // 6 帧跑动循环(素材朝右),朝左时整体镜像
-    const cp = pack.value
-    if (cp.fly) {
-      // 飞行:整机倾角不能快轮(会抽搐),按航段选帧——临近收势 > 起步前倾 > 巡航两帧慢摆
-      legFrames++
-      if (dist < 70) { roamerSrc.value = cp.run[3] }
-      else if (legFrames < 26) { roamerSrc.value = cp.run[0] }
-      else {
-        if (++gaitTick >= 24 / ROAM_SPEED) { gaitTick = 0; gaitPhase ^= 1 }
-        roamerSrc.value = cp.run[1 + (gaitPhase & 1)]
-      }
-    } else {
-      if (++gaitTick >= cp.tick / ROAM_SPEED) { gaitTick = 0; gaitPhase = (gaitPhase + 1) % cp.run.length }
-      roamerSrc.value = cp.run[gaitPhase]
-    }
-    roamerFlipped.value = facing < 0
-  }
-  // 图片自身 -50% 居中,这里直接写中心点(蹲/跑画布不同大也不会跳位)
-  if (roamer.value) roamer.value.style.transform = `translate(${dogX}px, ${dogY}px)`
-}
-onMounted(() => nextTick(() => newTarget()))
-useRafLoop(roamFrame) // 页面不可见(藏托盘/最小化)时自动暂停遛弯循环
+
 onMounted(() => window.addEventListener('keydown', onVoiceKey))
 onUnmounted(() => window.removeEventListener('keydown', onVoiceKey))
 let lastLen = 0
@@ -403,10 +393,28 @@ watch(messages, () => nextTick(() => {
         <li
           v-for="s in chat.conversations"
           :key="s.id"
-          :class="{ on: s.id === chat.convId }"
+          :class="{ on: s.id === chat.convId, pinned: s.pinned }"
           @click="selectConversation(s.id)"
+          @contextmenu="openConvMenu($event, s)"
         >
-          <span class="rc-title">{{ s.title || t('recents.untitled') }}</span>
+          <!-- 钉住标:右上角图钉(描边、跟随主题色,与渠道图标同语言) -->
+          <span v-if="s.pinned" class="rc-pin" :title="t('recents.pinned')">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M9 4h6M10 4v6l-3 3h10l-3-3V4M12 16v4" />
+            </svg>
+          </span>
+          <!-- 重命名:行内变输入框(回车/失焦提交,Esc 取消);否则显标题 -->
+          <input
+            v-if="renamingId === s.id"
+            ref="renameInput"
+            v-model="renameText"
+            class="rc-rename"
+            @click.stop
+            @keyup.enter="commitRename"
+            @keyup.esc="cancelRename"
+            @blur="commitRename"
+          />
+          <span v-else class="rc-title">{{ s.title || t('recents.untitled') }}</span>
           <div class="rc-meta">
             <span class="rc-time">{{ fmtTime(s.updated_at) }}</span>
             <!-- 有动静标:不在该会话时,后台/切走的回合收尾打标(done=完成 failed=失败),进入即清 -->
@@ -449,12 +457,14 @@ watch(messages, () => nextTick(() => {
     <main class="chat" v-show="activeRail !== 'settings' && activeRail !== 'memory' && activeRail !== 'ops' && activeRail !== 'reminders'">
       <header class="chat-head" data-tauri-drag-region>
         <button v-if="!panelOpen" class="reopen" @click="panelOpen = true" :title="t('recents.expand')">›</button>
-        <img :src="pack.idle[0]" class="head-av" :alt="petName" :title="t('avatar.switchTitle')" style="height: 46px; width: auto; cursor: pointer;" @click="switchCharacter" />
+        <img :src="pack.idle[0]" class="head-av" :alt="petName" :title="t('avatar.switchTitle')" style="height: 46px; width: auto; cursor: pointer;" @click="switchCharacter" @contextmenu="openPetMenu($event)" />
         <div class="who"><b>{{ petName }}</b><small><span class="led"></span>{{ statusText }}</small></div>
       </header>
 
       <div class="stream" ref="streamEl" @click="onStreamClick">
-        <div v-for="(m, mi) in messages" :key="m.id" class="bubble" :class="m.role">
+        <template v-for="(m, mi) in messages" :key="m.id">
+          <div v-if="streamLayout.sep[m.id]" class="day-sep"><span>{{ streamLayout.sep[m.id] }}</span></div>
+          <div class="bubble" :class="[m.role, { cont: streamLayout.cont.has(m.id) }]" @contextmenu="openBubbleMenu($event, m)">
           <!-- wang 走富文本(markdown);user 是用户原话,纯文本保留换行、不解析标记 -->
           <div v-if="m.role === 'wang'" class="md" v-html="renderMarkdown(m.text)"></div>
           <template v-else>
@@ -503,6 +513,17 @@ watch(messages, () => nextTick(() => {
           <!-- 完成的回复:读数默认隐身,hover 浮现;在飞的回复:跳秒常驻,不用 hover -->
           <span v-if="m.stats" class="turn-meta">{{ fmtStats(m.stats) }}</span>
           <span v-else-if="isLiveBubble(m, mi)" class="turn-meta live">{{ liveLine }}</span>
+          <!-- 一键复制这条回复(与 user 气泡同款;右键菜单也有,这给个 hover 直达) -->
+          <button
+            v-if="m.role === 'wang' && m.text"
+            class="copy-btn wang-copy"
+            :class="{ done: copiedId === m.id }"
+            @click="copyMsg(m)"
+            :title="t('chat.copy')"
+          >
+            <svg v-if="copiedId === m.id" viewBox="0 0 24 24"><path d="M5 12l4 4 10-10" /></svg>
+            <svg v-else viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M15 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h3" /></svg>
+          </button>
           <!-- 朗读(把这条回复念出来;hover 浮现,缓存命中秒回) -->
           <button
             v-if="m.role === 'wang' && m.text && chat.inTauri"
@@ -513,8 +534,10 @@ watch(messages, () => nextTick(() => {
             <!-- 耳机:朗读 = 把这条念出来(听),与语音输入的话筒区分;默认不念,所以不是「重播」 -->
             <svg viewBox="0 0 24 24"><path d="M4.5 14v-2a7.5 7.5 0 0 1 15 0v2" /><rect x="3" y="13.5" width="3.6" height="6.6" rx="1.8" /><rect x="17.4" y="13.5" width="3.6" height="6.6" rx="1.8" /></svg>
           </button>
-        </div>
-        <div class="roamer" ref="roamer"><img :class="{ flipped: roamerFlipped }" :src="roamerSrc" alt="" :style="{ width: pack.px + 'px' }" /></div>
+          </div>
+        </template>
+        <!-- 桌宠:漫游边界=聊天滚动区;不在聊天页时 paused 空转;隐藏=v-if 卸载(RAF 停) -->
+        <PetRoamer v-if="!petHidden" :bounds="streamEl" :paused="activeRail !== 'chat'" />
       </div>
 
       <div class="composer">
@@ -579,7 +602,16 @@ watch(messages, () => nextTick(() => {
           </button>
           <!-- 语音输入 = 输入框内的小话筒(轻量,不跟发送键并排抢戏;界面优先,语音只是输入之一) -->
           <span class="field-wrap">
-            <input v-model="input" class="field has-mic" :placeholder="fieldPlaceholder" @keyup.enter="send" @paste="onPaste" />
+            <textarea
+              ref="inputEl"
+              v-model="input"
+              class="field has-mic"
+              rows="1"
+              :placeholder="fieldPlaceholder"
+              @keydown="onInputKeydown"
+              @input="autoGrow"
+              @paste="onPaste"
+            ></textarea>
             <button class="mic-inline" @click="micToggle()" :title="t('chat.micTitle')">
               <svg viewBox="0 0 24 24"><rect x="9.2" y="3.2" width="5.6" height="10.4" rx="2.8" /><path d="M5.8 11.2a6.2 6.2 0 0 0 12.4 0M12 17.6v3.2M8.8 20.8h6.4" /></svg>
             </button>
@@ -653,6 +685,7 @@ watch(messages, () => nextTick(() => {
 .collapse:hover { color: var(--accent); }
 .rc-list { list-style: none; margin: 0; padding: 0 8px; flex: 1; overflow-y: auto; scrollbar-gutter: stable; }
 .rc-list li {
+  position: relative;
   margin-bottom: 8px; padding: 10px 12px; border-radius: 10px; cursor: pointer;
   display: flex; flex-direction: column; gap: 3px;
   background: var(--surface-2); border: 1px solid var(--line);
@@ -661,6 +694,17 @@ watch(messages, () => nextTick(() => {
 }
 .rc-list li:hover { border-color: rgba(var(--accent-rgb), 0.4); }
 .rc-list li.on { background: rgba(var(--accent-rgb), 0.12); border-color: rgba(var(--accent-rgb), 0.5); box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.12); }
+/* 钉住:左缘一道强调色细条 + 标题给图钉让出右内边距 */
+.rc-list li.pinned { border-left: 2px solid rgba(var(--accent-rgb), 0.65); }
+.rc-list li.pinned .rc-title { padding-right: 16px; }
+.rc-pin { position: absolute; top: 9px; right: 10px; color: var(--accent); line-height: 0; opacity: .9; }
+.rc-pin svg { width: 12px; height: 12px; display: block; }
+/* 行内重命名输入:贴着标题位,克制描边,不破列表节奏 */
+.rc-rename {
+  font-size: 13px; color: var(--text); width: 100%;
+  background: var(--surface-deep); border: 1px solid var(--accent); border-radius: 6px;
+  padding: 2px 6px; outline: none; font-family: inherit;
+}
 .rc-title { font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* 时间行:时间靠左,渠道图标靠右(右下角,与时间同一行) */
 .rc-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
@@ -694,16 +738,21 @@ watch(messages, () => nextTick(() => {
 .who b { font-size: 15px; color: var(--text); }
 
 /* scrollbar-gutter:stable —— 内容撑满出现滚动条时不再左移跳动(全局 ::-webkit-scrollbar 已统一样式,不再各设一份) */
-.stream { flex: 1; overflow-y: auto; scrollbar-gutter: stable; padding: 22px 20px 22px 26px; display: flex; flex-direction: column; gap: 13px; position: relative; }
-.roamer { position: absolute; top: 0; left: 0; z-index: 6; pointer-events: none; will-change: transform; }
+/* 间距改走气泡 margin(不用 gap):换角色拉开=turn 分组,同角色收紧;下边距给 hover 浮层留位 */
+.stream { flex: 1; overflow-y: auto; scrollbar-gutter: stable; padding: 22px 20px 22px 26px; display: flex; flex-direction: column; gap: 0; position: relative; }
 .bubble {
   max-width: 70%; padding: 11px 15px; border-radius: 16px; font-size: 14px; line-height: 1.55;
-  backdrop-filter: blur(9px); -webkit-backdrop-filter: blur(9px);
+  /* blur 是"磨砂"强度:大了会把背后星空/粒子糊没(看着像不透明)。科幻皮要透出背景动态,取小值;
+     文字稳靠 --bubble-them 的 tint 兜底。warm 皮气泡本身不透(token 无 alpha),blur 在那边无副作用。 */
+  backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px);
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28);
   word-break: break-word;
   position: relative;
+  margin: 12px 0 19px; /* 上=换角色间距(turn 分组);下=给 hover 浮层(读数/耳机/复制)留位,防压到下一条 */
   transition: transform .18s ease-out;
 }
+.bubble:first-child { margin-top: 0; }
+.bubble.cont { margin-top: 3px; } /* 相邻同角色:收紧,读出"一轮里连续几句" */
 /* 回复读数:贴在气泡下沿,默认隐身,hover 浮现(不挤布局,不打扰陪伴感) */
 .turn-meta {
   position: absolute; top: 100%; left: 13px; margin-top: 3px;
@@ -747,11 +796,8 @@ watch(messages, () => nextTick(() => {
 /* 用户原话:纯文本,保留换行、不解析 markdown */
 .usertext { white-space: pre-wrap; word-break: break-word; }
 
-.roamer img { display: block; transform: translate(-50%, -50%); }
-.roamer img.flipped { transform: translate(-50%, -50%) scaleX(-1); }
-
 .composer { padding: 12px 18px 16px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 9px; }
-.input-row { display: flex; gap: 9px; }
+.input-row { display: flex; gap: 9px; align-items: flex-end; } /* 底对齐:输入框长高时,话筒/发送键贴底不上浮 */
 .field {
   flex: 1; background: var(--surface-deep); border: 1px solid var(--line); border-radius: 13px;
   padding: 11px 15px; color: var(--text); font-size: 14px; outline: none;
@@ -759,8 +805,12 @@ watch(messages, () => nextTick(() => {
 }
 .field::placeholder { color: var(--text-dim); }
 .field:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(var(--accent-rgb), 0.12); }
+/* 多行输入框:去掉 textarea 默认外观,字体/行高跟随;高度由 JS autoGrow 控,封顶后内部滚动 */
+textarea.field { resize: none; font-family: inherit; line-height: 1.5; max-height: 132px; overflow-y: auto; display: block; }
 .send {
-  width: 46px; border: 1px solid var(--line); border-radius: 13px; cursor: pointer; font-size: 16px;
+  width: 46px; height: 45px; flex: 0 0 auto;
+  display: flex; align-items: center; justify-content: center;
+  border: 1px solid var(--line); border-radius: 13px; cursor: pointer; font-size: 16px;
   background: rgba(var(--accent-rgb), 0.1); color: var(--accent);
   backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
   transition: border-color .15s, background .15s, box-shadow .15s;
@@ -775,7 +825,7 @@ watch(messages, () => nextTick(() => {
 .field-wrap { flex: 1; position: relative; display: flex; min-width: 0; }
 .field.has-mic { padding-right: 42px; }
 .mic-inline {
-  position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+  position: absolute; right: 6px; bottom: 7px;
   width: 30px; height: 30px; padding: 0; border: none; background: none; cursor: pointer;
   color: var(--text-dim); display: flex; align-items: center; justify-content: center;
   border-radius: 8px; transition: color .15s, background .15s;
@@ -893,7 +943,7 @@ watch(messages, () => nextTick(() => {
 
 /* 朗读(耳机=念出来):贴气泡右下,默认隐身 hover 浮现(与读数同款克制),小巧 */
 .replay {
-  position: absolute; right: 8px; bottom: -22px; z-index: 7;
+  position: absolute; right: 8px; bottom: -19px; z-index: 7;
   width: 19px; height: 16px; padding: 0;
   display: flex; align-items: center; justify-content: center;
   background: rgba(var(--accent-rgb), 0.08); color: var(--accent);
@@ -922,6 +972,12 @@ watch(messages, () => nextTick(() => {
 .copy-btn:hover { color: var(--accent); border-color: var(--accent); }
 .copy-btn.done { color: var(--ok); border-color: rgba(var(--ok-rgb), 0.5); }
 .copy-btn svg { width: 11px; height: 11px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; display: block; }
+/* wang 回复一键复制:与 user 同款图标,贴右下、在耳机左侧,hover 浮现(右键菜单也有,这给个直达) */
+.wang-copy { position: absolute; right: 34px; bottom: -19px; z-index: 7; opacity: 0; transition: opacity .18s ease; }
+.bubble:hover .wang-copy { opacity: 0.9; }
+/* 日期分隔条:跨天会话的轻分隔,居中低对比、不抢气泡 */
+.day-sep { align-self: center; margin: 6px 0 4px; user-select: none; }
+.day-sep span { font-size: 11px; letter-spacing: .5px; color: var(--text-dim); background: var(--surface); border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; }
 
 /* —— HUD 增强 —— */
 .who small { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--text-dim); }

@@ -8,6 +8,7 @@ mod usage;
 pub use usage::{DayUsage, MsgStats, UsageDigest};
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use serde::Serialize;
@@ -214,6 +215,8 @@ const APP_SETTING_KEYS: &[&str] = &[
     "weather.qweather.project_id",
     "weather.qweather.credential_id",
     "net.proxy",
+    "net.proxy_enabled",
+    "memory.auto_consolidate",
 ];
 
 /// 语音的用户级设置(PLAN §11 逐键放行,不开 voice.* 通配——同前缀跨两个 scope)。
@@ -333,12 +336,21 @@ struct TurnHandle {
     join: tokio::task::JoinHandle<()>,
 }
 
+/// 每隔这么多用户回合,后台自动提炼一次记忆(PLAN §13 Phase 3 自动触发)。
+/// 偏稀:蒸馏 = 花钱的 LLM 调用,且 lookback 50 条本就覆盖多轮 → 稀一点、重叠靠去重兜。
+const CONSOLIDATE_EVERY_TURNS: u32 = 12;
+
 /// 会话槽:只装派生/瞬态状态。真相永远在库;丢槽 = 重算,绝不 = 出错。
 #[derive(Default)]
 struct SessionSlot {
     inflight: Option<TurnHandle>,
     /// 插队(PLAN §9 B):在飞回合的注入队列;回合在轮间/收尾前排空它。
     inject: Option<Arc<Mutex<InjectState>>>,
+    /// 自上次记忆提炼以来的用户回合数(§13 Phase 3);到阈值归零并后台蒸馏。
+    /// 瞬态:丢槽 = 从 0 重数,顶多晚一次提炼(尽力件 + 去重兜底),绝不出错。
+    turns_since_consolidate: u32,
+    /// 提炼在飞标志(防并发重复落库);spawn 出去的任务持同一 Arc,跑完置回 false。
+    consolidating: Arc<AtomicBool>,
     // 以后的会话级住户:工具已读标记、稳定前缀缓存、会话内统计(PLAN §4)
 }
 
@@ -453,9 +465,16 @@ impl Engine {
         })
     }
 
-    /// 解析代理:`net.proxy`(过 `${ENV}`)优先,空则回落环境变量(net::env_proxy)。
+    /// 解析代理:总开关 `net.proxy_enabled` 关 ⇒ 一律直连(连 env 也不读,与界面开关一致);
+    /// 开 ⇒ 用 `net.proxy` 地址(过 `${ENV}`),地址空则回落环境变量(net::env_proxy)。
     /// net 模块刻意不碰 store/llm;此处是 store×llm 合流点,故解析放这。
     fn resolve_proxy(store: &Store) -> Option<String> {
+        // 总开关:默认关。关 = 直连,地址虽存着也不用(铁律:开关一关一律直连)。
+        let enabled =
+            store.settings.get(None, "net.proxy_enabled").ok().flatten().as_deref() == Some("1");
+        if !enabled {
+            return None;
+        }
         store
             .settings
             .get(None, "net.proxy")
@@ -627,6 +646,16 @@ impl Engine {
         Ok(())
     }
 
+    /// 用户右键重命名会话(无条件覆盖标题;空串交给前端拦,这里只落库)。
+    pub fn rename_conversation(&self, conv_id: i64, title: &str) -> Result<(), AppError> {
+        Ok(self.store.chat.set_title(conv_id, title)?)
+    }
+
+    /// 钉住 / 取消钉住会话(列表排最前 + 📌)。
+    pub fn set_conversation_pinned(&self, conv_id: i64, pinned: bool) -> Result<(), AppError> {
+        Ok(self.store.chat.set_pinned(conv_id, pinned)?)
+    }
+
     pub fn set_skin(&self, skin_id: &str) -> Result<(), AppError> {
         let user = self.store.users.ensure_default_user()?;
         self.store.users.set_skin(user.id, skin_id)?;
@@ -703,8 +732,8 @@ impl Engine {
             }
             // 一句话性格设定(用户级):进稳定前缀的人格覆盖层,改动即生效(下一回合重装配)
             "persona.style" => {
-                if value.chars().count() > 100 {
-                    return Err(invalid("性格设定最多 100 字"));
+                if value.chars().count() > 500 {
+                    return Err(invalid("性格设定最多 500 字"));
                 }
                 let user = self.store.users.ensure_default_user()?;
                 self.store.settings.set(Some(user.id), key, value)?;
@@ -784,8 +813,8 @@ impl Engine {
                 self.store.settings.set(None, key, &v)?;
                 Ok(())
             }
-            // 全局代理(app 级,PLAN §代理):空 = 关(直连),否则 http(s)/socks5(h) 或 ${ENV};
-            // 写库后立即刷新全局 net(下载/LLM 现读即生效,无需重启)。
+            // 全局代理地址(app 级,PLAN §代理):单独保存、始终保留(用不用看总开关 net.proxy_enabled);
+            // 取值 http(s)/socks5(h) 或 ${ENV}(空也允许 = 占位,开关开时回落系统 env);写库后刷新全局 net。
             "net.proxy" => {
                 let v = value.trim();
                 let ok = v.is_empty()
@@ -794,10 +823,29 @@ impl Engine {
                         .iter()
                         .any(|p| v.starts_with(p));
                 if !ok {
-                    return Err(invalid("代理地址要以 http(s):// 或 socks5(h):// 开头(或留空关闭)"));
+                    return Err(invalid("代理地址要以 http(s):// 或 socks5(h):// 开头(或留空)"));
                 }
                 self.store.settings.set(None, key, v)?;
                 crate::net::set_proxy(Self::resolve_proxy(&self.store));
+                Ok(())
+            }
+            // 全局代理总开关(app 级):0/1。关 = 一律直连(地址照存不丢);开 = 用上面的地址。
+            // 写库后立即刷新全局 net(现读即生效,无需重启)。地址与开关分家 = 关掉不丢地址。
+            "net.proxy_enabled" => {
+                if !["0", "1"].contains(&value) {
+                    return Err(invalid("开关需为 0 或 1"));
+                }
+                self.store.settings.set(None, key, value)?;
+                crate::net::set_proxy(Self::resolve_proxy(&self.store));
+                Ok(())
+            }
+            // 记忆自动提炼总开关(app 级,PLAN §13 Phase 3):0/1,默认开(缺省 = 开,见 spawn_consolidate)。
+            // 关 = 不再后台蒸馏(手动 consolidate_conversation 入口不受影响);现读即生效,无需重启。
+            "memory.auto_consolidate" => {
+                if !["0", "1"].contains(&value) {
+                    return Err(invalid("开关需为 0 或 1"));
+                }
+                self.store.settings.set(None, key, value)?;
                 Ok(())
             }
             // 远程渠道配置(app 级,PLAN 远程渠道):enabled 校验 0/1;凭证/白名单原样写(trim)。
@@ -954,8 +1002,8 @@ impl Engine {
     /// 记忆提炼 / 反思(PLAN §13 Phase 3):把一段会话蒸馏成耐久记忆。**保守**——只增不删、
     /// 提炼条目进按需层(不污染前缀)、近重复跳过(详见 `consolidate`)。后台尽力件:没配
     /// provider / 会话不存在 = 返回 0,不报错。返回新增条数。
-    /// **不自动触发**(自动跑未经真模型验证的 LLM 环去改记忆,质量/成本须先验)—— 现作为
-    /// 可调用入口(会话收尾 / 每 N 轮 / 命令后续接,见 PLAN §13.6 Phase 3 待办)。
+    /// 这是**手动 / 命令入口**(按 conv_user 提炼);**自动触发**走 `spawn_consolidate`
+    /// (`send_message` 每 `CONSOLIDATE_EVERY_TURNS` 个用户回合后台跑、按说话人提炼,2026-06-18 接上)。
     pub async fn consolidate_conversation(&self, conv_id: i64) -> Result<usize, AppError> {
         // 锁内只取主选 provider 的 Arc 快照,await 在锁外(RwLock guard 不跨 await)
         let provider = {
@@ -966,6 +1014,69 @@ impl Engine {
         let Some(conv) = self.store.chat.get_conversation(conv_id)? else { return Ok(0) };
         let added = consolidate::run(&provider, &self.store, conv.user_id, conv_id, 50).await?;
         Ok(added)
+    }
+
+    /// 累加该会话「自上次提炼以来的用户回合数」,到阈值则归零并返回 true(该后台提炼了)。
+    /// 纯计数(只改 SessionSlot 瞬态、无 IO),便于单测;真正的提炼由 `spawn_consolidate` 起。
+    fn bump_consolidate_due(&self, conv_id: i64) -> bool {
+        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+        let slot = sessions.entry(conv_id).or_default();
+        slot.turns_since_consolidate += 1;
+        if slot.turns_since_consolidate >= CONSOLIDATE_EVERY_TURNS {
+            slot.turns_since_consolidate = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 记忆自动提炼总开关(`memory.auto_consolidate`,app 级):缺省 = 开;只有显式 "0" 才关。
+    fn auto_consolidate_enabled(&self) -> bool {
+        self.store
+            .settings
+            .get(None, "memory.auto_consolidate")
+            .ok()
+            .flatten()
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    }
+
+    /// 后台提炼一次该会话(PLAN §13 Phase 3 自动触发):尽力件 —— 开关关 / 没 provider / 上次还在跑
+    /// 则跳过,错误只记日志,绝不影响主对话。写到说话人 `user_id`(记忆归人 §6)。
+    /// cheap-model 路由仍后置(用主 provider);触发频率见 `CONSOLIDATE_EVERY_TURNS`。
+    fn spawn_consolidate(&self, conv_id: i64, user_id: i64) {
+        // 用户在设置关掉了自动提炼 = 直接不跑(手动入口不受影响)
+        if !self.auto_consolidate_enabled() {
+            return;
+        }
+        // 上次提炼还没跑完 = 跳过这轮(防并发重复落库;flag 持在会话槽,spawn 任务跑完清)
+        let flag = {
+            let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+            sessions.entry(conv_id).or_default().consolidating.clone()
+        };
+        if flag.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let provider = self.llm.read().expect("llm lock poisoned").first().map(|(_, p)| p.clone());
+        let Some(provider) = provider else {
+            flag.store(false, Ordering::Release);
+            return;
+        };
+        let store = self.store.clone();
+        tokio::spawn(async move {
+            match consolidate::run(&provider, &store, user_id, conv_id, 50).await {
+                Ok(n) if n > 0 => {
+                    tracing::info!(target: "larkwing::memory", conv = conv_id, added = n, "记忆自动提炼:+{n} 条")
+                }
+                Ok(_) => {
+                    tracing::debug!(target: "larkwing::memory", conv = conv_id, "记忆自动提炼:无新增")
+                }
+                Err(e) => {
+                    tracing::warn!(target: "larkwing::memory", conv = conv_id, "记忆自动提炼失败(尽力件): {e:#}")
+                }
+            }
+            flag.store(false, Ordering::Release);
+        });
     }
 
     /// 记错了点掉(记忆卫生 = 信任感);按当前用户限定。
@@ -1334,10 +1445,11 @@ impl Engine {
             }
             // 反应模式(最快/轻度/中度/重度):每回合取值,改完下一句话就生效,无需重建 provider
             let thinking = match store.settings.get(None, "llm.thinking")?.as_deref() {
+                Some("off") => crate::llm::Thinking::Off,
                 Some("light") => crate::llm::Thinking::Light,
-                Some("medium") | Some("on") => crate::llm::Thinking::Medium, // "on" 兼容旧值
                 Some("heavy") => crate::llm::Thinking::Heavy,
-                _ => crate::llm::Thinking::Off,
+                // 缺省/"medium"/旧值"on"/未知 → 中度(默认反应模式)
+                _ => crate::llm::Thinking::Medium,
             };
             if thinking != crate::llm::Thinking::Off {
                 request.options.thinking = Some(thinking);
@@ -1346,6 +1458,12 @@ impl Engine {
         })
         .await
         .map_err(AppError::internal)??;
+
+        // 记忆自动提炼(PLAN §13 Phase 3):每 N 个用户回合后台蒸馏一次(尽力件,不阻塞本回合)。
+        // 写到说话人(mem_user,记忆归人 §6);用户消息已落库,蒸馏读得到这段历史。
+        if self.bump_consolidate_due(conv_id) {
+            self.spawn_consolidate(conv_id, mem_user);
+        }
 
         // 4+5. 开流 + spawn 回合(与 wake_turn 共用尾段)。ToolCtx.user_id = mem_user:
         // remember 写到说话人(记忆归人);会话归属仍是 conv_user。
@@ -1545,10 +1663,11 @@ impl Engine {
                     .messages
                     .push(crate::llm::ChatMessage::user(context::event_injection(&content)));
                 let thinking = match store.settings.get(None, "llm.thinking")?.as_deref() {
+                    Some("off") => crate::llm::Thinking::Off,
                     Some("light") => crate::llm::Thinking::Light,
-                    Some("medium") | Some("on") => crate::llm::Thinking::Medium,
                     Some("heavy") => crate::llm::Thinking::Heavy,
-                    _ => crate::llm::Thinking::Off,
+                    // 缺省/"medium"/旧值"on"/未知 → 中度(默认反应模式)
+                    _ => crate::llm::Thinking::Medium,
                 };
                 if thinking != crate::llm::Thinking::Off {
                     request.options.thinking = Some(thinking);
@@ -1579,6 +1698,52 @@ impl Engine {
             }));
         });
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn engine(tag: &str) -> Arc<Engine> {
+        let dir = std::env::temp_dir().join(format!("lw-engine-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(dir.join("t.db"));
+        let store = Store::open(&dir.join("t.db")).unwrap();
+        Engine::new(store, crate::scenes::Scenes::builtin())
+    }
+
+    /// 自动提炼计数:前 N-1 轮不触发、第 N 轮触发并归零、不同会话各自独立。
+    #[test]
+    fn consolidate_due_fires_every_n_turns_and_resets() {
+        let eng = engine("consol-due");
+        let conv = 1i64;
+        for i in 1..CONSOLIDATE_EVERY_TURNS {
+            assert!(!eng.bump_consolidate_due(conv), "第 {i} 轮不该触发");
+        }
+        assert!(eng.bump_consolidate_due(conv), "第 N 轮该触发");
+        assert!(!eng.bump_consolidate_due(conv), "触发后计数归零、又从头数");
+        assert!(!eng.bump_consolidate_due(2), "另一会话独立计数,不受影响");
+    }
+
+    /// 没配 provider 时后台提炼直接放弃(不 panic、不卡住 in-flight 标志)。
+    #[test]
+    fn spawn_consolidate_noops_without_provider() {
+        let eng = engine("consol-noprov");
+        eng.spawn_consolidate(1, 1); // 无 provider → 早退;flag 复位,可再次进入
+        eng.spawn_consolidate(1, 1);
+    }
+
+    /// 自动提炼总开关:缺省 = 开;设 0 关、设回 1 开;非 0/1 被拒(顺带验白名单 + 校验臂)。
+    #[test]
+    fn auto_consolidate_setting_defaults_on_and_respects_off() {
+        let eng = engine("consol-toggle");
+        assert!(eng.auto_consolidate_enabled(), "缺省即开");
+        eng.set_setting("memory.auto_consolidate", "0").unwrap();
+        assert!(!eng.auto_consolidate_enabled(), "设 0 = 关");
+        eng.set_setting("memory.auto_consolidate", "1").unwrap();
+        assert!(eng.auto_consolidate_enabled(), "设回 1 = 开");
+        assert!(eng.set_setting("memory.auto_consolidate", "2").is_err(), "非 0/1 被拒");
     }
 }
 

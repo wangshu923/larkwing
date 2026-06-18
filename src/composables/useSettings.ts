@@ -19,11 +19,15 @@ const DEFAULTS: Record<string, string> = {
   // 默认留空 = 中性人设(不预设性格倾向,适配最多用户);用户想要性格自己写,占位符给了示例
   'persona.style': '',
   'ui.character': 'titan',
+  'ui.pet.hidden': '0', // 桌宠遛弯显隐('0' 显 / '1' 隐);右键「隐藏桌宠」置 1,设置页可恢复。ui.* 自动过白名单
   'ui.bubble_shape': 'round',
   'ui.text_scale': 'standard',
   'ui.locale': 'zh-CN', // 界面语言;'ui.' 前缀自动过 Rust 白名单。对话语言由模型跟随用户,与此解耦
   'llm.strategy': 'balanced',
-  'llm.thinking': 'off',
+  'llm.thinking': 'medium', // 默认反应模式=中度思考;与 Rust engine 缺省(→Medium)同步
+  // 记忆自动提炼(PLAN §13 Phase 3):后台把聊天里值得记的事蒸馏成长期记忆。'1' 开 / '0' 关(默认开);
+  // app 级,Rust APP_SETTING_KEYS + set_setting 0/1 校验逐键对应(§6.8 两边各加一行)。宁缺毋滥见 consolidate.rs
+  'memory.auto_consolidate': '1',
   // 声音(PLAN §11):与 Rust 白名单逐键对应(user 级 speaker/auto_speak/rate/patience/volume,
   // app 级 input_device);档位值是契约,改要两边一起改
   'voice.speaker': 'zh-CN-XiaoxiaoNeural',
@@ -32,7 +36,7 @@ const DEFAULTS: Record<string, string> = {
   'voice.patience': 'standard',
   'voice.volume': '100',
   'voice.input_device': '',
-  'voice.wake.sensitivity': '50', // 唤醒灵敏度 0~100(global)→ KWS 阈值;'50' = 经验折中
+  'voice.wake.sensitivity': '100', // 唤醒灵敏度 0~100(global)→ KWS 阈值;'100' = 最灵敏(默认偏召回,保障叫得应,见 AGENT.md §8.2)
 
   'voice.tts_backend': 'online', // 在线 edge / 离线 vits(断网兜底,需下大模型)
   // 天气(PLAN 天气块):和风 JWT 接入三件套(host + 项目 ID + 凭据 ID);齐备 + 全局公钥已生成 → 切和风,
@@ -40,9 +44,11 @@ const DEFAULTS: Record<string, string> = {
   'weather.qweather.host': '',
   'weather.qweather.project_id': '',
   'weather.qweather.credential_id': '',
-  // 全局代理(传输层):空 = 关(直连);否则 http(s)://host:port / socks5(h):// / ${ENV}。
-  // 直连优先、连接失败兜底走代理(墙内源永不被代理);Rust 白名单 net.proxy 逐键对应。
-  'net.proxy': '',
+  // 全局代理(传输层):开关 net.proxy_enabled 控总闸,地址 net.proxy 单独保存(始终保留、给默认值免空)。
+  // 关 = 一律直连;开 = 直连优先、连不通才兜底走该地址(墙内源永不被代理);地址支持 http(s):// / socks5(h):// / ${ENV}。
+  // Rust 白名单 net.proxy / net.proxy_enabled 逐键对应(§6.8 两边各加一行)。
+  'net.proxy_enabled': '0', // '1' 开 / '0' 关(默认关 = 直连)
+  'net.proxy': 'http://127.0.0.1:7890', // 代理地址;预填常见本地端口,开关一开即用
   // 桌面悬浮窗(PLAN §12);ui.* 走 engine set_setting 的 ui. 分支自动放行(无需改 Rust 白名单)
   'ui.float.enabled': '1', // '1' 开 / '0' 关
   'ui.float.opacity': '0.8', // 0.4–1.0

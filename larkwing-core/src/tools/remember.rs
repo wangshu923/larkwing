@@ -53,15 +53,21 @@ impl Tool for Remember {
     }
 
     async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
-        let fact: String = args
+        let fact = args
             .get("fact")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .context("缺少 fact 参数")?
-            .chars()
-            .take(FACT_MAX_CHARS)
-            .collect();
+            .to_string();
+        // 超长不静默截断(§3.5):退回错误,让模型精简成一句话或拆成多条分开记。
+        let n = fact.chars().count();
+        if n > FACT_MAX_CHARS {
+            anyhow::bail!(
+                "这条记忆 {n} 字,超过 {FACT_MAX_CHARS} 字上限,没有记。\
+                 请精简成一句话,或拆成多条分开记,再重试。"
+            );
+        }
         // 类别由模型分(§13.4):identity 受保护绝不被下沉、experience 是程序性经验、
         // 其余默认 fact;非法值一律落 fact(防御性收口)。
         use crate::store::memory::{KIND_EXPERIENCE, KIND_FACT, KIND_IDENTITY};
@@ -84,5 +90,41 @@ impl Tool for Remember {
         } else {
             "ok(常驻区满了,这条记成了按需查询 —— 想起时我会先翻一下)".to_string()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::media::MediaRuntime;
+    use crate::store::Store;
+    use crate::tools::Tool;
+
+    fn ctx(tag: &str) -> ToolCtx {
+        let dir = std::env::temp_dir().join(format!("lw-remembertool-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(dir.join("t.db"));
+        let store = Store::open(&dir.join("t.db")).unwrap();
+        store.users.ensure_default_user().unwrap();
+        ToolCtx { user_id: 1, conv_id: 1, media: MediaRuntime::detached(store.clone()), store }
+    }
+
+    #[tokio::test]
+    async fn normal_fact_is_remembered() {
+        let ctx = ctx("ok");
+        let out =
+            Remember::new().run(serde_json::json!({"fact": "用户不吃香菜"}), &ctx).await.unwrap();
+        assert!(out.starts_with("ok"));
+    }
+
+    #[tokio::test]
+    async fn over_limit_rejects_not_truncates() {
+        let ctx = ctx("overlimit");
+        let too_long = "九".repeat(FACT_MAX_CHARS + 50);
+        // 超长 → 退回错误,不静默截断(§3.5)
+        assert!(Remember::new()
+            .run(serde_json::json!({"fact": too_long}), &ctx)
+            .await
+            .is_err());
     }
 }

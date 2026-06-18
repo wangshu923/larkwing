@@ -1,6 +1,6 @@
 [package]
 name = "larkwing-core"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.77.2"
 
@@ -18,6 +18,8 @@ cpal = "0.17.1"
 # 全局 Ed25519 身份密钥(crypto.rs):和风 JWT 等服务的签名认证。私钥本地存、只产 token 不验,
 # JWT 手搓(base64 已在);pkcs8+pem 用于公钥导出 SPKI PEM 给用户复制到服务控制台。
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
+# 数据目录「搬家」预检:目标盘剩余空间(跨 Win/Mac/Linux 的 available_space)。
+fs2 = "0.4"
 futures-util = "0.3"
 # crypto 取随机种子生成密钥(直接填 32 字节种子 → SigningKey,省掉整个 rand 依赖)
 getrandom = "0.2"

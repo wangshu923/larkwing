@@ -1,5 +1,5 @@
 :root {
-  /* 暖萌原始色板(暖萌皮的语义值引用它;旧 ChatView 原型也在用) —— 低饱和、柔对比 */
+  /* 暖萌原始色板(暖萌皮的语义值引用它) —— 低饱和、柔对比 */
   --cream: #fffdf9;
   --cream-deep: #fff3e7;
   --peach: #ffe2c8;
@@ -28,7 +28,7 @@
   --attn: #ffb86b;     --attn-rgb: 255, 184, 107;
   --danger: #f09595;   --danger-rgb: 240, 149, 149;
   /* 气泡(科幻:深蓝玻璃 / 浅蓝) */
-  --bubble-them: rgba(20, 46, 78, 0.55);
+  --bubble-them: rgba(20, 46, 78, 0.45);
   --bubble-me: rgba(95, 175, 235, 0.22);
   --bubble-me-line: rgba(120, 200, 255, 0.3);
   --bubble-me-text: #eaf4ff;
@@ -98,6 +98,16 @@ body {
 
 /* 只有真正要输入/编辑的地方可选 */
 input, textarea, [contenteditable="true"] {
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+
+/* 内容文本可任意划选(body{user-select:none} 默认全关,这里逐类放开):
+   聊天气泡(.bubble 含助手 .md / 用户 .usertext / 展开的思考细节)、
+   回忆·记录·提醒列表的正文(.lp-text)。读数 / 时间等装饰各自 user-select:none 仍生效。
+   光标恢复成文本 I 形,提示可选。文字选中后右键菜单的「复制」即复制选中片段。 */
+.bubble, .lp-text {
   user-select: text;
   -webkit-user-select: text;
   cursor: text;

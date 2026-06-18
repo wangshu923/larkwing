@@ -23,6 +23,8 @@ export interface Conversation {
   title: string
   /** 渠道(会话级):ui(默认/不标) | voice | system | 未来 telegram/dingtalk/slack。列表按此渲染小图标。 */
   channel: string
+  /** 钉住:用户右键标记的「没聊完」会话,列表排最前 + 挂 📌。 */
+  pinned: boolean
   created_at: number
   updated_at: number
 }
@@ -632,6 +634,23 @@ export function onMediaControl(cb: (action: string, value?: number) => void): vo
   )
 }
 
+/** 数据目录「搬家」:当前根 / 待清理旧根 / 失效路径(字段随 Rust camelCase)。 */
+export interface DataLocation {
+  root: string
+  oldRoot: string | null
+  missing: string | null
+}
+
+/** 搬家预检结果(给确认弹窗:目标路径 + 体积 + 失败原因 code)。 */
+export interface RelocateCheck {
+  ok: boolean
+  /** 失败原因 code(→ settings.dataLocation.err.<reason>);ok 时 null。 */
+  reason: string | null
+  newRoot: string | null
+  needBytes: number
+  freeBytes: number
+}
+
 export const api = {
   boot: () => invoke<BootSnapshot>('boot'),
 
@@ -667,6 +686,10 @@ export const api = {
   listConversations: () => invoke<Conversation[]>('list_conversations'),
   loadConversation: (convId: number) => invoke<Message[]>('load_conversation', { convId }),
   deleteConversation: (convId: number) => invoke<void>('delete_conversation', { convId }),
+  renameConversation: (convId: number, title: string) =>
+    invoke<void>('rename_conversation', { convId, title }),
+  setConversationPinned: (convId: number, pinned: boolean) =>
+    invoke<void>('set_conversation_pinned', { convId, pinned }),
   setApiKey: (key: string) => invoke<void>('set_api_key', { key }),
   setSkin: (skinId: string) => invoke<void>('set_skin', { skinId }),
   skin: () => invoke<string>('skin'),
@@ -753,6 +776,24 @@ export const api = {
   /** 托盘菜单文案注入(§6:文案在前端字典,boot 后传给壳层建菜单)。 */
   setTrayMenu: (open: string, showFloat: string, quit: string) =>
     invoke<void>('set_tray_menu', { open, showFloat, quit }),
+  quitApp: () => invoke<void>('quit_app'),
+  // ---- 数据目录「搬家」(datadir) ----
+  /** 当前数据根 / 待清理旧根 / 失效路径(设置页一行 + boot 检查)。 */
+  dataLocation: () => invoke<DataLocation>('data_location'),
+  /** 唤起系统原生目录选择器;取消 = null。 */
+  pickDataFolder: () => invoke<string | null>('pick_data_folder'),
+  /** 搬家预检(选完目录、确认前):目标路径 + 体积 + 可行性。 */
+  relocatePrecheck: (picked: string) => invoke<RelocateCheck>('relocate_precheck', { picked }),
+  /** 执行搬家:拷贝(HUD 进度)→ 翻指针 → 立即重启(成功不返回,页面随重启刷新)。 */
+  relocateData: (picked: string) => invoke<void>('relocate_data', { picked }),
+  /** 搬家后删除旧数据(保留指针)。 */
+  cleanupOldData: () => invoke<void>('cleanup_old_data'),
+  /** 搬家后保留旧数据(只清提示,不删盘)。 */
+  keepOldData: () => invoke<void>('keep_old_data'),
+  /** 数据位置失效时「恢复默认」:清指针 → 重启从默认位置起(全新数据)。 */
+  dataResetToDefault: () => invoke<void>('data_reset_to_default'),
+  /** 在系统文件管理器里打开数据文件夹。 */
+  revealDataDir: () => invoke<void>('reveal_data_dir'),
 }
 
 /** 托盘点「显示悬浮窗」→ 壳层 emit,主窗据此重开悬浮窗(置 enabled + show)。 */

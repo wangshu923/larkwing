@@ -353,9 +353,9 @@ async function boot() {
     state.hasApiKey = !new URLSearchParams(location.search).has('nokey')
     state.convId = 1
     state.conversations = [
-      { id: 1, user_id: 1, scene_id: 'companion', channel: 'ui', title: '今天的碎碎念', created_at: 0, updated_at: Date.now() },
-      { id: 2, user_id: 1, scene_id: 'companion', channel: 'voice', title: '周末去哪儿玩', created_at: 0, updated_at: Date.now() - 3600_000 },
-      { id: 3, user_id: 1, scene_id: 'companion', channel: 'system', title: '吃药提醒', created_at: 0, updated_at: Date.now() - 86400_000 },
+      { id: 1, user_id: 1, scene_id: 'companion', channel: 'ui', title: '今天的碎碎念', pinned: true, created_at: 0, updated_at: Date.now() },
+      { id: 2, user_id: 1, scene_id: 'companion', channel: 'voice', title: '周末去哪儿玩', pinned: false, created_at: 0, updated_at: Date.now() - 3600_000 },
+      { id: 3, user_id: 1, scene_id: 'companion', channel: 'system', title: '吃药提醒', pinned: false, created_at: 0, updated_at: Date.now() - 86400_000 },
     ]
     pushOpening()
     if (!state.hasApiKey) pushNoLlmHint()
@@ -783,6 +783,72 @@ async function newConversation(channel?: string) {
   }
 }
 
+// ---- 会话列表的右键操作(MainLayout 右键菜单调用):重命名 / 钉住 / 删除。
+//      均乐观更新本地 state,失败回滚;本地排序与后端 SQL 对齐(pinned DESC, updated_at DESC)。----
+
+/** 本地按「钉住优先、再按最近活动」排序,与 list_conversations 的 SQL ORDER BY 一致。 */
+function sortConversations() {
+  state.conversations.sort(
+    (a, b) => Number(b.pinned) - Number(a.pinned) || b.updated_at - a.updated_at,
+  )
+}
+
+async function renameConversation(convId: number, title: string) {
+  const t = title.trim()
+  const conv = state.conversations.find((c) => c.id === convId)
+  if (!conv || !t || t === conv.title) return
+  const prev = conv.title
+  conv.title = t // 乐观
+  if (!state.inTauri) return
+  try {
+    await api.renameConversation(convId, t)
+  } catch (e) {
+    console.error('重命名会话失败', e)
+    conv.title = prev // 回滚
+  }
+}
+
+async function togglePinConversation(convId: number) {
+  const conv = state.conversations.find((c) => c.id === convId)
+  if (!conv) return
+  const next = !conv.pinned
+  conv.pinned = next // 乐观
+  sortConversations()
+  if (!state.inTauri) return
+  try {
+    await api.setConversationPinned(convId, next)
+    await refreshConversations() // 取库内权威排序
+  } catch (e) {
+    console.error('钉住会话失败', e)
+    conv.pinned = !next // 回滚
+    sortConversations()
+  }
+}
+
+async function deleteConversation(convId: number) {
+  const idx = state.conversations.findIndex((c) => c.id === convId)
+  if (idx < 0) return
+  const wasCurrent = state.convId === convId
+  const removed = state.conversations[idx]
+  state.conversations.splice(idx, 1) // 乐观
+  delete state.convBadges[convId]
+  if (state.inTauri) {
+    try {
+      await api.deleteConversation(convId)
+    } catch (e) {
+      console.error('删除会话失败', e)
+      state.conversations.splice(idx, 0, removed) // 补回
+      return
+    }
+  }
+  // 删的是当前会话:切到列表里下一个(已排序,取首条);空了就新建
+  if (wasCurrent) {
+    const nextConv = state.conversations[0]
+    if (nextConv) await selectConversation(nextConv.id)
+    else await newConversation()
+  }
+}
+
 // ---- 语音(免手唤醒)专属会话(PLAN §11):语音交互不灌进当前打字会话,自起一个;
 // 活着就续,「完全无动作」满 30 分钟才弃——媒体在播算动作(看电影不打断续接),停播
 // 后才开始计时;重启不接续(纯内存态)。喊醒说话时切到它显示,它照常进会话列表、可点
@@ -899,5 +965,5 @@ function fakeStream(msg: UiMessage, full: string, speak = false) {
 export function useChat() {
   void boot()
   wireVoiceActivity()
-  return { state, send, cancel, selectConversation, newConversation, ensureVoiceConv, saveApiKey, dequeue, inject }
+  return { state, send, cancel, selectConversation, newConversation, ensureVoiceConv, saveApiKey, dequeue, inject, renameConversation, togglePinConversation, deleteConversation }
 }

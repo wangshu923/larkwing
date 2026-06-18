@@ -63,15 +63,23 @@ impl Tool for MediaPlay {
         let audio_only =
             args.get("audio_only").and_then(serde_json::Value::as_bool).unwrap_or(false);
 
-        let np = ctx.media.play(url, audio_only).await?;
-        let mut out = format!("已开始播放《{}》", np.title);
-        if let Some(author) = &np.author {
-            out.push_str(&format!("(UP主: {author})"));
+        match ctx.media.play(url, audio_only).await? {
+            crate::media::PlayOutcome::Playing(np) => {
+                let mut out = format!("已开始播放《{}》", np.title);
+                if let Some(author) = &np.author {
+                    out.push_str(&format!("(UP主: {author})"));
+                }
+                if let Some(d) = np.duration_seconds {
+                    let (m, s) = ((d as i64) / 60, (d as i64) % 60);
+                    out.push_str(&format!(",时长 {m}:{s:02}"));
+                }
+                Ok(out)
+            }
+            // 需要登录 ≠ 失败:引导用户点登录扫码,登录成功后会自动重放(§7.1,不用再说一遍)。
+            crate::media::PlayOutcome::AwaitingLogin { detail } => Ok(format!(
+                "这个内容需要登录才能播放,不是出错了。请提示用户点一下登录、用手机扫码登录一下;\
+                 登录成功后会自动接着把它放出来,不用再说一遍。(原因:{detail})"
+            )),
         }
-        if let Some(d) = np.duration_seconds {
-            let (m, s) = ((d as i64) / 60, (d as i64) % 60);
-            out.push_str(&format!(",时长 {m}:{s:02}"));
-        }
-        Ok(out)
     }
 }

@@ -12,8 +12,9 @@ use super::{Tool, ToolCtx, ToolSpec};
 
 /// 常驻区(进前缀)总预算,字数计(中文 ~1.5 字/token,约合 600-800 token)。
 const RESIDENT_BUDGET_CHARS: usize = 1200;
-/// 单条内容上限(同 remember 的防撑爆纪律)。
-const CONTENT_MAX_CHARS: usize = 300;
+/// 单条内容上限:超过则退回让模型精简/拆主题重写,**不静默截断**(§3.5)。
+/// 媒体目录+一串 URL 容易破 300,放到与常驻预算同量级;真超大条目由预算逻辑自动降按需。
+const CONTENT_MAX_CHARS: usize = 1200;
 const DOMAIN_MAX_CHARS: usize = 24;
 
 /// scope 参数("home" 默认 / "user" = 当前用户个人)→ 存储 scope 串。
@@ -25,15 +26,19 @@ fn scope_of(args: &serde_json::Value, ctx: &ToolCtx) -> String {
 }
 
 fn domain_of(args: &serde_json::Value) -> anyhow::Result<String> {
-    Ok(args
+    let domain = args
         .get("domain")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .context("缺少 domain 参数")?
-        .chars()
-        .take(DOMAIN_MAX_CHARS)
-        .collect())
+        .to_string();
+    // 超长不静默截断(§3.5):主题词应短小,过长退回让模型换个短的。
+    let n = domain.chars().count();
+    if n > DOMAIN_MAX_CHARS {
+        anyhow::bail!("主题词 {n} 字,太长了(上限 {DOMAIN_MAX_CHARS} 字),请换个更短的主题词。");
+    }
+    Ok(domain)
 }
 
 // ---------------------------------------------------------------------------
@@ -88,15 +93,21 @@ impl Tool for BriefingWrite {
 
     async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
         let domain = domain_of(&args)?;
-        let content: String = args
+        let content = args
             .get("content")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .context("缺少 content 参数")?
-            .chars()
-            .take(CONTENT_MAX_CHARS)
-            .collect();
+            .to_string();
+        // 超长不静默截断(§3.5):退回错误,让模型自己精简或按主题拆开重写。
+        let n = content.chars().count();
+        if n > CONTENT_MAX_CHARS {
+            anyhow::bail!(
+                "这条备忘 {n} 字,超过 {CONTENT_MAX_CHARS} 字上限,没有写入。\
+                 请精简,或按主题(domain)拆成多条分开写,再重试。"
+            );
+        }
         let scope = scope_of(&args, ctx);
 
         let store = ctx.store.clone();
@@ -367,5 +378,31 @@ mod tests {
         .unwrap();
         let rows = ctx.store.briefings.list_for(1).unwrap();
         assert_eq!(rows[0].scope, "user:1");
+    }
+
+    #[tokio::test]
+    async fn over_limit_rejects_not_truncates() {
+        let ctx = ctx("overlimit");
+        let w = BriefingWrite::new();
+        let too_long = "九".repeat(CONTENT_MAX_CHARS + 50);
+        // 超长 → 退回错误,不静默截断(§3.5)
+        assert!(w
+            .run(serde_json::json!({"domain": "media", "content": too_long}), &ctx)
+            .await
+            .is_err());
+        // 拒绝写入后不留半截数据
+        assert!(ctx.store.briefings.list_for(1).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn over_long_domain_rejects() {
+        let ctx = ctx("longdomain");
+        let w = BriefingWrite::new();
+        let long_domain = "题".repeat(DOMAIN_MAX_CHARS + 5);
+        // 主题词超长 → 退回错误,不静默截断(§3.5)
+        assert!(w
+            .run(serde_json::json!({"domain": long_domain, "content": "x"}), &ctx)
+            .await
+            .is_err());
     }
 }

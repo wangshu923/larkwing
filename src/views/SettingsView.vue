@@ -36,6 +36,7 @@ watch(tab, (v) => {
   if (v === 'voice' && !voiceInfo.value) void loadVoice()
   if (v === 'system') {
     void loadAutostart()
+    void loadDataLocation()
     if (!appVer.value) void appVersion().then((x) => (appVer.value = x))
   }
 })
@@ -347,6 +348,79 @@ function toggleFloatUsage() {
   settings.set('ui.float.show_usage', floatShowUsage.value ? '0' : '1')
 }
 
+// 数据目录「搬家」(datadir):选目录 → 预检 → 内联确认 → 执行(HUD 进度,完后自动重启)。
+const dataRoot = ref('')
+const oldDataRoot = ref<string | null>(null)
+const relocateBusy = ref(false)
+const relocateError = ref('')
+const pendingMove = ref<{ picked: string; newRoot: string; needBytes: number } | null>(null)
+const gb = (n: number) => (n / 1073741824).toFixed(1)
+async function loadDataLocation() {
+  if (!isTauri()) return
+  try {
+    const loc = await api.dataLocation()
+    dataRoot.value = loc.root
+    oldDataRoot.value = loc.oldRoot
+  } catch (e) {
+    console.error('读取数据位置失败', e)
+  }
+}
+function revealData() {
+  if (isTauri()) void api.revealDataDir()
+}
+async function relocate() {
+  if (relocateBusy.value || !isTauri()) return
+  relocateError.value = ''
+  pendingMove.value = null
+  const picked = await api.pickDataFolder()
+  if (!picked) return
+  try {
+    const check = await api.relocatePrecheck(picked)
+    if (!check.ok) {
+      relocateError.value = t(`settings.system.dataErr.${check.reason ?? 'failed'}`)
+      return
+    }
+    pendingMove.value = { picked, newRoot: check.newRoot ?? '', needBytes: check.needBytes }
+  } catch (e) {
+    console.error('搬家预检失败', e)
+    relocateError.value = t('settings.system.relocateFailed')
+  }
+}
+async function confirmRelocate() {
+  const pm = pendingMove.value
+  if (!pm) return
+  relocateBusy.value = true
+  try {
+    await api.relocateData(pm.picked) // 成功 = 翻指针后自动重启,页面随之刷新,不会走到这下面
+  } catch (e) {
+    relocateBusy.value = false
+    pendingMove.value = null
+    console.error('搬家失败', e)
+    relocateError.value = t('settings.system.relocateFailed')
+  }
+}
+function cancelRelocate() {
+  pendingMove.value = null
+}
+async function cleanupOld() {
+  try {
+    await api.cleanupOldData()
+  } catch (e) {
+    console.error('清理旧数据失败', e)
+  } finally {
+    oldDataRoot.value = null
+  }
+}
+async function keepOld() {
+  try {
+    await api.keepOldData()
+  } catch (e) {
+    console.error(e)
+  } finally {
+    oldDataRoot.value = null
+  }
+}
+
 // 天气服务(PLAN 天气块):默认免 key Open-Meteo;接和风走 JWT —— 复制全局应用公钥到和风控制台,
 // 把项目 ID / 凭据 ID / API Host 三件套填回来。后端三件套齐 + 全局私钥已生成即切和风源。
 const appPublicKey = ref('')
@@ -373,7 +447,18 @@ const weatherConfigured = computed(
 function setQWeather(key: string, ev: Event) {
   settings.set(key, (ev.target as HTMLInputElement).value.trim())
 }
-// 全局代理(直连优先、失败兜底走代理;留空=关)。下载/LLM 现读即生效,无需重启。
+// 全局代理:开关 net.proxy_enabled 控总闸,地址 net.proxy 始终保留(默认已填,免空)。
+// 下载/LLM 现读即生效,无需重启。关掉只停用、不丢地址(铁律:地址可保存下来)。
+const proxyEnabled = computed(() => settings.get('net.proxy_enabled') === '1')
+function toggleProxy() {
+  const target = !proxyEnabled.value
+  // 开启时把当前地址(可能是默认值)一并落库,确保后端选路与界面显示一致。
+  if (target) {
+    const addr = settings.get('net.proxy').trim()
+    if (addr) void settings.set('net.proxy', addr)
+  }
+  void settings.set('net.proxy_enabled', target ? '1' : '0')
+}
 function setProxy(ev: Event) {
   settings.set('net.proxy', (ev.target as HTMLInputElement).value.trim())
 }
@@ -438,6 +523,14 @@ const segs = computed(() => ({
   character: {
     key: 'ui.character',
     options: ['titan', 'dog', 'cat'].map((v) => ({ v, label: t(`settings.general.char_${v}`) })),
+  },
+  // 桌宠遛弯显隐(值反义:'0'=显示 / '1'=隐藏);右键「隐藏桌宠」后从这里恢复
+  pet: {
+    key: 'ui.pet.hidden',
+    options: [
+      { v: '0', label: t('settings.general.pet_show') },
+      { v: '1', label: t('settings.general.pet_hide') },
+    ],
   },
   bubble: {
     key: 'ui.bubble_shape',
@@ -617,34 +710,33 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             @keyup.enter="savePetName"
           />
         </div>
-        <div class="row">
+        <div class="row persona-row">
           <span class="label">{{ t('settings.general.personaStyle') }}</span>
-          <input
-            v-model="styleDraft"
-            class="s-input"
-            maxlength="60"
-            :placeholder="t('settings.general.personaStylePlaceholder')"
-            @blur="saveStyle"
-            @keyup.enter="saveStyle"
-          />
-        </div>
-        <div class="row persona-quick">
-          <span class="label">{{ t('settings.general.personaQuick') }}</span>
-          <span class="sp-list">
-            <button
-              class="chip preset"
-              :class="{ on: !styleDraft.trim() }"
-              @click="applyPreset('')"
-            >{{ t('settings.general.personaPresets.neutral') }}</button>
-            <button
-              v-for="p in personaPresets"
-              :key="p.k"
-              class="chip preset"
-              :class="{ on: styleDraft.trim() === p.text }"
-              :title="p.text"
-              @click="applyPreset(p.text)"
-            >{{ p.label }}</button>
-          </span>
+          <div class="persona-field">
+            <textarea
+              v-model="styleDraft"
+              class="s-input persona-text"
+              maxlength="500"
+              rows="3"
+              :placeholder="t('settings.general.personaStylePlaceholder')"
+              @blur="saveStyle"
+            ></textarea>
+            <div class="persona-chips" :aria-label="t('settings.general.personaQuick')">
+              <button
+                class="chip preset mini"
+                :class="{ on: !styleDraft.trim() }"
+                @click="applyPreset('')"
+              >{{ t('settings.general.personaPresets.neutral') }}</button>
+              <button
+                v-for="p in personaPresets"
+                :key="p.k"
+                class="chip preset mini"
+                :class="{ on: styleDraft.trim() === p.text }"
+                :title="p.text"
+                @click="applyPreset(p.text)"
+              >{{ p.label }}</button>
+            </div>
+          </div>
         </div>
         <div class="row">
           <span class="label">{{ t('settings.general.skin') }}</span>
@@ -657,7 +749,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             >{{ t(`settings.general.skin_${s}`) }}</button>
           </span>
         </div>
-        <div v-for="(seg, name) in { character: segs.character, bubble: segs.bubble, textScale: segs.textScale }" :key="name" class="row">
+        <div v-for="(seg, name) in { character: segs.character, pet: segs.pet, bubble: segs.bubble, textScale: segs.textScale }" :key="name" class="row">
           <span class="label">{{ t(`settings.general.${name}`) }}</span>
           <span class="seg">
             <button
@@ -886,7 +978,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               min="0"
               max="100"
               step="5"
-              :value="Number(settings.get('voice.wake.sensitivity') || '50')"
+              :value="Number(settings.get('voice.wake.sensitivity') || '100')"
               @input="settings.set('voice.wake.sensitivity', ($event.target as HTMLInputElement).value)"
               @change="saveSensitivity(Number(($event.target as HTMLInputElement).value))"
             />
@@ -1148,15 +1240,47 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         </div>
         <p class="hint">{{ t('settings.system.floatHint') }}</p>
 
+        <p class="section">{{ t('settings.system.storage') }}</p>
+        <div class="row">
+          <span class="label">{{ t('settings.system.dataLocation') }}</span>
+          <span class="key-state">
+            <button class="link" :disabled="relocateBusy" @click="revealData">{{ t('settings.system.dataReveal') }}</button>
+            <button class="link" :disabled="relocateBusy" @click="relocate">{{ relocateBusy ? t('settings.system.relocating') : t('settings.system.relocate') }}</button>
+          </span>
+        </div>
+        <p class="hint s-mono">{{ dataRoot || '—' }}</p>
+        <div v-if="pendingMove" class="data-confirm">
+          <p>{{ t('settings.system.relocateConfirm', { path: pendingMove.newRoot, size: gb(pendingMove.needBytes) }) }}</p>
+          <span class="key-state">
+            <button class="link strong" @click="confirmRelocate">{{ t('settings.system.relocateGo') }}</button>
+            <button class="link" @click="cancelRelocate">{{ t('settings.system.relocateCancel') }}</button>
+          </span>
+        </div>
+        <p v-if="relocateError" class="hint data-err">{{ relocateError }}</p>
+        <p class="hint">{{ t('settings.system.dataLocationHint') }}</p>
+        <div v-if="oldDataRoot" class="row">
+          <span class="label">{{ t('settings.system.oldData') }}</span>
+          <span class="key-state">
+            <button class="link" @click="cleanupOld">{{ t('settings.system.oldDataDelete') }}</button>
+            <button class="link" @click="keepOld">{{ t('settings.system.oldDataKeep') }}</button>
+          </span>
+        </div>
+        <p v-if="oldDataRoot" class="hint s-mono">{{ oldDataRoot }}</p>
+
         <p class="section">{{ t('settings.system.network') }}</p>
+        <!-- 一行:代理 + 开关 + 地址输入(开关切 net.proxy_enabled,地址始终可改、关掉也留) -->
         <div class="row">
           <span class="label">{{ t('settings.system.proxy') }}</span>
-          <input
-            class="s-input s-mono-input"
-            :value="settings.get('net.proxy')"
-            :placeholder="t('settings.system.proxyPlaceholder')"
-            @change="setProxy"
-          />
+          <span class="key-state proxy-line">
+            <button class="link" @click="toggleProxy">{{ proxyEnabled ? t('settings.system.turnOff') : t('settings.system.turnOn') }}</button>
+            <input
+              class="s-input s-mono-input"
+              :class="{ off: !proxyEnabled }"
+              :value="settings.get('net.proxy')"
+              :placeholder="t('settings.system.proxyPlaceholder')"
+              @change="setProxy"
+            />
+          </span>
         </div>
         <p class="hint">{{ t('settings.system.proxyHint') }}</p>
 
@@ -1168,10 +1292,29 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
       </div>
     </div>
     </div>
+    <!-- 搬家中:全屏遮罩 + 详细进度在 HUD(完成后自动重启)。期间锁交互,别让新写入落老盘。 -->
+    <div v-if="relocateBusy" class="relocate-veil">
+      <div class="relocate-card">
+        <div class="spinner" />
+        <p>{{ t('settings.system.relocatingTitle') }}</p>
+        <p class="sub">{{ t('settings.system.relocatingSub') }}</p>
+      </div>
+    </div>
   </section>
 </template>
 
 <style scoped>
+/* 数据「搬家」:内联确认条 + 错误 + 搬家中遮罩 */
+.data-confirm { margin-top: 12px; padding: 12px 14px; border: 1px solid var(--accent); border-radius: 10px; background: rgba(var(--accent-rgb), 0.06); display: flex; flex-direction: column; gap: 10px; }
+.data-confirm p { font-size: 12.5px; color: var(--text); line-height: 1.6; word-break: break-all; }
+.link.strong { font-weight: 600; }
+.data-err { color: var(--danger); }
+.relocate-veil { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center; background: rgba(var(--veil-rgb, 0 0 0), 0.55); backdrop-filter: blur(2px); }
+.relocate-card { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 28px 34px; border-radius: 14px; background: var(--surface); border: 1px solid var(--line); box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4); max-width: 360px; text-align: center; }
+.relocate-card p { font-size: 14px; color: var(--text); }
+.relocate-card .sub { font-size: 12px; color: var(--text-dim); line-height: 1.6; }
+.relocate-card .spinner { width: 30px; height: 30px; border: 3px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: relocate-spin 0.8s linear infinite; }
+@keyframes relocate-spin { to { transform: rotate(360deg); } }
 /* 滚动交给 .view-scroll(全局);.settings 只当竖向骨架,表头/tab 钉在滚动区外 */
 .settings { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 /* padding-right 让「回去聊天」避开右上角窗控三键(二轮真机修复:不再重叠) */
@@ -1214,6 +1357,10 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
   padding: 7px 11px; color: var(--text); font-size: 13px; outline: none; min-width: 220px;
 }
 .s-input:focus { border-color: var(--accent); }
+/* 代理一行:开关 + 地址输入同排,输入框吃满 label 右侧空间;关掉时淡一档(状态可读,地址仍可改) */
+.proxy-line { flex: 1; justify-content: flex-end; min-width: 0; }
+.proxy-line .s-input { flex: 1; min-width: 0; max-width: 320px; }
+.s-input.off { opacity: .5; }
 
 .key-state, .key-edit { display: inline-flex; align-items: center; gap: 10px; }
 .ok-text { color: var(--ok); font-size: 12.5px; }
@@ -1226,11 +1373,15 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .chip.warn { border-color: rgba(var(--attn-rgb), 0.5); color: var(--attn); }
 .section.dt-sec { margin-top: 20px; }
 .chip.future { opacity: .62; color: var(--text-dim); }
-/* 性格快捷选择:复用音色 chip 的薄玻璃质感 + 可点;行顶对齐,chip 折行时标签不被居中拉偏 */
-.persona-quick { align-items: flex-start; }
+/* 性格:textarea + 紧贴下方的小快捷 chip(复用音色 chip 薄玻璃质感) */
+.persona-row { align-items: flex-start; }
+.persona-field { display: flex; flex-direction: column; gap: 6px; flex: 1 1 340px; max-width: 440px; min-width: 220px; }
+.persona-text { width: 100%; min-height: 4.4em; line-height: 1.55; resize: vertical; font-family: inherit; }
+.persona-chips { display: flex; flex-wrap: wrap; gap: 5px; }
 .chip.preset { cursor: pointer; background: rgba(var(--accent-rgb), 0.04); transition: border-color .15s, color .15s, background .15s; }
 .chip.preset:hover { border-color: rgba(var(--accent-rgb), 0.45); }
 .chip.preset.on { border-color: rgba(var(--accent-rgb), 0.55); color: var(--accent); background: rgba(var(--accent-rgb), 0.1); }
+.chip.preset.mini { padding: 2px 8px; font-size: 11px; border-radius: 7px; }
 .hint { font-size: 12px; color: var(--text-dim); line-height: 1.7; display: flex; align-items: center; gap: 10px; padding-top: 13px; }
 .hint.err { color: var(--danger); }
 .hint.warn { color: var(--warn); }

@@ -112,7 +112,8 @@
 - 所有联网(下载 / LLM / web / 天气 / 媒体 …)**必须**经 `larkwing-core/src/net.rs` 的 `net::Client`,**禁止新建裸 `reqwest::Client`**(唯二例外:net 模块自身、`#[cfg(test)]`)。
 - 它是「全局代理总开关 + 直连优先 / 连接失败兜底 / per-host sticky」的唯一接缝。
 - 加联网代码 = 给调用点一个 `net::Client` 字段,请求走 `.send(url, |c| …)`,下载用 `.direct()` / `.proxy_client()` 两趟。改「该不该走代理」的策略只改 net 一处。
-- 硬规则:`net.proxy` 关(空)⇒ 一律直连,哪怕某 host 之前被 sticky 标记;换值 / 关代理即清 sticky。net 模块**不碰 store/llm**(守 engine 唯一合流点),解析在 `Engine::resolve_proxy`。
+- 硬规则:总开关关 ⇒ 一律直连,哪怕某 host 之前被 sticky 标记;换值 / 关代理即清 sticky。net 模块**不碰 store/llm**(守 engine 唯一合流点),解析在 `Engine::resolve_proxy`。
+- **开关与地址分家(2026-06-18,用户要求)**:UI 是一个**总开关** `net.proxy_enabled`(默认 `0` 关)+ 一个**始终保存的地址** `net.proxy`(默认预填 `http://127.0.0.1:7890`,免「空框」烦恼)。关掉只停用、地址不丢;`resolve_proxy` 先看开关——关 ⇒ 直连(**连系统 env 也不读**,比旧的「空=自动读 HTTPS_PROXY」更可预测);开 ⇒ 用地址,地址空才回落 `net::env_proxy`。net 层语义不变(`set_proxy(None)` = 关),开关只是 engine 侧的「用不用」闸门。新增键照 §6.8 两边各加一行(`useSettings` DEFAULTS + Rust `APP_SETTING_KEYS` + `set_setting` 校验 0/1)。
 - **未接**:TTS(msedge-tts 同步 connect 不吃代理,国内疑似直连可用);LLM 走代理也可由 `base_url` 覆盖。
 
 ### 4.7 记忆归人 🔒
@@ -163,6 +164,7 @@
 - 小状态 / 开关**不开新域**,走 `settings` scoped KV(key 带前缀自治,如 `tool.reminder.*`);blob / 可重建缓存(TTS 音频、向量、日志)**不进库,走文件**。
 - 横切:Repo 方法**全同步**(亚毫秒;异步调用方自己 `spawn_blocking`);ID 用 rowid,时间戳 unix 毫秒;流式回复**不逐 token 写库**,流完一次落一行;首启 `ensure_default_user()`。
 - **schema 不隔离**(跨域外键照用,engine 跨域读拼 prompt),防滑回 per-agent 数据孤岛(§4.7 记忆归人)。
+- **数据根可「搬家」(`datadir`,2026-06-18 用户拍板):别再假设 `app_data_dir` 就是数据根。** 用户可把整个数据目录(DB + `media/` + `voice/` + 模型缓存 + 日志)整体搬到别的盘(Windows 多盘:不想全堆 C 盘)。机制 = **锚点 + 指针文件**:锚点 = OS 默认 `app_data_dir`(永远找得到、住指针、永不参与搬家),锚点放 `location.json` 指针说真实根在哪;`larkwing-core/src/datadir.rs` 的 `resolve(anchor)` 在 boot **最先**跑(lib.rs 装配头),返回生效根,**之后 store/日志/media/voice 全部 `root.join(...)` 派生**(原有单一出口不变,这是搬家能干净的前提)。三态:无指针/空 = 用锚点;指向别处且在 = 用它;指向别处但目录不在(盘没插/被删)= 回落锚点 + `data_missing`,前端弹恢复弹窗(**绝不静默在默认位置重建空数据**,§3.5)。搬家 = 拷可重建子树 → DB 走 `VACUUM INTO` 出一致快照(放最后)→ staging 同卷原子改名 → **翻指针 = 提交点**(翻前老数据始终权威)→ 立即 `app.restart()`。**判据:写任何"数据放哪"的路径,都从生效根派生,绝不直接 `app_data_dir()`;DB 里也绝不存绝对路径**(克隆音色 wav / TTS 缓存只存相对文件名 → 整棵子树挪走路径不断,这条已是约定、搬家依赖它)。真机验见 §8.1 + PLAN「数据搬家」watch-items。
 
 ### 6.3 llm
 - **翻译三处各归其位**(同一逻辑只出现一次):`store::Message → ChatMessage` = 策略,在 engine `build_context()`(1 份);`ChatRequest → 厂商 JSON` / `厂商 SSE → ChatEvent` = 方言,在各 provider 私有 `to_wire()`/`parse_chunk()`(每家一份,内容互不相同)。判别「重复」= 一个变化要不要同步改 N 处。
@@ -191,7 +193,8 @@
 - **轮数三层控制**(用户拍板,不是单个魔法数):① 每 `SELF_CHECK_EVERY=10` 轮软提示自检(中立一句 append 进 request 尾,不落库不进历史 → 不破前缀缓存);② 连续 `MAX_STALL_ROUNDS=5` 轮「全重复调用 / 全报错」→ 强制收尾;③ 硬上限 `MAX_TOOL_ROUNDS`(失控 backstop)。命中收尾闸即 `tool_choice=none`。
 - **`Tool` trait**(`tools/`,一工具一文件):`spec()`(name/description/JSON-Schema 参数 / 超时档 / 给 UI 的友好动词)+ `async run(args, &ToolCtx)`;`ToolCtx { user_id, conv_id, store }`(手脚清单不是插件总线)。注册表 `Tools::builtin()`;白名单子集 = 场景数据声明。`Tool::risk()` 元数据 slot 已备但**引擎当前不消费**(执行前确认闸门 YAGNI,未建)。
 - **工具六条预记录约束**(PLAN §3):可并行 / 每工具超时 / 异步两型(turn 内阻塞 + 分离 job)/ 状态可视 / 可中断(取消级联进工具,合成「已取消」ToolResult 保历史完形)/ 流式碎片重组规范。
-- **few-shot 纪律**:每场景 2–4 段、总预算 **≤800 token**、**至少一段反例**(不该调工具的对话);示例 id 用 `fs_*` 前缀与真实 id 隔开;加载时校验(引用工具 ⊆ 白名单、call/result 配对完整)。**绝不嵌「用户的具体事实」**(有名有姓有属性的虚构人物会被模型当真事——「朵朵」bug);remember 类示范用一次性、自我纠正的事实(不吃香菜)。
+- **工具写入超长一律退回、绝不静默截断**(§3.5,2026-06-18):模型供给且要落库的字段(记忆 `fact`、备忘 `domain`/`content`、提醒 / 盯天气 `content`)超过字数上限就 `anyhow::bail!` 退回报错(经 `run_tools` 当观察喂回模型),让它精简或拆条重写,**绝不 `.chars().take(MAX)` 默默吃半截**(实锤 bug:萌鸡小队第五季 URL 被 300 字上限悄悄截没,模型却以为写全了)。豁免:派生的展示标签(会话标题取前 N 字、不是数据)、外部内容**读取**(`fs` 列目录/读文本、`web` 抓取已各自「如实告知」截断)。
+- **few-shot 纪律**:每场景 2–4 段、总预算 **≤800 token**、**至少一段反例**(不该调工具的对话);示例 id 用 `fs_*` 前缀与真实 id 隔开;加载时校验(引用工具 ⊆ 白名单、call/result 配对完整)。**任何 few-shot 都绝不嵌「具体、可复用的事实」**(不只 remember 示范——闲聊/建议类示范同样会泄漏):有名有姓有属性的虚构人物会被当真人(「朵朵」bug);**带属性的具名清单**(地点/资源)会被模型当用户真事抄进 remember(2026-06-18 实锤:建议示范里「湿地公园(放风筝、喂鸭子)、科技馆、采摘园」被原样记成「用户周末常去的三个地方」)。对策:示范内容要么是一次性/自我纠正的事实(不吃香菜),要么是**泛指、无可复用属性**的方向(「户外走走/室内逛逛」),绝不出现结构化的「具名+属性」清单。
 - **落库**:messages 加 nullable `payload` TEXT(assistant 行存 tool_calls + 该轮 reasoning;`role='tool'` 行存 call_id/name/status);UI 渲染过滤 tool 行。
 - **场景自决**(>1 预设时):常驻基础工具 `enter_mode(mode_id)`,turn 内立即生效(写 `conversations.scene_id` 会话级粘性 → 本轮重建请求);换 persona/few-shot/白名单/options,**不换**记忆 / 历史 / 循环代码;每 turn 最多切 1 次;不调用 = 维持现状。
 
@@ -231,6 +234,7 @@
 - **yt-dlp = 解析器组件**(用时下载),**mpv 不搬**——播放器长在自己 UI(WebView 解码 + core localhost relay 转发,音视频分离流 ffmpeg `-c copy` 混 fMP4)。
 - **进度总线 `tasks`**(影音引入的通用件):进度句柄 **drop 未收尾 = 自动 fail**(防僵尸进度条);label / step = key + params 走前端字典(core 不产文案)。
 - **登录一期 = app 内扫码**取 cookie(原生 CookieManager;SESSDATA 是 HttpOnly),**绝不依赖外部浏览器保持登录**。匿名也能跑,首次成功后 `LoginHint` 提示一次。
+- **需登录的播放 ≠ 失败 + 登录后自动重放(2026-06-18,用户反馈「扫码时还哐哐往下跑、最后失败」)**:`play()` 命中「需登录」时**不再 `bail` 当失败**——记下待重放(`pending_play`,按源,10min 过期作废)+ 发 `AuthRequired`(弹扫码气泡)+ 解析任务**正常收尾**(不标红 HUD、不喂模型「放失败了」),返回 `PlayOutcome::AwaitingLogin{detail}`(工具层据此引导用户扫码、说「登录后会自动接着放」)。扫码成功 `set_cookies` 那一刻**带新 cookie 自动重放**(不绕模型、同嘴控哲学;无 tokio 运行时的同步调用方保留待重放不丢)。未知来源无登录通道才回落「如实退回」。`play()` 返回 `Result<PlayOutcome>`(原 `NowPlaying`),`media_retry` 只看 `Err` 不受影响。
 - 多源立场与 LLM 同构:解析层天然多源,按源分化的只有搜索 + 登录态(`MediaSource` trait),MVP 单源 bilibili。
 - 工具三原语:`media_search`(读)/ `media_play`(写,job 型秒回)/ `media_control`(嘴控,按钮直连前端 VM 不绕 LLM);**校验收口 core**,音量跨播放粘住、倍速每次复位(mpv 时代教训)。
 - 本地播放链:需知(目录)→ 文件原语找文件 → `media_play` 放行本地绝对路径 → relay `/f/` 本地文件端点(手写 Range)。NAS 挂载盘符 / UNC 是普通路径。
@@ -278,7 +282,7 @@
 - **单实例 / 二次启动唤回**(2026-06-16):全程序只跑一个进程。已在运行时再点快捷方式 / 重复启动**不开新进程**——`tauri-plugin-single-instance`(**放最前注册**),OS 把第二个进程的命令行交给已运行实例的回调、第二个进程退出;回调复用 `show_window` 把主窗(可能藏托盘)唤到前台,沿用 `--autostart` 静默语义(自启触发不唤窗)。无 IPC 命令、不需 capability。**OS 转发 + 窗口前置待 Windows 真机验**(§8.1;若只闪任务栏不前置,加 always-on-top 翻转兜底,见 PLAN §12 watch-item)。
 - ⚠️ **悬浮窗 useMedia 只读不发声**(独立 WebView 复用播放 VM 会与主窗双播——多窗变体的双播坑,`play` 分支已堵)。**反向媒体控制已落地**(2026-06-16):悬浮窗迷你播控按钮**转发**给主窗执行(`emitMediaControl`→主窗 `onMediaControl`→`applyControl`,与嘴控汇同一执行口),float 仍不出声;播放态经 `emitNowPlaying(np,status)` 镜像回 float(播/暂停图标翻转)。跨窗联动 Mac/浏览器测不出,**待 Windows 真机验**(§8.1)。
 - **托盘「显示悬浮窗」**(2026-06-16):✕ 关掉悬浮窗后,托盘菜单一项重开(`show_float`→壳层 emit `lw:show-float`→主窗置 `ui.float.enabled='1'`+`setFloatVisible(true)`,持久化由主窗收口);比绕设置页顺手。
-- **失败任务「重试」已落地**(2026-06-16,轻量版、不等 JobRunner):仅影音解析/组件下载失败带 `TaskRetry::MediaPlay{page_url,audio_only}` 载体,UI 显「重试」直连重放(`media_retry` 命令→`media.play`,按钮不绕 LLM,§7.1 哲学);auth 失败不给盲目重试(走登录)。通用 JobRunner 重试仍后置。
+- **失败任务「重试」已落地**(2026-06-16,轻量版、不等 JobRunner):仅影音解析/组件下载失败带 `TaskRetry::MediaPlay{page_url,audio_only}` 载体,UI 显「重试」直连重放(`media_retry` 命令→`media.play`,按钮不绕 LLM,§7.1 哲学);auth **不再算失败**——改为记下待重放、扫码登录成功后**自动续播**(2026-06-18,§7.1),不出重试钮。通用 JobRunner 重试仍后置。
 - 排序立场:**不做优先级排序**(robot 配置病)——通知「最新优先 + 自动淡出」、进行中「钉住」。
 - **打包 / 卸载 / 默认自启**(2026-06-17,用户拍板):
   - **Windows 只发 NSIS、不发 MSI**:`bundle.targets` 由 `"all"` 改成显式清单 `["app","dmg","deb","rpm","appimage","nsis"]`(= all 去 msi);Mac 仍 app+dmg、Linux 仍 deb/rpm/appimage,CI(release.yml 三平台)零改。NSIS 钩子灵活、官方推荐;MSI 卸载清理麻烦故弃。
@@ -314,10 +318,12 @@
   - 全屏闪烁 / 退出穿帮——HTML5 `requestFullscreen` 与 DWM 打架 + 透明窗放大穿帮;修 = 改走原生窗口全屏 `win.setFullscreen`。
   - 滚动条占布局宽度跳动(§6.7 `scrollbar-gutter`)、唤醒标定**性能**坑(`KeywordSpotter::create` Mac 264ms 不暴露、Windows 卡分钟级)。
   - **藏托盘的主窗仍 60fps 空烧 CPU**(2026-06-17,Windows 实测 ~3.3%):关主窗 = `hide()` 进程不退(§7.6),而主窗 `transparent:true` 让 Chromium 遮挡检测失效(透明窗永不算"被挡")→ 隐藏后 RAF **不被自动节流**;加之动画循环本来没有可见性判断 → 背景 canvas + 遛弯 `roamFrame` 藏起来照样满帧空跑。修 = `usePageVisible`(`visibilitychange` + 壳层 `lw:win-visible` 事件**双触发**,后者只为 main 发否则关悬浮窗误停主窗)+ `useRafLoop`(不可见即 `cancelAnimationFrame`);所有 canvas 背景(Neon/Hologram/Hud/Starfield)与 `MainLayout.roamFrame` 都改走它。**新代码起 RAF 循环一律用 `useRafLoop`,别再裸 `requestAnimationFrame` 自调度。** 浏览器验过暂停逻辑(88→0→88 帧/秒);藏托盘后 CPU≈0 **待 Windows 真机验**。
-- **规则**:改**影音播放 / 窗口全屏 / 编解码 / WebView 渲染 / 媒体流 / 唤醒标定性能 / 动画循环**类代码,默认假设 WebView2 更受限;**Mac 跑通 ≠ 验证通过**,这类**必须出 Windows 包真机验**;设计时主动选 WebView2 也支持的路径(avc、原生窗口全屏)。
+  - **数据「搬家」(datadir)只能 Windows 真机验**(2026-06-18):跨盘 C:→D: 搬(同卷 rename 退化成拷+删的边界)、重启绑新根、`VACUUM INTO` 出的库可开且数据全、原生目录选择器、`explorer` 打开数据文件夹、剩余空间预检(fs2 `available_space`)、拔盘后启动弹恢复弹窗、卸载重装后指针仍在 → 数据找得回。Mac 开发能跑通拷贝/VACUUM/重启逻辑,但盘符/可移动盘/资源管理器行为测不出。详见 PLAN「数据搬家」watch-items。
+- **规则**:改**影音播放 / 窗口全屏 / 编解码 / WebView 渲染 / 媒体流 / 唤醒标定性能 / 动画循环 / 数据目录搬家**类代码,默认假设 WebView2 / Windows 文件系统更受限;**Mac 跑通 ≠ 验证通过**,这类**必须出 Windows 包真机验**;设计时主动选 WebView2 也支持的路径(avc、原生窗口全屏)。
 
 ### 8.2 唤醒「叫不答应」根因与决策(2026-06-16 拍板:保持 KWS)
 - 已定案:**默认唤醒阈值 0.45 太严**(口语 / 偏小的「旺财」KWS 分数 ~0.3,robot 用 0.20 → 8/10,0.45 只接咬字清亮的 → 3/10)。已修(降阈 + 修灵敏度滑块落库)。
+- **默认灵敏度拉满(2026-06-18,用户拍板)**:默认 `voice.wake.sensitivity` 从 50(→阈值 0.2)改成 **100(最灵敏 →阈值 0.1,映射 clamp 下限)**。理由 = KWS 召回本就偏弱,「**保障能唤醒再说**」——默认偏召回、先保证叫得应,误触嫌吵的人自己往左调 / 录标定,胜过喊半天不答应。**改默认 = 改三处**(同 §6.8 接线纪律):Rust `voice/mod.rs::wake_threshold` 的 `unwrap_or(100.0)` · 前端 `useSettings` DEFAULTS · `SettingsView` 滑块 fallback。标定流程不受影响(用户主动录制时仍按 calib「宁松勿严」择档,会覆盖此默认)。
 - **再定案**:阈值这条路到头,病灶 = **通用 3.3M KWS 模型对真实「旺财」召回太弱**(阈拉到 0.12 仍 0 命中,再压只招误触);同采集链上 ASR(听写)又准又能小声 → 采集 / 麦 / 阈值都没问题,就是 KWS 弱。两段式(KWS→ASR 复核)作废。
 - **已拍板(2026-06-16,用户准则):保持 KWS,不做 VAD→ASR。** 召回靠**降阈 + 唤醒标定(录几遍定灵敏度 + 拼写覆盖)**兜,接受 KWS 召回上限,换**秒应零延迟**;放弃的 `VAD→ASR 当探测器`(VAD→SenseVoice 转写→命中即唤醒)代价 = +0.5–1s 延迟 + 每段说话跑一次 ASR,用户不取。**记档:此方案已设计完整,留作后备**——若 Windows 真机召回仍不可接受再启,届时走「KWS 秒应快车道 + VAD→ASR 兜底」混合,不动手前别当 TODO。
 - `sherpa KWS 不给分数`(`KeywordResult` 无 score)→ 标定只能**二值阈值扫描**,这是阈值类工作的硬前提。

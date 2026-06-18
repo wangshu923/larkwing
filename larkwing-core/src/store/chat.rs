@@ -32,6 +32,11 @@ pub const MIGRATIONS: &[Migration] = &[
         "0006_conversations_channel",
         "ALTER TABLE conversations ADD COLUMN channel TEXT NOT NULL DEFAULT 'ui';",
     ),
+    // 会话钉住(用户右键「钉住」):没聊完的会话排到最前 + 列表挂 📌。0/1 布尔,列表排序 pinned DESC 在前。
+    m(
+        "0007_conversations_pinned",
+        "ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;",
+    ),
 ];
 
 /// 会话渠道(渠道=数据):列保持开放 TEXT 让未来渠道当数据加,已知值给常量防拼错。
@@ -48,6 +53,8 @@ pub struct Conversation {
     pub title: String,
     /// 渠道(会话级,持久):ui/voice/system/…。列表按此渲染小图标。见 CHANNEL_* 常量。
     pub channel: String,
+    /// 钉住:用户右键标记的「没聊完」会话,列表排最前 + 挂 📌。
+    pub pinned: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -101,6 +108,7 @@ impl ChatRepo {
                 scene_id: scene_id.into(),
                 title: String::new(),
                 channel: channel.into(),
+                pinned: false,
                 created_at: now,
                 updated_at: now,
             })
@@ -111,7 +119,7 @@ impl ChatRepo {
         self.db.with(|c| {
             let conv = c
                 .query_row(
-                    "SELECT id, user_id, scene_id, title, channel, created_at, updated_at
+                    "SELECT id, user_id, scene_id, title, channel, pinned, created_at, updated_at
                      FROM conversations WHERE id = ?1",
                     [id],
                     row_to_conversation,
@@ -125,7 +133,7 @@ impl ChatRepo {
         self.db.with(|c| {
             let conv = c
                 .query_row(
-                    "SELECT id, user_id, scene_id, title, channel, created_at, updated_at
+                    "SELECT id, user_id, scene_id, title, channel, pinned, created_at, updated_at
                      FROM conversations WHERE user_id = ?1
                      ORDER BY updated_at DESC LIMIT 1",
                     [user],
@@ -156,8 +164,9 @@ impl ChatRepo {
     pub fn list_conversations(&self, user: i64) -> Result<Vec<Conversation>> {
         self.db.with(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, user_id, scene_id, title, channel, created_at, updated_at
-                 FROM conversations WHERE user_id = ?1 ORDER BY updated_at DESC",
+                "SELECT id, user_id, scene_id, title, channel, pinned, created_at, updated_at
+                 FROM conversations WHERE user_id = ?1
+                 ORDER BY pinned DESC, updated_at DESC",
             )?;
             let list = stmt
                 .query_map([user], row_to_conversation)?
@@ -224,11 +233,23 @@ impl ChatRepo {
     }
 
     /// 显式定题。任务专属会话用:它只有 event/assistant 行,标题不会自动生成。
+    /// 用户右键「重命名」也走这条(无条件覆盖)。
     pub fn set_title(&self, conv: i64, title: &str) -> Result<()> {
         self.db.with(|c| {
             c.execute(
                 "UPDATE conversations SET title = ?2 WHERE id = ?1",
                 rusqlite::params![conv, title],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// 钉住 / 取消钉住(用户右键)。只改标记,不动 updated_at(钉住不算"有新活动")。
+    pub fn set_pinned(&self, conv: i64, pinned: bool) -> Result<()> {
+        self.db.with(|c| {
+            c.execute(
+                "UPDATE conversations SET pinned = ?2 WHERE id = ?1",
+                rusqlite::params![conv, pinned],
             )?;
             Ok(())
         })
@@ -285,8 +306,9 @@ fn row_to_conversation(r: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation> 
         scene_id: r.get(2)?,
         title: r.get(3)?,
         channel: r.get(4)?,
-        created_at: r.get(5)?,
-        updated_at: r.get(6)?,
+        pinned: r.get(5)?,
+        created_at: r.get(6)?,
+        updated_at: r.get(7)?,
     })
 }
 

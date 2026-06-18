@@ -56,6 +56,8 @@ pub fn run() {
     // 外部链接交系统浏览器:WebView 里 window.open 是 no-op(Win 真机尤甚),
     // 统一走 opener 插件(前端经 backend.openExternal 调 plugin:opener|open_url)。
     .plugin(tauri_plugin_opener::init())
+    // 数据目录「搬家」:原生目录选择器(pick_data_folder 命令在 Rust 侧调其 DialogExt)。
+    .plugin(tauri_plugin_dialog::init())
     .on_window_event(|window, event| {
       // 关主窗 / 悬浮窗 = 隐藏到托盘,不退进程(PLAN §12;真退出走托盘菜单 quit)。
       // media-login 等其它窗口照常关闭。
@@ -82,7 +84,15 @@ pub fn run() {
       }
 
       // ---- 装配:数据目录 / 日志 / store / provider / engine ----
-      let data_dir = app.path().app_data_dir()?;
+      // 数据目录「搬家」(datadir):锚点 = OS 默认 app_data_dir(永远找得到、住指针);
+      // 真实数据根由锚点的 location.json 指针决定。没搬过家 → 用锚点;搬过 → 用记的路径;
+      // 路径失效(盘没插)→ 回落锚点 + data_missing,前端弹恢复弹窗(绝不静默重建,§3.5)。
+      let anchor = app.path().app_data_dir()?;
+      std::fs::create_dir_all(&anchor)?;
+      let resolution = larkwing_core::datadir::resolve(&anchor);
+      let data_missing = resolution.missing.clone();
+      let data_dir = resolution.root.clone();
+      std::fs::create_dir_all(&data_dir)?;
       std::fs::create_dir_all(data_dir.join("logs"))?;
 
       let file_appender = tracing_appender::rolling::daily(data_dir.join("logs"), "larkwing.log");
@@ -98,6 +108,10 @@ pub fn run() {
         .ok();
       app.manage(LogGuard(guard));
       logkeep::spawn(data_dir.join("logs")); // 滚动之外的管护:压缩历史日志、清理 30 天前的
+      if let Some(m) = &data_missing {
+        tracing::warn!(missing = %m.display(), root = %data_dir.display(),
+          "数据位置失效(盘没插/被删),已回落默认根;前端将提示恢复(退出去插回磁盘 / 恢复默认)");
+      }
 
       let store = Store::open(&data_dir.join("larkwing.db"))?;
       store.users.ensure_default_user()?; // 首启零配置
@@ -159,7 +173,16 @@ pub fn run() {
       // 远程渠道(Telegram/钉钉):shell-side 监督器,boot 起启用项(读 settings 决定起哪些)
       let channels = commands::ChannelSup::new(engine.clone());
       channels.restart();
-      app.manage(AppState { engine, media, voice, channels });
+      app.manage(AppState {
+        engine,
+        media,
+        voice,
+        channels,
+        data_root: data_dir.clone(),
+        anchor: anchor.clone(),
+        bus: bus.clone(),
+        data_missing,
+      });
 
       let forward = app.handle().clone();
       let mut bus_rx = bus.subscribe();
@@ -284,6 +307,8 @@ pub fn run() {
       commands::list_conversations,
       commands::load_conversation,
       commands::delete_conversation,
+      commands::rename_conversation,
+      commands::set_conversation_pinned,
       commands::set_api_key,
       commands::usage_today,
       commands::usage_conversation,
@@ -338,6 +363,15 @@ pub fn run() {
       commands::autostart_enabled,
       commands::set_autostart,
       commands::set_tray_menu,
+      commands::quit_app,
+      commands::data_location,
+      commands::pick_data_folder,
+      commands::relocate_precheck,
+      commands::relocate_data,
+      commands::cleanup_old_data,
+      commands::keep_old_data,
+      commands::data_reset_to_default,
+      commands::reveal_data_dir,
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

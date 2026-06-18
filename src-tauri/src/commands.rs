@@ -1,13 +1,17 @@
 //! 边界薄层:只做翻译和转发,不写业务(PLAN §5)。
 //! command 面就是前端能做的全集;错误统一 AppError { kind, message }。
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tauri::ipc::Channel;
 use tauri::{Manager, State};
 use tokio_util::sync::CancellationToken;
 
+use larkwing_core::bus::{Bus, Text};
 use larkwing_core::channels::{self, ChannelState, ChannelStatus};
+use larkwing_core::datadir::{self, Pointer};
+use larkwing_core::tasks::Tasks;
 
 use larkwing_core::engine::{
     AppError, BootSnapshot, DayUsage, Engine, FloatIdle, MsgStats, ProviderPatch, ProviderView,
@@ -25,6 +29,14 @@ pub struct AppState {
     pub media: MediaRuntime,
     pub voice: VoiceRuntime,
     pub channels: ChannelSup,
+    /// 当前生效的数据根(boot 时由 datadir 指针解析得到)。
+    pub data_root: PathBuf,
+    /// 锚点 = OS 默认 app_data_dir(住指针 location.json;搬家命令据此读写指针)。
+    pub anchor: PathBuf,
+    /// 事件总线(搬家进度起一个临时 Tasks 推 HUD)。
+    pub bus: Bus,
+    /// boot 时数据位置失效(盘没插/被删)的记录:Some=前端弹恢复弹窗(§3.5 不静默)。
+    pub data_missing: Option<PathBuf>,
 }
 
 /// 远程渠道的 shell-side 监督器(§6.1:停旧起新的编排在壳层,顶层 spawn 用 tauri runtime;
@@ -149,6 +161,26 @@ pub async fn delete_conversation(
     conv_id: i64,
 ) -> Result<(), AppError> {
     state.engine.delete_conversation(conv_id).await
+}
+
+/// 用户右键重命名会话。
+#[tauri::command]
+pub fn rename_conversation(
+    state: State<'_, AppState>,
+    conv_id: i64,
+    title: String,
+) -> Result<(), AppError> {
+    state.engine.rename_conversation(conv_id, &title)
+}
+
+/// 用户右键钉住 / 取消钉住会话。
+#[tauri::command]
+pub fn set_conversation_pinned(
+    state: State<'_, AppState>,
+    conv_id: i64,
+    pinned: bool,
+) -> Result<(), AppError> {
+    state.engine.set_conversation_pinned(conv_id, pinned)
 }
 
 #[tauri::command]
@@ -705,4 +737,182 @@ pub fn set_tray_menu(
     .map_err(AppError::internal)?;
     tray.set_menu(Some(menu)).map_err(AppError::internal)?;
     Ok(())
+}
+
+/// 退出整个程序(悬浮窗右键「退出」/ 复刻托盘 quit)。与托盘菜单 quit 同义 = app.exit(0)。
+#[tauri::command]
+pub fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
+// ---- 数据目录「搬家」(datadir;用户决策 2026-06-18) ----
+
+/// 设置页「数据位置」一行 + boot 后检查:当前根 / 待清理旧根 / 失效路径。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataLocation {
+    /// 当前生效的数据根(绝对路径)。
+    pub root: String,
+    /// 刚搬完待清理的旧根(Some = 前端弹「删除/保留」提示);清理后为 None。
+    pub old_root: Option<String>,
+    /// 数据位置失效(盘没插/被删)的记录(Some = 前端弹恢复弹窗);正常为 None。
+    pub missing: Option<String>,
+}
+
+/// 读数据位置(指针每次现读,反映清理后的最新态)。
+#[tauri::command]
+pub fn data_location(state: State<'_, AppState>) -> DataLocation {
+    let ptr = datadir::read_pointer(&state.anchor);
+    DataLocation {
+        root: state.data_root.to_string_lossy().into_owned(),
+        old_root: ptr.old_root.filter(|s| !s.trim().is_empty()),
+        missing: state.data_missing.as_ref().map(|p| p.to_string_lossy().into_owned()),
+    }
+}
+
+/// 唤起系统原生目录选择器(在 Rust 侧调 DialogExt,不走 JS 插件命令故无需 capability)。
+/// 返回所选目录绝对路径;用户取消 = None。
+#[tauri::command]
+pub async fn pick_data_folder(app: tauri::AppHandle) -> Result<Option<String>, AppError> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_folder(move |p| {
+        let _ = tx.send(p);
+    });
+    let picked = rx.await.map_err(AppError::internal)?;
+    Ok(picked
+        .and_then(|fp| fp.into_path().ok())
+        .map(|p| p.to_string_lossy().into_owned()))
+}
+
+/// 搬家预检结果(给前端确认弹窗:目标路径 + 体积 + 失败原因 code)。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelocateCheck {
+    pub ok: bool,
+    /// 失败原因(MoveBlock code → 前端 `settings.dataLocation.err.<reason>`);ok 时 None。
+    pub reason: Option<String>,
+    /// 最终数据根(= 所选目录/Larkwing);ok 时 Some。
+    pub new_root: Option<String>,
+    /// 需要 / 可用字节(给前端显「约 X GB,目标剩余 Y GB」)。
+    pub need_bytes: u64,
+    pub free_bytes: u64,
+}
+
+/// 搬家预检(选完目录、确认前调:把目标路径 + 体积 + 可行性给前端)。
+#[tauri::command]
+pub fn relocate_precheck(state: State<'_, AppState>, picked: String) -> RelocateCheck {
+    match datadir::precheck(&state.data_root, Path::new(&picked)) {
+        Ok(plan) => RelocateCheck {
+            ok: true,
+            reason: None,
+            new_root: Some(plan.new_root.to_string_lossy().into_owned()),
+            need_bytes: plan.need_bytes,
+            free_bytes: plan.free_bytes,
+        },
+        Err(b) => RelocateCheck {
+            ok: false,
+            reason: Some(b.code().into()),
+            new_root: None,
+            need_bytes: 0,
+            free_bytes: 0,
+        },
+    }
+}
+
+/// 执行搬家:预检 → 拷贝/VACUUM(HUD 进度)→ 翻指针(提交点,记 old_root)→ 立即重启。
+/// 成功路径不返回(进程重启);失败返回 AppError(前端兜底文案提示)。
+#[tauri::command]
+pub async fn relocate_data(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    picked: String,
+) -> Result<(), AppError> {
+    let current = state.data_root.clone();
+    let anchor = state.anchor.clone();
+    let bus = state.bus.clone();
+    let picked = PathBuf::from(picked);
+
+    // 重检(前端已 precheck,这里防竞态/直接调用)。
+    let plan = datadir::precheck(&current, &picked)
+        .map_err(|b| AppError::internal(format!("搬家预检未过: {}", b.code())))?;
+    let new_root = plan.new_root.clone();
+
+    // 拷贝/VACUUM 是阻塞活,放 spawn_blocking;进度走 Tasks → bus → app_event → HUD。
+    let current_for_move = current.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let task = Tasks::new(bus).start("relocate", Text::new("task.relocate"));
+        match datadir::perform_move(&current_for_move, &plan, &task) {
+            Ok(()) => {
+                task.done();
+                Ok(())
+            }
+            Err(e) => {
+                task.fail("task.err.relocate", serde_json::Value::Null);
+                Err(e)
+            }
+        }
+    })
+    .await
+    .map_err(AppError::internal)? // join 错误
+    .map_err(AppError::internal)?; // perform_move 错误
+
+    // 翻指针 = 提交点:记新根 + 旧根(供清理)。此刻起新位置权威。
+    datadir::write_pointer(
+        &anchor,
+        &Pointer {
+            data_root: Some(new_root.to_string_lossy().into_owned()),
+            old_root: Some(current.to_string_lossy().into_owned()),
+        },
+    )
+    .map_err(AppError::internal)?;
+
+    tracing::info!(new_root = %new_root.display(), "数据搬家完成,重启生效");
+    app.restart(); // -> !,不返回
+}
+
+/// 搬家后「删除旧数据」:删旧根数据(保留指针)→ 清指针 old_root 字段。
+#[tauri::command]
+pub fn cleanup_old_data(state: State<'_, AppState>) -> Result<(), AppError> {
+    let ptr = datadir::read_pointer(&state.anchor);
+    if let Some(old) = ptr.old_root.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        datadir::cleanup_old(Path::new(old), &state.anchor).map_err(AppError::internal)?;
+    }
+    datadir::write_pointer(&state.anchor, &Pointer { data_root: ptr.data_root, old_root: None })
+        .map_err(AppError::internal)
+}
+
+/// 搬家后「保留旧数据」:只清指针 old_root 字段,不删盘(用户日后自己删)。
+#[tauri::command]
+pub fn keep_old_data(state: State<'_, AppState>) -> Result<(), AppError> {
+    let ptr = datadir::read_pointer(&state.anchor);
+    datadir::write_pointer(&state.anchor, &Pointer { data_root: ptr.data_root, old_root: None })
+        .map_err(AppError::internal)
+}
+
+/// 数据位置失效时「恢复默认」:清指针 → 重启从锚点起(全新数据)。
+#[tauri::command]
+pub fn data_reset_to_default(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), AppError> {
+    datadir::write_pointer(&state.anchor, &Pointer::default()).map_err(AppError::internal)?;
+    app.restart(); // -> !,不返回
+}
+
+/// 在系统文件管理器里「显示」数据文件夹(走原生命令,绕开 opener scope 坑,§8.3)。
+/// macOS 用 `open -R`(在 Finder 里定位并选中)= 标准「在文件夹中显示」语义,且对任何目录命名都安全
+/// (历史坑:旧标识符 `com.larkwing.app` 末段以 `.app` 结尾 → `open <dir>` 被 LaunchServices 当应用包
+/// 去启动、报 "executable is missing" 且 Finder 不弹;已改标识符为 com.larkwing.desktop 根治,`-R` 留作稳妥)。
+#[tauri::command]
+pub fn reveal_data_dir(state: State<'_, AppState>) -> Result<(), AppError> {
+    let path = state.data_root.clone();
+    let spawned = if cfg!(target_os = "windows") {
+        std::process::Command::new("explorer").arg(&path).spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg("-R").arg(&path).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(&path).spawn()
+    };
+    spawned.map(|_| ()).map_err(AppError::internal)
 }

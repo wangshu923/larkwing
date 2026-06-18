@@ -5,9 +5,21 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { api, isTauri, type Briefing, type Memory } from '../lib/backend'
+import { useContextMenu } from '../composables/useContextMenu'
+import { useSettings } from '../composables/useSettings'
+import { copyText } from '../lib/clipboard'
 
 const emit = defineEmits<{ (e: 'close'): void }>()
 const { t } = useI18n()
+const { openMenu } = useContextMenu()
+const settings = useSettings()
+
+/** 自动记住开关(memory.auto_consolidate,默认开):回忆页是记忆的唯一用户触点(§7.3),
+ *  开关安在它产出的记忆上方,因果一目了然。关掉只停后台自动提炼,手动/对话里记不受影响。 */
+const autoRemember = computed(() => settings.get('memory.auto_consolidate') !== '0')
+function toggleAuto() {
+  void settings.set('memory.auto_consolidate', autoRemember.value ? '0' : '1')
+}
 
 const memories = ref<Memory[]>([])
 const briefings = ref<Briefing[]>([])
@@ -40,14 +52,10 @@ async function load() {
   loaded.value = true
 }
 
-async function removeMemory(m: Memory) {
-  if (arming.value !== `m-${m.id}`) {
-    arming.value = `m-${m.id}`
-    return
-  }
-  arming.value = null
+/** 真删记忆(乐观更新,失败补回)。hover ✕ 走两步确认后调它;右键菜单直接调(右键本身已是明确动作)。 */
+async function doRemoveMemory(m: Memory) {
   const idx = memories.value.findIndex((x) => x.id === m.id)
-  if (idx >= 0) memories.value.splice(idx, 1) // 乐观更新,失败补回
+  if (idx >= 0) memories.value.splice(idx, 1)
   if (!isTauri()) return
   try {
     await api.deleteMemory(m.id)
@@ -57,12 +65,16 @@ async function removeMemory(m: Memory) {
   }
 }
 
-async function removeBriefing(b: Briefing) {
-  if (arming.value !== `b-${b.id}`) {
-    arming.value = `b-${b.id}`
+async function removeMemory(m: Memory) {
+  if (arming.value !== `m-${m.id}`) {
+    arming.value = `m-${m.id}`
     return
   }
   arming.value = null
+  await doRemoveMemory(m)
+}
+
+async function doRemoveBriefing(b: Briefing) {
   const idx = briefings.value.findIndex((x) => x.id === b.id)
   if (idx >= 0) briefings.value.splice(idx, 1)
   if (!isTauri()) return
@@ -72,6 +84,31 @@ async function removeBriefing(b: Briefing) {
     console.error('删除备忘失败', e)
     if (idx >= 0) briefings.value.splice(idx, 0, b)
   }
+}
+
+async function removeBriefing(b: Briefing) {
+  if (arming.value !== `b-${b.id}`) {
+    arming.value = `b-${b.id}`
+    return
+  }
+  arming.value = null
+  await doRemoveBriefing(b)
+}
+
+// 右键菜单:复制内容 / 删除(右键的删除直达,不走 hover 那套两步确认)
+function openMemoryMenu(e: MouseEvent, m: Memory) {
+  openMenu(e, [
+    { label: t('ctx.copy'), action: () => copyText(m.content) },
+    { separator: true },
+    { label: t('ctx.delete'), danger: true, action: () => doRemoveMemory(m) },
+  ])
+}
+function openBriefingMenu(e: MouseEvent, b: Briefing) {
+  openMenu(e, [
+    { label: t('ctx.copy'), action: () => copyText(b.content) },
+    { separator: true },
+    { label: t('ctx.delete'), danger: true, action: () => doRemoveBriefing(b) },
+  ])
 }
 
 /** 记忆/备忘是长期事实,绝对日期比"几小时前"更称职。 */
@@ -120,12 +157,23 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
     </header>
 
     <div class="view-scroll">
+      <!-- 自动记住开关(§13 Phase 3):回忆页是记忆唯一触点,开关放它产出的记忆上方 -->
+      <div class="mem-auto">
+        <b class="mem-auto-title">{{ t('memory.autoTitle') }}</b>
+        <span class="key-state">
+          <span class="chip" :class="{ on: autoRemember }">{{ autoRemember ? t('memory.autoOn') : t('memory.autoOff') }}</span>
+          <button class="link" type="button" @click="toggleAuto">
+            {{ autoRemember ? t('memory.autoTurnOff') : t('memory.autoTurnOn') }}
+          </button>
+        </span>
+      </div>
+
       <p v-if="loaded && total" class="lp-count">{{ t('memory.count', { n: total }) }}</p>
 
       <!-- 关于你(小本本) -->
       <p v-if="memories.length" class="lp-group">{{ t('memory.groupYou') }}</p>
       <TransitionGroup name="lp" tag="div">
-        <div v-for="m in memories" :key="`m-${m.id}`" class="lp-card top" :title="recallHint(m)">
+        <div v-for="m in memories" :key="`m-${m.id}`" class="lp-card top" :title="recallHint(m)" @contextmenu="openMemoryMenu($event, m)">
           <span class="lp-dot sm"></span>
           <span class="lp-text multiline">{{ m.content }}</span>
           <span class="lp-date top">{{ fmtDate(m.created_at) }}</span>
@@ -142,7 +190,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
       <!-- 家里的事(家庭备忘) -->
       <p v-if="briefings.length" class="lp-group">{{ t('memory.groupHome') }}</p>
       <TransitionGroup name="lp" tag="div">
-        <div v-for="b in briefings" :key="`b-${b.id}`" class="lp-card top">
+        <div v-for="b in briefings" :key="`b-${b.id}`" class="lp-card top" @contextmenu="openBriefingMenu($event, b)">
           <span class="lp-chip">{{ b.domain }}</span>
           <span class="lp-text multiline">{{ b.content }}</span>
           <span class="lp-date top">{{ fmtDate(b.updated_at || b.created_at) }}</span>
@@ -165,4 +213,50 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 </template>
 
 <!-- 外壳 / 卡片 / 空态样式全在 style.css 的 .view-* / .lp-* 共用类(回忆·记录·提醒同款) -->
+
+<!-- 自动记住开关:回忆页专属、自包含;只用语义 token(§6.7 绝不写死颜色),换肤自动跟随 -->
+<style scoped>
+.mem-auto {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 9px 15px;
+  margin-bottom: 14px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 11px;
+}
+.mem-auto-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+  min-width: 0;
+}
+/* 与设置页开关一致(开机自启 / 悬浮窗):状态徽章 + 文字链接,纯语义 token */
+.key-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+.chip {
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 4px 11px;
+  font-size: 12.5px;
+  color: var(--text);
+}
+.chip.on {
+  border-color: rgba(var(--accent-rgb), 0.45);
+  color: var(--accent);
+}
+.link {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 12.5px;
+  padding: 0;
+}
+</style>
 

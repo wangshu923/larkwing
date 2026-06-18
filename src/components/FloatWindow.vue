@@ -176,7 +176,8 @@ onUnmounted(() => stopMoved())
 <template>
   <div
     class="float"
-    :style="{ opacity: hovering ? 1 : baseOpacity }"
+    :class="{ hover: hovering }"
+    :style="{ opacity: baseOpacity }"
     @mouseenter="hovering = true; idle.setPaused(true)"
     @mouseleave="hovering = false; idle.setPaused(false)"
   >
@@ -285,6 +286,11 @@ onUnmounted(() => stopMoved())
   border-radius: 17px;
   background: var(--f-solid);
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  transition: box-shadow 0.2s ease;
+}
+/* hover:不改透明度(那会盖掉用户调的档),只加一圈淡淡强调色辉光表示"选中/可点" */
+.float.hover .bar {
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 13px rgba(var(--accent-rgb), 0.45);
 }
 .orb {
   position: absolute;
@@ -300,7 +306,7 @@ onUnmounted(() => stopMoved())
   align-items: center;
   justify-content: center;
   pointer-events: auto; /* 头像 = 拖动手柄(其余区域 pointer-events:none 穿透到 cap 点击展开) */
-  cursor: move;
+  cursor: pointer; /* 小手(用户偏好);拖动手柄但不用 move 那个"十"字光标 */
 }
 .orb img { width: 36px; height: 36px; object-fit: contain; pointer-events: none; }
 /* 头像状态灯:语音/mood 给圆头像加辉光环(box-shadow 严格贴圆,不用 drop-shadow 防 WKWebView 方块影) */

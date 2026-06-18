@@ -6,6 +6,7 @@ pub mod bus;
 pub mod channels;
 pub mod components;
 pub mod crypto;
+pub mod datadir;
 pub mod engine;
 pub mod files;
 pub mod llm;
