@@ -122,6 +122,13 @@ pub(crate) async fn drive_turn(
             _ => {}
         }
     }
+    // 渠道回合收尾 → 经全局事件车道喊一声(同 wake_turn 自启回合):前端据此刷新「最近」列表,
+    // 否则渠道新建的会话要重启 app 才出现(用户 2026-06-19 实测)。
+    engine.bus().publish(crate::bus::AppEvent::Conversation(crate::bus::ConversationActivity {
+        conv_id,
+        kind: "channel".into(),
+        outcome: crate::bus::TurnOutcome::Done,
+    }));
     Ok(Some(buf))
 }
 

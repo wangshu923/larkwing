@@ -439,6 +439,13 @@ watch(messages, () => nextTick(() => {
                 <path d="M6 9.5a6 6 0 0 1 12 0c0 4.4 1.8 5.5 1.8 5.5H4.2S6 13.9 6 9.5Z" />
                 <path d="M10.2 19a2 2 0 0 0 3.6 0" />
               </svg>
+              <svg v-else-if="s.channel === 'telegram'" class="rc-chan-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M22 3 11 14" />
+                <path d="M22 3 15 21l-4-8-8-4 19-6Z" />
+              </svg>
+              <svg v-else-if="s.channel === 'dingtalk'" class="rc-chan-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M20 4H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3v4l5-4h8a1 1 0 0 0 1-1V5a1 1 0 0 0-1-1Z" />
+              </svg>
               <span v-else class="rc-chan-dot" />
             </span>
           </div>
@@ -713,6 +720,8 @@ watch(messages, () => nextTick(() => {
 .rc-chan-ic { width: 11px; height: 11px; display: block; }
 .rc-chan-voice { color: var(--accent); }
 .rc-chan-system { color: var(--text-dim); }
+.rc-chan-telegram,
+.rc-chan-dingtalk { color: var(--accent); }
 .rc-chan-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
 .rc-time { font-size: 11px; color: var(--text-dim); margin-right: auto; } /* 时间靠左,标记/渠道图标归右侧成组 */
 /* 有动静标:发光小圆点(done=ok 青绿 / failed=danger 红),克制不抢标题;进入会话即清 */

@@ -241,6 +241,8 @@ export default {
   channel: {
     voice: '语音',
     system: '系统提醒',
+    telegram: 'Telegram',
+    dingtalk: '钉钉',
   },
   time: {
     today: '今天',

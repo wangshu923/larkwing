@@ -242,6 +242,8 @@ export default {
   channel: {
     voice: 'Voice',
     system: 'System',
+    telegram: 'Telegram',
+    dingtalk: 'DingTalk',
   },
   time: {
     today: 'today',

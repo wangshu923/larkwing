@@ -1,6 +1,6 @@
 [package]
 name = "larkwing"
-version = "0.1.4"
+version.workspace = true
 description = "Larkwing — 旺财的桌面版"
 authors = ["shenglin"]
 license = ""
