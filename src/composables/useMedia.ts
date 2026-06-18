@@ -190,10 +190,15 @@ function setRate(v: number) {
   if (el) el.playbackRate = state.rate
 }
 
-/** 主窗(唯一真播放位)把 current 全量广播给悬浮窗(被动镜像)。绝对态快照 → 幂等;
- *  只主窗发、只悬浮窗收(见 wire),无回声环。悬浮窗自身调用是 no-op(它不该出声当真相源)。 */
+/** 主窗(唯一真播放位)把当下播放态广播出去:① 给悬浮窗镜像(被动跟随);② 回报给 core,
+ *  让模型下个回合拿到「此刻」真相(修「歌放完了却以为还在播」)。绝对态快照 → 幂等;
+ *  只主窗发,悬浮窗自身调用是 no-op(它是镜像、不当真相源)。所有播放态切换都经此(play/暂停/
+ *  ended/stop 的监听都调它),所以回报 core 一处接上即全覆盖。 */
 function syncToPeers() {
-  if (!isFloat) emitNowPlaying(state.current, state.status)
+  if (isFloat) return
+  emitNowPlaying(state.current, state.status)
+  // fire-and-forget;非 Tauri(浏览器预览)跳过,失败不打断播放
+  if (isTauri()) void api.reportMediaState(state.status, state.current?.title ?? null).catch(() => {})
 }
 
 function stopElements() {

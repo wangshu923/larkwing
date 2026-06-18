@@ -83,6 +83,75 @@
 :root[data-skin="warm"] .recents::after { display: none; }
 :root[data-skin="warm"] .rb.on::after { display: none; }
 
+/* —— 护眼·豆沙绿(日间)—— 经典护眼绿:淡豆沙绿底 / 青苔绿强调 / 深绿灰字。
+   护眼三铁律:降对比(深绿灰字配暖绿白底,不纯黑)、降饱和(强调压沉不刺)、杀辉光(下方 override)。
+   面做近不透明 → 平面无玻璃,安静不抢戏(同暖萌路子)。 */
+:root[data-skin="green"] {
+  --bg: #e4efdc;                              /* 淡豆沙绿(再淡一档:整族 +~11 提亮,保留层间明度差) */
+  --surface: rgba(241, 247, 236, 0.96);       /* 卡片/导航:近白绿,浮在淡绿底上、与底同族 */
+  --surface-2: rgba(237, 245, 231, 0.95);
+  --surface-deep: #dbe8d0;                    /* 输入框:略深绿 → 读着像凹下去 */
+  --line: rgba(74, 96, 64, 0.2);              /* 墨绿描边:淡底上略减重,仍分得开 */
+  --accent: #5a8f6a;                          /* 青苔绿:沉静、不刺眼(前景不动,淡底上更清爽) */
+  --accent-rgb: 90, 143, 106;
+  --text: #2f3d2c;                            /* 主字:深绿灰,低对比不发黑 */
+  --text-dim: #61735a;                        /* 次字 */
+  --ok: #4e9e6f;       --ok-rgb: 78, 158, 111;
+  --warn: #bf942f;     --warn-rgb: 191, 148, 47;
+  --attn: #c2814e;     --attn-rgb: 194, 129, 78;
+  --danger: #c06a6a;   --danger-rgb: 192, 106, 106;
+  --bubble-them: #f1f7ec;
+  --bubble-me: #d8e9c8;                       /* 我方:稍饱和一点的豆绿 */
+  --bubble-me-line: rgba(90, 143, 106, 0.32);
+  --bubble-me-text: #2c3a28;
+  --veil-top: transparent;                    /* 护眼:几乎无氛围罩,保持平静均匀 */
+  --veil-bottom: rgba(90, 143, 106, 0.04);
+  /* 悬浮窗护眼绿档 */
+  --f-txt: #2f3d2c;
+  --f-txt2: #61735a;
+  --f-solid: #d2e3c4;
+  --f-glass: rgba(241, 247, 236, 0.92);
+  --f-line: rgba(74, 96, 64, 0.2);
+}
+
+/* —— 护眼·暗夜(夜间)—— 暖炭黑底,非冷蓝、非纯黑;暖琥珀强调 + 暖灰白字(绝不纯白,纯白配暗最刺)。
+   补当前缺的"安静暗色":科幻虽暗但又冷又辉光(费眼),这档暖、哑光、低刺激,适合整晚常驻。 */
+:root[data-skin="night"] {
+  --bg: #1f1c17;
+  --surface: rgba(42, 38, 32, 0.92);          /* 暖炭卡片 */
+  --surface-2: rgba(36, 32, 27, 0.9);
+  --surface-deep: #16130f;                    /* 输入框:更深 → 凹下去 */
+  --line: rgba(210, 196, 170, 0.16);          /* 暖浅描边 */
+  --accent: #c9a96a;                          /* 暖琥珀:像台灯,低饱和不发光 */
+  --accent-rgb: 201, 169, 106;
+  --text: #d8cfbe;                            /* 主字:暖灰白(非纯白) */
+  --text-dim: #948b78;
+  --ok: #8aab86;       --ok-rgb: 138, 171, 134;
+  --warn: #d2ad6a;     --warn-rgb: 210, 173, 106;
+  --attn: #d99a5f;     --attn-rgb: 217, 154, 95;
+  --danger: #cf8a8a;   --danger-rgb: 207, 138, 138;
+  --bubble-them: rgba(42, 38, 32, 0.92);
+  --bubble-me: #3a3022;                       /* 我方:暖琥珀棕,比对方稍亮暖 */
+  --bubble-me-line: rgba(201, 169, 106, 0.3);
+  --bubble-me-text: #ede3cf;
+  --veil-top: rgba(10, 8, 5, 0.1);
+  --veil-bottom: rgba(10, 8, 5, 0.32);
+  /* 悬浮窗暗夜档 */
+  --f-txt: #d8cfbe;
+  --f-txt2: #948b78;
+  --f-solid: #3a3328;
+  --f-glass: rgba(36, 32, 27, 0.9);
+  --f-line: rgba(201, 169, 106, 0.22);
+}
+
+/* 护眼两皮同样关掉科幻 HUD 花活(辉光/流光与"降刺激"相悖):同暖萌的 :root 提权手法。 */
+:root[data-skin="green"] .rail::after,
+:root[data-skin="green"] .recents::after,
+:root[data-skin="night"] .rail::after,
+:root[data-skin="night"] .recents::after { display: none; }
+:root[data-skin="green"] .rb.on::after,
+:root[data-skin="night"] .rb.on::after { display: none; }
+
 * { box-sizing: border-box; }
 
 html, body { margin: 0; height: 100%; }

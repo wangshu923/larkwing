@@ -33,7 +33,7 @@ pub(super) const LAWS: &str = "\
 - 情绪、闲聊、一次性安排 → 不记。拿不准就先不记:记错了用户能删,乱记很烦人。
 
 ## 用你知道的,别反问
-下方「你记得关于用户的这些事」和「任务需知」里写着的,就是你已经知道的,直接用——比如任务需知里有电影目录,用户说「放个电影」就直接去目录里找,绝不反问「电影放在哪」。像是以前聊到过、但「你记得的事」里没写的(某个习惯、说过的偏好、家人或宠物),先用 recall 查一遍;像是家里登记过、但「任务需知」里没写的(资源/目录/设备),先用 briefing_lookup 查一遍;都查不到再说不知道。
+下方「你记得关于用户的这些事」和「任务需知」里写着的,就是你已经知道的,直接用,别去反问你手上已经有的信息。像是以前聊到过、但「你记得的事」里没写的(某个习惯、说过的偏好、家人或宠物),先用 recall 查一遍;像是家里登记过、但「任务需知」里没写的(资源/目录/设备),先用 briefing_lookup 查一遍;都查不到再说不知道。
 
 ## 说人话
 工具安静地用,结果自然织进话里,不念原始数据。记完用一句话确认你理解的内容,让用户有机会当场纠正。永远不向用户提「工具」「调用」「数据库」「需知」这些词;「小本本」可以说——那是用户看得见的本子。
@@ -44,8 +44,25 @@ pub(super) const LAWS: &str = "\
 ## 不是每句话都冲你来
 〔语音〕回合里,如果听到的内容明显不是对你说的——电视的声音、家里人互相聊天、没头没尾的环境碎片——就只回 __IGNORE__ 这一个词,什么都不解释。拿不准的就当是对你说的,正常回应。
 
+## 此刻状态(背景信息)
+用户消息末尾有时带一行〔此刻 · …〕,那是系统给你的当下真实状态。当背景看:**只在用户这句话确实跟它有关时才参考**,就按它给的当下情况来、别凭印象或旧消息瞎猜,也别为此反问;无关时别主动提起,任何时候都绝不复述这行标记本身。
+
 ## 出厂示范
-对话最开头以【示范】开头的几段是出厂教学样例:人物、称呼、事实全部是虚构的,与眼前这位用户无关,绝不当作用户信息来引用或称呼;真实对话从示范之后开始。";
+对话最开头以【示范】开头的几段是出厂教学样例,**只用来学怎么用工具、怎么说话**。里面的人物、称呼、地名、文件、片名/歌名,以及工具查到的结果(本地有没有某文件、搜到什么、想起什么)**全部是编的**,与眼前这位用户无关:既不能当作用户的真实信息去引用或称呼,也绝不能当成你自己已经知道的事实——该查证的仍要现查现问,不拿示范里的结论当答案。真实对话从示范之后开始。";
+
+/// 把「此刻状态」背景行追加到最后一条 user 消息上(回合级、**不落库** → 持久前缀字节不动、
+/// 前缀缓存不破;与附件当轮注入同款手法)。summary 由各 ambient 源给出(目前只有 media 播放态,
+/// 这条通用缝以后可叠加进行中任务 / 待触发提醒等)。中性机制语言,模型据此知道当下真相
+/// (修「歌放完了却以为还在播」)。理论上必有 user 消息;万一没有则静默跳过。
+pub(super) fn attach_ambient(request: &mut ChatRequest, summary: &str) {
+    if let Some(ChatMessage::User { content, .. }) =
+        request.messages.iter_mut().rev().find(|m| matches!(m, ChatMessage::User { .. }))
+    {
+        content.push_str("\n\n〔此刻 · ");
+        content.push_str(summary);
+        content.push('〕');
+    }
+}
 
 /// 定时任务到点的注入形:wake_turn 现场构造一条;历史回放里的 event 行走同一翻译
 /// (两处字节一致)。中性机制语言(人格中立),对外话术由模型按当前人格组织。
@@ -419,5 +436,26 @@ mod tests {
             other => panic!("应是带 tool_calls 的 Assistant,实际 {other:?}"),
         }
         assert!(matches!(&tail[2], ChatMessage::ToolResult { call_id, .. } if call_id == "call_a"));
+    }
+
+    #[test]
+    fn attach_ambient_appends_to_last_user_and_spares_prefix() {
+        let scenes = Scenes::builtin();
+        let scene = scenes.default_scene();
+        let history = vec![msg(1, "user", "放点啥", None)];
+        let mut req = build_context(scene, None, None, &[], &[], &history, &[]);
+        let sys_before = req.system.clone();
+        let n_before = req.messages.len();
+        attach_ambient(&mut req, "播放器现在空闲,没有在播放任何内容");
+        // 稳定前缀(system)绝不被碰 → 前缀缓存不破;也不新增消息(挂到末条 user 上)
+        assert_eq!(req.system, sys_before, "ambient 注入绝不动 system 前缀");
+        assert_eq!(req.messages.len(), n_before, "ambient 不新增消息,只追加到末条 user");
+        match req.messages.last() {
+            Some(ChatMessage::User { content, .. }) => {
+                assert!(content.starts_with("放点啥"), "用户原文在前");
+                assert!(content.contains("〔此刻 · 播放器现在空闲"), "末尾挂上此刻状态标记");
+            }
+            other => panic!("末条应是 user,实际 {other:?}"),
+        }
     }
 }

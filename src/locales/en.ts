@@ -337,6 +337,8 @@ export default {
       skin: 'Skin',
       skin_scifi: 'Sci-fi',
       skin_warm: 'Cozy',
+      skin_green: 'Soft green',
+      skin_night: 'Amber',
       bubble: 'Bubble shape',
       bubble_round: 'Rounded',
       bubble_cut: 'Clipped',

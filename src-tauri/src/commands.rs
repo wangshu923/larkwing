@@ -634,6 +634,14 @@ pub fn media_retry(
     Ok(())
 }
 
+/// 前端回报播放器当下状态(播放真相在前端 WebView):playing/paused 时带标题,
+/// ended/stop → idle。core 据此校准快照,下个回合装配时喂模型「此刻」背景
+/// (修「歌放完了模型却以为还在播」)。只主窗(真播放位)回报,悬浮窗是镜像不报。
+#[tauri::command]
+pub fn report_media_state(state: State<'_, AppState>, status: String, title: Option<String>) {
+    state.media.set_playback(&status, title);
+}
+
 // ---- 远程渠道(PLAN 远程渠道:Telegram / 钉钉 bot) ----
 
 /// 远程渠道设置页一行的视图:开关 / 是否已配凭证(**凭证本身永不过桥**,只报 bool)/ 白名单 / 连接态。

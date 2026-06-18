@@ -3,6 +3,8 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import NeonBackdrop from './components/NeonBackdrop.vue'
 import WarmBackdrop from './components/WarmBackdrop.vue'
+import GreenBackdrop from './components/GreenBackdrop.vue'
+import NightBackdrop from './components/NightBackdrop.vue'
 import MainLayout from './components/MainLayout.vue'
 import TasksOverlay from './components/TasksOverlay.vue'
 import VideoOverlay from './components/VideoOverlay.vue'
@@ -32,10 +34,16 @@ const { phase, run, skip } = useBoot(1800)
 if (!isFloat) run()
 const booting = computed(() => !isFloat && phase.value === 'boot')
 
-// 皮肤驱动背景:语义 token 负责换色,背景组件按皮肤切(科幻=霓虹辉光,暖萌=柔光晕);
-// skin 由 boot 过桥设到 <html data-skin>,切换即时反映。
+// 皮肤驱动背景:语义 token 负责换色,背景组件按皮肤切(科幻=霓虹辉光,暖萌=柔光晕,
+// 护眼绿/暗夜=安静柔晕);skin 由 boot 过桥设到 <html data-skin>,切换即时反映。
+// 未知皮肤(脏数据)回落科幻 —— 与 useSettings.applySkin 的兜底同向。
 const settings = useSettings()
-const backdrop = computed(() => (settings.state.skin === 'warm' ? WarmBackdrop : NeonBackdrop))
+const BACKDROPS: Record<string, typeof NeonBackdrop> = {
+  warm: WarmBackdrop,
+  green: GreenBackdrop,
+  night: NightBackdrop,
+}
+const backdrop = computed(() => BACKDROPS[settings.state.skin] || NeonBackdrop)
 
 // 数据「搬家」提示(仅主窗,§3.5 不静默):位置失效 → 恢复弹窗;搬完有旧数据 → 清理弹窗。
 const dataNotice = ref<'missing' | 'old' | null>(null)

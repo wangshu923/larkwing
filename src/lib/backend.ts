@@ -706,6 +706,10 @@ export const api = {
   /** 失败任务重试(目前仅影音):按 retry 载体直连重放,进展/结果照常走事件车道。 */
   mediaRetry: (pageUrl: string, audioOnly: boolean) =>
     invoke<void>('media_retry', { pageUrl, audioOnly }),
+  /** 回报播放器当下状态给 core(只主窗调):playing/paused 带标题,idle 不带。
+   *  core 据此在下个回合喂模型「此刻」背景,修「歌放完了却以为还在播」。fire-and-forget。 */
+  reportMediaState: (status: string, title: string | null) =>
+    invoke<void>('report_media_state', { status, title }),
   /** 远程渠道状态(设置页):开关/已配凭证/白名单/连接态(凭证不过桥)。 */
   remoteStatus: () => invoke<RemoteChannelView[]>('remote_status'),
   /** 保存远程渠道配置后调:停旧起新(类比 provider 保存即重建)。 */

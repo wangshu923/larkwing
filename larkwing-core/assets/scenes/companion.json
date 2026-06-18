@@ -12,78 +12,78 @@
   "options": {},
   "tools": ["now", "weather", "media_search", "media_play", "media_control", "fs_list", "fs_find", "fs_read_text", "fs_move", "fs_copy", "fs_mkdir", "fs_trash", "fs_write_text", "fs_append", "fs_edit", "fs_undo", "reminder_set", "reminder_list", "reminder_cancel", "watch_set", "web_search", "web_fetch"],
   "few_shots": [
-    { "role": "user", "content": "【示范】对了,动画片都放在 NAS 的 kids 文件夹里" },
+    { "role": "user", "content": "【示范】记一下,电影都放在 D:\\Movies" },
     {
       "role": "assistant",
       "content": "",
-      "tool_calls": [{ "id": "fs_b1", "name": "briefing_write", "args": { "domain": "media", "content": "动画片在 NAS 的 kids 文件夹" } }]
+      "tool_calls": [{ "id": "fs_b1", "name": "briefing_write", "args": { "domain": "media", "content": "电影在 D:\\Movies" } }]
     },
     { "role": "tool", "call_id": "fs_b1", "content": "ok,已记入家庭备忘(主题: media)" },
-    { "role": "assistant", "content": "记下了,动画片在 NAS 的 kids 文件夹。" },
-    { "role": "user", "content": "【示范】电影也加一下,在 D:\\Movies" },
+    { "role": "assistant", "content": "记下了,放电影我会先去那个目录找。" },
+    { "role": "user", "content": "【示范】音乐也加一下,在 D:\\Music" },
     {
       "role": "assistant",
       "content": "",
-      "tool_calls": [{ "id": "fs_b2", "name": "briefing_write", "args": { "domain": "media", "content": "动画片在 NAS 的 kids 文件夹;电影在 D:\\Movies" } }]
+      "tool_calls": [{ "id": "fs_b2", "name": "briefing_write", "args": { "domain": "media", "content": "电影在 D:\\Movies;音乐在 D:\\Music" } }]
     },
-    { "role": "tool", "call_id": "fs_b2", "content": "ok,已更新家庭备忘(主题: media)。(此前记的是:动画片在 NAS 的 kids 文件夹)" },
-    { "role": "assistant", "content": "都记下了:动画片在 NAS 的 kids,电影在 D:\\Movies。" },
-    { "role": "user", "content": "【示范】放首恭喜发财听听" },
+    { "role": "tool", "call_id": "fs_b2", "content": "ok,已更新家庭备忘(主题: media)。(此前记的是:电影在 D:\\Movies)" },
+    { "role": "assistant", "content": "都记下了。以后补充我会把旧的也带上,不会把之前的冲掉。" },
+    { "role": "user", "content": "【示范】放首儿歌" },
     {
       "role": "assistant",
       "content": "",
-      "tool_calls": [{ "id": "fs_m0", "name": "fs_find", "args": { "root": "D:\\Music", "pattern": "恭喜发财" } }]
+      "tool_calls": [{ "id": "fs_m1", "name": "fs_find", "args": { "root": "D:\\Music", "pattern": "儿歌" } }]
     },
-    { "role": "tool", "call_id": "fs_m0", "content": "D:\\Music\\恭喜发财 刘德华.mp3" },
+    { "role": "tool", "call_id": "fs_m1", "content": "D:\\Music\\儿歌串烧.mp3" },
     {
       "role": "assistant",
       "content": "",
-      "tool_calls": [{ "id": "fs_m2", "name": "media_play", "args": { "url": "D:\\Music\\恭喜发财 刘德华.mp3", "audio_only": true } }]
+      "tool_calls": [{ "id": "fs_m2", "name": "media_play", "args": { "url": "D:\\Music\\儿歌串烧.mp3", "audio_only": true } }]
     },
-    { "role": "tool", "call_id": "fs_m2", "content": "已开始播放《恭喜发财 刘德华.mp3》" },
-    { "role": "assistant", "content": "本地找到这首《恭喜发财》,放上了。想换的话跟我说。" },
-    { "role": "user", "content": "【示范】〔语音〕放一下流浪地球2" },
+    { "role": "tool", "call_id": "fs_m2", "content": "已开始播放《儿歌串烧》" },
+    { "role": "assistant", "content": "本地找到一份儿歌,放上了。想换跟我说。" },
+    { "role": "user", "content": "【示范】〔语音〕放一下星海漫游" },
     {
       "role": "assistant",
       "content": "",
-      "tool_calls": [{ "id": "fs_mv0", "name": "fs_find", "args": { "root": "D:\\Movies", "pattern": "流浪地球2" } }]
+      "tool_calls": [{ "id": "fs_v1", "name": "fs_find", "args": { "root": "D:\\Movies", "pattern": "星海漫游" } }]
     },
-    { "role": "tool", "call_id": "fs_mv0", "content": "在 D:\\Movies 里没找到匹配「流浪地球2」的文件" },
+    { "role": "tool", "call_id": "fs_v1", "content": "在 D:\\Movies 里没找到匹配的文件" },
     {
       "role": "assistant",
       "content": "",
-      "tool_calls": [{ "id": "fs_mv1", "name": "media_search", "args": { "query": "流浪地球2" } }]
+      "tool_calls": [{ "id": "fs_v2", "name": "media_search", "args": { "query": "星海漫游" } }]
     },
     {
       "role": "tool",
-      "call_id": "fs_mv1",
-      "content": "[{\"url\":\"https://www.bilibili.com/video/BV1xx411c7zz\",\"title\":\"流浪地球2 蓝光修复版\",\"author\":\"影视档案馆\",\"duration_seconds\":10440,\"source\":\"bilibili\"}]"
+      "call_id": "fs_v2",
+      "content": "[{\"url\":\"https://www.bilibili.com/video/BVxxxxxxxxxx\",\"title\":\"星海漫游\",\"author\":\"某影视\",\"duration_seconds\":7200,\"source\":\"bilibili\"}]"
     },
     {
       "role": "assistant",
       "content": "",
-      "tool_calls": [{ "id": "fs_mv2", "name": "media_play", "args": { "url": "https://www.bilibili.com/video/BV1xx411c7zz", "audio_only": false } }]
+      "tool_calls": [{ "id": "fs_v3", "name": "media_play", "args": { "url": "https://www.bilibili.com/video/BVxxxxxxxxxx", "audio_only": false } }]
     },
-    { "role": "tool", "call_id": "fs_mv2", "content": "已开始播放《流浪地球2 蓝光修复版》,时长 174:00" },
-    { "role": "assistant", "content": "本地没有,从网上找到《流浪地球2》蓝光版,放上了。" },
+    { "role": "tool", "call_id": "fs_v3", "content": "已开始播放《星海漫游》,时长 120:00" },
+    { "role": "assistant", "content": "本地没有,从网上找到一个放上了。" },
     { "role": "user", "content": "【示范】下载文件夹里的歌乱七八糟的,按歌手分一下" },
     {
       "role": "assistant",
       "content": "",
       "tool_calls": [{ "id": "fs_o1", "name": "fs_list", "args": { "path": "D:\\Downloads" } }]
     },
-    { "role": "tool", "call_id": "fs_o1", "content": "周杰伦-晴天.mp3 (8MB)\n周杰伦-稻香.mp3 (7MB)\n林俊杰-江南.mp3 (8MB)" },
+    { "role": "tool", "call_id": "fs_o1", "content": "歌手A-歌曲一.mp3 (8MB)\n歌手A-歌曲二.mp3 (7MB)\n歌手B-歌曲三.mp3 (8MB)" },
     {
       "role": "assistant",
       "content": "",
       "tool_calls": [{ "id": "fs_o2", "name": "fs_move", "args": { "moves": [
-        { "src": "D:\\Downloads\\周杰伦-晴天.mp3", "dst": "D:\\Downloads\\周杰伦\\周杰伦-晴天.mp3" },
-        { "src": "D:\\Downloads\\周杰伦-稻香.mp3", "dst": "D:\\Downloads\\周杰伦\\周杰伦-稻香.mp3" },
-        { "src": "D:\\Downloads\\林俊杰-江南.mp3", "dst": "D:\\Downloads\\林俊杰\\林俊杰-江南.mp3" }
+        { "src": "D:\\Downloads\\歌手A-歌曲一.mp3", "dst": "D:\\Downloads\\歌手A\\歌手A-歌曲一.mp3" },
+        { "src": "D:\\Downloads\\歌手A-歌曲二.mp3", "dst": "D:\\Downloads\\歌手A\\歌手A-歌曲二.mp3" },
+        { "src": "D:\\Downloads\\歌手B-歌曲三.mp3", "dst": "D:\\Downloads\\歌手B\\歌手B-歌曲三.mp3" }
       ] } }]
     },
     { "role": "tool", "call_id": "fs_o2", "content": "移动了 3 个" },
-    { "role": "assistant", "content": "整理好了:周杰伦 2 首、林俊杰 1 首,各自归进文件夹。想退回的话跟我说「撤销」就行。" },
+    { "role": "assistant", "content": "整理好了,各自归进歌手的文件夹。想退回的话跟我说「撤销」就行。" },
     { "role": "user", "content": "【示范】这个文件夹有几个文件,别动它们" },
     { "role": "assistant", "content": "好,我只看不动。是哪个文件夹?我数给你。" },
     { "role": "user", "content": "【示范】今天几号来着?" },
@@ -100,7 +100,7 @@
       "content": "",
       "tool_calls": [{ "id": "fs_w1", "name": "weather", "args": { "when": "3d" } }]
     },
-    { "role": "tool", "call_id": "fs_w1", "content": "杭州 当前多云 26℃,湿度 70%\n预报:\n2026-06-16 22~28℃ 小雨\n生活提示:有雨,出门记得带伞\n(来源:Open-Meteo)" },
+    { "role": "tool", "call_id": "fs_w1", "content": "本地 当前多云 26℃\n预报:明天 22~28℃ 小雨\n生活提示:有雨,出门记得带伞" },
     { "role": "assistant", "content": "明天有小雨,记得带伞。22 到 28 度,别穿太厚。" },
     { "role": "user", "content": "【示范】这两天要是降温了提醒我加衣服" },
     {
@@ -108,7 +108,7 @@
       "content": "",
       "tool_calls": [{ "id": "fs_wt1", "name": "watch_set", "args": { "content": "天气转凉了,提醒加件外套", "metric": "low_temp", "op": "below", "value": 12 } }]
     },
-    { "role": "tool", "call_id": "fs_wt1", "content": "已盯上了 #5:杭州最低温降到 12℃ 以下(守 7 天),满足就提醒你" },
+    { "role": "tool", "call_id": "fs_wt1", "content": "已盯上了 #5:本地最低温降到 12℃ 以下(守 7 天),满足就提醒你" },
     { "role": "assistant", "content": "好,盯上了。降到 12 度以下我就提醒你加衣服。" },
     { "role": "user", "content": "【示范】记一下,我不吃香菜" },
     {
@@ -118,14 +118,14 @@
     },
     { "role": "tool", "call_id": "fs_2", "content": "ok" },
     { "role": "assistant", "content": "记下了,以后推荐吃的会帮你避开香菜。" },
-    { "role": "user", "content": "【示范】上次跟你说的那个歌单,叫啥来着?" },
+    { "role": "user", "content": "【示范】上次我说的那件事,你还记得吗?" },
     {
       "role": "assistant",
       "content": "",
-      "tool_calls": [{ "id": "fs_rc1", "name": "recall", "args": { "query": "歌单" } }]
+      "tool_calls": [{ "id": "fs_rc1", "name": "recall", "args": { "query": "上次说的事" } }]
     },
-    { "role": "tool", "call_id": "fs_rc1", "content": "- 上次说「放轻松的」指纯音乐歌单" },
-    { "role": "assistant", "content": "是那个纯音乐歌单吧?要放起来吗?" },
+    { "role": "tool", "call_id": "fs_rc1", "content": "(这里会列出以前记下的相关事项)" },
+    { "role": "assistant", "content": "记得,你是说那件事吧?要我接着办吗?" },
     { "role": "user", "content": "【示范】不是按专辑,我们家整理音乐都按歌手分" },
     {
       "role": "assistant",
@@ -136,9 +136,7 @@
     { "role": "assistant", "content": "好,记下了,以后整理音乐按歌手分,不按专辑。" },
     { "role": "user", "content": "【示范】唉,今天上班好累啊" },
     { "role": "assistant", "content": "辛苦了。先歇会儿,想聊聊今天忙了些什么吗?" },
-    { "role": "user", "content": "【示范】〔语音〕周末去哪儿逛逛好" },
-    { "role": "assistant", "content": "看你想怎么过——出去走走,还是在家歇着?你说个方向,我帮你想。" },
     { "role": "user", "content": "【示范】周末去哪儿玩好,多给几个选项" },
-    { "role": "assistant", "content": "给你几个方向挑:\n- 想透气:户外走走\n- 下雨天:室内逛逛\n- 想热闹:周边市集\n看中哪个方向,我再帮你找具体地点。" }
+    { "role": "assistant", "content": "看你想怎么过,给你几个方向挑:想透气就户外走走,下雨天就室内逛逛,想热闹就周边市集。看中哪个方向,我再帮你找具体地点。" }
   ]
 }

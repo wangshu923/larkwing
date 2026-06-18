@@ -485,6 +485,20 @@ impl Engine {
             .or_else(crate::net::env_proxy)
     }
 
+    /// 回合开始时把「此刻」背景状态追加给模型(通用缝):各源各贡献一行,拼成一条不落库的
+    /// 〔此刻 · …〕注记挂到末条 user 消息(持久前缀字节不动 → 前缀缓存不破)。目前只有 media
+    /// 播放态(修「歌放完了模型却以为还在播」);以后的进行中任务 / 待触发提醒等在此各 push 一条
+    /// 即可,缝不再动。在 build_context **之后**调,因装配闭包在线程池里拿不到 &self。
+    fn inject_ambient(&self, request: &mut crate::llm::ChatRequest) {
+        let mut lines: Vec<String> = Vec::new();
+        if let Some(s) = self.media.playback_summary() {
+            lines.push(s);
+        }
+        if !lines.is_empty() {
+            context::attach_ambient(request, &lines.join(";"));
+        }
+    }
+
     /// 全局事件车道(测试/调度器观测用)。
     pub fn bus(&self) -> &crate::bus::Bus {
         &self.bus
@@ -1368,7 +1382,7 @@ impl Engine {
         // 落用户消息 + 取上下文原料 + 单一装配权出 ChatRequest(阻塞 IO 下沉线程池)
         let store = self.store.clone();
         let conv_user = conversation.user_id;
-        let (request, user_msg_id, mem_user) = tokio::task::spawn_blocking(
+        let (mut request, user_msg_id, mem_user) = tokio::task::spawn_blocking(
             move || -> anyhow::Result<(crate::llm::ChatRequest, i64, i64)> {
             // 入站附件(媒体输入 PLAN §9):图 → image_url 当轮注入;文档 → 抽文字当轮注入;
             // 只把小票(AttachmentRef)落 payload,附件本体不进持久前缀(省 token/体积)。与插队共用
@@ -1464,6 +1478,9 @@ impl Engine {
         if self.bump_consolidate_due(conv_id) {
             self.spawn_consolidate(conv_id, mem_user);
         }
+
+        // 「此刻」背景状态(播放器在不在放…)挂到末条 user,喂模型当下真相(不落库、不破缓存)
+        self.inject_ambient(&mut request);
 
         // 4+5. 开流 + spawn 回合(与 wake_turn 共用尾段)。ToolCtx.user_id = mem_user:
         // remember 写到说话人(记忆归人);会话归属仍是 conv_user。
@@ -1633,7 +1650,7 @@ impl Engine {
         let store = self.store.clone();
         let user_id = job.user_id;
         let content = job.content.clone();
-        let (request, event_msg_id) = tokio::task::spawn_blocking(
+        let (mut request, event_msg_id) = tokio::task::spawn_blocking(
             move || -> anyhow::Result<(crate::llm::ChatRequest, i64)> {
                 let event_msg = store.chat.append_message(conv_id, "event", &content)?;
                 // 只取常驻·画像层(§13.3 ②);任务回合与聊天回合共用同款前缀
@@ -1678,6 +1695,8 @@ impl Engine {
         .await
         .map_err(AppError::internal)??;
 
+        // 自启回合也带「此刻」背景(任务到点时音乐可能正放着);不落库、不破缓存
+        self.inject_ambient(&mut request);
         let mut rx =
             self.launch(conv_id, user_id, candidates, request, tool_subset, event_msg_id).await?;
 

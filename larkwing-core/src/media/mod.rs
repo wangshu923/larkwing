@@ -135,6 +135,18 @@ struct PendingPlay {
 /// 待重放有效期:超过即作废。
 const PENDING_PLAY_TTL: Duration = Duration::from_secs(600);
 
+/// 前端播放器的「此刻」状态快照。播放真相在前端 WebView(播放在那跑、放完只有它知道);
+/// core 起播时乐观 seed,前端在生命周期切换(playing/paused/ended/stop)时经
+/// `report_media_state` 命令回报校准。app 级瞬态(§6.4 派生可丢:丢了 = 按空闲算、不出错)。
+/// 回合装配时读成一行「此刻」背景喂模型 → 修「歌放完了模型却以为还在播着」。
+#[derive(Debug, Clone, Default)]
+struct Playback {
+    /// None = 空闲(没在播任何东西);Some = 正在放/暂停的标题。
+    title: Option<String>,
+    /// 仅当 title 为 Some 时有意义:true = 暂停,false = 正在播。
+    paused: bool,
+}
+
 // ---------- 运行时 ----------
 
 struct Inner {
@@ -148,6 +160,8 @@ struct Inner {
     login_hint_sent: AtomicBool,
     /// 因「需登录」卡住、待登录后自动重放的播放(按源 id)。
     pending_play: Mutex<HashMap<String, PendingPlay>>,
+    /// 前端播放器的当下状态(回合装配读它喂模型「此刻」背景;见 Playback 注释)。
+    playback: Mutex<Playback>,
 }
 
 #[derive(Clone)]
@@ -170,6 +184,7 @@ impl MediaRuntime {
                 sources: vec![Arc::new(bilibili::Bilibili::new())],
                 login_hint_sent: AtomicBool::new(false),
                 pending_play: Mutex::new(HashMap::new()),
+                playback: Mutex::new(Playback::default()),
             }),
         }
     }
@@ -372,6 +387,7 @@ impl MediaRuntime {
             page_url: page_url.into(),
             source: source_id.clone().unwrap_or_else(|| "web".into()),
         };
+        self.seed_playing(&np.title);
         self.publish(MediaEvent::Play(np.clone()));
 
         // 建议气泡素材:还没登录 → 每次启动至多提示一次"登录画质更清晰"
@@ -411,6 +427,7 @@ impl MediaRuntime {
             page_url: path_str.into(),
             source: "local".into(),
         };
+        self.seed_playing(&np.title);
         self.publish(MediaEvent::Play(np.clone()));
         Ok(np)
     }
@@ -434,6 +451,36 @@ impl MediaRuntime {
         }
         self.publish(MediaEvent::Control { action: action.into(), value });
         Ok(())
+    }
+
+    /// 起播时乐观 seed「正在放」(前端随后经 report 校准;这步只是让模型立刻就知道在放什么)。
+    fn seed_playing(&self, title: &str) {
+        *self.inner.playback.lock().unwrap() =
+            Playback { title: Some(title.to_string()), paused: false };
+    }
+
+    /// 前端回报播放态(`report_media_state` 命令 → 这里):前端是播放真相源,
+    /// ended/stop/pause/resume 全经此校准 core 快照。status: playing|paused|idle(其余按 playing)。
+    pub fn set_playback(&self, status: &str, title: Option<String>) {
+        let pb = match status {
+            "idle" => Playback::default(),
+            "paused" => Playback { title, paused: true },
+            // playing / loading / 其它 → 正在播
+            _ => Playback { title, paused: false },
+        };
+        *self.inner.playback.lock().unwrap() = pb;
+    }
+
+    /// 「此刻」播放器状态的一行背景:回合装配追加到末条 user 喂模型,让它任何时候都拿得到
+    /// 当下真相(修「歌放完了却以为还在播」)。总返回一行(含空闲),由提示词法条约束「只在
+    /// 跟播放有关时才参考、平时别主动提」。
+    pub fn playback_summary(&self) -> Option<String> {
+        let pb = self.inner.playback.lock().unwrap().clone();
+        Some(match (pb.title, pb.paused) {
+            (None, _) => "播放器现在空闲,没有在播放任何内容".to_string(),
+            (Some(t), false) => format!("播放器正在播放《{t}》"),
+            (Some(t), true) => format!("播放器已暂停,停在《{t}》"),
+        })
     }
 }
 
@@ -590,5 +637,27 @@ mod tests {
             );
             assert!(rt.take_pending_play("bilibili").is_none(), "过期的待重放不返回");
         }
+    }
+
+    #[test]
+    fn playback_snapshot_seed_report_and_summary() {
+        let (rt, _rx) = runtime("playback");
+        // 初始空闲(回合装配会据此告诉模型「没在播」)
+        assert_eq!(
+            rt.playback_summary().as_deref(),
+            Some("播放器现在空闲,没有在播放任何内容")
+        );
+        // 起播乐观 seed → 正在播
+        rt.seed_playing("天空之城");
+        assert_eq!(rt.playback_summary().as_deref(), Some("播放器正在播放《天空之城》"));
+        // 前端回报暂停
+        rt.set_playback("paused", Some("天空之城".into()));
+        assert_eq!(rt.playback_summary().as_deref(), Some("播放器已暂停,停在《天空之城》"));
+        // 前端回报 ended/stop → 空闲(修「歌放完了模型却以为还在播」)
+        rt.set_playback("idle", None);
+        assert_eq!(
+            rt.playback_summary().as_deref(),
+            Some("播放器现在空闲,没有在播放任何内容")
+        );
     }
 }

@@ -129,7 +129,20 @@ pub(crate) async fn run(
         return Ok(0);
     }
     let existing = store.memory.list(user_id)?;
-    let req = build_request(&recent, &existing);
+    let mut req = build_request(&recent, &existing);
+    // 提炼认全局反应模式 `llm.thinking`,**解析与回合循环完全一致**(engine/mod.rs:1461):
+    // **缺省 → Medium**(2026-06-19 起后台提炼默认开思考)。依据 = eval A/B 实测:关思考时提炼
+    // 几乎一律 `[]`、开思考 consolidate-learns 0/5→5/5 且 restraint 仍 5/5(双向判对)。后台任务
+    // 不卡延迟、成本每 N 回合一次推理可忽略。用户显式设 `off` 仍可关。
+    let thinking = match store.settings.get(None, "llm.thinking")?.as_deref() {
+        Some("off") => crate::llm::Thinking::Off,
+        Some("light") => crate::llm::Thinking::Light,
+        Some("heavy") => crate::llm::Thinking::Heavy,
+        _ => crate::llm::Thinking::Medium,
+    };
+    if thinking != crate::llm::Thinking::Off {
+        req.options.thinking = Some(thinking);
+    }
     let text = provider
         .chat(req)
         .await

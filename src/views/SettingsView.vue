@@ -742,7 +742,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           <span class="label">{{ t('settings.general.skin') }}</span>
           <span class="seg">
             <button
-              v-for="s in ['scifi', 'warm']"
+              v-for="s in ['scifi', 'warm', 'green', 'night']"
               :key="s"
               :class="{ on: settings.state.skin === s }"
               @click="settings.setSkin(s)"

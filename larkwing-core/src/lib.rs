@@ -8,6 +8,7 @@ pub mod components;
 pub mod crypto;
 pub mod datadir;
 pub mod engine;
+pub mod eval;
 pub mod files;
 pub mod llm;
 pub mod media;

@@ -336,6 +336,8 @@ export default {
       skin: '皮肤',
       skin_scifi: '科幻',
       skin_warm: '暖萌',
+      skin_green: '豆沙绿',
+      skin_night: '琥珀夜',
       bubble: '气泡形状',
       bubble_round: '圆角',
       bubble_cut: '切角',

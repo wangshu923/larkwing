@@ -327,6 +327,7 @@ pub fn run() {
       commands::remove_provider,
       commands::media_login,
       commands::media_retry,
+      commands::report_media_state,
       commands::remote_status,
       commands::reload_channels,
       commands::voice_listen_start,

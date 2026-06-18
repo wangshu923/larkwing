@@ -181,7 +181,7 @@ export function hydrateUserName(name: string) {
 
 // 皮肤 = 用户级偏好(users.skin_id)。语义 token 在 style.css 按 <html data-skin> 生效;
 // 换皮只换观感、不改组件(宪法 §3.6/§5)。未知值一律回科幻,脏数据不黑屏。
-const SKINS = ['scifi', 'warm']
+const SKINS = ['scifi', 'warm', 'green', 'night']
 function applySkin(id: string) {
   const skin = SKINS.includes(id) ? id : 'scifi'
   state.skin = skin
