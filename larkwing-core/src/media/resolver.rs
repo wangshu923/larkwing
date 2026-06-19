@@ -22,11 +22,21 @@ const VIDEO_FORMAT: &str = "bv*[vcodec^=avc][height<=1080]+ba[ext=m4a]/\
                             b[vcodec^=avc]/\
                             bv*[ext=mp4][height<=1080]+ba[ext=m4a]/bv*+ba/b";
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct UpStream {
     pub url: String,
     /// yt-dlp 给的 http_headers(Referer/UA 防盗链就在这),转发/混流时原样带上。
     pub headers: Vec<(String, String)>,
+    // 以下供合成 DASH MPD(B 站两路自适应流走 MSE 播放,见 relay::build_mpd);
+    // 非 DASH 路径(直转 / 本地)忽略。来自 yt-dlp 的 per-format 元数据。
+    /// 视频编码(RFC6381,如 `avc1.640028`);音频流为 None。
+    pub vcodec: Option<String>,
+    /// 音频编码(RFC6381,如 `mp4a.40.2`);视频流为 None。
+    pub acodec: Option<String>,
+    pub width: Option<u64>,
+    pub height: Option<u64>,
+    /// 码率(bits/s),DASH Representation 必填项。
+    pub bandwidth: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -171,7 +181,18 @@ fn stream_of(v: &serde_json::Value) -> Option<UpStream> {
                 .collect()
         })
         .unwrap_or_default();
-    Some(UpStream { url, headers })
+    // 编码/码率/尺寸:供 DASH MPD 合成;"none"/空当缺失。码率优先 tbr,回落 vbr/abr。
+    let codec = |key| v[key].as_str().filter(|s| !s.is_empty() && *s != "none").map(str::to_string);
+    let kbps = v["tbr"].as_f64().or_else(|| v["vbr"].as_f64()).or_else(|| v["abr"].as_f64());
+    Some(UpStream {
+        url,
+        headers,
+        vcodec: codec("vcodec"),
+        acodec: codec("acodec"),
+        width: v["width"].as_u64(),
+        height: v["height"].as_u64(),
+        bandwidth: kbps.map(|k| (k * 1000.0) as u64),
+    })
 }
 
 #[cfg(test)]

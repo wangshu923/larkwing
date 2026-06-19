@@ -101,6 +101,10 @@ pub struct NowPlaying {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_seconds: Option<f64>,
     pub stream_url: String,
+    /// 有值 = 自适应流(DASH/HLS):前端用 shaka(MSE)播它,播放器自己管时间轴 → 原生 seek/同步。
+    /// 否则前端用 `stream_url` 挂原生 `<video>/<audio>`(直传文件/单流,原生 seek)。(B 站 DASH 走这里。)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_url: Option<String>,
     pub page_url: String,
     pub source: String,
 }
@@ -382,23 +386,44 @@ impl MediaRuntime {
             .context("转发服务起不来")?;
 
         let mut streams = resolved.streams.clone();
+        let mut manifest_url: Option<String> = None;
         let stream_url = if streams.len() == 2 {
-            // 音视频分离(B 站 DASH 常态):要 ffmpeg 混流
-            let ffmpeg = match self.ensure_component(Component::Ffmpeg).await {
-                Ok(p) => p,
-                Err(e) => {
-                    // 组件(ffmpeg)下载失败同属可重试:同样给重放口
-                    task.fail_retryable(
-                        "task.err.download",
-                        serde_json::Value::Null,
-                        TaskRetry::MediaPlay { page_url: page_url.to_string(), audio_only },
-                    );
-                    return Err(e);
-                }
-            };
+            // 音视频分离(B 站 DASH 常态)。**优先 DASH 直供**:不混流 → 前端 shaka 经 MSE 播两条流、
+            // 播放器自己管时间轴 → 原生 seek + 音画同步(像 b 站网页;治混流 ?t= 重启 seek 的错位)。
+            // 合成 MPD 需时长 + 探到 sidx;任一不满足 → 回落 ffmpeg 混流(老路,seek 有错位但至少能放)。
             let audio = streams.pop().expect("len==2");
             let video = streams.pop().expect("len==2");
-            relay.register_remux(video, audio, ffmpeg)
+            let dash = match resolved.duration_seconds {
+                Some(dur) => match relay.register_dash(video.clone(), audio.clone(), dur).await {
+                    Ok(url) => Some(url),
+                    Err(e) => {
+                        tracing::info!("DASH 直供不可用,回落 ffmpeg 混流: {e:#}");
+                        None
+                    }
+                },
+                None => {
+                    tracing::info!("解析无时长,DASH 直供跳过,走 ffmpeg 混流");
+                    None
+                }
+            };
+            if let Some(url) = dash {
+                manifest_url = Some(url.clone());
+                url // stream_url 也存 manifest(前端优先用 manifest_url 走 shaka;此处只为非空)
+            } else {
+                let ffmpeg = match self.ensure_component(Component::Ffmpeg).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        // 组件(ffmpeg)下载失败同属可重试:同样给重放口
+                        task.fail_retryable(
+                            "task.err.download",
+                            serde_json::Value::Null,
+                            TaskRetry::MediaPlay { page_url: page_url.to_string(), audio_only },
+                        );
+                        return Err(e);
+                    }
+                };
+                relay.register_remux(video, audio, ffmpeg)
+            }
         } else {
             relay.register_direct(streams.pop().expect("resolver 保证非空"))
         };
@@ -410,6 +435,7 @@ impl MediaRuntime {
             author: resolved.uploader,
             duration_seconds: resolved.duration_seconds,
             stream_url,
+            manifest_url,
             page_url: page_url.into(),
             source: source_id.clone().unwrap_or_else(|| "web".into()),
         };
@@ -552,6 +578,7 @@ impl MediaRuntime {
             author: None,
             duration_seconds,
             stream_url,
+            manifest_url: None, // 本地走原生 /f/ 或 /m/(Stage 2 才上 HLS);非自适应
             page_url: path_str.into(),
             source: "local".into(),
         };

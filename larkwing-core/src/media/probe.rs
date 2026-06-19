@@ -110,6 +110,60 @@ pub fn parse_ffmpeg_stderr(stderr: &str) -> LocalProbe {
     p
 }
 
+/// 一条单文件 fMP4(B 站 DASH 的 video.m4s / audio.m4s)里两个关键字节范围,供合成 DASH MPD
+/// 的 `<SegmentBase>` 用:Initialization(ftyp+moov,字节 `0..=init_last`)+ sidx 索引盒
+/// (`index_first..=index_last`)。播放器(shaka)据此 Range 拉 init + index,再自行解析 sidx
+/// 拿到各分片的时间/字节表 → 原生精确 seek。我们只**定位字节范围**,不解析 sidx 内容。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SidxRanges {
+    /// Initialization 段末字节(含):`0..=init_last` = ftyp + moov。
+    pub init_last: u64,
+    /// sidx 盒首字节(含)。
+    pub index_first: u64,
+    /// sidx 盒末字节(含)。
+    pub index_last: u64,
+}
+
+/// 在 fMP4 头部字节里逐盒前进,定位 `sidx`(在 ftyp/moov 之后、moof 之前)。返回 init 段与
+/// sidx 的字节范围。`head` 取流前段(~64KB 足够:DASH 单表示流的 moov 很小)。找不到 sidx /
+/// 头太短 / 畸形 → None(调用方回落:换方案或不走 DASH)。
+pub fn probe_sidx(head: &[u8]) -> Option<SidxRanges> {
+    let total = head.len() as u64;
+    let mut off: u64 = 0;
+    loop {
+        if off + 8 > total {
+            return None; // 头不够长,还没到 sidx
+        }
+        let o = off as usize;
+        let size32 = u32::from_be_bytes([head[o], head[o + 1], head[o + 2], head[o + 3]]) as u64;
+        let btype = &head[o + 4..o + 8];
+        let box_size = match size32 {
+            1 => {
+                if off + 16 > total {
+                    return None;
+                }
+                u64::from_be_bytes(head[o + 8..o + 16].try_into().ok()?)
+            }
+            0 => return None, // 延伸到 EOF 的盒不可能在 sidx 之前(畸形)
+            n => n,
+        };
+        if box_size < 8 {
+            return None; // 畸形
+        }
+        if btype == b"sidx" {
+            if off == 0 {
+                return None; // sidx 在最前 = 没有 init 段(ftyp/moov),不合我们用途
+            }
+            return Some(SidxRanges {
+                init_last: off - 1,
+                index_first: off,
+                index_last: off + box_size - 1,
+            });
+        }
+        off = off.checked_add(box_size)?;
+    }
+}
+
 /// "Duration: 02:03:45.67, start: …" → 秒。N/A / 解析不出 → None。
 fn parse_duration_line(line: &str) -> Option<f64> {
     let rest = line.strip_prefix("Duration:")?.trim_start();
@@ -334,6 +388,38 @@ Input #0, matroska,webm, from 'movie.mkv':
         assert!(!p.video_incompatible, "h264 兼容,copy");
         assert!(!p.audio_incompatible, "aac 兼容,copy");
         assert_eq!(p.duration_seconds, Some(21.0 * 60.0 + 5.0));
+    }
+
+    #[test]
+    fn probe_sidx_locates_init_and_index() {
+        // 典型 DASH 单文件:ftyp + moov + sidx + moof(后者只是占位)
+        let ftyp = mp4_box(b"ftyp", b"dashiso6");
+        let moov = mp4_box(b"mvhd", &mvhd_v0(1000, 1000)); // 当 moov 内容占位,够长即可
+        let moov = mp4_box(b"moov", &moov);
+        let sidx = mp4_box(b"sidx", &[0u8; 40]); // sidx 盒(内容不解析,只定位)
+        let mut file = Vec::new();
+        file.extend_from_slice(&ftyp);
+        file.extend_from_slice(&moov);
+        let sidx_start = file.len() as u64;
+        file.extend_from_slice(&sidx);
+        file.extend_from_slice(&mp4_box(b"moof", &[0u8; 16]));
+
+        let r = probe_sidx(&file).expect("应定位到 sidx");
+        assert_eq!(r.init_last, sidx_start - 1, "init 段 = ftyp+moov,到 sidx 前一字节");
+        assert_eq!(r.index_first, sidx_start, "index 从 sidx 盒首字节起");
+        assert_eq!(r.index_last, sidx_start + sidx.len() as u64 - 1, "index 到 sidx 盒末字节");
+    }
+
+    #[test]
+    fn probe_sidx_none_when_absent_or_short() {
+        // 没有 sidx(纯 ftyp+moov+mdat)→ None
+        let mut no_sidx = mp4_box(b"ftyp", b"isom");
+        no_sidx.extend_from_slice(&mp4_box(b"moov", &mp4_box(b"mvhd", &mvhd_v0(1000, 1000))));
+        no_sidx.extend_from_slice(&mp4_box(b"mdat", b"data"));
+        assert_eq!(probe_sidx(&no_sidx), None, "无 sidx → None");
+        // 头太短(只有半个盒头)→ None,不 panic
+        assert_eq!(probe_sidx(b"\x00\x00"), None);
+        assert_eq!(probe_sidx(b""), None);
     }
 
     #[test]

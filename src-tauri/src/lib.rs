@@ -124,17 +124,25 @@ pub fn run() {
       // 开机自启:正式版「首启默认开一次」(用户决策 2026-06-17;§7.6 常驻临场强默认)。
       // 关闭入口走设置页开关(已有);这里只在「从未默认过」时落一次产品默认 = ON,之后全交用户。
       // 用 auto-launch 自己的 enable() 写(而非装机时直接写注册表)——保证写入值的格式与
-      // is_enabled()/disable() 完全一致,零漂移(§6.8 薄封装防漂移);卸载时由 installer-hooks.nsh
-      // 删那两条键。dev 版不碰:自启会指向临时调试程序、连不上本地前端(前端开关同样 dev 禁用)。
+      // is_enabled()/disable() 完全一致,零漂移(§6.8 薄封装防漂移)。
+      // dev 版不碰:自启会指向临时调试程序、连不上本地前端(前端开关同样 dev 禁用)。
+      //
+      // ⚠️ 标记带版本号(.v2,2026-06-19 修升级丢自启 bug):升级走 Tauri NSIS「跑旧版卸载器」流程,
+      // 旧版卸载钩子会无条件删自启注册表项;但本标记存数据目录、升级不动用户数据 → 标记残留 →
+      // 新版首启误判「已默认过」而跳过 → 自启被删了又不补 = 升级后自启莫名变关(用户实测)。两手根治:
+      //   ① installer-hooks.nsh 改「升级不删、真卸载才删」——护住「以后」的升级;
+      //   ② 这里把标记键名升一版——让已装机器在「修好版」首启把默认自启「再开一次」,补上升级当跳
+      //      被旧卸载器删掉的那次(旧卸载器是被替换的旧版本编进去的,①管不到这一跳)。
+      // 升版只重置一次:重开后落 .v2,之后照旧「不与用户手动关掉打架」。旧键 .defaulted 留作惰性垃圾、无害。
       // 仅 Windows 正式版真机能验(§8.1)。
       if !cfg!(debug_assertions) {
         use tauri_plugin_autostart::ManagerExt;
-        const AUTOSTART_DEFAULTED: &str = "system.autostart.defaulted";
+        const AUTOSTART_DEFAULTED: &str = "system.autostart.defaulted.v2";
         let already = store.settings.get(None, AUTOSTART_DEFAULTED).ok().flatten();
         if already.as_deref() != Some("1") {
           match app.autolaunch().enable() {
-            Ok(()) => tracing::info!("首启:按产品默认开启开机自启"),
-            Err(e) => tracing::warn!("首启默认开启开机自启失败(忽略,不反复试): {e:#}"),
+            Ok(()) => tracing::info!("首启/升级修复:按产品默认开启开机自启"),
+            Err(e) => tracing::warn!("默认开启开机自启失败(忽略,不反复试): {e:#}"),
           }
           // 成败都落标记:避免每次启动重试,也不与用户日后手动关掉打架。
           let _ = store.settings.set(None, AUTOSTART_DEFAULTED, "1");

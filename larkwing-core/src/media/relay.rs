@@ -33,6 +33,11 @@ enum Entry {
     /// (不掉画质/CPU 近零)。两者皆假时也仍跑(给 mkv 这类只需"转封装成 mp4"的容器用)。走 /m/
     /// 通道(渐进流、无原生 seek,前端按 ?t= 换 src 重启),与 B 站 DASH 混流同播放路径,前端零改。
     FileRemux { path: PathBuf, ffmpeg: PathBuf, transcode_video: bool, transcode_audio: bool },
+    /// B 站 DASH:两条独立自适应流(video.m4s + audio.m4s)。**不混流** —— 合成一份 DASH MPD,
+    /// 前端 shaka 经 MSE 把两条喂给播放器、播放器自己管时间轴 → 原生 seek、天生同步(像 b 站网页)。
+    /// `/dash/{token}/manifest.mpd` 返回 `mpd`;`/dash/{token}/v|a` 把 shaka 的 Range 请求带防盗链
+    /// 头透传到对应上游(复用 proxy_upstream)。修「混流 + ?t= 重启 seek」的音画错位(那是固有缺陷)。
+    Dash { mpd: String, video: UpStream, audio: UpStream },
 }
 
 struct Inner {
@@ -66,6 +71,8 @@ impl Relay {
             .route("/s/{token}", get(direct))
             .route("/m/{token}", get(remux))
             .route("/f/{token}", get(file))
+            // DASH:manifest + 两路段透传。shaka 用 fetch() 拉(跨源 → 需 CORS,见 dash 处理)。
+            .route("/dash/{token}/{seg}", get(dash).options(dash_preflight))
             .with_state(inner.clone());
         tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app).await {
@@ -123,6 +130,114 @@ impl Relay {
     ) -> String {
         self.register(Entry::FileRemux { path, ffmpeg, transcode_video, transcode_audio }, "m")
     }
+
+    /// B 站 DASH:**不混流**。探两条流的 sidx → 合成 MPD → 注册,返回 `…/dash/{token}/manifest.mpd`。
+    /// 前端 shaka 经 MSE 播这份 manifest → 播放器管时间轴、原生 seek、音画同步(治混流重启 seek 的错位)。
+    /// 探不到 sidx(流不是 SegmentBase 单文件 DASH,头里没有)→ Err,调用方回落混流。
+    pub async fn register_dash(
+        &self,
+        video: UpStream,
+        audio: UpStream,
+        duration: f64,
+    ) -> Result<String> {
+        // sidx 在 ftyp+moov 之后;DASH 单表示流的 moov 很小,96KB 头足够覆盖。
+        const HEAD: u64 = 96 * 1024;
+        let vhead = fetch_head(&self.inner.net, &video, HEAD).await.context("取视频流头失败")?;
+        let ahead = fetch_head(&self.inner.net, &audio, HEAD).await.context("取音频流头失败")?;
+        let vsidx = super::probe::probe_sidx(&vhead)
+            .context("视频流头里没有 sidx(非 SegmentBase 单文件 DASH)")?;
+        let asidx = super::probe::probe_sidx(&ahead).context("音频流头里没有 sidx")?;
+        let mpd = build_mpd(duration, &video, vsidx, &audio, asidx);
+        let token = self.token();
+        self.inner
+            .streams
+            .lock()
+            .expect("relay streams lock poisoned")
+            .insert(token.clone(), Arc::new(Entry::Dash { mpd, video, audio }));
+        Ok(format!("http://127.0.0.1:{}/dash/{token}/manifest.mpd", self.inner.port))
+    }
+}
+
+/// 取一条上游流的前段(≤cap 字节)用于探 sidx:带防盗链头 + Range;上游若忽略 Range 回 200 全量,
+/// 也只读到 cap 就停(绝不把整片拉进内存)。失败 → None。
+async fn fetch_head(net: &crate::net::Client, up: &UpStream, cap: u64) -> Option<Vec<u8>> {
+    let mut resp = net
+        .send(&up.url, |c| {
+            let mut req = c.get(&up.url);
+            for (k, v) in &up.headers {
+                req = req.header(k, v);
+            }
+            req.header(axum::http::header::RANGE, format!("bytes=0-{}", cap - 1))
+        })
+        .await
+        .ok()?;
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                buf.extend_from_slice(&chunk);
+                if buf.len() as u64 >= cap {
+                    buf.truncate(cap as usize);
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => return None,
+        }
+    }
+    Some(buf)
+}
+
+/// 合成一份 on-demand DASH MPD(纯函数,可测):两条单文件流各一个 Representation,用 SegmentBase
+/// + indexRange(sidx)+ Initialization range。shaka 据此 Range 拉 init/index/段、自己管时间轴 →
+/// 原生精确 seek + 音画同步。codecs/bandwidth 来自 yt-dlp(缺则给保守默认);音频采样率/声道 shaka
+/// 会从 init 段读真值,故 MPD 不写、免对不上。段地址用相对 `v`/`a`(相对 manifest URL → /dash/{token}/v|a)。
+fn build_mpd(
+    duration: f64,
+    video: &UpStream,
+    vsidx: super::probe::SidxRanges,
+    audio: &UpStream,
+    asidx: super::probe::SidxRanges,
+) -> String {
+    let vcodec = video.vcodec.as_deref().unwrap_or("avc1.640028");
+    let acodec = audio.acodec.as_deref().unwrap_or("mp4a.40.2");
+    let vbw = video.bandwidth.unwrap_or(2_000_000);
+    let abw = audio.bandwidth.unwrap_or(128_000);
+    let w = video.width.unwrap_or(1920);
+    let h = video.height.unwrap_or(1080);
+    format!(
+        concat!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>"#,
+            "\n",
+            r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011" type="static" minBufferTime="PT2S" mediaPresentationDuration="PT{dur:.3}S">"#,
+            "\n  <Period>\n",
+            r#"    <AdaptationSet contentType="video" mimeType="video/mp4" segmentAlignment="true" startWithSAP="1">"#,
+            "\n",
+            r#"      <Representation id="v" bandwidth="{vbw}" codecs="{vcodec}" width="{w}" height="{h}">"#,
+            "\n        <BaseURL>v</BaseURL>\n",
+            r#"        <SegmentBase indexRange="{vif}-{vil}"><Initialization range="0-{vinit}"/></SegmentBase>"#,
+            "\n      </Representation>\n    </AdaptationSet>\n",
+            r#"    <AdaptationSet contentType="audio" mimeType="audio/mp4" segmentAlignment="true" startWithSAP="1">"#,
+            "\n",
+            r#"      <Representation id="a" bandwidth="{abw}" codecs="{acodec}">"#,
+            "\n        <BaseURL>a</BaseURL>\n",
+            r#"        <SegmentBase indexRange="{aif}-{ail}"><Initialization range="0-{ainit}"/></SegmentBase>"#,
+            "\n      </Representation>\n    </AdaptationSet>\n  </Period>\n</MPD>\n",
+        ),
+        dur = duration,
+        vbw = vbw,
+        vcodec = vcodec,
+        w = w,
+        h = h,
+        vif = vsidx.index_first,
+        vil = vsidx.index_last,
+        vinit = vsidx.init_last,
+        abw = abw,
+        acodec = acodec,
+        aif = asidx.index_first,
+        ail = asidx.index_last,
+        ainit = asidx.init_last,
+    )
 }
 
 /// 按扩展名给 Content-Type(WebView 解码选型用;不认识的交给 Chromium 嗅探)。
@@ -188,7 +303,13 @@ async fn direct(
 ) -> Response {
     let Some(entry) = lookup(&state, &token) else { return bad(StatusCode::NOT_FOUND) };
     let Entry::Direct(up) = entry.as_ref() else { return bad(StatusCode::NOT_FOUND) };
+    proxy_upstream(&state, up, &headers).await
+}
 
+/// 把一条上游流透传给客户端:带防盗链头、透传客户端 Range、镜像响应头/状态。`/s/`(`<video src>`)
+/// 与 `/dash/…/v|a`(shaka `fetch`,跨源)共用。**带 CORS**:shaka 用 fetch 拉段是跨源请求(app 源
+/// ≠ relay 回环端口),`<video src>` 不查 CORS 但 fetch 查 → 必须放行 + 暴露 Range 相关响应头。
+async fn proxy_upstream(state: &Inner, up: &UpStream, client_headers: &HeaderMap) -> Response {
     let upstream = match state
         .net
         .send(&up.url, |c| {
@@ -196,7 +317,7 @@ async fn direct(
             for (k, v) in &up.headers {
                 req = req.header(k, v);
             }
-            if let Some(range) = headers.get(axum::http::header::RANGE) {
+            if let Some(range) = client_headers.get(axum::http::header::RANGE) {
                 req = req.header(axum::http::header::RANGE, range);
             }
             req
@@ -210,7 +331,10 @@ async fn direct(
         }
     };
 
-    let mut builder = Response::builder().status(upstream.status().as_u16());
+    let mut builder = Response::builder()
+        .status(upstream.status().as_u16())
+        .header("access-control-allow-origin", "*")
+        .header("access-control-expose-headers", "Content-Length, Content-Range, Accept-Ranges");
     for key in ["content-type", "content-length", "content-range", "accept-ranges"] {
         if let Some(v) = upstream.headers().get(key) {
             builder = builder.header(key, v);
@@ -218,6 +342,39 @@ async fn direct(
     }
     let stream = upstream.bytes_stream().map_err(std::io::Error::other);
     builder.body(Body::from_stream(stream)).unwrap_or_else(|_| bad(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
+/// DASH:`manifest.mpd` 返回合成的 MPD(带 CORS);`v`/`a` 把 shaka 的 Range 请求透传到对应上游。
+async fn dash(
+    State(state): State<Arc<Inner>>,
+    AxPath((token, seg)): AxPath<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(entry) = lookup(&state, &token) else { return bad(StatusCode::NOT_FOUND) };
+    let Entry::Dash { mpd, video, audio } = entry.as_ref() else { return bad(StatusCode::NOT_FOUND) };
+    match seg.as_str() {
+        "manifest.mpd" => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/dash+xml")
+            .header("access-control-allow-origin", "*")
+            .body(Body::from(mpd.clone()))
+            .unwrap_or_else(|_| bad(StatusCode::INTERNAL_SERVER_ERROR)),
+        "v" => proxy_upstream(&state, video, &headers).await,
+        "a" => proxy_upstream(&state, audio, &headers).await,
+        _ => bad(StatusCode::NOT_FOUND),
+    }
+}
+
+/// CORS 预检(shaka 带 Range 的 fetch 可能先发 OPTIONS):放行 GET + Range。
+async fn dash_preflight() -> Response {
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header("access-control-allow-origin", "*")
+        .header("access-control-allow-methods", "GET, OPTIONS")
+        .header("access-control-allow-headers", "Range")
+        .header("access-control-max-age", "86400")
+        .body(Body::empty())
+        .unwrap_or_else(|_| bad(StatusCode::INTERNAL_SERVER_ERROR))
 }
 
 /// 本地文件:Range 透传的文件流(原生 seek 白送);UNC/挂载盘符就是普通路径。
@@ -314,7 +471,7 @@ async fn remux(
             let mut cmd = tokio::process::Command::new(ffmpeg);
             cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin");
             if q.t > 0.0 {
-                cmd.arg("-ss").arg(format!("{:.3}", q.t)); // 输入 seek(对 copy 是关键帧对齐,够用)
+                cmd.arg("-ss").arg(format!("{:.3}", q.t)); // 输入 seek(对 copy 是关键帧对齐)
             }
             cmd.arg("-i").arg(path);
             // 首条视频可选(纯音频不报错)+ 首条音轨可选(无声轨不报错);字幕等不带。
@@ -332,6 +489,8 @@ async fn remux(
             } else {
                 cmd.arg("-c:a").arg("copy");
             }
+            // 注:拖动 seek 后的音画同步是 /m/ 重启式 seek 的固有难题(copy 视频回退关键帧),
+            // 网络 DASH 两路输入同样存在;修法是方向决策(见与用户的讨论),不在此处堆 flag。
             cmd
         }
         _ => return bad(StatusCode::NOT_FOUND),
@@ -411,8 +570,8 @@ mod tests {
             counter: AtomicU64::new(1),
         });
         let relay = Relay { inner };
-        let a = relay.register_direct(UpStream { url: "u1".into(), headers: vec![] });
-        let b = relay.register_direct(UpStream { url: "u2".into(), headers: vec![] });
+        let a = relay.register_direct(UpStream { url: "u1".into(), ..Default::default() });
+        let b = relay.register_direct(UpStream { url: "u2".into(), ..Default::default() });
         assert_ne!(a, b);
         assert!(a.starts_with("http://127.0.0.1:12345/s/"));
         assert_eq!(relay.inner.streams.lock().unwrap().len(), 2);
@@ -444,6 +603,7 @@ mod tests {
         let url = relay.register_direct(UpStream {
             url: format!("http://127.0.0.1:{up_port}/a.m4a"),
             headers: vec![("Referer".into(), "https://www.bilibili.com/".into())],
+            ..Default::default()
         });
 
         let resp = reqwest::Client::new()
@@ -464,6 +624,38 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(nf.status().as_u16(), 404);
+    }
+
+    #[test]
+    fn build_mpd_embeds_codecs_ranges_duration() {
+        use super::super::probe::SidxRanges;
+        let video = UpStream {
+            vcodec: Some("avc1.640028".into()),
+            width: Some(1920),
+            height: Some(1080),
+            bandwidth: Some(3_000_000),
+            ..Default::default()
+        };
+        let audio = UpStream {
+            acodec: Some("mp4a.40.2".into()),
+            bandwidth: Some(128_000),
+            ..Default::default()
+        };
+        let mpd = build_mpd(
+            3600.5,
+            &video,
+            SidxRanges { init_last: 799, index_first: 800, index_last: 1199 },
+            &audio,
+            SidxRanges { init_last: 599, index_first: 600, index_last: 699 },
+        );
+        // 编码、码率、时长、两路 SegmentBase 的 init/index range 都进 MPD
+        assert!(mpd.contains(r#"codecs="avc1.640028""#) && mpd.contains(r#"codecs="mp4a.40.2""#));
+        assert!(mpd.contains(r#"bandwidth="3000000""#) && mpd.contains(r#"bandwidth="128000""#));
+        assert!(mpd.contains("PT3600.500S"), "时长 ISO8601");
+        assert!(mpd.contains(r#"indexRange="800-1199""#) && mpd.contains(r#"range="0-799""#), "视频 init/index");
+        assert!(mpd.contains(r#"indexRange="600-699""#) && mpd.contains(r#"range="0-599""#), "音频 init/index");
+        assert!(mpd.contains("<BaseURL>v</BaseURL>") && mpd.contains("<BaseURL>a</BaseURL>"), "段相对地址");
+        assert!(mpd.contains(r#"width="1920""#) && mpd.contains(r#"height="1080""#));
     }
 
     #[test]

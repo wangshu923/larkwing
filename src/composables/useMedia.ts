@@ -46,6 +46,69 @@ let wired = false
 /** 悬浮窗(独立 WebView):不出声、只镜像主窗;播控转发给主窗执行(窗口标签恒定,缓存一次)。 */
 const isFloat = windowLabel() === 'float'
 
+// ── shaka(MSE 自适应流):只在放 DASH/HLS(np.manifest_url 有值,如 B 站)时**懒加载**,音频/本地
+// 直传不碰它(省 ~400KB)。播放器自己管时间轴 → 原生 seek + 音画同步,治「混流 + ?t= 重启 seek」的
+// 错位(那是固有缺陷,见 relay::Entry::Dash)。shaka 经 MSE 接管 <video>,故不再手设 el.src。
+let shakaLib: any = null
+let shakaPlayer: any = null
+async function loadShaka(): Promise<any> {
+  if (!shakaLib) {
+    const mod: any = await import('shaka-player')
+    shakaLib = mod.default ?? mod
+    try {
+      shakaLib.polyfill?.installAll?.()
+    } catch {
+      /* 尽力 */
+    }
+  }
+  return shakaLib
+}
+async function destroyShaka() {
+  const p = shakaPlayer
+  shakaPlayer = null
+  if (p) {
+    try {
+      await p.destroy()
+    } catch {
+      /* 已销毁/未挂载 */
+    }
+  }
+}
+/** 把当前视频装进 <video>:自适应流(manifest_url)走 shaka(MSE);否则原生 src(直传/本地混流)。
+ *  play() 与 registerVideoEl(后挂场景)都走它。异步加载期间若已切走/停了,据 state.current 比对退出。 */
+async function loadVideoInto(el: HTMLVideoElement) {
+  const cur = state.current
+  if (!cur || cur.kind !== 'video') return
+  el.playbackRate = 1
+  el.volume = state.volume
+  if (!cur.manifest_url) {
+    el.src = cur.stream_url
+    void el.play().catch(() => (state.status = 'paused'))
+    return
+  }
+  try {
+    const shaka = await loadShaka()
+    await destroyShaka()
+    if (state.current !== cur) return // 加载期间已切走/停
+    const player = new shaka.Player()
+    shakaPlayer = player
+    await player.attach(el)
+    player.addEventListener('error', (e: any) => {
+      console.error('[shaka] error', e?.detail ?? e)
+      if (state.current?.kind === 'video') state.status = 'paused'
+    })
+    await player.load(cur.manifest_url)
+    if (state.current !== cur) {
+      void destroyShaka()
+      return
+    }
+    void el.play().catch(() => {})
+  } catch (e) {
+    console.error('[shaka] load failed', e)
+    if (state.current === cur) state.status = 'paused'
+  }
+}
+
 function ensureAudio(): HTMLAudioElement {
   if (!audio) {
     audio = new Audio()
@@ -77,7 +140,10 @@ function ensureAudio(): HTMLAudioElement {
 /** VideoOverlay 挂载/卸载时登记播放元素(全 app 只有一个)。 */
 export function registerVideoEl(el: HTMLVideoElement | null) {
   videoEl = el
-  if (!el) return
+  if (!el) {
+    void destroyShaka() // 浮层卸载:拆掉 shaka(它接管了那个 <video>)
+    return
+  }
   el.addEventListener('timeupdate', () => {
     if (state.current?.kind === 'video') state.position = videoBase + el.currentTime
   })
@@ -107,8 +173,7 @@ export function registerVideoEl(el: HTMLVideoElement | null) {
   el.volume = state.volume
   el.playbackRate = state.rate
   if (state.current?.kind === 'video') {
-    el.src = state.current.stream_url
-    void el.play().catch(() => {})
+    void loadVideoInto(el) // 后挂场景:接力起播(自适应走 shaka,否则原生 src)
   }
 }
 
@@ -136,13 +201,8 @@ function play(np: NowPlaying) {
     a.src = np.stream_url
     void a.play().catch(() => (state.status = 'paused'))
   } else if (np.kind === 'video') {
-    if (videoEl) {
-      videoEl.playbackRate = 1
-      videoEl.volume = state.volume
-      videoEl.src = np.stream_url
-      void videoEl.play().catch(() => (state.status = 'paused'))
-    }
-    // videoEl 还没挂:VideoOverlay 随 current 出现,registerVideoEl 接力起播。
+    if (videoEl) void loadVideoInto(videoEl) // 自适应走 shaka,否则原生 src
+    // videoEl 还没挂:VideoOverlay 随 current 出现,registerVideoEl 接力起播(同样走 loadVideoInto)。
     // 视频默认:叫主窗到最前(藏在托盘/别的窗后面时只闻其声)+ 置顶(别被盖住)+ 全屏(用户要求)。
     // 置位放在 videoEl 守卫外,后挂场景也直接铺满、不窗口化闪一下;.maximized 绑 state.fullscreen,
     // 浮层挂载瞬间即全屏。此处必是主窗(float 已在函数开头早退)。
@@ -206,9 +266,15 @@ function stopElements() {
     audio.pause()
     audio.removeAttribute('src')
   }
+  void destroyShaka() // 自适应流:先拆 shaka(它经 MSE 接管了 <video>),再清原生 src
   if (videoEl) {
     videoEl.pause()
     videoEl.removeAttribute('src')
+    try {
+      videoEl.load() // 复位元素,清掉 MSE 残留
+    } catch {
+      /**/
+    }
   }
 }
 
@@ -232,7 +298,8 @@ function stop() {
   syncToPeers() // 广播"停了"给悬浮窗(修:UI 点停止 / 自然播完时它仍显在放)
 }
 
-/** seek:音频/直转流走原生(转发层透传 Range);混流视频换 src 重启(?t=)。 */
+/** seek:自适应流(shaka)/ 音频 / 直转单文件走**原生** currentTime(播放器管时间轴,精确 + 同步);
+ *  只有本地转码的渐进混流(/m/、无 manifest)才换 src 重启(?t=)—— Stage 2 上 HLS 后这条也会消失。 */
 function seek(seconds: number) {
   const cur = state.current
   if (!cur) return
@@ -241,14 +308,14 @@ function seek(seconds: number) {
     return
   }
   if (cur.kind === 'video' && videoEl) {
-    if (cur.stream_url.includes('/m/')) {
+    if (!cur.manifest_url && cur.stream_url.includes('/m/')) {
       videoBase = seconds
       state.status = 'loading' // 换 src 重启混流,黑屏期间显示 spinner(别看着像卡死);playing 事件复位
       const base = cur.stream_url.split('?')[0]
       videoEl.src = `${base}?t=${seconds.toFixed(1)}`
       void videoEl.play().catch(() => (state.status = 'paused'))
     } else {
-      videoEl.currentTime = seconds
+      videoEl.currentTime = seconds // shaka 自适应 / 直传:原生精确 seek
     }
     state.position = seconds
   }

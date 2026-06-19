@@ -288,6 +288,9 @@ export interface NowPlaying {
   author?: string
   duration_seconds?: number
   stream_url: string
+  /** 有值 = 自适应流(DASH/HLS):前端用 shaka(MSE)播,播放器管时间轴 → 原生 seek/同步(B 站走这里)。
+   *  否则用 stream_url 挂原生 <video>/<audio>(直传文件/单流)。 */
+  manifest_url?: string
   page_url: string
   source: string
 }

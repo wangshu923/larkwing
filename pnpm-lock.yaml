@@ -20,6 +20,9 @@ importers:
       marked:
         specifier: ^18.0.5
         version: 18.0.5
+      shaka-player:
+        specifier: ^5.1.10
+        version: 5.1.10
       vue:
         specifier: ^3.5.13
         version: 3.5.35(typescript@5.7.3)
@@ -609,6 +612,10 @@ packages:
     engines: {node: '>=18.0.0', npm: '>=8.0.0'}
     hasBin: true
 
+  shaka-player@5.1.10:
+    resolution: {integrity: sha512-1QBR29E8d+6f5lNf1pDWAv1Bto7dpURipQg9opCA6HgBVe7rGbeQJUw7fy03h4ywLJB0IwJYl7U7zLQqWnGKHw==}
+    engines: {node: '>=18'}
+
   source-map-js@1.2.1:
     resolution: {integrity: sha512-UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA==}
     engines: {node: '>=0.10.0'}
@@ -1134,6 +1141,8 @@ snapshots:
       '@rollup/rollup-win32-x64-gnu': 4.61.1
       '@rollup/rollup-win32-x64-msvc': 4.61.1
       fsevents: 2.3.3
+
+  shaka-player@5.1.10: {}
 
   source-map-js@1.2.1: {}
 
