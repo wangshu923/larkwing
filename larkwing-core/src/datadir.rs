@@ -322,6 +322,63 @@ fn vacuum_into(src_db: &Path, dest_db: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 一键备份:在用户所选目录 `dest_dir` 生成 `larkwing-backup-<时间戳>.zip`,内含
+/// **DB 一致快照**(`VACUUM INTO`,WAL 下也是完整已提交库)+ **克隆音色 wav**
+/// (`voice/clones/`)—— 都是不可重建的用户数据。可重新下载的模型 / 缓存 / 媒体 / 日志
+/// 一律不收(免备份包动辄上 G)。区别于「搬家」:不翻指针、不重启,纯导出一份拷贝。
+/// 返回生成的压缩包绝对路径(前端提示「已备份到…」)。
+pub fn backup_to(data_root: &Path, dest_dir: &Path) -> Result<PathBuf> {
+    if !dest_dir.is_dir() {
+        bail!("备份目录不存在: {}", dest_dir.display());
+    }
+    let src_db = data_root.join(DB_FILE);
+    if !src_db.is_file() {
+        bail!("找不到数据库: {}", src_db.display());
+    }
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let zip_path = dest_dir.join(format!("larkwing-backup-{stamp}.zip"));
+    // VACUUM 出一致快照到系统临时目录(读进 zip 后即删,不在用户所选目录里散落临时文件)。
+    let snap_db = std::env::temp_dir().join(format!("lw-backup-{}-{stamp}.db", std::process::id()));
+    let _ = std::fs::remove_file(&snap_db);
+
+    let build = || -> Result<()> {
+        vacuum_into(&src_db, &snap_db)?;
+        let file = std::fs::File::create(&zip_path)
+            .with_context(|| format!("创建备份包失败: {}", zip_path.display()))?;
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default();
+
+        // 1) DB 一致快照。
+        zip.start_file(DB_FILE, opts)?;
+        std::io::copy(&mut std::fs::File::open(&snap_db)?, &mut zip)?;
+
+        // 2) 克隆音色 wav(若有):data_root/voice/clones/*(DB 只存相对名,整目录带走即自洽)。
+        let clones = data_root.join("voice").join("clones");
+        if clones.is_dir() {
+            for e in std::fs::read_dir(&clones)?.flatten() {
+                let p = e.path();
+                if p.is_file() {
+                    zip.start_file(
+                        format!("voice/clones/{}", e.file_name().to_string_lossy()),
+                        opts,
+                    )?;
+                    std::io::copy(&mut std::fs::File::open(&p)?, &mut zip)?;
+                }
+            }
+        }
+        zip.finish()?;
+        Ok(())
+    };
+
+    let result = build();
+    let _ = std::fs::remove_file(&snap_db); // 不管成败都清临时快照
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&zip_path); // 失败别留半截包
+        return Err(e);
+    }
+    Ok(zip_path)
+}
+
 fn dir_size(root: &Path) -> u64 {
     fn walk(p: &Path, acc: &mut u64) {
         if let Ok(rd) = std::fs::read_dir(p) {
@@ -365,6 +422,40 @@ mod tests {
         let back = read_pointer(&anchor);
         assert_eq!(back.data_root.as_deref(), Some("/d/Larkwing"));
         assert_eq!(back.old_root.as_deref(), Some("/c/old"));
+    }
+
+    #[test]
+    fn backup_produces_zip_with_db_snapshot_and_clones() {
+        use std::io::Read;
+        let root = tmp("backup-src");
+        // 造一个真库(VACUUM INTO 要求合法 sqlite)。
+        {
+            let c = rusqlite::Connection::open(root.join(DB_FILE)).unwrap();
+            c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);").unwrap();
+        }
+        // 造一个克隆音色 wav(应被收进包)。
+        let clones = root.join("voice").join("clones");
+        std::fs::create_dir_all(&clones).unwrap();
+        std::fs::write(clones.join("c1.wav"), b"RIFFfake").unwrap();
+        // 可重建的(模型/日志)不该进包。
+        std::fs::create_dir_all(root.join("logs")).unwrap();
+        std::fs::write(root.join("logs").join("app.log"), b"noise").unwrap();
+
+        let dest = tmp("backup-dest");
+        let zip_path = backup_to(&root, &dest).unwrap();
+        assert!(zip_path.is_file(), "应生成 zip");
+        assert_eq!(zip_path.extension().and_then(|e| e.to_str()), Some("zip"));
+
+        let mut z = zip::ZipArchive::new(std::fs::File::open(&zip_path).unwrap()).unwrap();
+        let names: Vec<String> =
+            (0..z.len()).map(|i| z.by_index(i).unwrap().name().to_string()).collect();
+        assert!(names.iter().any(|n| n == DB_FILE), "含 DB 快照: {names:?}");
+        assert!(names.iter().any(|n| n == "voice/clones/c1.wav"), "含克隆音色: {names:?}");
+        assert!(!names.iter().any(|n| n.contains("logs")), "日志不该进包: {names:?}");
+        // DB 快照是合法 sqlite(头 16 字节魔数)。
+        let mut buf = vec![];
+        z.by_name(DB_FILE).unwrap().read_to_end(&mut buf).unwrap();
+        assert!(buf.len() > 16 && &buf[0..16] == b"SQLite format 3\0", "DB 快照应为合法 sqlite");
     }
 
     #[test]

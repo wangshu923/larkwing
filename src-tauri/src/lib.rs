@@ -1,6 +1,9 @@
 //! 壳:只做装配(开库 → 解析 key → 造 provider/Engine → 注册 commands)和窗口,不写业务。
 
 mod commands;
+// 前台全屏检测(悬浮窗让位):仅 Windows 编译,Mac 原生 space 已天然不覆盖别 app 全屏。
+#[cfg(windows)]
+mod fullscreen;
 mod logkeep;
 
 use larkwing_core::engine::Engine;
@@ -289,6 +292,25 @@ pub fn run() {
         }
       }
 
+      // 别的程序全屏 → 悬浮窗让位(仅 Windows;Mac 原生 space 已天然不覆盖别 app 全屏):
+      // 固定间隔轮询前台是否全屏(几次 Win32 调用,1.5s 一跳 ≈ 0 CPU,不碰 §8.1 的 RAF 空烧坑),
+      // 只在「全屏态真变化」时把事实推给主窗 —— 显隐决策仍归主窗 JS(applyFloat,与 lw:show-float 同构)。
+      #[cfg(windows)]
+      {
+        let handle = app.handle().clone();
+        std::thread::spawn(move || {
+          let mut last: Option<bool> = None;
+          loop {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            let fs = fullscreen::foreground_fullscreen();
+            if last != Some(fs) {
+              last = Some(fs);
+              let _ = handle.emit("lw:foreground-fullscreen", fs);
+            }
+          }
+        });
+      }
+
       // 开机静默启动(--autostart,PLAN §12):不弹主窗,只留托盘(+ 悬浮窗按前端 enabled)
       if std::env::args().any(|a| a == "--autostart") {
         if let Some(win) = app.get_webview_window("main") {
@@ -373,6 +395,8 @@ pub fn run() {
       commands::keep_old_data,
       commands::data_reset_to_default,
       commands::reveal_data_dir,
+      commands::backup_data,
+      commands::search_messages,
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

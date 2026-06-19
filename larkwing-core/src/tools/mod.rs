@@ -51,6 +51,25 @@ impl ToolSpec {
     }
 }
 
+/// 从工具入参里**宽容**地取一个布尔值。模型(尤其流式 JSON)常把 schema 里声明为
+/// boolean 的参数发成字符串 `"true"` / `"false"`、甚至数字 1/0 —— `Value::as_bool`
+/// 只认真正的 JSON bool,认不出就静默回落默认值(实锤:`audio_only` 被发成字符串
+/// `"true"` → 当成 false → 放本地歌却弹出全屏视频框,当电影放了)。这里照"Quirks 数据
+/// 修正"(§4.4)在入口兜底:真 bool 原样;字符串认 true/false/1/0/yes/no;数字非零为真;
+/// 缺省 / null / 认不出 → 回落 `default`。新加 boolean 入参一律走它,别再裸 `as_bool`。
+pub(crate) fn arg_bool(args: &serde_json::Value, key: &str, default: bool) -> bool {
+    match args.get(key) {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "y" => true,
+            "false" | "0" | "no" | "n" | "" => false,
+            _ => default,
+        },
+        Some(serde_json::Value::Number(n)) => n.as_f64().map(|v| v != 0.0).unwrap_or(default),
+        _ => default,
+    }
+}
+
 /// 每次执行的现场:多用户与会话归属由此带入,工具自身无状态。
 pub struct ToolCtx {
     pub user_id: i64,
@@ -180,6 +199,29 @@ mod tests {
             ["remember", "recall", "briefing_write", "briefing_lookup", "briefing_remove", "now"],
             "base 在前(声明里的 remember 被去重),场景序在后,ghost 被忽略"
         );
+    }
+
+    #[test]
+    fn arg_bool_tolerates_stringified_and_numeric() {
+        use serde_json::json;
+        // 真 bool 原样
+        assert!(arg_bool(&json!({ "x": true }), "x", false));
+        assert!(!arg_bool(&json!({ "x": false }), "x", true));
+        // 字符串(模型实锤发法):大小写 / 空白都认
+        assert!(arg_bool(&json!({ "x": "true" }), "x", false), "字符串 true 应为真(audio_only 实锤)");
+        assert!(arg_bool(&json!({ "x": " TRUE " }), "x", false));
+        assert!(!arg_bool(&json!({ "x": "false" }), "x", true));
+        assert!(arg_bool(&json!({ "x": "1" }), "x", false));
+        assert!(!arg_bool(&json!({ "x": "0" }), "x", true));
+        assert!(arg_bool(&json!({ "x": "yes" }), "x", false));
+        // 数字非零为真
+        assert!(arg_bool(&json!({ "x": 1 }), "x", false));
+        assert!(!arg_bool(&json!({ "x": 0 }), "x", true));
+        // 缺省 / null / 认不出 → 回落默认
+        assert!(!arg_bool(&json!({}), "x", false));
+        assert!(arg_bool(&json!({}), "x", true));
+        assert!(arg_bool(&json!({ "x": null }), "x", true));
+        assert!(arg_bool(&json!({ "x": "maybe" }), "x", true), "认不出回落默认");
     }
 
     #[test]

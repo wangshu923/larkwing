@@ -17,7 +17,7 @@ pub mod voiceprints;
 
 pub use briefings::{Briefing, BriefingRepo};
 pub use channels::ChannelRepo;
-pub use chat::{ChatRepo, Conversation, Message};
+pub use chat::{ChatRepo, Conversation, Message, SearchHit};
 pub use cloned_voices::{ClonedVoice, ClonedVoiceRepo};
 pub use db::Db;
 pub use fsops::{FsOpRepo, FsOpRow};
@@ -160,6 +160,30 @@ mod tests {
         store.chat.delete_conversation(conv.id).unwrap();
         assert_eq!(store.chat.count_messages(conv.id).unwrap(), 0);
         assert!(store.chat.get_conversation(conv.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn search_messages_excludes_internal_rows_and_escapes_wildcards() {
+        let store = Store::open(&temp_db("search")).unwrap();
+        let user = store.users.ensure_default_user().unwrap();
+        let conv = store.chat.create_conversation(user.id, "companion").unwrap();
+        store.chat.append_message(conv.id, "user", "帮我整理下载文件夹里的电影").unwrap();
+        store.chat.append_message(conv.id, "assistant", "好的,正在整理你的电影目录").unwrap();
+        // tool / event 内部行也含「电影」,但不该被搜出来(UI 不渲染它们)。
+        store.chat.append_message(conv.id, "tool", "fs_find: 电影 → 12 个文件").unwrap();
+        store.chat.append_message(conv.id, "event", "提醒:该看电影了").unwrap();
+
+        let hits = store.chat.search_messages(user.id, "电影", 50).unwrap();
+        assert_eq!(hits.len(), 2, "只命中 user/assistant,排除 tool/event: {hits:?}");
+        assert!(hits.iter().all(|h| h.role == "user" || h.role == "assistant"));
+        assert!(hits.iter().all(|h| h.conversation_id == conv.id));
+
+        // 空查询 = 空结果。
+        assert!(store.chat.search_messages(user.id, "  ", 50).unwrap().is_empty());
+        // 通配符当字面量:没有消息含字面 `%` → 0 命中(没转义会被当「匹配全部」)。
+        assert!(store.chat.search_messages(user.id, "%", 50).unwrap().is_empty());
+        // 归属隔离:别的用户搜不到。
+        assert!(store.chat.search_messages(user.id + 999, "电影", 50).unwrap().is_empty());
     }
 
     #[test]

@@ -82,8 +82,8 @@ impl Tool for WebSearch {
             .and_then(serde_json::Value::as_u64)
             .map(|n| n.clamp(1, 8) as usize)
             .unwrap_or(5);
-        let with_content =
-            args.get("fetch_content").and_then(serde_json::Value::as_bool).unwrap_or(true);
+        // 宽容解析(同 audio_only 坑):字符串 "false" 也认得,不静默回落默认。
+        let with_content = super::arg_bool(&args, "fetch_content", true);
 
         let hits = self.web.search(query, count).await?;
         if hits.is_empty() {

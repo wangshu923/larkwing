@@ -402,6 +402,28 @@ async function confirmRelocate() {
 function cancelRelocate() {
   pendingMove.value = null
 }
+// 一键备份:选目录 → 导出 larkwing-backup-<时间戳>.zip(DB 快照 + 克隆音色)。不重启。
+const backupBusy = ref(false)
+const backupMsg = ref('')
+const backupErr = ref(false)
+async function backupNow() {
+  if (backupBusy.value || relocateBusy.value || !isTauri()) return
+  backupMsg.value = ''
+  backupErr.value = false
+  const dest = await api.pickDataFolder()
+  if (!dest) return
+  backupBusy.value = true
+  try {
+    const zip = await api.backupData(dest)
+    backupMsg.value = t('settings.system.backupDone', { path: zip })
+  } catch (e) {
+    console.error('备份失败', e)
+    backupErr.value = true
+    backupMsg.value = t('settings.system.backupFailed')
+  } finally {
+    backupBusy.value = false
+  }
+}
 async function cleanupOld() {
   try {
     await api.cleanupOldData()
@@ -1245,10 +1267,12 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           <span class="label">{{ t('settings.system.dataLocation') }}</span>
           <span class="key-state">
             <button class="link" :disabled="relocateBusy" @click="revealData">{{ t('settings.system.dataReveal') }}</button>
-            <button class="link" :disabled="relocateBusy" @click="relocate">{{ relocateBusy ? t('settings.system.relocating') : t('settings.system.relocate') }}</button>
+            <button class="link" :disabled="relocateBusy || backupBusy" @click="backupNow">{{ backupBusy ? t('settings.system.backingUp') : t('settings.system.backup') }}</button>
+            <button class="link" :disabled="relocateBusy || backupBusy" @click="relocate">{{ relocateBusy ? t('settings.system.relocating') : t('settings.system.relocate') }}</button>
           </span>
         </div>
         <p class="hint s-mono">{{ dataRoot || '—' }}</p>
+        <p v-if="backupMsg" class="hint" :class="{ 'data-err': backupErr, 's-mono': !backupErr }">{{ backupMsg }}</p>
         <div v-if="pendingMove" class="data-confirm">
           <p>{{ t('settings.system.relocateConfirm', { path: pendingMove.newRoot, size: gb(pendingMove.needBytes) }) }}</p>
           <span class="key-state">

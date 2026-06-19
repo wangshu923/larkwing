@@ -8,7 +8,7 @@ import { useSpeech } from '../composables/useSpeech'
 import { useContextMenu } from '../composables/useContextMenu'
 import { useCharacter } from '../composables/useCharacter'
 import { fmtMs, fmtTokens, fmtUsd } from '../lib/fmt'
-import { openExternal } from '../lib/backend'
+import { openExternal, api, type SearchHit } from '../lib/backend'
 import { renderMarkdown } from '../lib/md'
 import { copyText } from '../lib/clipboard'
 import MemoryView from '../views/MemoryView.vue'
@@ -292,6 +292,48 @@ function fmtTime(ts: number): string {
   return `${d.getMonth() + 1}/${d.getDate()}`
 }
 
+// 聊天搜索:输入即查(去抖 180ms),跨会话子串命中;点结果跳该会话并清空搜索框。
+const searchQuery = ref('')
+const searchHits = ref<SearchHit[]>([])
+let searchTimer: ReturnType<typeof setTimeout> | undefined
+watch(searchQuery, (q) => {
+  clearTimeout(searchTimer)
+  const query = q.trim()
+  if (!query || !chat.inTauri) {
+    searchHits.value = []
+    return
+  }
+  searchTimer = setTimeout(async () => {
+    try {
+      searchHits.value = await api.searchMessages(query, 50)
+    } catch (e) {
+      console.error('搜索失败', e)
+      searchHits.value = []
+    }
+  }, 180)
+})
+async function openHit(convId: number) {
+  await selectConversation(convId)
+  searchQuery.value = ''
+  searchHits.value = []
+}
+
+// 起步建议气泡(发现性,§3.2「替用户说一句话」):空会话(还没用户消息)才显;点一下=替用户发出去。
+const suggestions = computed(() => [
+  t('chat.suggest.s1'),
+  t('chat.suggest.s2'),
+  t('chat.suggest.s3'),
+  t('chat.suggest.s4'),
+  t('chat.suggest.s5'),
+  t('chat.suggest.s6'),
+])
+const showSuggestions = computed(
+  () => chat.ready && chat.hasApiKey && !messages.value.some((m) => m.role === 'user'),
+)
+function sendSuggestion(text: string) {
+  chatSend(text, 'typed')
+}
+
 // 用户消息 hover 的精确时刻:当天显 HH:MM,跨天加日期(比相对时间更"看时间")
 function fmtClock(ts?: number): string {
   if (!ts) return ''
@@ -389,7 +431,23 @@ watch(messages, () => nextTick(() => {
         <span>{{ t('recents.title') }}</span>
         <button class="collapse" @click="panelOpen = false" :title="t('recents.collapse')">‹</button>
       </header>
-      <ul class="rc-list">
+      <div class="rc-search">
+        <svg class="rc-search-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="11" cy="11" r="7" />
+          <path d="m21 21-4.3-4.3" />
+        </svg>
+        <input v-model="searchQuery" class="rc-search-input" :placeholder="t('recents.searchPlaceholder')" />
+        <button v-if="searchQuery" class="rc-search-clear" @click="searchQuery = ''" :title="t('recents.searchClear')">×</button>
+      </div>
+      <ul v-if="searchQuery.trim()" class="rc-list rc-results">
+        <li v-for="(h, hi) in searchHits" :key="hi" @click="openHit(h.conversation_id)">
+          <span class="rc-title">{{ h.conversation_title || t('recents.untitled') }}</span>
+          <div class="rc-snippet">{{ h.snippet }}</div>
+          <span class="rc-time">{{ fmtTime(h.created_at) }}</span>
+        </li>
+        <li v-if="!searchHits.length" class="rc-empty">{{ t('recents.searchEmpty') }}</li>
+      </ul>
+      <ul v-else class="rc-list">
         <li
           v-for="s in chat.conversations"
           :key="s.id"
@@ -543,6 +601,10 @@ watch(messages, () => nextTick(() => {
           </button>
           </div>
         </template>
+        <!-- 起步建议(发现性,§3.2「替用户说一句话」):空会话才显,一开口就消失;点一下替你发出去 -->
+        <div v-if="showSuggestions" class="suggest">
+          <button v-for="(s, si) in suggestions" :key="si" class="suggest-chip" @click="sendSuggestion(s)">{{ s }}</button>
+        </div>
         <!-- 桌宠:漫游边界=聊天滚动区;不在聊天页时 paused 空转;隐藏=v-if 卸载(RAF 停) -->
         <PetRoamer v-if="!petHidden" :bounds="streamEl" :paused="activeRail !== 'chat'" />
       </div>
@@ -730,6 +792,17 @@ watch(messages, () => nextTick(() => {
 .rc-badge-failed { background: var(--danger); box-shadow: 0 0 7px rgba(var(--danger-rgb), 0.85); }
 .rc-new { margin: 10px; padding: 9px; border-radius: 10px; background: none; border: 1px dashed var(--line); color: var(--text-dim); cursor: pointer; font-size: 12.5px; }
 .rc-new:hover { color: var(--accent); border-color: var(--accent); }
+/* 聊天搜索:框 + 放大镜 + 清除;命中片段比标题暗一档 */
+.rc-search { display: flex; align-items: center; gap: 6px; margin: 0 12px 8px; padding: 6px 9px; border-radius: 9px; background: var(--surface-deep); border: 1px solid var(--line); }
+.rc-search:focus-within { border-color: rgba(var(--accent-rgb), 0.5); }
+.rc-search-ic { width: 13px; height: 13px; flex: none; color: var(--text-dim); }
+.rc-search-input { flex: 1; min-width: 0; background: none; border: none; outline: none; color: var(--text); font-size: 12.5px; font-family: inherit; }
+.rc-search-input::placeholder { color: var(--text-dim); }
+.rc-search-clear { flex: none; background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 15px; line-height: 1; padding: 0 2px; }
+.rc-search-clear:hover { color: var(--accent); }
+.rc-results .rc-snippet { font-size: 12px; color: var(--text-dim); line-height: 1.5; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.rc-empty { color: var(--text-dim); font-size: 12.5px; text-align: center; cursor: default; background: none !important; border: none !important; }
+.rc-empty:hover { border-color: transparent !important; }
 
 /* —— 右:对话 —— */
 .chat { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
@@ -749,6 +822,10 @@ watch(messages, () => nextTick(() => {
 /* scrollbar-gutter:stable —— 内容撑满出现滚动条时不再左移跳动(全局 ::-webkit-scrollbar 已统一样式,不再各设一份) */
 /* 间距改走气泡 margin(不用 gap):换角色拉开=turn 分组,同角色收紧;下边距给 hover 浮层留位 */
 .stream { flex: 1; overflow-y: auto; scrollbar-gutter: stable; padding: 22px 20px 22px 26px; display: flex; flex-direction: column; gap: 0; position: relative; }
+/* 起步建议气泡:贴在开场白下方,药丸样式跟随主题色(同 PlayerBar 登录 chip 语言) */
+.suggest { display: flex; flex-wrap: wrap; gap: 8px; padding: 4px 2px; margin-top: 6px; }
+.suggest-chip { padding: 7px 14px; border-radius: 999px; font-size: 12.5px; font-family: inherit; cursor: pointer; background: rgba(var(--accent-rgb), 0.1); border: 1px solid rgba(var(--accent-rgb), 0.32); color: var(--accent); transition: border-color .15s, box-shadow .15s, background .15s; }
+.suggest-chip:hover { border-color: var(--accent); box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.28); background: rgba(var(--accent-rgb), 0.16); }
 .bubble {
   max-width: 70%; padding: 11px 15px; border-radius: 16px; font-size: 14px; line-height: 1.55;
   /* blur 是"磨砂"强度:大了会把背后星空/粒子糊没(看着像不透明)。科幻皮要透出背景动态,取小值;

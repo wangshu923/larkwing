@@ -70,6 +70,7 @@ export default {
   step: {
     connect: '连接 {host}…',
     download: '下载中 {done}/{total} MB',
+    downloading: '下载中 {done} MB',
     verify: '校验中…',
     extract: '解压中…',
     resolve: '找播放地址…',
@@ -166,6 +167,15 @@ export default {
     openingFallback: '你好,我在。今天过得怎么样?',
     interrupted: '(信号断了一下…要不再问我一次?)',
     noLlm: '我还没接上大脑,暂时开不了口——在下面贴一把 DeepSeek 钥匙,或者去「设置 → 大脑」接一个,接好我马上上线!',
+    // 起步建议(空会话气泡,§3.2「替用户说一句话」):点一下=替用户把这句发出去,覆盖几个高频能力
+    suggest: {
+      s1: '放首歌听听',
+      s2: '晚上十点提醒我睡觉',
+      s3: '帮我整理下载文件夹',
+      s4: '今天天气怎么样?',
+      s5: '陪我聊会儿天',
+      s6: '你都会做什么?',
+    },
   },
   // 「想了想」漏出(PLAN §9):折叠药丸干净默认,展开露技术细节(工具名/入参/结果 + CoT 原文)
   trace: {
@@ -217,6 +227,9 @@ export default {
     expand: '展开',
     newTopic: '＋ 开个新话题',
     untitled: '新话题',
+    searchPlaceholder: '搜聊天记录',
+    searchClear: '清空',
+    searchEmpty: '没找到相关的聊天',
     pinned: '已钉住', // 钉住标的 tooltip
     // 会话列表「有动静」标 tooltip(不在该会话时浮现;完成 / 失败)
     badge: {
@@ -510,7 +523,11 @@ export default {
       relocateGo: '确认搬家',
       relocateCancel: '取消',
       relocateFailed: '搬家没成功,数据仍在原处。',
-      dataLocationHint: '所有数据都在这个文件夹。点「搬家」可挪到别的盘,完成后自动重启。',
+      dataLocationHint: '所有数据都在这个文件夹。点「备份」导出一份压缩包副本,点「搬家」可挪到别的盘。',
+      backup: '备份…',
+      backingUp: '备份中…',
+      backupDone: '已备份到 {path}',
+      backupFailed: '备份没成功,请换个位置再试。',
       oldData: '旧数据',
       oldDataDelete: '删除旧数据',
       oldDataKeep: '保留',

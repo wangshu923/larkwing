@@ -20,7 +20,8 @@ use larkwing_core::engine::{
 use larkwing_core::llm::AccountBalance;
 use larkwing_core::media::{CookieRec, MediaRuntime};
 use larkwing_core::store::{
-    Briefing, ClonedVoice, Conversation, FsOpRow, Job, Memory, Message, UsageTotals, User,
+    Briefing, ClonedVoice, Conversation, FsOpRow, Job, Memory, Message, SearchHit, UsageTotals,
+    User,
 };
 use larkwing_core::voice::{FamilyMember, VoiceRuntime, VoiceStatus};
 
@@ -152,6 +153,16 @@ pub fn load_conversation(
     conv_id: i64,
 ) -> Result<Vec<Message>, AppError> {
     state.engine.load_conversation(conv_id)
+}
+
+/// 跨会话搜索聊天记录(子串匹配,排除工具 / 系统事件行)。最近命中在前,封顶 limit。
+#[tauri::command]
+pub fn search_messages(
+    state: State<'_, AppState>,
+    query: String,
+    limit: i64,
+) -> Result<Vec<SearchHit>, AppError> {
+    state.engine.search_messages(&query, limit.clamp(1, 200))
 }
 
 /// 先取消在飞 → 级联删消息 → 清会话槽。
@@ -791,6 +802,24 @@ pub async fn pick_data_folder(app: tauri::AppHandle) -> Result<Option<String>, A
     Ok(picked
         .and_then(|fp| fp.into_path().ok())
         .map(|p| p.to_string_lossy().into_owned()))
+}
+
+/// 一键备份:在所选目录导出 `larkwing-backup-<时间戳>.zip`(DB 一致快照 + 克隆音色)。
+/// 区别于搬家:纯导出拷贝,不翻指针 / 不重启。返回压缩包绝对路径(前端提示「已备份到…」)。
+/// VACUUM + 打包是阻塞活 → spawn_blocking。
+#[tauri::command]
+pub async fn backup_data(
+    state: State<'_, AppState>,
+    dest_dir: String,
+) -> Result<String, AppError> {
+    let data_root = state.data_root.clone();
+    let dest = PathBuf::from(dest_dir);
+    let zip = tauri::async_runtime::spawn_blocking(move || datadir::backup_to(&data_root, &dest))
+        .await
+        .map_err(AppError::internal)? // join 错误
+        .map_err(AppError::internal)?; // backup_to 错误
+    tracing::info!(zip = %zip.display(), "数据备份完成");
+    Ok(zip.to_string_lossy().into_owned())
 }
 
 /// 搬家预检结果(给前端确认弹窗:目标路径 + 体积 + 失败原因 code)。

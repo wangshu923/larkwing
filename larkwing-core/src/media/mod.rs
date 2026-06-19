@@ -5,6 +5,7 @@
 
 mod bilibili;
 pub mod cookies;
+mod probe;
 mod relay;
 mod resolver;
 
@@ -158,6 +159,8 @@ struct Inner {
     relay: tokio::sync::OnceCell<relay::Relay>,
     sources: Vec<Arc<dyn MediaSource>>,
     login_hint_sent: AtomicBool,
+    /// ffmpeg 是否已发起后台预取(每进程至多一次;失败复位留给用时下载重试)。
+    ffmpeg_prefetch_started: AtomicBool,
     /// 因「需登录」卡住、待登录后自动重放的播放(按源 id)。
     pending_play: Mutex<HashMap<String, PendingPlay>>,
     /// 前端播放器的当下状态(回合装配读它喂模型「此刻」背景;见 Playback 注释)。
@@ -183,6 +186,7 @@ impl MediaRuntime {
                 relay: tokio::sync::OnceCell::new(),
                 sources: vec![Arc::new(bilibili::Bilibili::new())],
                 login_hint_sent: AtomicBool::new(false),
+                ffmpeg_prefetch_started: AtomicBool::new(false),
                 pending_play: Mutex::new(HashMap::new()),
                 playback: Mutex::new(Playback::default()),
             }),
@@ -300,9 +304,31 @@ impl MediaRuntime {
         result
     }
 
+    /// 首次播放**任何**媒体(含放歌)就后台预取 ffmpeg(fire-and-forget,不 await):视频迟早要它
+    /// (网络 DASH 混流 / 本地 HEVC/AC3 转码),提前下好 → 真用到时零等待。下了不一定用、后台不阻塞
+    /// 当前播放,所以放歌也预取(用户拍板,2026-06-19:预取的是工具不是转码,「下了不一定用、真用到不必等」)。
+    /// 每进程至多触发一次;失败复位标记,留给后续重试。`ensure_component` 内有锁去重 + 已在磁盘即秒返回
+    /// → 预取与用时下载只下一份、只冒一张卡,ffmpeg 已就绪时这步是即时 no-op。
+    fn prefetch_ffmpeg(&self) {
+        if self.inner.ffmpeg_prefetch_started.swap(true, Ordering::Relaxed) {
+            return; // 本进程已预取过(或正在跑)
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            match this.ensure_component(Component::Ffmpeg).await {
+                Ok(_) => tracing::info!("ffmpeg 预取就绪"),
+                Err(e) => {
+                    tracing::warn!("ffmpeg 预取失败(用时会再试): {e:#}");
+                    this.inner.ffmpeg_prefetch_started.store(false, Ordering::Relaxed);
+                }
+            }
+        });
+    }
+
     /// 播放:本地路径直走文件端点(免解析、即时);网络页面走 yt-dlp 解析 → 注册转发。
     /// 错误向上抛(工具层转成喂模型的观察)。
     pub async fn play(&self, page_url: &str, audio_only: bool) -> Result<PlayOutcome> {
+        self.prefetch_ffmpeg(); // 后台预取(首次播放任何媒体即触发),不阻塞本次播放
         if is_local_path(page_url) {
             return self.play_local(page_url, audio_only).await.map(PlayOutcome::Playing);
         }
@@ -400,8 +426,69 @@ impl MediaRuntime {
         Ok(PlayOutcome::Playing(np))
     }
 
+    /// 探测结论记一行诊断(解释「为什么这片要转 / 为什么可能黑屏」)。
+    fn log_local_codec(&self, path: &std::path::Path, pr: &probe::LocalProbe) {
+        if pr.video_incompatible {
+            tracing::warn!(path = %path.display(),
+                "视频编码 WebView2 解不了(HEVC/AV1/杜比视界等),转 H.264(吃 CPU,弱机可能跟不上)");
+        }
+        if pr.audio_incompatible {
+            tracing::info!(path = %path.display(), "音轨 WebView2 解不了(AC3/DTS 等),转 AAC");
+        }
+    }
+
+    /// 取 ffmpeg 注册转封装/转码 URL(走 /m/);ffmpeg 取不到则退回原生直传,绝不阻断播放。
+    async fn remux_or_direct(
+        &self,
+        relay: &relay::Relay,
+        path: &std::path::Path,
+        transcode_video: bool,
+        transcode_audio: bool,
+    ) -> String {
+        match self.ensure_component(Component::Ffmpeg).await {
+            Ok(ffmpeg) => {
+                relay.register_file_remux(path.to_path_buf(), ffmpeg, transcode_video, transcode_audio)
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), "ffmpeg 取不到,退回直传(可能黑屏/无声): {e:#}");
+                relay.register_file(path.to_path_buf())
+            }
+        }
+    }
+
+    /// 用已就绪的 ffmpeg 探测非 BMFF 容器(mkv/avi…):跑 `ffmpeg -i` 读 stderr 拿编码/时长。
+    /// `-i` 无输出会非零退出但信息照打 stderr → 不看退出码、只解析 stderr;探不出按全兼容降级。
+    async fn probe_with_ffmpeg(
+        &self,
+        ffmpeg: &std::path::Path,
+        path: &std::path::Path,
+    ) -> probe::LocalProbe {
+        let mut cmd = tokio::process::Command::new(ffmpeg);
+        cmd.arg("-hide_banner").arg("-i").arg(path);
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        no_console(&mut cmd);
+        match tokio::time::timeout(std::time::Duration::from_secs(20), cmd.output()).await {
+            Ok(Ok(out)) => probe::parse_ffmpeg_stderr(&String::from_utf8_lossy(&out.stderr)),
+            _ => {
+                tracing::warn!(path = %path.display(), "ffmpeg 探测失败/超时,按全兼容降级");
+                probe::LocalProbe::default()
+            }
+        }
+    }
+
     /// 本地文件(含 NAS 挂载/UNC):跳过 yt-dlp,注册文件端点即播 —— 单文件免混流,
     /// Range 原生 seek 白送,秒级无任务进度可言,不上 HUD。
+    ///
+    /// 视频按编码/容器三分路(§8.1「WebView2 编解码坑」的本地补课,网络路径早强制了 avc+m4a,
+    /// 本地直传此前全漏了):**只转 WebView2 处理不了的那部分**(§7.1 用户拍板「按需」)——
+    ///   · BMFF(mp4/mov/m4v):读 moov 轻量探测(不下 ffmpeg),全兼容则原生直传秒开;音轨 AC3/DTS
+    ///     或视频 HEVC 不兼容才取 ffmpeg 转(兼容轨 -c copy、不兼容轨才转码);
+    ///   · mkv/avi 等容器(WebView2 本就放不了):必经 ffmpeg 转封装成 fMP4,先确保 ffmpeg、`ffmpeg -i`
+    ///     探编码,再按需 copy/转码;
+    ///   · webm / 未知 / 放歌(audio_only):直传,交给浏览器。
     async fn play_local(&self, path_str: &str, audio_only: bool) -> Result<NowPlaying> {
         let path = std::path::PathBuf::from(path_str);
         let meta = tokio::fs::metadata(&path)
@@ -418,12 +505,53 @@ impl MediaRuntime {
             .get_or_try_init(relay::Relay::start)
             .await
             .context("转发服务起不来")?;
+
+        // 三分路(详见上方 doc):放歌直传 / BMFF 轻量探测 / mkv 等容器走 ffmpeg。
+        let mut duration_seconds = None;
+        let stream_url = if audio_only {
+            relay.register_file(path.clone()) // 放歌:本地音频常见格式浏览器都吃,直传
+        } else if probe::is_isobmff_ext(&path) {
+            // BMFF:读 moov 探测(同步 IO,挪 spawn_blocking),普通文件秒开不下 ffmpeg
+            let p = path.clone();
+            let pr = tokio::task::spawn_blocking(move || probe::probe_local(&p))
+                .await
+                .unwrap_or_default();
+            duration_seconds = pr.duration_seconds;
+            if pr.audio_incompatible || pr.video_incompatible {
+                self.log_local_codec(&path, &pr);
+                self.remux_or_direct(relay, &path, pr.video_incompatible, pr.audio_incompatible).await
+            } else {
+                relay.register_file(path.clone()) // 全兼容:原生直传秒开
+            }
+        } else if probe::needs_ffmpeg_container(&path) {
+            // mkv/avi 等容器 WebView2 放不了,必经 ffmpeg 转封装:先确保 ffmpeg、用它探编码、按需转
+            match self.ensure_component(Component::Ffmpeg).await {
+                Ok(ffmpeg) => {
+                    let pr = self.probe_with_ffmpeg(&ffmpeg, &path).await;
+                    duration_seconds = pr.duration_seconds;
+                    self.log_local_codec(&path, &pr);
+                    relay.register_file_remux(
+                        path.clone(),
+                        ffmpeg,
+                        pr.video_incompatible,
+                        pr.audio_incompatible,
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), "ffmpeg 取不到,容器无法转封装,退回直传(可能放不了): {e:#}");
+                    relay.register_file(path.clone())
+                }
+            }
+        } else {
+            relay.register_file(path.clone()) // webm / 未知 → 直传,交给浏览器
+        };
+
         let np = NowPlaying {
             kind: if audio_only { MediaKind::Audio } else { MediaKind::Video },
             title,
             author: None,
-            duration_seconds: None,
-            stream_url: relay.register_file(path),
+            duration_seconds,
+            stream_url,
             page_url: path_str.into(),
             source: "local".into(),
         };

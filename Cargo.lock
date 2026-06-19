@@ -2696,7 +2696,7 @@ dependencies = [
 
 [[package]]
 name = "larkwing"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "ctrlc",
  "flate2",
@@ -2718,11 +2718,12 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "windows 0.61.3",
 ]
 
 [[package]]
 name = "larkwing-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-trait",

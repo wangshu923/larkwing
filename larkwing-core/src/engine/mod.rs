@@ -20,7 +20,7 @@ use serde::Deserialize;
 use crate::llm::registry::{resolve_env, Protocol, ProviderRegistry, ProviderSpec, Strategy};
 use crate::llm::{LlmError, LlmProvider, ToolCall, ToolDef};
 use crate::scenes::{Scenes, DEFAULT_SCENE_ID};
-use crate::store::{Briefing, Conversation, Memory, Message, Store, User};
+use crate::store::{Briefing, Conversation, Memory, Message, SearchHit, Store, User};
 use crate::tools::Tools;
 
 // ---------- engine ↔ UI 的词汇表 ----------
@@ -650,6 +650,12 @@ impl Engine {
 
     pub fn load_conversation(&self, conv_id: i64) -> Result<Vec<Message>, AppError> {
         Ok(self.store.chat.recent_messages(conv_id, 200)?)
+    }
+
+    /// 跨会话搜索当前用户的聊天记录(排除工具 / 系统事件内部行)。最近命中在前。
+    pub fn search_messages(&self, query: &str, limit: i64) -> Result<Vec<SearchHit>, AppError> {
+        let user = self.store.users.ensure_default_user()?;
+        Ok(self.store.chat.search_messages(user.id, query, limit)?)
     }
 
     /// 先取消在飞 → 级联删消息 → 清会话槽。

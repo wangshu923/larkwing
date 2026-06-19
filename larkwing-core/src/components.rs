@@ -257,6 +257,7 @@ pub(crate) async fn fetch_url_to(
     let mut stream = resp.bytes_stream();
     let mut done: u64 = 0;
     let mut last_pct = -1i32;
+    let mut last_mb = -1i64;
     loop {
         let chunk = tokio::time::timeout(std::time::Duration::from_secs(30), stream.next())
             .await
@@ -265,6 +266,7 @@ pub(crate) async fn fetch_url_to(
         let bytes = chunk?;
         file.write_all(&bytes).await?;
         done += bytes.len() as u64;
+        let done_mb = (done as f64 / 1_048_576.0 * 10.0).round() / 10.0;
         if total > 0 {
             let pct = ((done as f64 / total as f64) * 100.0) as i32;
             if pct > last_pct {
@@ -272,12 +274,17 @@ pub(crate) async fn fetch_url_to(
                 task.step_progress(
                     "step.download",
                     serde_json::json!({
-                        "done": (done as f64 / 1_048_576.0 * 10.0).round() / 10.0,
+                        "done": done_mb,
                         "total": (total as f64 / 1_048_576.0 * 10.0).round() / 10.0,
                     }),
                     (done as f64 / total as f64) as f32,
                 );
             }
+        } else if done as i64 / 1_048_576 > last_mb {
+            // 上游没给 Content-Length(部分镜像就这样):算不出百分比,但仍每涨 1MB 报一次已下大小,
+            // 别让 HUD 一直停在"连接…"像卡死(用户反馈:下载条看不出在下什么/有没有动)。
+            last_mb = done as i64 / 1_048_576;
+            task.step("step.downloading", serde_json::json!({ "done": done_mb }));
         }
     }
     file.flush().await?;

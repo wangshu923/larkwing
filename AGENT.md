@@ -63,7 +63,7 @@
 1. **收敛、强调、强默认**:设置面客观上不小(LLM / 语音 / 远程渠道,体量趋近 robot),不追求完全隐藏;原则 = 第一层只放高频少数项,其余分层可达。第一屏不是设置页;唯一不可避免的首次设置 = LLM 的 key(友好填一次,或读环境变量)。
 2. **用户只面对一个 7274,绝不暴露 agent / 插件 / prompt / 配置**:用户侧**不存在**场景 / 模式概念,UI 不做场景切换器。场景退为内部偏置预设,由系统 / 模型自决(多模式时走内部 `enter_mode` 类工具,会话级粘性保前缀缓存;**拒绝**每条消息前的意图分类预调用——杀缓存、加延迟)。发现性由**建议气泡**承担(替用户说一句话,不是模式开关)。
    - ⚠️ 一处放开:聊天「想了想」**展开层**会露工具名 / 入参 / 结果 + CoT 原文(会展开的就是想看机器的人);**折叠层仍守**铁律。是否正式入规则待定。
-3. **引导式上手**:示例、建议气泡;普通人靠「看到能点的」探索,不读文档。
+3. **引导式上手**:示例、建议气泡;普通人靠「看到能点的」探索,不读文档。**建议气泡通用版已落地(v0.1.6)**:空会话(还没用户消息)显一组精选「起步建议」chips(放歌 / 提醒 / 整理文件 / 查天气 / 闲聊 / 问能力),点一下 = 替用户把那句发出去(走正常 send,**不是模式开关**);一开口即消失、`hasApiKey` 才显;文案在前端字典 `chat.suggest.*`(core 不产文案 §6.6)。场景触发气泡(如刚放完歌问「单曲循环?」)留后续。
 4. **界面优先;语音只是输入方式之一**。**两类交互二分**(贯穿语音设计):
    - **UI 交互** = 打字 / 麦克风按钮 / 听写快捷键 → 正常排版,**默认不念**(气泡可点「再听一遍」)。
    - **语音交互** = 免手唤醒(人可能不在屏幕前)→ 口语短句、不出表格 / 代码 / 链接,**必念**。
@@ -165,6 +165,8 @@
 - 横切:Repo 方法**全同步**(亚毫秒;异步调用方自己 `spawn_blocking`);ID 用 rowid,时间戳 unix 毫秒;流式回复**不逐 token 写库**,流完一次落一行;首启 `ensure_default_user()`。
 - **schema 不隔离**(跨域外键照用,engine 跨域读拼 prompt),防滑回 per-agent 数据孤岛(§4.7 记忆归人)。
 - **数据根可「搬家」(`datadir`,2026-06-18 用户拍板):别再假设 `app_data_dir` 就是数据根。** 用户可把整个数据目录(DB + `media/` + `voice/` + 模型缓存 + 日志)整体搬到别的盘(Windows 多盘:不想全堆 C 盘)。机制 = **锚点 + 指针文件**:锚点 = OS 默认 `app_data_dir`(永远找得到、住指针、永不参与搬家),锚点放 `location.json` 指针说真实根在哪;`larkwing-core/src/datadir.rs` 的 `resolve(anchor)` 在 boot **最先**跑(lib.rs 装配头),返回生效根,**之后 store/日志/media/voice 全部 `root.join(...)` 派生**(原有单一出口不变,这是搬家能干净的前提)。三态:无指针/空 = 用锚点;指向别处且在 = 用它;指向别处但目录不在(盘没插/被删)= 回落锚点 + `data_missing`,前端弹恢复弹窗(**绝不静默在默认位置重建空数据**,§3.5)。搬家 = 拷可重建子树 → DB 走 `VACUUM INTO` 出一致快照(放最后)→ staging 同卷原子改名 → **翻指针 = 提交点**(翻前老数据始终权威)→ 立即 `app.restart()`。**判据:写任何"数据放哪"的路径,都从生效根派生,绝不直接 `app_data_dir()`;DB 里也绝不存绝对路径**(克隆音色 wav / TTS 缓存只存相对文件名 → 整棵子树挪走路径不断,这条已是约定、搬家依赖它)。真机验见 §8.1 + PLAN「数据搬家」watch-items。
+  - **一键备份(v0.1.6)= 搬家的轻量姊妹**:`datadir::backup_to(data_root, dest_dir)` 在用户所选目录导出 `larkwing-backup-<时间戳>.zip`(`VACUUM INTO` 一致快照当 `larkwing.db` + `voice/clones/` 克隆音色 wav;可重建的模型 / 缓存 / 媒体 / 日志不收)。**纯导出拷贝、不翻指针不重启**(区别于搬家),命令 `backup_data`,`zip` crate(v2 deflate)已在依赖。延续「备份 = 拷文件」(§4.3)+「DB 只存相对名,整棵子树挪走自洽」。完整流程真机验(Windows zip / 大克隆音色)随搬家一并看。
+  - **聊天搜索(v0.1.6)**:`ChatRepo::search_messages(user, query, limit)` 跨会话 `content LIKE` 子串(转义 `% _ \`)、**排除 `tool`/`event` 内部行**、按用户隔离;命中带会话标题 / 渠道 + 截断 snippet。**仍是 substring,不上检索核心**(记忆量小够用,守 §13.9 deferred —— 搜索没构成「第二个 RAG 消费者」,它要语义才触发)。前端最近列表顶部搜索框,输入即查(去抖),点结果跳会话。
 
 ### 6.3 llm
 - **翻译三处各归其位**(同一逻辑只出现一次):`store::Message → ChatMessage` = 策略,在 engine `build_context()`(1 份);`ChatRequest → 厂商 JSON` / `厂商 SSE → ChatEvent` = 方言,在各 provider 私有 `to_wire()`/`parse_chunk()`(每家一份,内容互不相同)。判别「重复」= 一个变化要不要同步改 N 处。
@@ -238,6 +240,8 @@
 - 多源立场与 LLM 同构:解析层天然多源,按源分化的只有搜索 + 登录态(`MediaSource` trait),MVP 单源 bilibili。
 - 工具三原语:`media_search`(读)/ `media_play`(写,job 型秒回)/ `media_control`(嘴控,按钮直连前端 VM 不绕 LLM);**校验收口 core**,音量跨播放粘住、倍速每次复位(mpv 时代教训)。
 - 本地播放链:需知(目录)→ 文件原语找文件 → `media_play` 放行本地绝对路径 → relay `/f/` 本地文件端点(手写 Range)。NAS 挂载盘符 / UNC 是普通路径。
+  - **本地视频"探测→只转处理不了的那部分"(2026-06-19,§8.1 编解码坑的本地补课;用户拍板「按需」)**:`play_local` 三分路(均**只转 WebView2 解不了的轨**,兼容轨一律 `-c copy`):① **BMFF(mp4/mov/m4v)** 走 `probe::probe_local` 读 `moov`(零子进程、不下 ffmpeg、不拖慢普通文件)→ 全兼容原生 `/f/` 直传秒开,音轨 AC3/DTS/EAC3/TrueHD/ALAC 或视频 HEVC/AV1/杜比视界不兼容才取 ffmpeg;② **mkv/avi/ts/wmv… 容器**(`needs_ffmpeg_container`,WebView2 本就放不了)必经 ffmpeg 转封装 → 先 `ensure_component(Ffmpeg)`、再 `ffmpeg -i` 解析 stderr(`probe::parse_ffmpeg_stderr` 纯函数可测)拿编码+时长、按需 copy/转;③ webm/未知/`audio_only`(放歌)→ 直传。转码走 relay `Entry::FileRemux`(`-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p` / `-c:a aac`,与 B 站 DASH 混流共用 `stream_ffmpeg` + 走 `/m/` + 前端 `?t=` 重启 seek,**前端零改**);ffmpeg 取不到一律退回直传不阻断。配套:`play()` 一进来**后台预取 ffmpeg**(首次播放**任何**媒体含放歌就 fire-and-forget 下好——预取的是工具不是转码,下了不一定用但真用到时零等待;不卡播放,§4.6 同款 net 下载;锁去重+已在磁盘秒返回 → 与用时下载只下一份)。视频转码吃 CPU、弱机可能跟不上,preset/硬解是真机调优项。
+- **工具入参的布尔值走 `tools::arg_bool` 宽容解析(2026-06-19)**:模型(尤其流式 JSON)常把 schema 声明为 boolean 的参数发成**字符串** `"true"`/`"false"`,裸 `Value::as_bool` 认不出就静默回落默认(实锤:`audio_only:"true"` → 当 false → 放本地歌弹出全屏视频框)。新加 boolean 入参一律用 `arg_bool`(真 bool / "true"/"false"/1/0/yes/no 都认),别再裸 `as_bool`。属 §4.4「Quirks 数据修正」一类。
 
 ### 7.2 文件能力(PLAN §9「文件能力」)
 - **安全立场:不做任何安全承诺**(用户拍板)——可逆(撤销 / 重做、操作记录页)是**功能性**的(跟普通文件管理器一样),**不是安全网**;**UI / 文案 / 工具描述一律功能口吻**,别用「承重墙 / 兜底 / 保护文件」叙事。
@@ -281,6 +285,7 @@
 - **关主窗 = 隐藏到托盘、不退进程**(✕ 首次点出友好气泡兜底);主窗无边框(`decorations:false`)→ 自绘右上角三键。**mac 左上原生红绿灯 = 不做(2026-06-16 用户拍板)**:目标平台 Windows 没红绿灯、纯开发机便利;原生 Aqua 红绿灯系统锁死无法主题化(与科幻皮不搭),要它只能 mac 专属 `titleBarStyle:Overlay` 分叉窗形——不值,自绘三键跨平台一致 + 贴主题。
 - **单实例 / 二次启动唤回**(2026-06-16):全程序只跑一个进程。已在运行时再点快捷方式 / 重复启动**不开新进程**——`tauri-plugin-single-instance`(**放最前注册**),OS 把第二个进程的命令行交给已运行实例的回调、第二个进程退出;回调复用 `show_window` 把主窗(可能藏托盘)唤到前台,沿用 `--autostart` 静默语义(自启触发不唤窗)。无 IPC 命令、不需 capability。**OS 转发 + 窗口前置待 Windows 真机验**(§8.1;若只闪任务栏不前置,加 always-on-top 翻转兜底,见 PLAN §12 watch-item)。
 - ⚠️ **悬浮窗 useMedia 只读不发声**(独立 WebView 复用播放 VM 会与主窗双播——多窗变体的双播坑,`play` 分支已堵)。**反向媒体控制已落地**(2026-06-16):悬浮窗迷你播控按钮**转发**给主窗执行(`emitMediaControl`→主窗 `onMediaControl`→`applyControl`,与嘴控汇同一执行口),float 仍不出声;播放态经 `emitNowPlaying(np,status)` 镜像回 float(播/暂停图标翻转)。跨窗联动 Mac/浏览器测不出,**待 Windows 真机验**(§8.1)。
+- **别的程序全屏 → 悬浮窗让位(2026-06-19,仅 Windows)**:float 是 `always_on_top`,Windows 上会盖在别 app 的全屏画面上(游戏 / 全屏视频打扰);**Mac 原生 space 已天然不覆盖别 app 全屏 = 正确,不动**。修 = 壳层 `src-tauri/src/fullscreen.rs::foreground_fullscreen()`(整块 `#[cfg(windows)]`:Win32 `GetForegroundWindow` + 前台窗口矩形 vs `MonitorFromWindow` 的 `rcMonitor` 比对,铺满整块显示器 = 全屏;排除桌面 Progman/WorkerW + 我们自己进程的窗口,免误判)+ setup 里 1.5s 轮询线程**仅在全屏态真变化**时 `emit("lw:foreground-fullscreen", bool)`。**Rust 只报事实、显隐决策仍归主窗 JS**(`App.vue::applyFloat` = `floatOn() && !ownFs && !foreignFs`,与 `lw:show-float` 同构;自愈式去重读实时开关值),Mac 不发此事件、`foreignFs` 恒 false 维持原行为。`windows` crate 复用 Tauri 已拉的 0.61(`[target.'cfg(windows)'.dependencies]`,不引入新版本)。属 §8.1「Windows 专属 + 只能真机验」一类(轮询前台 / Win32 行为 Mac 测不出),见 PLAN §12 watch-item。
 - **托盘「显示悬浮窗」**(2026-06-16):✕ 关掉悬浮窗后,托盘菜单一项重开(`show_float`→壳层 emit `lw:show-float`→主窗置 `ui.float.enabled='1'`+`setFloatVisible(true)`,持久化由主窗收口);比绕设置页顺手。
 - **失败任务「重试」已落地**(2026-06-16,轻量版、不等 JobRunner):仅影音解析/组件下载失败带 `TaskRetry::MediaPlay{page_url,audio_only}` 载体,UI 显「重试」直连重放(`media_retry` 命令→`media.play`,按钮不绕 LLM,§7.1 哲学);auth **不再算失败**——改为记下待重放、扫码登录成功后**自动续播**(2026-06-18,§7.1),不出重试钮。通用 JobRunner 重试仍后置。
 - 排序立场:**不做优先级排序**(robot 配置病)——通知「最新优先 + 自动淡出」、进行中「钉住」。
@@ -315,6 +320,7 @@
 ### 8.1 WebView2 ≠ WKWebView(头号陷阱)
 - 目标 = Windows(WebView2),开发在 Mac(WKWebView)。**WKWebView 更宽容,会掩盖一整类只在 Windows 暴露的 bug。** 已实锤:
   - B 站视频只有声音(黑屏)——WebView2 解不了 HEVC/AV1;修 = `resolver.rs` 强制 `vcodec^=avc`。
+  - **本地电影有画面没声音(2026-06-19,上面那条的镜像)**——BD 国英双语压制片音轨常是 **AC3/E-AC3/DTS/TrueHD**,WebView2(Chromium)解不了 → 视频轨(H.264)正常、音轨静默(Mac WKWebView 走系统解码器有声,故漏网)。根因 = **网络路径早强制 avc+m4a 兜底,本地 `/f/` 直传却原样喂文件、漏了这道兜底**。修 = "探测→只转处理不了的那部分"(§7.1,用户拍板「按需」):**BMFF(mp4/mov)读 `moov` 盒探测**(`media/probe.rs`,**不下 ffmpeg、不跑子进程**,逐盒 seek 跳过 mdat、子串匹配 fourcc)——全兼容则原生 `/f/` 直传秒开,音轨 AC3/DTS 或视频 HEVC 不兼容才取 ffmpeg 走 `/m/`(兼容轨 `-c copy`、不兼容轨才转:音→AAC、视→H.264 `yuv420p`);**mkv/avi 等容器 WebView2 本就放不了 → 必经 ffmpeg 转封装**(先确保 ffmpeg、`ffmpeg -i` 探编码、再按需 copy/转)。视频转码(HEVC→H.264)**吃 CPU、弱机可能跟不上 1x**(preset/硬件加速是真机调优项)。**待 Windows 真机验**:AC3/DTS 真片有声、普通 mp4 仍秒开不下 ffmpeg、HEVC/mkv 能放且 CPU 可接受、`?t=` 换台、进度条(mvhd / `ffmpeg -i` 时长)、5.1 转 AAC 声道、AV1 是否真要转(若 WebView2 能放则从拦截表去掉省 CPU)。
   - 全屏闪烁 / 退出穿帮——HTML5 `requestFullscreen` 与 DWM 打架 + 透明窗放大穿帮;修 = 改走原生窗口全屏 `win.setFullscreen`。
   - 滚动条占布局宽度跳动(§6.7 `scrollbar-gutter`)、唤醒标定**性能**坑(`KeywordSpotter::create` Mac 264ms 不暴露、Windows 卡分钟级)。
   - **藏托盘的主窗仍 60fps 空烧 CPU**(2026-06-17,Windows 实测 ~3.3%):关主窗 = `hide()` 进程不退(§7.6),而主窗 `transparent:true` 让 Chromium 遮挡检测失效(透明窗永不算"被挡")→ 隐藏后 RAF **不被自动节流**;加之动画循环本来没有可见性判断 → 背景 canvas + 遛弯 `roamFrame` 藏起来照样满帧空跑。修 = `usePageVisible`(`visibilitychange` + 壳层 `lw:win-visible` 事件**双触发**,后者只为 main 发否则关悬浮窗误停主窗)+ `useRafLoop`(不可见即 `cancelAnimationFrame`);所有 canvas 背景(Neon/Hologram/Hud/Starfield)与 `MainLayout.roamFrame` 都改走它。**新代码起 RAF 循环一律用 `useRafLoop`,别再裸 `requestAnimationFrame` 自调度。** 浏览器验过暂停逻辑(88→0→88 帧/秒);藏托盘后 CPU≈0 **待 Windows 真机验**。

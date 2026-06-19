@@ -39,6 +39,16 @@ export interface Message {
   payload?: string | null
 }
 
+/** 聊天搜索命中(跨会话):带会话标题/渠道供列表展示;snippet 是截断的展示片段。 */
+export interface SearchHit {
+  conversation_id: number
+  conversation_title: string
+  channel: string
+  role: string
+  snippet: string
+  created_at: number
+}
+
 /** 小本本一条(回忆页);kind: fact/profile/summary(宪法 §6,细化 TBD)。 */
 export interface Memory {
   id: number
@@ -685,6 +695,9 @@ export const api = {
   newConversation: (channel?: string) => invoke<Conversation>('new_conversation', { channel }),
   listConversations: () => invoke<Conversation[]>('list_conversations'),
   loadConversation: (convId: number) => invoke<Message[]>('load_conversation', { convId }),
+  /** 跨会话搜索聊天记录(子串,排除工具/系统行);最近命中在前。 */
+  searchMessages: (query: string, limit = 50) =>
+    invoke<SearchHit[]>('search_messages', { query, limit }),
   deleteConversation: (convId: number) => invoke<void>('delete_conversation', { convId }),
   renameConversation: (convId: number, title: string) =>
     invoke<void>('rename_conversation', { convId, title }),
@@ -798,12 +811,22 @@ export const api = {
   dataResetToDefault: () => invoke<void>('data_reset_to_default'),
   /** 在系统文件管理器里打开数据文件夹。 */
   revealDataDir: () => invoke<void>('reveal_data_dir'),
+  /** 一键备份:在所选目录导出 larkwing-backup-<时间戳>.zip(DB 快照 + 克隆音色),返回包路径。 */
+  backupData: (destDir: string) => invoke<string>('backup_data', { destDir }),
 }
 
 /** 托盘点「显示悬浮窗」→ 壳层 emit,主窗据此重开悬浮窗(置 enabled + show)。 */
 export function onShowFloat(cb: () => void): void {
   if (!isTauri()) return
   void listen('lw:show-float', () => cb())
+}
+
+/** 壳层(仅 Windows)轮询「别的程序是否全屏」→ 变化时推事实给主窗,让常驻悬浮窗让位
+ *  (游戏 / 全屏视频别被浮窗打扰)。Mac 不发此事件(原生 space 已不覆盖别 app 全屏),
+ *  前端默认 false 即维持原行为。 */
+export function onForegroundFullscreen(cb: (fullscreen: boolean) => void): void {
+  if (!isTauri()) return
+  void listen<boolean>('lw:foreground-fullscreen', (e) => cb(e.payload))
 }
 
 /** 主窗 hide/show 时壳层发的可见性信号(只为 main 发):藏托盘后据此暂停动画省 CPU。

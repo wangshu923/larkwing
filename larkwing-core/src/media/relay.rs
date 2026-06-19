@@ -27,6 +27,12 @@ enum Entry {
     Remux { video: UpStream, audio: UpStream, ffmpeg: PathBuf },
     /// 本地文件(含 NAS 挂载/UNC 路径):带 Range 的文件流,seek 白送。
     File(PathBuf),
+    /// 本地文件但 WebView2 放不了(音轨 AC3/DTS、视频 HEVC、或容器是 mkv/avi;见 probe.rs):
+    /// ffmpeg 单输入实时转封装/转码成 fMP4 —— **只转处理不了的那部分**:`transcode_audio` 真则
+    /// 音轨转 AAC 否则 `-c:a copy`;`transcode_video` 真则视频转 H.264(吃 CPU)否则 `-c:v copy`
+    /// (不掉画质/CPU 近零)。两者皆假时也仍跑(给 mkv 这类只需"转封装成 mp4"的容器用)。走 /m/
+    /// 通道(渐进流、无原生 seek,前端按 ?t= 换 src 重启),与 B 站 DASH 混流同播放路径,前端零改。
+    FileRemux { path: PathBuf, ffmpeg: PathBuf, transcode_video: bool, transcode_audio: bool },
 }
 
 struct Inner {
@@ -101,9 +107,21 @@ impl Relay {
         self.register(Entry::Remux { video, audio, ffmpeg }, "m")
     }
 
-    /// 本地文件 URL。
+    /// 本地文件 URL(原生 Range 直传)。
     pub fn register_file(&self, path: PathBuf) -> String {
         self.register(Entry::File(path), "f")
+    }
+
+    /// 本地文件、ffmpeg 转封装/转码后的混流 URL(走 /m/ 通道,与 register_remux 同播放路径)。
+    /// `transcode_video`/`transcode_audio` 各自决定该轨 copy 还是转码(按 probe 结论,只转不兼容的)。
+    pub fn register_file_remux(
+        &self,
+        path: PathBuf,
+        ffmpeg: PathBuf,
+        transcode_video: bool,
+        transcode_audio: bool,
+    ) -> String {
+        self.register(Entry::FileRemux { path, ffmpeg, transcode_video, transcode_audio }, "m")
     }
 }
 
@@ -262,8 +280,10 @@ struct RemuxQuery {
     t: f64,
 }
 
-/// 混流:两路上游经 ffmpeg `-c copy` 拼 fMP4 吐 stdout。无总长、不可 Range ——
-/// <video> 按渐进流播;child 的生死跟着搬运任务走(响应体被 drop → 搬运 send
+/// 混流:经 ffmpeg 拼 fMP4 吐 stdout。无总长、不可 Range —— <video> 按渐进流播;两种来源:
+///   Remux      两路网络上游 `-c copy`(B 站 DASH);
+///   FileRemux  单个本地文件,视频 `-c:v copy` + 音轨转 AAC(AC3/DTS 本地片,见 probe.rs)。
+/// 共用 stream_ffmpeg 起进程吐流。child 的生死跟着搬运任务走(响应体被 drop → 搬运 send
 /// 失败 → 任务退出 → child drop → kill_on_drop 收尸),与 llm 取消同一个所有权手法。
 async fn remux(
     State(state): State<Arc<Inner>>,
@@ -271,26 +291,58 @@ async fn remux(
     Query(q): Query<RemuxQuery>,
 ) -> Response {
     let Some(entry) = lookup(&state, &token) else { return bad(StatusCode::NOT_FOUND) };
-    let Entry::Remux { video, audio, ffmpeg } = entry.as_ref() else {
-        return bad(StatusCode::NOT_FOUND);
+    let cmd = match entry.as_ref() {
+        Entry::Remux { video, audio, ffmpeg } => {
+            let mut cmd = tokio::process::Command::new(ffmpeg);
+            cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin");
+            for up in [video, audio] {
+                if q.t > 0.0 {
+                    cmd.arg("-ss").arg(format!("{:.3}", q.t));
+                }
+                if !up.headers.is_empty() {
+                    let joined: String =
+                        up.headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
+                    cmd.arg("-headers").arg(joined);
+                }
+                cmd.arg("-i").arg(&up.url);
+            }
+            cmd.arg("-map").arg("0:v:0").arg("-map").arg("1:a:0")
+                .arg("-c").arg("copy"); // 纯复制不转码:CPU 几乎零开销
+            cmd
+        }
+        Entry::FileRemux { path, ffmpeg, transcode_video, transcode_audio } => {
+            let mut cmd = tokio::process::Command::new(ffmpeg);
+            cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin");
+            if q.t > 0.0 {
+                cmd.arg("-ss").arg(format!("{:.3}", q.t)); // 输入 seek(对 copy 是关键帧对齐,够用)
+            }
+            cmd.arg("-i").arg(path);
+            // 首条视频可选(纯音频不报错)+ 首条音轨可选(无声轨不报错);字幕等不带。
+            cmd.arg("-map").arg("0:v:0?").arg("-map").arg("0:a:0?");
+            if *transcode_video {
+                // HEVC/AV1 等转 H.264:veryfast 平衡速度/画质;yuv420p 把 10bit 压回 8bit(浏览器只认),
+                // 否则 H.264 10bit 一样放不了。CPU 重,弱机可能跟不上 1x —— preset/硬件加速是真机调优项。
+                cmd.arg("-c:v").arg("libx264").arg("-preset").arg("veryfast")
+                    .arg("-crf").arg("23").arg("-pix_fmt").arg("yuv420p");
+            } else {
+                cmd.arg("-c:v").arg("copy"); // 视频兼容:原样搬,不掉画质、CPU 近零
+            }
+            if *transcode_audio {
+                cmd.arg("-c:a").arg("aac").arg("-b:a").arg("256k");
+            } else {
+                cmd.arg("-c:a").arg("copy");
+            }
+            cmd
+        }
+        _ => return bad(StatusCode::NOT_FOUND),
     };
+    stream_ffmpeg(cmd)
+}
 
-    let mut cmd = tokio::process::Command::new(ffmpeg);
-    cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin");
-    for up in [video, audio] {
-        if q.t > 0.0 {
-            cmd.arg("-ss").arg(format!("{:.3}", q.t));
-        }
-        if !up.headers.is_empty() {
-            let joined: String =
-                up.headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
-            cmd.arg("-headers").arg(joined);
-        }
-        cmd.arg("-i").arg(&up.url);
-    }
-    cmd.arg("-map").arg("0:v:0").arg("-map").arg("1:a:0")
-        .arg("-c").arg("copy") // 纯复制不转码:CPU 几乎零开销
-        .arg("-movflags").arg("frag_keyframe+empty_moov+default_base_moof")
+/// 给一个已配好程序+参数的 ffmpeg 命令收口 stdio、起进程、把 stdout 搬成 HTTP 流。
+/// 两条混流路径(网络 DASH / 本地转码)共用,fMP4 输出参数也在此统一(别两处各写一遍)。
+fn stream_ffmpeg(mut cmd: tokio::process::Command) -> Response {
+    cmd.arg("-movflags").arg("frag_keyframe+empty_moov+default_base_moof")
         .arg("-f").arg("mp4")
         .arg("pipe:1");
     cmd.stdout(std::process::Stdio::piped())

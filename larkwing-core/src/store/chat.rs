@@ -71,6 +71,18 @@ pub struct Message {
     pub payload: Option<String>,
 }
 
+/// 跨会话搜索命中:带会话标题 / 渠道供列表展示;`snippet` 是截断的展示标签(非数据,§6.5)。
+/// 字段保持 snake_case(与 Message/Conversation 一致,前端接口同形)。
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchHit {
+    pub conversation_id: i64,
+    pub conversation_title: String,
+    pub channel: String,
+    pub role: String,
+    pub snippet: String,
+    pub created_at: i64,
+}
+
 /// 标题默认 = 首条用户消息截断(字符数,不花 LLM)。
 const TITLE_MAX_CHARS: usize = 24;
 
@@ -297,6 +309,67 @@ impl ChatRepo {
             Ok(list)
         })
     }
+
+    /// 跨会话搜索(当前用户):`messages.content` 子串匹配,排除 tool/event 内部行
+    /// (`role IN (user, assistant)`)。substring `LIKE` 即可(同 recall 立场,历史量小够用;
+    /// 真要语义查找走 §13.9 检索核心)。最近命中在前。
+    pub fn search_messages(&self, user: i64, query: &str, limit: i64) -> Result<Vec<SearchHit>> {
+        let q = query.trim();
+        if q.is_empty() {
+            return Ok(vec![]);
+        }
+        // 转义 LIKE 通配符,让用户查的 % _ \ 当字面量(配 SQL 里 ESCAPE '\')。
+        let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let ql = q.to_lowercase();
+        self.db.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT m.conversation_id, c.title, c.channel, m.role, m.content, m.created_at
+                 FROM messages m JOIN conversations c ON c.id = m.conversation_id
+                 WHERE c.user_id = ?1
+                   AND m.role IN ('user', 'assistant')
+                   AND m.content LIKE ?2 ESCAPE '\\'
+                 ORDER BY m.id DESC LIMIT ?3",
+            )?;
+            let list = stmt
+                .query_map(rusqlite::params![user, pattern, limit], |r| {
+                    let content: String = r.get(4)?;
+                    Ok(SearchHit {
+                        conversation_id: r.get(0)?,
+                        conversation_title: r.get(1)?,
+                        channel: r.get(2)?,
+                        role: r.get(3)?,
+                        snippet: snippet_around(&content, &ql, 36),
+                        created_at: r.get(5)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(list)
+        })
+    }
+}
+
+/// 命中片段:短则原样;长则取命中词附近一窗(字符级,避免切碎多字节 UTF-8)。展示标签,非数据。
+fn snippet_around(content: &str, query_lower: &str, radius: usize) -> String {
+    let chars: Vec<char> = content.chars().collect();
+    let qn = query_lower.chars().count();
+    if chars.len() <= radius * 2 + qn {
+        return content.to_string();
+    }
+    let lower = content.to_lowercase();
+    let hit_char =
+        lower.find(query_lower).map(|bp| lower[..bp].chars().count()).unwrap_or(0);
+    let start = hit_char.saturating_sub(radius);
+    let end = (hit_char + qn + radius).min(chars.len());
+    let mut s = String::new();
+    if start > 0 {
+        s.push('…');
+    }
+    s.extend(&chars[start..end]);
+    if end < chars.len() {
+        s.push('…');
+    }
+    s
 }
 
 fn row_to_conversation(r: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation> {

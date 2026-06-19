@@ -71,6 +71,7 @@ export default {
   step: {
     connect: 'Connecting to {host}…',
     download: 'Downloading {done}/{total} MB',
+    downloading: 'Downloading {done} MB',
     verify: 'Verifying…',
     extract: 'Extracting…',
     resolve: 'Finding the stream…',
@@ -167,6 +168,15 @@ export default {
     openingFallback: 'Hi, I’m here. How’s your day going?',
     interrupted: '(Signal dropped for a sec… mind asking me again?)',
     noLlm: 'I’m not wired to a brain yet, so I can’t speak up — paste a DeepSeek key below, or hook one up in Settings → Brain, and I’ll be right online!',
+    // starter suggestions (empty-conversation chips, §3.2 "say it for the user"): a tap sends the line; covers a few common abilities
+    suggest: {
+      s1: 'Play me a song',
+      s2: 'Remind me to sleep at 10pm',
+      s3: 'Tidy up my Downloads folder',
+      s4: 'What’s the weather today?',
+      s5: 'Just chat with me',
+      s6: 'What can you do?',
+    },
   },
   // “Thought it through” reveal (PLAN §9): clean collapsed pill; expand shows technical detail (tool name/args/result + raw CoT)
   trace: {
@@ -218,6 +228,9 @@ export default {
     expand: 'Expand',
     newTopic: '＋ New topic',
     untitled: 'New topic',
+    searchPlaceholder: 'Search chats',
+    searchClear: 'Clear',
+    searchEmpty: 'No matching chats',
     pinned: 'Pinned', // pin marker tooltip
     // conversation list activity badge tooltips (shown when not viewing that conversation)
     badge: {
@@ -509,7 +522,11 @@ export default {
       relocateGo: 'Move it',
       relocateCancel: 'Cancel',
       relocateFailed: 'The move didn’t finish — your data is still in place.',
-      dataLocationHint: 'All data lives in this folder. Click Relocate to move it to another drive; restarts when done.',
+      dataLocationHint: 'All data lives in this folder. Back up exports a zip copy; Relocate moves it to another drive.',
+      backup: 'Back up…',
+      backingUp: 'Backing up…',
+      backupDone: 'Backed up to {path}',
+      backupFailed: 'Backup didn’t finish — try another location.',
       oldData: 'Old data',
       oldDataDelete: 'Delete old data',
       oldDataKeep: 'Keep',

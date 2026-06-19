@@ -60,8 +60,9 @@ impl Tool for MediaPlay {
             .ok_or_else(|| {
                 anyhow::anyhow!("缺少合法的 url 参数(http(s) 链接或本地文件绝对路径)")
             })?;
-        let audio_only =
-            args.get("audio_only").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        // 宽容解析:模型常把 audio_only 发成字符串 "true"(裸 as_bool 认不出 → 回落 false →
+        // 放歌弹全屏视频框)。走共享 arg_bool 兜底(§4.4 Quirks)。
+        let audio_only = super::arg_bool(&args, "audio_only", false);
 
         match ctx.media.play(url, audio_only).await? {
             crate::media::PlayOutcome::Playing(np) => {

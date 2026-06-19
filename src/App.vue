@@ -17,6 +17,7 @@ import { useSettings } from './composables/useSettings'
 import {
   api,
   isTauri,
+  onForegroundFullscreen,
   onOpenConversation,
   onShowFloat,
   setFloatVisible,
@@ -69,26 +70,42 @@ async function noticeAction(kind: 'reset' | 'quit' | 'delete' | 'keep') {
 if (!isFloat && isTauri()) {
   void api.setTrayMenu(t('tray.open'), t('tray.showFloat'), t('tray.quit'))
   const floatOn = () => settings.get('ui.float.enabled') !== '0'
-  // 显隐规则(§12 E 修订 2026-06-14):悬浮窗与主窗共存——master 开关 ui.float.enabled 开着就常驻,
-  // 不再随主窗聚焦藏匿(用户:开了就一直有)。唯一例外:主窗全屏(沉浸观感,如看视频)时让位,退出即恢复
-  // ——float 是 always_on_top,不显式藏会浮在全屏画面上。全屏切换会触发 resize,借 onResized 兜住。
-  let lastFs: boolean | null = null
-  const syncFloat = async () => {
+  // 显隐规则(§12 E 修订 2026-06-14;2026-06-19 加「别的程序全屏」让位):悬浮窗与主窗共存——
+  // master 开关 ui.float.enabled 开着就常驻,不随主窗聚焦藏匿(用户:开了就一直有)。
+  // 但 float 是 always_on_top,会盖在任何全屏画面上 → 两类全屏都得显式让位,退出即恢复:
+  //   ① 主窗自己全屏(看视频沉浸)—— win.isFullscreen(),全屏切换会触发 resize。
+  //   ② 别的程序全屏(游戏 / 全屏视频)—— Windows 专属打扰(Mac 原生 space 天然不覆盖别 app
+  //      全屏,不发此事件、foreignFs 恒 false);壳层轮询前台是否铺满显示器,变化时推事实过来。
+  // 决策收成一个自愈的 applyFloat:floatOn() 每次实时读 → 即便 setFloatVisible 被别处(设置页开关)
+  // 直接调过、shown 暂时不准,下一次事件也会按真值重算落实。
+  let ownFs = false // 主窗自己是否全屏
+  let foreignFs = false // 别的程序是否全屏(仅 Windows 会变)
+  let shown: boolean | null = null // 上次落实的显隐,用于去重免反复 show/hide
+  const applyFloat = () => {
     if (!settings.state.ready) return
-    const fs = await win.isFullscreen()
-    if (fs === lastFs) return // 拖拽改窗口大小也发 resize;只在全屏态真变化时动手,免反复 show/hide
-    lastFs = fs
-    void setFloatVisible(floatOn() && !fs)
+    const target = floatOn() && !ownFs && !foreignFs
+    if (target === shown) return
+    shown = target
+    void setFloatVisible(target)
   }
-  watch(() => settings.state.ready, () => void syncFloat(), { immediate: true })
-  win.onResized(syncFloat)
+  const syncOwnFs = async () => {
+    ownFs = await win.isFullscreen()
+    applyFloat()
+  }
+  watch(() => settings.state.ready, () => void syncOwnFs(), { immediate: true })
+  win.onResized(syncOwnFs) // 拖拽改窗口大小也发 resize,applyFloat 自带去重
+  onForegroundFullscreen((on) => {
+    foreignFs = on
+    applyFloat()
+  })
   // 悬浮窗点通知 → 主窗切到该会话
   onOpenConversation((convId) => useChat().selectConversation(convId))
-  // 托盘「显示悬浮窗」→ 重开:置 master 开关(持久化 + 广播)再显示;
-  // enabled=1 后续 syncFloat(全屏切换等)也维持显示,不会被策略重新藏掉。
+  // 托盘「显示悬浮窗」→ 重开:置 master 开关(持久化 + 广播)后按当前全屏态落实
+  // (shown 清空 = 强制重算;若此刻有全屏内容仍让位,不会硬怼上去)。
   onShowFloat(() => {
     settings.set('ui.float.enabled', '1')
-    void setFloatVisible(true)
+    shown = null
+    void syncOwnFs()
   })
   // boot 后查一次数据位置:失效 → 恢复弹窗;有旧数据残留 → 清理弹窗(主动来找用户,不用回设置页)。
   onMounted(async () => {
