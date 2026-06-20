@@ -74,6 +74,13 @@ pub async fn resolve(
     cmd.arg("-j") // 单条 JSON,不下载
         .arg("--no-warnings")
         .arg("--no-playlist")
+        // 强制直连,忽略继承来的系统/全局代理(`--proxy ""` 覆盖 env + Windows 系统代理)。
+        // 与 net::Client 的「墙内 CDN 直连优先永不代理」(§4.6)一致 —— B 站是墙内站,绝不走代理:
+        // 用户开的全局代理(为翻墙)会把 B 站流量塞进墙外节点 → TLS 被掐(SSLError EOF,实锤)。
+        // yt-dlp 是子进程、本来不受 net::Client 管,这里显式拉齐。墙外源(YouTube 等)以后再按
+        // net::Client「直连优先→失败兜底代理」给 yt-dlp 做 per-源逻辑(MVP 单源 bilibili,先一律直连)。
+        .arg("--proxy")
+        .arg("")
         .arg("--socket-timeout")
         .arg("15")
         .arg("-f")
