@@ -463,7 +463,40 @@ impl MediaRuntime {
         }
     }
 
-    /// 取 ffmpeg 注册转封装/转码 URL(走 /m/);ffmpeg 取不到则退回原生直传,绝不阻断播放。
+    /// 本地不兼容文件:优先 **HLS 按需切片**(/hls/,前端 shaka 播 → 原生 seek + 音画同步,Stage 2)。
+    /// 返回 `(stream_url, manifest_url)`:HLS 时 manifest_url 有值(前端走 shaka)。无时长(建不了 VOD
+    /// 列表)→ 回落老 /m/ 渐进混流(能放、seek 仍错);ffmpeg 取不到 → 直传。绝不阻断播放。
+    async fn hls_or_fallback(
+        &self,
+        relay: &relay::Relay,
+        path: &std::path::Path,
+        transcode_video: bool,
+        transcode_audio: bool,
+        duration: Option<f64>,
+    ) -> (String, Option<String>) {
+        let Some(dur) = duration.filter(|d| *d > 0.0) else {
+            tracing::warn!(path = %path.display(), "无时长,HLS VOD 列表建不了,回落 /m/ 渐进混流(seek 仍错)");
+            return (self.remux_or_direct(relay, path, transcode_video, transcode_audio).await, None);
+        };
+        match self.ensure_component(Component::Ffmpeg).await {
+            Ok(ffmpeg) => {
+                let url = relay.register_file_hls(
+                    path.to_path_buf(),
+                    ffmpeg,
+                    transcode_video,
+                    transcode_audio,
+                    dur,
+                );
+                (url.clone(), Some(url))
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), "ffmpeg 取不到,本地无法转码,退回直传(可能黑屏/无声): {e:#}");
+                (relay.register_file(path.to_path_buf()), None)
+            }
+        }
+    }
+
+    /// 取 ffmpeg 注册转封装/转码 URL(走 /m/);ffmpeg 取不到则退回原生直传。HLS 无时长时的回落用。
     async fn remux_or_direct(
         &self,
         relay: &relay::Relay,
@@ -532,8 +565,10 @@ impl MediaRuntime {
             .await
             .context("转发服务起不来")?;
 
-        // 三分路(详见上方 doc):放歌直传 / BMFF 轻量探测 / mkv 等容器走 ffmpeg。
+        // 三分路(详见上方 doc):放歌直传 / BMFF 轻量探测 / mkv 等容器走 ffmpeg。不兼容文件走 HLS
+        //(manifest_url 有值 → 前端 shaka 播 → 原生 seek + 音画同步);兼容文件原生 /f/ 直传。
         let mut duration_seconds = None;
+        let mut manifest_url: Option<String> = None;
         let stream_url = if audio_only {
             relay.register_file(path.clone()) // 放歌:本地音频常见格式浏览器都吃,直传
         } else if probe::is_isobmff_ext(&path) {
@@ -545,23 +580,39 @@ impl MediaRuntime {
             duration_seconds = pr.duration_seconds;
             if pr.audio_incompatible || pr.video_incompatible {
                 self.log_local_codec(&path, &pr);
-                self.remux_or_direct(relay, &path, pr.video_incompatible, pr.audio_incompatible).await
+                let (su, mu) = self
+                    .hls_or_fallback(relay, &path, pr.video_incompatible, pr.audio_incompatible, pr.duration_seconds)
+                    .await;
+                manifest_url = mu;
+                su
             } else {
                 relay.register_file(path.clone()) // 全兼容:原生直传秒开
             }
         } else if probe::needs_ffmpeg_container(&path) {
-            // mkv/avi 等容器 WebView2 放不了,必经 ffmpeg 转封装:先确保 ffmpeg、用它探编码、按需转
+            // mkv/avi 等容器 WebView2 放不了,必经 ffmpeg:先确保 ffmpeg、用它探编码,有时长走 HLS、否则 /m/
             match self.ensure_component(Component::Ffmpeg).await {
                 Ok(ffmpeg) => {
                     let pr = self.probe_with_ffmpeg(&ffmpeg, &path).await;
                     duration_seconds = pr.duration_seconds;
                     self.log_local_codec(&path, &pr);
-                    relay.register_file_remux(
-                        path.clone(),
-                        ffmpeg,
-                        pr.video_incompatible,
-                        pr.audio_incompatible,
-                    )
+                    if let Some(dur) = pr.duration_seconds.filter(|d| *d > 0.0) {
+                        let url = relay.register_file_hls(
+                            path.clone(),
+                            ffmpeg,
+                            pr.video_incompatible,
+                            pr.audio_incompatible,
+                            dur,
+                        );
+                        manifest_url = Some(url.clone());
+                        url
+                    } else {
+                        relay.register_file_remux(
+                            path.clone(),
+                            ffmpeg,
+                            pr.video_incompatible,
+                            pr.audio_incompatible,
+                        )
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(path = %path.display(), "ffmpeg 取不到,容器无法转封装,退回直传(可能放不了): {e:#}");
@@ -578,7 +629,7 @@ impl MediaRuntime {
             author: None,
             duration_seconds,
             stream_url,
-            manifest_url: None, // 本地走原生 /f/ 或 /m/(Stage 2 才上 HLS);非自适应
+            manifest_url,
             page_url: path_str.into(),
             source: "local".into(),
         };

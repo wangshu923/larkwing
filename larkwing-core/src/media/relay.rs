@@ -38,7 +38,16 @@ enum Entry {
     /// `/dash/{token}/manifest.mpd` 返回 `mpd`;`/dash/{token}/v|a` 把 shaka 的 Range 请求带防盗链
     /// 头透传到对应上游(复用 proxy_upstream)。修「混流 + ?t= 重启 seek」的音画错位(那是固有缺陷)。
     Dash { mpd: String, video: UpStream, audio: UpStream },
+    /// 本地不兼容文件(HEVC/AC3/mkv)走 **HLS 按需切片**(Stage 2,取代 FileRemux 的 /m/ 渐进流):
+    /// `/hls/{token}/index.m3u8` 由 `duration` 合成完整 VOD 播放列表(全片段都列出 → shaka 知道完整
+    /// 时间轴、可任意 seek);`/hls/{token}/s{N}.ts` 按需用 ffmpeg `-ss N*SEG -t SEG` 出一段 mpegts
+    /// (重置时间戳、单输入 → 段内音画同步;copy/转按需)。无临时目录/无会话(每段无状态),seek =
+    /// shaka 请求目标段 → 现切现回 → 原生 seek + 同步(治 /m/ 重启 seek 的错位)。
+    FileHls { path: PathBuf, ffmpeg: PathBuf, transcode_video: bool, transcode_audio: bool, duration: f64 },
 }
+
+/// HLS 切片时长(秒):段越短 seek 越细但请求越多;6s 是常见折中。
+const HLS_SEG: f64 = 6.0;
 
 struct Inner {
     port: u16,
@@ -73,6 +82,8 @@ impl Relay {
             .route("/f/{token}", get(file))
             // DASH:manifest + 两路段透传。shaka 用 fetch() 拉(跨源 → 需 CORS,见 dash 处理)。
             .route("/dash/{token}/{seg}", get(dash).options(dash_preflight))
+            // 本地 HLS:m3u8 + 按需切片(同样 shaka fetch 跨源 → CORS)。
+            .route("/hls/{token}/{seg}", get(hls).options(dash_preflight))
             .with_state(inner.clone());
         tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app).await {
@@ -155,6 +166,24 @@ impl Relay {
             .expect("relay streams lock poisoned")
             .insert(token.clone(), Arc::new(Entry::Dash { mpd, video, audio }));
         Ok(format!("http://127.0.0.1:{}/dash/{token}/manifest.mpd", self.inner.port))
+    }
+
+    /// 本地不兼容文件走 HLS 按需切片(Stage 2)。注册返回 `…/hls/{token}/index.m3u8`(前端 shaka
+    /// 经 manifest_url 播,自动认 HLS)。duration 来自 probe(mvhd / ffmpeg -i);切片按需现切(见 hls)。
+    pub fn register_file_hls(
+        &self,
+        path: PathBuf,
+        ffmpeg: PathBuf,
+        transcode_video: bool,
+        transcode_audio: bool,
+        duration: f64,
+    ) -> String {
+        let token = self.token();
+        self.inner.streams.lock().expect("relay streams lock poisoned").insert(
+            token.clone(),
+            Arc::new(Entry::FileHls { path, ffmpeg, transcode_video, transcode_audio, duration }),
+        );
+        format!("http://127.0.0.1:{}/hls/{token}/index.m3u8", self.inner.port)
     }
 }
 
@@ -377,6 +406,71 @@ async fn dash_preflight() -> Response {
         .unwrap_or_else(|_| bad(StatusCode::INTERNAL_SERVER_ERROR))
 }
 
+/// 本地 HLS:`index.m3u8` 合成完整 VOD 列表;`s{N}.ts` 按需切第 N 段(ffmpeg `-ss N*SEG -t SEG`
+/// → mpegts,重置时间戳、单输入 → 段内音画同步)。无临时目录/无会话:每段现切现回、用完即弃。
+async fn hls(State(state): State<Arc<Inner>>, AxPath((token, seg)): AxPath<(String, String)>) -> Response {
+    let Some(entry) = lookup(&state, &token) else { return bad(StatusCode::NOT_FOUND) };
+    let Entry::FileHls { path, ffmpeg, transcode_video, transcode_audio, duration } =
+        entry.as_ref()
+    else {
+        return bad(StatusCode::NOT_FOUND);
+    };
+    if seg == "index.m3u8" {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/vnd.apple.mpegurl")
+            .header("access-control-allow-origin", "*")
+            .body(Body::from(build_hls_playlist(*duration, HLS_SEG)))
+            .unwrap_or_else(|_| bad(StatusCode::INTERNAL_SERVER_ERROR));
+    }
+    // s{N}.ts → 第 N 段 [N*SEG, N*SEG+SEG)
+    let Some(n) = seg
+        .strip_prefix('s')
+        .and_then(|s| s.strip_suffix(".ts"))
+        .and_then(|s| s.parse::<u64>().ok())
+    else {
+        return bad(StatusCode::NOT_FOUND);
+    };
+    let start = n as f64 * HLS_SEG;
+    if start >= *duration {
+        return bad(StatusCode::NOT_FOUND);
+    }
+    let mut cmd = tokio::process::Command::new(ffmpeg);
+    cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin");
+    // 输入 seek 到段首(copy 落最近关键帧、段间略重叠 → shaka 按时间戳拼接去重);单输入 → 段内音画同步。
+    cmd.arg("-ss").arg(format!("{start:.3}")).arg("-i").arg(path).arg("-t").arg(format!("{HLS_SEG:.3}"));
+    cmd.arg("-map").arg("0:v:0?").arg("-map").arg("0:a:0?");
+    if *transcode_video {
+        cmd.arg("-c:v").arg("libx264").arg("-preset").arg("veryfast").arg("-crf").arg("23")
+            .arg("-pix_fmt").arg("yuv420p");
+    } else {
+        cmd.arg("-c:v").arg("copy");
+    }
+    if *transcode_audio {
+        cmd.arg("-c:a").arg("aac").arg("-b:a").arg("256k");
+    } else {
+        cmd.arg("-c:a").arg("copy");
+    }
+    // 重置时间戳(**不 copyts** —— 带它独立 .ts 段会坏,实测)+ 低 mux 延迟;输出 mpegts。
+    cmd.arg("-muxpreload").arg("0").arg("-muxdelay").arg("0").arg("-f").arg("mpegts").arg("pipe:1");
+    stream_ffmpeg(cmd, "video/mp2t", true)
+}
+
+/// 合成完整 VOD HLS 播放列表(纯函数,可测):全段列出 → shaka 知道完整时长、可任意 seek。
+/// 段数 = ceil(duration/seg);末段时长 = 余量。段地址相对 `sN.ts`(相对 index.m3u8 解析)。
+fn build_hls_playlist(duration: f64, seg: f64) -> String {
+    let n = (duration / seg).ceil().max(1.0) as u64;
+    let mut s = String::from("#EXTM3U\n#EXT-X-VERSION:3\n");
+    s.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", seg.ceil() as u64));
+    s.push_str("#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n");
+    for i in 0..n {
+        let dur = (duration - i as f64 * seg).clamp(0.0, seg);
+        s.push_str(&format!("#EXTINF:{dur:.3},\ns{i}.ts\n"));
+    }
+    s.push_str("#EXT-X-ENDLIST\n");
+    s
+}
+
 /// 本地文件:Range 透传的文件流(原生 seek 白送);UNC/挂载盘符就是普通路径。
 async fn file(
     State(state): State<Arc<Inner>>,
@@ -448,7 +542,7 @@ async fn remux(
     Query(q): Query<RemuxQuery>,
 ) -> Response {
     let Some(entry) = lookup(&state, &token) else { return bad(StatusCode::NOT_FOUND) };
-    let cmd = match entry.as_ref() {
+    let mut cmd = match entry.as_ref() {
         Entry::Remux { video, audio, ffmpeg } => {
             let mut cmd = tokio::process::Command::new(ffmpeg);
             cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin");
@@ -495,15 +589,20 @@ async fn remux(
         }
         _ => return bad(StatusCode::NOT_FOUND),
     };
-    stream_ffmpeg(cmd)
+    // 两条路都吐流式 fMP4(渐进播);HLS 段走另一条(mpegts,见 hls_segment)。
+    cmd.arg("-movflags")
+        .arg("frag_keyframe+empty_moov+default_base_moof")
+        .arg("-f")
+        .arg("mp4")
+        .arg("pipe:1");
+    stream_ffmpeg(cmd, "video/mp4", false)
 }
 
-/// 给一个已配好程序+参数的 ffmpeg 命令收口 stdio、起进程、把 stdout 搬成 HTTP 流。
-/// 两条混流路径(网络 DASH / 本地转码)共用,fMP4 输出参数也在此统一(别两处各写一遍)。
-fn stream_ffmpeg(mut cmd: tokio::process::Command) -> Response {
-    cmd.arg("-movflags").arg("frag_keyframe+empty_moov+default_base_moof")
-        .arg("-f").arg("mp4")
-        .arg("pipe:1");
+/// 给一个**已配好程序+参数+输出格式(`-f … pipe:1`)**的 ffmpeg 命令收口 stdio、起进程、把
+/// stdout 搬成 HTTP 流。三条路共用:网络 DASH 混流 / 本地 fMP4 混流(content_type=video/mp4)、
+/// 本地 HLS 按需切片(content_type=video/mp2t,cors=true 给 shaka fetch)。child 生死跟搬运任务走
+/// (响应体被 drop → send 失败 → 任务退出 → kill_on_drop 收尸)。
+fn stream_ffmpeg(mut cmd: tokio::process::Command, content_type: &'static str, cors: bool) -> Response {
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .stdin(std::process::Stdio::null())
@@ -542,9 +641,12 @@ fn stream_ffmpeg(mut cmd: tokio::process::Command) -> Response {
         }
     });
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "video/mp4")
+    let mut builder = Response::builder().status(StatusCode::OK).header("content-type", content_type);
+    if cors {
+        // HLS 段被 shaka 用 fetch 拉(跨源:app 源 ≠ relay 回环口)→ 必须放行。
+        builder = builder.header("access-control-allow-origin", "*");
+    }
+    builder
         .body(Body::from_stream(tokio_stream_from(rx)))
         .unwrap_or_else(|_| bad(StatusCode::INTERNAL_SERVER_ERROR))
 }
@@ -624,6 +726,20 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(nf.status().as_u16(), 404);
+    }
+
+    #[test]
+    fn hls_playlist_lists_all_segments_vod() {
+        let m = build_hls_playlist(20.0, 6.0); // 20s/6 → 4 段(6,6,6,2)
+        assert!(m.starts_with("#EXTM3U"));
+        assert!(m.contains("#EXT-X-PLAYLIST-TYPE:VOD") && m.contains("#EXT-X-ENDLIST"), "完整 VOD → 可任意 seek");
+        for seg in ["s0.ts", "s1.ts", "s2.ts", "s3.ts"] {
+            assert!(m.contains(seg), "应列出 {seg}");
+        }
+        assert!(!m.contains("s4.ts"), "只 4 段");
+        assert!(m.contains("#EXTINF:6.000,") && m.contains("#EXTINF:2.000,"), "首段 6s、末段余量 2s");
+        // 短于一段的片子也至少出一段
+        assert!(build_hls_playlist(3.0, 6.0).contains("s0.ts"));
     }
 
     #[test]
