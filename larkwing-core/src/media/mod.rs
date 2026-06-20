@@ -644,13 +644,9 @@ impl MediaRuntime {
         };
         match self.ensure_component(Component::Ffmpeg).await {
             Ok(ffmpeg) => {
-                let url = relay.register_file_hls(
-                    path.to_path_buf(),
-                    ffmpeg,
-                    transcode_video,
-                    transcode_audio,
-                    dur,
-                );
+                // HLS 段一律转码视频 + 立体声 AAC(见 relay::build_frag_cmd 三处实证),
+                // 故不再传 transcode_* —— 它们只在上面无时长回落 /m/ 时用。
+                let url = relay.register_file_hls(path.to_path_buf(), ffmpeg, dur);
                 (url.clone(), Some(url))
             }
             Err(e) => {
@@ -767,13 +763,8 @@ impl MediaRuntime {
                     duration_seconds = pr.duration_seconds;
                     self.log_local_codec(&path, &pr);
                     if let Some(dur) = pr.duration_seconds.filter(|d| *d > 0.0) {
-                        let url = relay.register_file_hls(
-                            path.clone(),
-                            ffmpeg,
-                            pr.video_incompatible,
-                            pr.audio_incompatible,
-                            dur,
-                        );
+                        // HLS 段一律转码视频 + 立体声 AAC(relay::build_frag_cmd),不传 transcode_*
+                        let url = relay.register_file_hls(path.clone(), ffmpeg, dur);
                         manifest_url = Some(url.clone());
                         url
                     } else {

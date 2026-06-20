@@ -53,13 +53,10 @@ let shakaLib: any = null
 let shakaPlayer: any = null
 async function loadShaka(): Promise<any> {
   if (!shakaLib) {
-    // 【诊断版】用 shaka 调试构建 + 详细日志,把「卡在哪」打到控制台(生产 compiled 版不打日志)。
-    // 黑屏定位完恢复成 `import('shaka-player')`(生产版)。
-    const mod: any = await import('shaka-player/dist/shaka-player.compiled.debug.js')
+    const mod: any = await import('shaka-player')
     shakaLib = mod.default ?? mod
     try {
       shakaLib.polyfill?.installAll?.()
-      shakaLib.log?.setLevel?.(shakaLib.log.Level.DEBUG)
     } catch {
       /* 尽力 */
     }
@@ -90,29 +87,27 @@ async function loadVideoInto(el: HTMLVideoElement) {
     return
   }
   try {
-    console.log('[lw] shaka 加载 manifest:', cur.manifest_url) // 【诊断】
     const shaka = await loadShaka()
     await destroyShaka()
     if (state.current !== cur) return // 加载期间已切走/停
     const player = new shaka.Player()
     shakaPlayer = player
     await player.attach(el)
+    // 出错时打全 code/category/data + MSE 的 video.error —— 生产版也带 data,够定位
+    //(本地 fMP4-HLS 黑屏就是靠它定位到 MSE append 失败,见 relay::build_frag_cmd)。
     player.addEventListener('error', (e: any) => {
-      console.error('[lw][shaka] error', e?.detail ?? e) // 【诊断】shaka 报错(带 code/category)
+      const err = e?.detail ?? e
+      console.error('[lw][shaka] error', { code: err?.code, category: err?.category, data: err?.data, mediaError: el.error?.message })
       if (state.current?.kind === 'video') state.status = 'paused'
     })
-    player.addEventListener('buffering', (e: any) => console.log('[lw][shaka] buffering=', e?.buffering)) // 【诊断】
-    el.addEventListener('waiting', () => console.log('[lw] <video> waiting(等数据,卡了)')) // 【诊断】
-    el.addEventListener('canplay', () => console.log('[lw] <video> canplay,buffered=', el.buffered.length ? `${el.buffered.start(0)}-${el.buffered.end(0)}` : '空')) // 【诊断】
     await player.load(cur.manifest_url)
-    console.log('[lw] shaka.load 完成;el.duration=', el.duration, 'buffered段=', el.buffered.length) // 【诊断】
     if (state.current !== cur) {
       void destroyShaka()
       return
     }
-    el.play().then(() => console.log('[lw] play() 成功')).catch((err) => console.warn('[lw] play() 被拒:', err?.name, err?.message)) // 【诊断】
+    el.play().catch(() => (state.status = 'paused'))
   } catch (e) {
-    console.error('[lw][shaka] load failed', e) // 【诊断】
+    console.error('[lw][shaka] load failed', e, 'mediaError=', el.error?.message)
     if (state.current === cur) state.status = 'paused'
   }
 }

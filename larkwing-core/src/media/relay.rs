@@ -45,7 +45,8 @@ enum Entry {
     /// mfra、把 tfdt 改成累计起点(probe::patch_segment_tfdt)→ 标准 fMP4-HLS。**段走 fMP4 而非 mpegts**:
     /// 实锤 mpegts 段经 shaka 的 mux.js transmux 视频会失败(code 3015/3016)→ 黑屏;fMP4 = B 站 DASH
     /// 已验通的同路、MSE 直吃。无临时目录/无会话(每段无状态),seek = shaka 请求目标段 → 现切现回。
-    FileHls { path: PathBuf, ffmpeg: PathBuf, transcode_video: bool, transcode_audio: bool, duration: f64 },
+    /// 段一律转码视频 + 下混立体声 AAC(见 build_frag_cmd 三处实证),故无 transcode_* 旋钮。
+    FileHls { path: PathBuf, ffmpeg: PathBuf, duration: f64 },
 }
 
 /// HLS 切片时长(秒):段越短 seek 越细但请求越多;6s 是常见折中。
@@ -172,18 +173,11 @@ impl Relay {
 
     /// 本地不兼容文件走 HLS 按需切片(Stage 2)。注册返回 `…/hls/{token}/index.m3u8`(前端 shaka
     /// 经 manifest_url 播,自动认 HLS)。duration 来自 probe(mvhd / ffmpeg -i);切片按需现切(见 hls)。
-    pub fn register_file_hls(
-        &self,
-        path: PathBuf,
-        ffmpeg: PathBuf,
-        transcode_video: bool,
-        transcode_audio: bool,
-        duration: f64,
-    ) -> String {
+    pub fn register_file_hls(&self, path: PathBuf, ffmpeg: PathBuf, duration: f64) -> String {
         let token = self.token();
         self.inner.streams.lock().expect("relay streams lock poisoned").insert(
             token.clone(),
-            Arc::new(Entry::FileHls { path, ffmpeg, transcode_video, transcode_audio, duration }),
+            Arc::new(Entry::FileHls { path, ffmpeg, duration }),
         );
         format!("http://127.0.0.1:{}/hls/{token}/index.m3u8", self.inner.port)
     }
@@ -408,13 +402,11 @@ async fn dash_preflight() -> Response {
         .unwrap_or_else(|_| bad(StatusCode::INTERNAL_SERVER_ERROR))
 }
 
-/// 本地 HLS:`index.m3u8` 合成完整 VOD 列表;`s{N}.ts` 按需切第 N 段(ffmpeg `-ss N*SEG -t SEG`
-/// → mpegts,重置时间戳、单输入 → 段内音画同步)。无临时目录/无会话:每段现切现回、用完即弃。
+/// 本地 HLS:`index.m3u8` 合成完整 VOD 列表;`init.mp4` 取 ftyp+moov;`s{N}.m4s` 按需切第 N 段
+/// (fMP4 单 moof,一律转码视频 + 立体声 AAC,见 build_frag_cmd)。无临时目录/无会话:每段现切现回。
 async fn hls(State(state): State<Arc<Inner>>, AxPath((token, seg)): AxPath<(String, String)>) -> Response {
     let Some(entry) = lookup(&state, &token) else { return bad(StatusCode::NOT_FOUND) };
-    let Entry::FileHls { path, ffmpeg, transcode_video, transcode_audio, duration } =
-        entry.as_ref()
-    else {
+    let Entry::FileHls { path, ffmpeg, duration } = entry.as_ref() else {
         return bad(StatusCode::NOT_FOUND);
     };
     // 三种请求:清单 / 共享 init / moof 段。段走 **fMP4(非 mpegts)** —— MSE 直接吃,绕开 shaka 的
@@ -431,7 +423,7 @@ async fn hls(State(state): State<Arc<Inner>>, AxPath((token, seg)): AxPath<(Stri
         // 共享 init(ftyp+moov):切一小段、取首个 moof 之前的部分。codec 配置与各 moof 段一致
         //(同输入 + 同 copy/转码 flag → ffmpeg 产出确定、跨调用兼容,Mac 已验 init+moof 可拼)。
         tracing::info!("HLS:发 init");
-        let cmd = build_frag_cmd(ffmpeg, path, 0.0, 0.1, *transcode_video, *transcode_audio);
+        let cmd = build_frag_cmd(ffmpeg, path, 0.0, 0.1);
         let Some(full) = run_ffmpeg_collect(cmd, 8 * 1024 * 1024).await else {
             return bad(StatusCode::BAD_GATEWAY);
         };
@@ -454,7 +446,7 @@ async fn hls(State(state): State<Arc<Inner>>, AxPath((token, seg)): AxPath<(Stri
         return bad(StatusCode::NOT_FOUND);
     }
     tracing::info!(seg = n, start, "HLS:现切一段");
-    let cmd = build_frag_cmd(ffmpeg, path, start, HLS_SEG, *transcode_video, *transcode_audio);
+    let cmd = build_frag_cmd(ffmpeg, path, start, HLS_SEG);
     let Some(full) = run_ffmpeg_collect(cmd, 256 * 1024 * 1024).await else {
         return bad(StatusCode::BAD_GATEWAY);
     };
@@ -472,33 +464,29 @@ async fn hls(State(state): State<Arc<Inner>>, AxPath((token, seg)): AxPath<(Stri
 }
 
 /// 构建「区间 [start, start+dur) 的自包含分片 mp4」命令(ftyp+moov+moof+mdat 吐 stdout)。
-/// 单输入 → 段内音画同步;只转不兼容轨。HLS 的 init(取 0.1s)与各段(取 HLS_SEG)都用它。
-fn build_frag_cmd(
-    ffmpeg: &Path,
-    path: &Path,
-    start: f64,
-    dur: f64,
-    transcode_video: bool,
-    transcode_audio: bool,
-) -> tokio::process::Command {
+/// HLS 的 init(取 0.1s)与各段(取 HLS_SEG)都用它。
+///
+/// **视频、音频一律转码(不 copy),这是按需 fMP4-HLS 在 WebView2/Chromium MSE 上稳的前提**
+/// (三处实证,2026-06-20 Mac Chromium MSE 复现):
+/// ① **视频转码**:`-ss` + `-c:v copy` 只能落到关键帧、切不准 → 段时长漂(实测请求 6s 出 8s)、
+///    段间重叠/错位;转码则每段从干净 IDR 起、恰好 dur 秒、编码配置(avcC)跨段一致 → MSE 拼得上。
+/// ② **音频必转码**:视频转码 + 音频 `copy` 时,fragmented muxer 把样本时长写成 2×(段被拉长一倍,
+///    实测),两轨都转码即消失。
+/// ③ **下混立体声 `-ac 2`**:多声道 AAC 若声道布局不明确(AC3/DTS 转 AAC 常见)→ MSE **拒绝 append**
+///    整个 init(报在 video 轨上,正是用户「video:2 code=3014 黑屏」),立体声永远能 append。
+/// 代价 = 已是 H.264 的片子(仅因容器 mkv / 音轨 AC3 才进 HLS)也被重编视频,弱机吃 CPU;
+/// 但这些片子当前本就黑屏(mpegts 链路),不是回退。后续可给「视频已兼容」者走整文件 copy-remux→DASH 省 CPU。
+fn build_frag_cmd(ffmpeg: &Path, path: &Path, start: f64, dur: f64) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(ffmpeg);
     cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin");
     if start > 0.0 {
-        cmd.arg("-ss").arg(format!("{start:.3}")); // 输入 seek 到段首(copy 落最近关键帧)
+        cmd.arg("-ss").arg(format!("{start:.3}")); // 输入 seek 到段首(转码从此处起新 IDR)
     }
     cmd.arg("-i").arg(path).arg("-t").arg(format!("{dur:.3}"));
     cmd.arg("-map").arg("0:v:0?").arg("-map").arg("0:a:0?");
-    if transcode_video {
-        cmd.arg("-c:v").arg("libx264").arg("-preset").arg("veryfast").arg("-crf").arg("23")
-            .arg("-pix_fmt").arg("yuv420p");
-    } else {
-        cmd.arg("-c:v").arg("copy");
-    }
-    if transcode_audio {
-        cmd.arg("-c:a").arg("aac").arg("-b:a").arg("256k");
-    } else {
-        cmd.arg("-c:a").arg("copy");
-    }
+    cmd.arg("-c:v").arg("libx264").arg("-preset").arg("veryfast").arg("-crf").arg("23")
+        .arg("-pix_fmt").arg("yuv420p");
+    cmd.arg("-c:a").arg("aac").arg("-ac").arg("2").arg("-b:a").arg("256k");
     // 单 moof/段:`-frag_duration` 给个远超段长(600s)的值 → ffmpeg 不在段内再分片,整段就一个
     // moof+mdat,便于把 tfdt 改成累计值(见 probe::patch_segment_tfdt)。default_base_moof 让 trun
     // 数据偏移相对 moof → 切掉 init 后偏移仍对。
