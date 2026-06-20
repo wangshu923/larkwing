@@ -20,9 +20,7 @@ larkwing-core = { path = "../larkwing-core" }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
-# devtools:让 release 包也能开 F12 / 右键检查(debug 构建本就自带;release 默认不带,需此特性)。
-# 调试影音用(网络面板看 /hls/ 切片状态、控制台看 shaka 报错);正式 0.1.8 发布前再决定去留。
-tauri = { version = "2.11.2", features = ["macos-private-api", "tray-icon", "devtools"] }
+tauri = { version = "2.11.2", features = ["macos-private-api", "tray-icon"] }
 tauri-plugin-log = "2"
 tauri-plugin-autostart = "2"
 tauri-plugin-opener = "2"
