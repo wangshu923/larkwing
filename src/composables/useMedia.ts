@@ -53,10 +53,13 @@ let shakaLib: any = null
 let shakaPlayer: any = null
 async function loadShaka(): Promise<any> {
   if (!shakaLib) {
-    const mod: any = await import('shaka-player')
+    // 【诊断版】用 shaka 调试构建 + 详细日志,把「卡在哪」打到控制台(生产 compiled 版不打日志)。
+    // 黑屏定位完恢复成 `import('shaka-player')`(生产版)。
+    const mod: any = await import('shaka-player/dist/shaka-player.compiled.debug.js')
     shakaLib = mod.default ?? mod
     try {
       shakaLib.polyfill?.installAll?.()
+      shakaLib.log?.setLevel?.(shakaLib.log.Level.DEBUG)
     } catch {
       /* 尽力 */
     }
@@ -87,6 +90,7 @@ async function loadVideoInto(el: HTMLVideoElement) {
     return
   }
   try {
+    console.log('[lw] shaka 加载 manifest:', cur.manifest_url) // 【诊断】
     const shaka = await loadShaka()
     await destroyShaka()
     if (state.current !== cur) return // 加载期间已切走/停
@@ -94,17 +98,21 @@ async function loadVideoInto(el: HTMLVideoElement) {
     shakaPlayer = player
     await player.attach(el)
     player.addEventListener('error', (e: any) => {
-      console.error('[shaka] error', e?.detail ?? e)
+      console.error('[lw][shaka] error', e?.detail ?? e) // 【诊断】shaka 报错(带 code/category)
       if (state.current?.kind === 'video') state.status = 'paused'
     })
+    player.addEventListener('buffering', (e: any) => console.log('[lw][shaka] buffering=', e?.buffering)) // 【诊断】
+    el.addEventListener('waiting', () => console.log('[lw] <video> waiting(等数据,卡了)')) // 【诊断】
+    el.addEventListener('canplay', () => console.log('[lw] <video> canplay,buffered=', el.buffered.length ? `${el.buffered.start(0)}-${el.buffered.end(0)}` : '空')) // 【诊断】
     await player.load(cur.manifest_url)
+    console.log('[lw] shaka.load 完成;el.duration=', el.duration, 'buffered段=', el.buffered.length) // 【诊断】
     if (state.current !== cur) {
       void destroyShaka()
       return
     }
-    void el.play().catch(() => {})
+    el.play().then(() => console.log('[lw] play() 成功')).catch((err) => console.warn('[lw] play() 被拒:', err?.name, err?.message)) // 【诊断】
   } catch (e) {
-    console.error('[shaka] load failed', e)
+    console.error('[lw][shaka] load failed', e) // 【诊断】
     if (state.current === cur) state.status = 'paused'
   }
 }
