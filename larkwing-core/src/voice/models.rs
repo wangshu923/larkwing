@@ -58,6 +58,90 @@ pub const ASR_SENSE_VOICE: ModelSpec = ModelSpec {
     ],
 };
 
+/// 可选 ASR ①:Whisper-small 多语版(非 .en;encoder+decoder+tokens 三件,int8 ~374MB)。
+/// Whisper 是 autoregressive、CPU 上比 SenseVoice 慢(稍等一两秒),但对**儿童 / 非标准发音**
+/// 的鲁棒性是候选里唯一有实证的(68 万小时多样语料;AGENT §7.5)。用户报「小朋友识别差」选它。
+pub const ASR_WHISPER_SMALL: ModelSpec = ModelSpec {
+    id: "whisper-small-multi",
+    label_key: "task.download.voice_asr",
+    files: &[
+        ModelFile {
+            name: "small-encoder.int8.onnx",
+            urls: &[
+                "https://hf-mirror.com/csukuangfj/sherpa-onnx-whisper-small/resolve/main/small-encoder.int8.onnx",
+                "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-small/resolve/main/small-encoder.int8.onnx",
+            ],
+        },
+        ModelFile {
+            name: "small-decoder.int8.onnx",
+            urls: &[
+                "https://hf-mirror.com/csukuangfj/sherpa-onnx-whisper-small/resolve/main/small-decoder.int8.onnx",
+                "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-small/resolve/main/small-decoder.int8.onnx",
+            ],
+        },
+        ModelFile {
+            name: "small-tokens.txt",
+            urls: &[
+                "https://hf-mirror.com/csukuangfj/sherpa-onnx-whisper-small/resolve/main/small-tokens.txt",
+                "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-small/resolve/main/small-tokens.txt",
+            ],
+        },
+    ],
+};
+
+/// 可选 ASR ②:小红书 FireRedASR2-CTC int8(单文件 ~740MB)。CTC 在 CPU 上快(RTF~0.17),
+/// 标准普通话**最准一档**;但对儿童**无实证**(成人 SOTA ≠ 对孩子最好,AGENT §7.5)——作为
+/// 「中文最准」选项给用户,孩子那条仍主推 Whisper。备用源 = GitHub release 同名 .tar.bz2(已验)。
+pub const ASR_FIRERED_CTC: ModelSpec = ModelSpec {
+    id: "fire-red-asr2-ctc-2026-02-25",
+    label_key: "task.download.voice_asr",
+    files: &[
+        ModelFile {
+            name: "model.int8.onnx",
+            urls: &[
+                "https://hf-mirror.com/csukuangfj/sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25/resolve/main/model.int8.onnx",
+                "https://huggingface.co/csukuangfj/sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25/resolve/main/model.int8.onnx",
+            ],
+        },
+        ModelFile {
+            name: "tokens.txt",
+            urls: &[
+                "https://hf-mirror.com/csukuangfj/sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25/resolve/main/tokens.txt",
+                "https://huggingface.co/csukuangfj/sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25/resolve/main/tokens.txt",
+            ],
+        },
+    ],
+};
+
+/// 选中的中文 ASR 档(setting `voice.asr.model`,app 级)。默认 SenseVoice(快);加新档 =
+/// 这里加一支 + 一个 `ModelSpec` + `asr.rs` 一个构造分支(架构不同),`X = 数据`(AGENT §1)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AsrModel {
+    SenseVoice,
+    WhisperSmall,
+    FireRedCtc,
+}
+
+impl AsrModel {
+    /// setting 值 → 档(空 / 未知一律回落默认 SenseVoice;值是契约,与前端/engine 校验同源)。
+    pub fn from_setting(s: &str) -> AsrModel {
+        match s {
+            "whisper-small" => AsrModel::WhisperSmall,
+            "firered-ctc" => AsrModel::FireRedCtc,
+            _ => AsrModel::SenseVoice,
+        }
+    }
+
+    /// 对应的下载规格(就绪检查 / 用时下载都认它)。
+    pub fn spec(self) -> &'static ModelSpec {
+        match self {
+            AsrModel::SenseVoice => &ASR_SENSE_VOICE,
+            AsrModel::WhisperSmall => &ASR_WHISPER_SMALL,
+            AsrModel::FireRedCtc => &ASR_FIRERED_CTC,
+        }
+    }
+}
+
 /// tar.bz2 整包模型(KWS 的 HF 仓库是 gated,只有 GitHub release 包;~4MB 走 gh 镜像)。
 pub struct TarModelSpec {
     pub id: &'static str,
@@ -416,12 +500,18 @@ mod tests {
 
     #[test]
     fn specs_have_files_and_sources() {
-        for spec in [&SILERO_VAD, &ASR_SENSE_VOICE] {
+        for spec in [&SILERO_VAD, &ASR_SENSE_VOICE, &ASR_WHISPER_SMALL, &ASR_FIRERED_CTC] {
             assert!(!spec.files.is_empty());
             for f in spec.files {
                 assert!(!f.urls.is_empty(), "{}/{} 没有下载源", spec.id, f.name);
             }
         }
+        // 三档 ASR 与 from_setting 的值一一对应(契约同步:前端 option / engine 校验同此三值)。
+        assert_eq!(AsrModel::from_setting("sense-voice").spec().id, ASR_SENSE_VOICE.id);
+        assert_eq!(AsrModel::from_setting("whisper-small").spec().id, ASR_WHISPER_SMALL.id);
+        assert_eq!(AsrModel::from_setting("firered-ctc").spec().id, ASR_FIRERED_CTC.id);
+        assert_eq!(AsrModel::from_setting("").spec().id, ASR_SENSE_VOICE.id, "空=默认");
+        assert_eq!(AsrModel::from_setting("bogus").spec().id, ASR_SENSE_VOICE.id, "未知=默认");
     }
 
     #[test]

@@ -305,8 +305,7 @@ export default {
     listening: 'Listening…',
     thinking: 'Thinking…',
     speaking: 'Speaking…',
-    idle: 'I’m around', // idle greeting: channel-neutral; shown even when voice is off (wakeArmed is the voice state)
-    wakeArmed: '🎙 Say “{kw}”', // idle ticker · mic waiting for the wake word (hands-free wake on)
+    idle: 'I’m around', // idle greeting: fallback shown when there’s nothing else (reminder/usage) to surface
     zoneNow: 'Now',
     zoneNews: 'Recent',
     todayCost: 'Today {amount}',
@@ -436,16 +435,13 @@ export default {
       sensitivity: 'Wake sensitivity',
       sensSteady: 'Steady',
       sensKeen: 'Keen',
-      sensitivityHint: 'It’s set to maximum sensitivity by default, so it wakes whenever you call; if it keeps triggering on stray sounds, drag left to calm it down.',
-      // calibration (instead of blindly dragging the slider): record a few takes → set sensitivity from your real voice + room (and the trigger spelling if needed)
-      calib: 'Tune it for me',
-      calibStart: 'Record a few to set it',
+      // calibration (instead of blindly dragging the slider): record a few takes → set sensitivity from your real voice + room (and the trigger spelling if needed). Compact entry sits on the sensitivity row
+      calibStart: 'Calibrate',
       calibAgain: 'Again',
       calibCancel: 'Cancel',
       calibRound: 'Say it clearly — {n}/{total}…',
       calibAmbient: 'Quiet for a moment — recording the room…',
       calibComputing: 'Working out the best setting for you…',
-      calibHint: 'Don’t want to drag the slider yourself? Tap this, say the wake word a few times, and it tunes sensitivity to your real voice and room (calibrating the trigger spelling too, if needed).',
       calibSayHint: 'When prompted, say 「{kw}」 clearly, a few times; at the end, stay quiet for a short room recording. It’s all processed on this machine.',
       calibVerdict_good: 'All tuned · sensitivity set to {sens}',
       calibVerdict_noisy: 'Tuned, but it’s a bit noisy here · sensitivity {sens}; if it false-wakes often, nudge toward “Steady.”',
@@ -469,6 +465,12 @@ export default {
       ttsBackend: 'Voice source',
       tts_online: 'Online',
       tts_offline: 'Offline',
+      // recognition model (exposed 2026-06): SenseVoice fast by default; Whisper steadier on kids/accents; FireRed sharpest Chinese
+      asrModel: 'Recognition model',
+      asr_standard: 'Standard · fast (default)',
+      asr_kids: 'Better with kids · Whisper (~370MB, a bit slower)',
+      asr_zh: 'Sharpest Chinese · FireRed (~740MB)',
+      asrModelHint: 'If it struggles to understand a child, “Better with kids” usually helps (steadier on kids and accents, at the cost of a little speed). Switching downloads that model on first use; recognition stays fully on this machine.',
       component: 'Voice components',
       compReady: 'Ready',
       compMissing: 'Not downloaded · prepared automatically on first use',

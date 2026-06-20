@@ -80,8 +80,9 @@ struct Inner {
     bus: Bus,
     scenes: Scenes,
     models: VoiceModels,
-    /// ASR 模型加载贵(秒级),进程内只一次;OfflineRecognizer 是 Send+Sync。
-    asr: tokio::sync::OnceCell<Arc<SherpaAsr>>,
+    /// ASR 模型加载贵(秒级),进程内缓存;带档身份 —— 用户切 voice.asr.model 即重建,
+    /// 旧 Arc 在用完后自然 drop(同档复用,不重复加载)。
+    asr: tokio::sync::Mutex<Option<(models::AsrModel, Arc<SherpaAsr>)>>,
     /// 同时只有一个听写会话。
     session: std::sync::Mutex<Option<SessionCtl>>,
     gen: AtomicU64,
@@ -135,6 +136,9 @@ pub struct VoiceStatus {
     pub devices: Vec<String>,
     /// 音色目录(当前语言行;目录 = 数据)。
     pub speakers: Vec<VoiceOption>,
+    /// 出厂默认音色 id(单源 = `tts::DEFAULT_SPEAKER`):前端未设音色时用它高亮默认项,
+    /// 不在前端硬编码副本(§4.11 写死默认值须单源)。
+    pub default_speaker: String,
 }
 
 impl VoiceRuntime {
@@ -147,7 +151,7 @@ impl VoiceRuntime {
                 bus,
                 scenes,
                 models,
-                asr: tokio::sync::OnceCell::new(),
+                asr: tokio::sync::Mutex::new(None),
                 session: std::sync::Mutex::new(None),
                 gen: AtomicU64::new(0),
                 tts: Arc::new(tts::EdgeTts),
@@ -593,7 +597,7 @@ impl VoiceRuntime {
             self.inner.models.ensure(&models::SILERO_VAD, &mirrors).await?.join("silero_vad.onnx");
         // ASR 只用于"确认这段确实是唤醒词"——已下好才用(顺手把样本质量把一道关);
         // 没下好就跳过这道关(靠 KWS 扫描天然容错:听岔的样本不命中 = 自动降权),不拖慢首次标定。
-        let asr: Option<Arc<SherpaAsr>> = if self.inner.models.is_ready(&models::ASR_SENSE_VOICE) {
+        let asr: Option<Arc<SherpaAsr>> = if self.inner.models.is_ready(self.asr_model().spec()) {
             self.ensure_engines().await.ok().map(|(_, a)| a)
         } else {
             None
@@ -914,13 +918,14 @@ impl VoiceRuntime {
 
     pub fn status(&self) -> VoiceStatus {
         VoiceStatus {
-            asr_ready: self.inner.models.is_ready(&models::ASR_SENSE_VOICE),
+            asr_ready: self.inner.models.is_ready(self.asr_model().spec()),
             vad_ready: self.inner.models.is_ready(&models::SILERO_VAD),
             kws_ready: self.inner.models.is_tar_ready(&models::KWS_ZIPFORMER_ZH),
             wake_running: self.wake_running(),
             keywords: self.wake_keywords(),
             devices: list_input_devices(),
             speakers: self.voice_options(),
+            default_speaker: tts::DEFAULT_SPEAKER.to_string(),
         }
     }
 
@@ -997,24 +1002,37 @@ impl VoiceRuntime {
         }
     }
 
-    /// 模型就绪 + ASR 单例加载(听写与唤醒共用)。
+    /// 选中的中文 ASR 档(voice.asr.model,app 级;空 / 未知回落默认 SenseVoice)。
+    fn asr_model(&self) -> models::AsrModel {
+        let v = self
+            .inner
+            .store
+            .settings
+            .get(None, "voice.asr.model")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        models::AsrModel::from_setting(&v)
+    }
+
+    /// 模型就绪 + ASR 加载(听写与唤醒共用)。按 voice.asr.model 选档:同档复用缓存,
+    /// 换档则现下现载并替换缓存。锁全程持有 = 顺带去重(并发调用方要的也是同一档,等就好)。
     async fn ensure_engines(&self) -> Result<(PathBuf, Arc<SherpaAsr>)> {
         let mirrors = self.mirrors();
         let vad_dir = self.inner.models.ensure(&models::SILERO_VAD, &mirrors).await?;
-        let asr_dir = self.inner.models.ensure(&models::ASR_SENSE_VOICE, &mirrors).await?;
-        let asr = self
-            .inner
-            .asr
-            .get_or_try_init(|| async {
-                // 语言目录一期只有中文行(PLAN §11);voice.lang 进目录时在此择路
-                tokio::task::spawn_blocking(move || {
-                    SherpaAsr::sense_voice(&asr_dir, "zh").map(Arc::new)
-                })
-                .await
-                .context("ASR 加载任务挂了")?
-            })
-            .await?
-            .clone();
+        let model = self.asr_model();
+        let mut guard = self.inner.asr.lock().await;
+        if let Some((m, a)) = guard.as_ref() {
+            if *m == model {
+                return Ok((vad_dir.join("silero_vad.onnx"), a.clone()));
+            }
+        }
+        // 换档 / 首次:用时下载对应模型(HUD 进度)→ spawn_blocking 加载(秒级,别堵 runtime)。
+        let asr_dir = self.inner.models.ensure(model.spec(), &mirrors).await?;
+        let asr = tokio::task::spawn_blocking(move || SherpaAsr::load(model, &asr_dir, "zh").map(Arc::new))
+            .await
+            .context("ASR 加载任务挂了")??;
+        *guard = Some((model, asr.clone()));
         Ok((vad_dir.join("silero_vad.onnx"), asr))
     }
 

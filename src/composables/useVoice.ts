@@ -81,10 +81,9 @@ function wire() {
   wired = true
   media = useMedia()
   if (!isTauri()) {
-    // 浏览器预览:?demo=float 让待机栏显示"在等唤醒"那条(纯看视觉)
+    // 浏览器预览:?demo=float 让头像显示 armed 竖耳环(纯看视觉)
     if (new URLSearchParams(location.search).get('demo')?.includes('float')) {
       state.wakeArmed = true
-      state.wakeKeywords = ['小七']
     }
     return
   }

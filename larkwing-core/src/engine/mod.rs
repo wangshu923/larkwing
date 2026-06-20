@@ -210,6 +210,7 @@ const APP_SETTING_KEYS: &[&str] = &[
     "voice.wake.enabled",
     "voice.wake.keywords",
     "voice.wake.sensitivity",
+    "voice.asr.model",
     "voice.tts_backend",
     "weather.qweather.host",
     "weather.qweather.project_id",
@@ -810,6 +811,17 @@ impl Engine {
             "voice.tts_backend" => {
                 if !["online", "offline"].contains(&value) {
                     return Err(invalid("未知的语音合成档"));
+                }
+                self.store.settings.set(None, key, value)?;
+                Ok(())
+            }
+            // 中文 ASR 模型档(app 级,机器属性,2026-06 用户要求放出来选,AGENT §7.5):
+            // sense-voice(快,默认)/ whisper-small(对孩子/口音更稳,稍慢,~370MB)/
+            // firered-ctc(小红书,中文最准,~740MB)。模型用时下载;开着唤醒时前端会重启
+            // 循环让新模型生效(同 sensitivity)。漏了这条 → 写被白名单拒 → 前端乐观写回滚。
+            "voice.asr.model" => {
+                if !["sense-voice", "whisper-small", "firered-ctc"].contains(&value) {
+                    return Err(invalid("未知的识别模型档"));
                 }
                 self.store.settings.set(None, key, value)?;
                 Ok(())

@@ -30,13 +30,14 @@ const DEFAULTS: Record<string, string> = {
   'memory.auto_consolidate': '1',
   // 声音(PLAN §11):与 Rust 白名单逐键对应(user 级 speaker/auto_speak/rate/patience/volume,
   // app 级 input_device);档位值是契约,改要两边一起改
-  'voice.speaker': 'zh-CN-XiaoxiaoNeural',
+  'voice.speaker': '', // 默认音色单源在后端 tts::DEFAULT_SPEAKER(§4.11,前端不写死副本);空 = 未设,设置页用 voiceStatus.defaultSpeaker 高亮默认项
   'voice.auto_speak': 'follow',
   'voice.rate': 'standard',
   'voice.patience': 'standard',
   'voice.volume': '100',
   'voice.input_device': '',
   'voice.wake.sensitivity': '100', // 唤醒灵敏度 0~100(global)→ KWS 阈值;'100' = 最灵敏(默认偏召回,保障叫得应,见 AGENT.md §8.2)
+  'voice.asr.model': 'sense-voice', // 中文识别模型档(global):sense-voice(快,默认)/ whisper-small(对孩子/口音更稳)/ firered-ctc(中文最准);值与 Rust 校验同源,模型用时下载
 
   'voice.tts_backend': 'online', // 在线 edge / 离线 vits(断网兜底,需下大模型)
   // 天气(PLAN 天气块):和风 JWT 接入三件套(host + 项目 ID + 凭据 ID);齐备 + 全局公钥已生成 → 切和风,

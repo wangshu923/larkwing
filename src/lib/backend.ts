@@ -365,6 +365,8 @@ export interface VoiceStatus {
   devices: string[]
   /** 音色列表:内置在线音色 + 克隆(含内置 BT 预置);id 克隆为 "clone:<id>"。 */
   speakers: { id: string; name: string; isClone?: boolean; builtin?: boolean }[]
+  /** 出厂默认音色 id(单源 = 后端 tts::DEFAULT_SPEAKER);前端未设音色时用它高亮默认项,不写死副本(§4.11)。 */
+  defaultSpeaker: string
 }
 
 /** 输入形态(语音会话模式,PLAN §11):发送瞬间物化,真相在库。省略 = 打字默认形。 */

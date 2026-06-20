@@ -304,8 +304,7 @@ export default {
     listening: '在听你说…',
     thinking: '正在想…',
     speaking: '正在说…',
-    idle: '我有空~', // 待机问候(胶囊条窄,短到不截断;长信息才走滚动/省略):channel-neutral,不写"喊"(语音关着时也显示,见 wakeArmed 才是语音态)
-    wakeArmed: '🎙 喊「{kw}」', // 待机轮播·麦克风在等唤醒词(免手唤醒开着时);框架词压短,留唤醒词本身
+    idle: '我有空~', // 待机问候(胶囊条窄,短到不截断;长信息才走滚动/省略):没有提醒/用量等可显时的兜底
     zoneNow: '正在进行',
     zoneNews: '最近消息',
     todayCost: '今日 {amount}',
@@ -435,9 +434,7 @@ export default {
       sensitivity: '唤醒灵敏度',
       sensSteady: '稳重',
       sensKeen: '灵敏',
-      sensitivityHint: '默认已拉到最灵敏,优先保证你一叫就应;要是老被无关声音误触、自己醒,就往左拖调稳一点。',
-      // 录音标定(替代盲拖滑块):录几遍 → 按真声+环境一次定灵敏度(必要时连触发拼写)
-      calib: '帮我调准',
+      // 录音标定(替代盲拖滑块):录几遍 → 按真声+环境一次定灵敏度(必要时连触发拼写)。小入口贴在灵敏度行
       calibStart: '录几遍帮我定',
       calibAgain: '再来一次',
       calibCancel: '取消',
@@ -445,7 +442,6 @@ export default {
       calibRound: '清楚念第 {n}/{total} 遍…',
       calibAmbient: '安静一下,录段环境音…',
       calibComputing: '正在算最适合你的设置…',
-      calibHint: '不想自己拖滑块?点这个,跟着念几遍唤醒词,它按你的真实发音和家里环境把灵敏度调到正好(必要时连触发发音一起校)。',
       calibSayHint: '听到提示就清楚地念一遍「{kw}」,要录几遍;最后安静一下,录一小段环境音。全程只在本机处理。',
       calibVerdict_good: '调好啦 · 灵敏度已设为 {sens}',
       calibVerdict_noisy: '调好了,但家里有点吵 · 灵敏度 {sens};要是常被误唤醒,再往「稳重」挪一点。',
@@ -469,6 +465,12 @@ export default {
       ttsBackend: '嗓音来源',
       tts_online: '在线',
       tts_offline: '离线',
+      // 识别模型档(2026-06 放出来选):默认 SenseVoice 快;Whisper 对小孩/口音更稳;FireRed 中文最准
+      asrModel: '识别模型',
+      asr_standard: '标准 · 快(默认)',
+      asr_kids: '听小孩更准 · Whisper(约 370MB,稍慢)',
+      asr_zh: '中文最准 · 小红书 FireRed(约 740MB)',
+      asrModelHint: '听不清小朋友说话时,选「听小孩更准」多半会好些(它对小孩、口音更稳,代价是慢一点点)。换了之后第一次用会自动下载对应模型,识别全程只在本机。',
       component: '语音组件',
       compReady: '已就绪',
       compMissing: '未下载 · 首次使用时自动准备',

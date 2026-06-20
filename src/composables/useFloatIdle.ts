@@ -14,10 +14,9 @@ import {
 } from '../lib/backend'
 import { i18n } from '../i18n'
 import { useSettings } from './useSettings'
-import { useVoice } from './useVoice'
 
 export interface IdleItem {
-  kind: 'wake' | 'reminder' | 'cost' | 'balance'
+  kind: 'reminder' | 'cost' | 'balance'
   text: string
 }
 
@@ -34,7 +33,6 @@ const state = reactive({
 
 let wired = false
 let timer: ReturnType<typeof setInterval> | undefined
-let voiceState: ReturnType<typeof useVoice>['state'] | null = null // 唤醒态归 useVoice 单例,这里只读
 
 /** due_at(ms)→ HH:MM(时分;日期/区域格式归 OS,这里只取钟点)。 */
 function hhmm(ms: number): string {
@@ -66,7 +64,6 @@ async function refresh() {
 function wire() {
   if (wired) return
   wired = true
-  voiceState = useVoice().state
   if (!isTauri()) {
     // 浏览器预览:?demo=float 塞一条提醒,纯看轮播视觉(唤醒那条由 useVoice 的 demo 塞)
     if (new URLSearchParams(location.search).get('demo')?.includes('float')) {
@@ -89,11 +86,8 @@ function wire() {
 
 const items = computed<IdleItem[]>(() => {
   const out: IdleItem[] = []
-  // ① 麦克风在等唤醒(最该让人知道"它在听着我"):喊名字唤醒开着时置顶,与提醒/问候轮播
-  if (voiceState?.wakeArmed) {
-    const kw = voiceState.wakeKeywords.length ? voiceState.wakeKeywords.join('、') : '小七'
-    out.push({ kind: 'wake', text: t('float.wakeArmed', { kw }) })
-  }
+  // 待机轮播只显示 OS 不会主动告诉你的事:下个提醒 +(opt-in)今日花费/余额。
+  // 「在等唤醒」不进文字条(用户:留头像的竖耳环示意即可),空池由 FloatWindow 回退到「我有空」。
   const r = state.data?.next_reminder
   if (r) out.push({ kind: 'reminder', text: `${hhmm(r.due_at)}  ${r.content}` })
   // (去掉"最近一句旺财说的话":用户反馈意义不大)

@@ -48,7 +48,7 @@ async function loadVoice() {
       vadReady: false,
       kwsReady: false,
       wakeRunning: false,
-      keywords: ['小七'],
+      keywords: ['示例唤醒词'], // 预览占位(非默认值副本——默认唤醒词单源在后端 voice/mod.rs::wake_keywords,§4.11)
       devices: ['MacBook 麦克风(预览)', 'USB 会议麦(预览)'],
       speakers: [
         { id: 'zh-CN-XiaoxiaoNeural', name: '晓晓 · 温柔' },
@@ -57,6 +57,7 @@ async function loadVoice() {
         { id: 'zh-CN-YunjianNeural', name: '云健 · 沉稳' },
         { id: 'clone:demo', name: '我的声音(示例)', isClone: true, builtin: false },
       ],
+      defaultSpeaker: 'zh-CN-XiaoxiaoNeural', // 预览假数据(§6.6 豁免);真机时来自后端 VoiceStatus.defaultSpeaker
     }
   } else {
     try {
@@ -199,6 +200,14 @@ function onVoiceSeg(key: string, v: string) {
 function onTtsBackend(b: string) {
   void settings.set('voice.tts_backend', b)
   refreshAckPrompts()
+}
+
+// 识别模型档(sense-voice/whisper-small/firered-ctc):写库 → 开着唤醒就重启循环让新模型生效
+// (同 sensitivity;新模型首次会用时下载)→ 刷状态行(组件就绪反映的是当前选中的模型)。
+async function onAsrModel(e: Event) {
+  await settings.set('voice.asr.model', (e.target as HTMLSelectElement).value)
+  await restartWakeIfRunning()
+  if (isTauri()) voiceInfo.value = await api.voiceStatus().catch(() => voiceInfo.value)
 }
 
 // 自定义音色:选本地音频文件 → 前端解码/重采样成 16k → 后端转写出草稿 → 起名/改稿 → 保存。
@@ -903,7 +912,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             <template v-for="sp in voiceInfo?.speakers ?? []" :key="sp.id">
               <button
                 class="chip sp"
-                :class="{ on: settings.get('voice.speaker') === sp.id, busy: previewing === sp.id }"
+                :class="{ on: (settings.get('voice.speaker') || voiceInfo?.defaultSpeaker) === sp.id, busy: previewing === sp.id }"
                 :title="t('settings.voice.preview')"
                 @click="previewSpeaker(sp.id)"
               >{{ sp.name }}</button>
@@ -1005,30 +1014,19 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               @change="saveSensitivity(Number(($event.target as HTMLInputElement).value))"
             />
             <small>{{ t('settings.voice.sensKeen') }}</small>
-          </span>
-        </div>
-        <p class="hint">{{ t('settings.voice.sensitivityHint') }}</p>
-        <!-- 录音标定:不想盲拖滑块就录几遍,按真实发音+环境把灵敏度(必要时连触发拼写)定到正好 -->
-        <div class="row">
-          <span class="label">{{ t('settings.voice.calib') }}</span>
-          <span class="key-state">
-            <span v-if="calib.running" class="calib-live" :class="{ pulse: calib.listening }">{{ calibStepLabel }}</span>
-            <span
-              v-else-if="calib.phase === 'done' && calib.result"
-              class="calib-done"
-              :class="{ ok: calib.result.ok }"
-            >{{ calibVerdict }}</span>
-            <button v-if="calib.running" class="link" @click="cancelCalib">{{ t('settings.voice.calibCancel') }}</button>
-            <button v-else class="link" :disabled="keywordWarn === 'all-bad'" @click="startCalib">
+            <!-- 录音标定挪进灵敏度行当小入口:不想盲拖就录几遍,按真实发音+环境(必要时连触发拼写)定到正好 -->
+            <button v-if="calib.running" class="link calib-link" @click="cancelCalib">{{ t('settings.voice.calibCancel') }}</button>
+            <button v-else class="link calib-link" :disabled="keywordWarn === 'all-bad'" @click="startCalib">
               {{ calib.phase === 'done' ? t('settings.voice.calibAgain') : t('settings.voice.calibStart') }}
             </button>
           </span>
         </div>
-        <p class="hint">
-          {{ calib.running
-            ? t('settings.voice.calibSayHint', { kw: (voiceInfo?.keywords ?? []).join('、') })
-            : t('settings.voice.calibHint') }}
+        <!-- 平时不占版面(去掉了原来两段大提示);只有标定进行中给念词引导、刚结束报一句结果 -->
+        <p v-if="calib.running" class="hint">
+          <span class="calib-live" :class="{ pulse: calib.listening }">{{ calibStepLabel }}</span>
+          {{ t('settings.voice.calibSayHint', { kw: (voiceInfo?.keywords ?? []).join('、') }) }}
         </p>
+        <p v-else-if="calib.phase === 'done' && calib.result" class="hint" :class="{ ok: calib.result.ok }">{{ calibVerdict }}</p>
         <div v-for="(seg, name) in { rate: segs.rate, patience: segs.patience }" :key="name" class="row">
           <span class="label">{{ t(`settings.voice.${name}`) }}</span>
           <span class="seg">
@@ -1070,6 +1068,21 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             >{{ t(`settings.voice.tts_${b}`) }}</button>
           </span>
         </div>
+        <!-- 识别模型(2026-06 用户要求放出来选):默认 SenseVoice 快;Whisper 对小孩/口音更稳;
+             FireRed 中文最准。模型用时下载;换档后开着唤醒会重启循环让新模型生效(同 sensitivity) -->
+        <div class="row">
+          <span class="label">{{ t('settings.voice.asrModel') }}</span>
+          <select
+            class="s-input v-mic"
+            :value="settings.get('voice.asr.model') || 'sense-voice'"
+            @change="onAsrModel"
+          >
+            <option value="sense-voice">{{ t('settings.voice.asr_standard') }}</option>
+            <option value="whisper-small">{{ t('settings.voice.asr_kids') }}</option>
+            <option value="firered-ctc">{{ t('settings.voice.asr_zh') }}</option>
+          </select>
+        </div>
+        <p class="hint">{{ t('settings.voice.asrModelHint') }}</p>
         <div class="row">
           <span class="label">{{ t('settings.voice.component') }}</span>
           <span class="s-mono comp" :class="{ ok: voiceInfo?.asrReady }">
@@ -1409,6 +1422,9 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .hint { font-size: 12px; color: var(--text-dim); line-height: 1.7; display: flex; align-items: center; gap: 10px; padding-top: 13px; }
 .hint.err { color: var(--danger); }
 .hint.warn { color: var(--warn); }
+.hint.ok { color: var(--ok); }
+/* 灵敏度行里的标定小入口:贴着「灵敏」,别撑行 */
+.sens .calib-link { margin-left: 4px; white-space: nowrap; }
 .s-input.bad { border-color: var(--danger); }
 
 .teaser { padding: 26px 0; color: var(--text-dim); font-size: 13.5px; }
