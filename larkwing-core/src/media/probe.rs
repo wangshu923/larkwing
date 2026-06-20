@@ -276,6 +276,173 @@ fn duration_from_moov(moov: &[u8]) -> Option<f64> {
     (secs.is_finite() && secs > 0.0).then_some(secs)
 }
 
+/// fMP4 里第一个 `moof` 盒的偏移(= `ftyp`+`moov` 之后)。把 ffmpeg 出的「自包含分片 mp4」
+/// (ftyp+moov+moof+mdat)切成 HLS fMP4 要的两块:**共享 init**(`0..first_moof`,即 ftyp+moov)
+/// 与 **moof 段**(`first_moof..`,moof+mdat)。逐顶层盒前进找 moof;找不到/畸形 → None。
+pub fn first_moof_offset(b: &[u8]) -> Option<usize> {
+    let total = b.len() as u64;
+    let mut off: u64 = 0;
+    loop {
+        if off + 8 > total {
+            return None;
+        }
+        let o = off as usize;
+        let size32 = u32::from_be_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]) as u64;
+        let btype = &b[o + 4..o + 8];
+        let box_size = match size32 {
+            1 => {
+                if off + 16 > total {
+                    return None;
+                }
+                u64::from_be_bytes(b[o + 8..o + 16].try_into().ok()?)
+            }
+            0 => return None,
+            n => n,
+        };
+        if box_size < 8 {
+            return None;
+        }
+        if btype == b"moof" {
+            return Some(o);
+        }
+        off = off.checked_add(box_size)?;
+    }
+}
+
+/// 在字节区间 `[start, end)` 内逐顶层盒前进,对每个盒回调 `f(type4, header_len, box_start, box_end)`
+/// (payload = `[box_start+header_len, box_end)`)。处理 32 位 size、size==1 的 64 位 largesize、
+/// size==0(延伸到 end)。畸形即停。不下钻 —— 进容器盒靠对其 payload 再调一次。
+fn for_each_box(b: &[u8], start: usize, end: usize, mut f: impl FnMut(&[u8], usize, usize, usize)) {
+    let end = end.min(b.len());
+    let mut o = start;
+    while o + 8 <= end {
+        let size32 = u32::from_be_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]) as usize;
+        let typ = &b[o + 4..o + 8];
+        let (box_end, hdr) = match size32 {
+            1 => {
+                if o + 16 > end {
+                    break;
+                }
+                let sz = u64::from_be_bytes(b[o + 8..o + 16].try_into().unwrap()) as usize;
+                (o.saturating_add(sz).min(end), 16usize)
+            }
+            0 => (end, 8usize),
+            n => (o.saturating_add(n).min(end), 8usize),
+        };
+        if box_end < o + hdr {
+            break; // 畸形:盒比头还小
+        }
+        f(typ, hdr, o, box_end);
+        if size32 == 0 || box_end <= o {
+            break;
+        }
+        o = box_end;
+    }
+}
+
+/// 找直接子盒 `typ`,返回其 **payload** 范围 `[start, end)`(已跳过盒头)。
+fn find_box(b: &[u8], typ: &[u8; 4], start: usize, end: usize) -> Option<(usize, usize)> {
+    let mut found = None;
+    for_each_box(b, start, end, |t, hdr, bs, be| {
+        if found.is_none() && t == &typ[..] {
+            found = Some((bs + hdr, be));
+        }
+    });
+    found
+}
+
+/// 从 fMP4 的 init(ftyp+moov)解析每条轨道的 `(track_id, timescale)`。用于把按需切出的分片段
+/// 里被重置为 0 的 `tfdt.baseMediaDecodeTime` 改回累计值(段在时间轴上的正确起点 = start×timescale)。
+/// 走 moov → trak →(tkhd 取 track_id、mdia/mdhd 取 timescale)。解析不出某轨就跳过(降级:不患的轨
+/// 不动 tfdt,等价于回落 0 起点,绝不 panic)。
+pub fn init_timescales(init: &[u8]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let Some((mo_s, mo_e)) = find_box(init, b"moov", 0, init.len()) else { return out };
+    for_each_box(init, mo_s, mo_e, |t, hdr, bs, be| {
+        if t != b"trak" {
+            return;
+        }
+        let (ps, pe) = (bs + hdr, be);
+        // tkhd: fullbox version/flags(4) + creation/mod(v1:8+8 / v0:4+4) + track_ID(4)
+        let Some((tk_s, _)) = find_box(init, b"tkhd", ps, pe) else { return };
+        let tkv = init.get(tk_s).copied().unwrap_or(0);
+        let tid_off = tk_s + 4 + if tkv == 1 { 16 } else { 8 };
+        let Some(tid) =
+            init.get(tid_off..tid_off + 4).and_then(|s| s.try_into().ok()).map(u32::from_be_bytes)
+        else {
+            return;
+        };
+        // mdia → mdhd: version/flags(4) + creation/mod(v1:8+8 / v0:4+4) + timescale(4)
+        let Some((md_s, md_e)) = find_box(init, b"mdia", ps, pe) else { return };
+        let Some((mh_s, _)) = find_box(init, b"mdhd", md_s, md_e) else { return };
+        let mhv = init.get(mh_s).copied().unwrap_or(0);
+        let ts_off = mh_s + 4 + if mhv == 1 { 16 } else { 8 };
+        let Some(ts) =
+            init.get(ts_off..ts_off + 4).and_then(|s| s.try_into().ok()).map(u32::from_be_bytes)
+        else {
+            return;
+        };
+        if ts != 0 {
+            out.push((tid, ts));
+        }
+    });
+    out
+}
+
+/// 段体末偏移 = 第一个 `mdat` 盒的结尾。`ffmpeg -f mp4` 会在文件尾再写一个 `mfra`(随机访问索引),
+/// 普通 HLS 媒体段没有它、且其偏移在切掉 init 后已失效 —— 截到 mdat 结尾,产出干净的「moof+mdat」段。
+/// 找不到 mdat → `full.len()`(原样不截,绝不挡播放)。`moof` = `first_moof_offset` 的返回值。
+pub fn moof_segment_end(full: &[u8], moof: usize) -> usize {
+    let mut end = full.len();
+    let mut found = false;
+    for_each_box(full, moof, full.len(), |t, _hdr, _bs, be| {
+        if !found && t == b"mdat" {
+            end = be;
+            found = true;
+        }
+    });
+    end
+}
+
+/// 把按需切出的分片段(`moof+mdat`,单 moof、每轨一个 traf)里被重置为 0 的
+/// `tfdt.baseMediaDecodeTime` 改写成累计值,使该段在 MSE 时间轴上落到正确起点 `start_secs`。
+/// 这样产出的是**标准「累计 tfdt」fMP4-HLS 段**,shaka 直接按 tfdt 拼接 —— 不依赖播放器对 HLS
+/// 分片额外算 timestampOffset 的实现细节(实测 ffmpeg 输入 seek 出的分片 tfdt 恒为 0,不修则各段
+/// 全堆在 0 秒 → 黑屏/错乱)。`track_ts` = `init_timescales` 的结果。某轨找不到则跳过(不动那条 tfdt)。
+pub fn patch_segment_tfdt(seg: &mut [u8], track_ts: &[(u32, u32)], start_secs: f64) {
+    let Some((mf_s, mf_e)) = find_box(seg, b"moof", 0, seg.len()) else { return };
+    // 先只读扫描收集补丁((tfdt payload 偏移, version, 新 base)),再统一写回(避免可变借用穿插)。
+    let mut patches: Vec<(usize, u8, u64)> = Vec::new();
+    for_each_box(seg, mf_s, mf_e, |t, hdr, bs, be| {
+        if t != b"traf" {
+            return;
+        }
+        let (ps, pe) = (bs + hdr, be);
+        // tfhd: version/flags(4) + track_ID(4)(track_ID 恒在最前,与可选 flag 字段无关)
+        let Some((th_s, _)) = find_box(seg, b"tfhd", ps, pe) else { return };
+        let Some(tid) =
+            seg.get(th_s + 4..th_s + 8).and_then(|s| s.try_into().ok()).map(u32::from_be_bytes)
+        else {
+            return;
+        };
+        let Some(&(_, ts)) = track_ts.iter().find(|(id, _)| *id == tid) else { return };
+        let Some((td_s, _)) = find_box(seg, b"tfdt", ps, pe) else { return };
+        let ver = seg.get(td_s).copied().unwrap_or(0);
+        let base = (start_secs * ts as f64).round().max(0.0) as u64;
+        patches.push((td_s, ver, base));
+    });
+    for (td_s, ver, base) in patches {
+        let off = td_s + 4; // 跳过 version/flags
+        if ver == 1 {
+            if let Some(slot) = seg.get_mut(off..off + 8) {
+                slot.copy_from_slice(&base.to_be_bytes());
+            }
+        } else if let Some(slot) = seg.get_mut(off..off + 4) {
+            slot.copy_from_slice(&(base as u32).to_be_bytes());
+        }
+    }
+}
+
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
     find_subslice(hay, needle).is_some()
 }
@@ -455,6 +622,175 @@ Input #0, matroska,webm, from 'movie.mkv':
         // 头太短(只有半个盒头)→ None,不 panic
         assert_eq!(probe_sidx(b"\x00\x00"), None);
         assert_eq!(probe_sidx(b""), None);
+    }
+
+    /// fullbox payload 头:version + 3 字节 flags(0)。
+    fn fullbox(version: u8) -> Vec<u8> {
+        vec![version, 0, 0, 0]
+    }
+
+    /// tkhd v0(只到 track_id 即可,后续字段填零):flags + creation(4)+mod(4)+track_ID(4)。
+    fn tkhd_v0(track_id: u32) -> Vec<u8> {
+        let mut p = fullbox(0);
+        p.extend_from_slice(&0u32.to_be_bytes()); // creation
+        p.extend_from_slice(&0u32.to_be_bytes()); // modification
+        p.extend_from_slice(&track_id.to_be_bytes());
+        p.extend_from_slice(&[0u8; 60]); // 余下字段(reserved/duration/matrix…),解析读不到此处
+        p
+    }
+
+    /// mdhd v0:flags + creation(4)+mod(4)+timescale(4)+duration(4)。
+    fn mdhd_v0(timescale: u32) -> Vec<u8> {
+        let mut p = fullbox(0);
+        p.extend_from_slice(&0u32.to_be_bytes());
+        p.extend_from_slice(&0u32.to_be_bytes());
+        p.extend_from_slice(&timescale.to_be_bytes());
+        p.extend_from_slice(&0u32.to_be_bytes()); // duration
+        p
+    }
+
+    fn trak(track_id: u32, timescale: u32) -> Vec<u8> {
+        let tkhd = mp4_box(b"tkhd", &tkhd_v0(track_id));
+        let mdhd = mp4_box(b"mdhd", &mdhd_v0(timescale));
+        let mdia = mp4_box(b"mdia", &mdhd);
+        let mut payload = tkhd;
+        payload.extend_from_slice(&mdia);
+        mp4_box(b"trak", &payload)
+    }
+
+    /// tfhd:flags + track_ID(4)。
+    fn tfhd(track_id: u32) -> Vec<u8> {
+        let mut p = fullbox(0);
+        p.extend_from_slice(&track_id.to_be_bytes());
+        p
+    }
+
+    /// tfdt v1:flags + baseMediaDecodeTime(u64)。
+    fn tfdt_v1(base: u64) -> Vec<u8> {
+        let mut p = fullbox(1);
+        p.extend_from_slice(&base.to_be_bytes());
+        p
+    }
+
+    fn traf(track_id: u32, base: u64) -> Vec<u8> {
+        let mut payload = mp4_box(b"tfhd", &tfhd(track_id));
+        payload.extend_from_slice(&mp4_box(b"tfdt", &tfdt_v1(base)));
+        mp4_box(b"traf", &payload)
+    }
+
+    /// 读某 traf 的 tfdt(v1)base —— 测试断言用。
+    fn read_tfdt_base(seg: &[u8], track_id: u32) -> Option<u64> {
+        let (mf_s, mf_e) = find_box(seg, b"moof", 0, seg.len())?;
+        let mut got = None;
+        for_each_box(seg, mf_s, mf_e, |t, hdr, bs, be| {
+            if t != b"traf" || got.is_some() {
+                return;
+            }
+            let (ps, pe) = (bs + hdr, be);
+            let Some((th_s, _)) = find_box(seg, b"tfhd", ps, pe) else { return };
+            let tid = u32::from_be_bytes(seg[th_s + 4..th_s + 8].try_into().unwrap());
+            if tid != track_id {
+                return;
+            }
+            let Some((td_s, _)) = find_box(seg, b"tfdt", ps, pe) else { return };
+            got = Some(u64::from_be_bytes(seg[td_s + 4..td_s + 12].try_into().unwrap()));
+        });
+        got
+    }
+
+    /// 端到端:用 HLS 段的真实 ffmpeg flag 切一段,跑真·probe 函数链(first_moof_offset →
+    /// init_timescales → moof_segment_end → patch_segment_tfdt),断言 tfdt 被改成累计起点。
+    /// 需要 PATH 里有 ffmpeg → 平时 `#[ignore]`,本机手动 `cargo test -- --ignored real_ffmpeg` 跑。
+    #[test]
+    #[ignore]
+    fn real_ffmpeg_segment_patches_to_cumulative_tfdt() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("lw-hls-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.mp4");
+        // 20s testsrc + sine,H.264 + AAC
+        let ok = Command::new("ffmpeg")
+            .args(["-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=20",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=20",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-g", "50",
+                "-c:a", "aac"])
+            .arg(&src)
+            .status().expect("run ffmpeg").success();
+        assert!(ok, "生成测试源失败");
+
+        // 切第 2 段 [6,12)(对应 build_frag_cmd 的 flag:单 moof、empty_moov+default_base_moof)
+        let out = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-ss", "6.000"])
+            .arg("-i").arg(&src)
+            .args(["-t", "6.000", "-map", "0:v:0?", "-map", "0:a:0?", "-c:v", "copy", "-c:a", "copy",
+                "-movflags", "empty_moov+default_base_moof", "-frag_duration", "600000000",
+                "-f", "mp4", "pipe:1"])
+            .output().expect("切段");
+        let full = out.stdout;
+        assert!(!full.is_empty(), "ffmpeg 无输出");
+
+        let moof = first_moof_offset(&full).expect("找 moof");
+        let ts = init_timescales(&full[..moof]);
+        assert!(ts.iter().any(|(_, t)| *t > 0), "应解析出 timescale: {ts:?}");
+        let end = moof_segment_end(&full, moof);
+        let mut body = full[moof..end].to_vec();
+        // 改前 tfdt 应 ≈ 0
+        for (tid, _) in &ts {
+            assert_eq!(read_tfdt_base(&body, *tid), Some(0), "输入 seek 出的段 tfdt 改前应为 0");
+        }
+        patch_segment_tfdt(&mut body, &ts, 6.0);
+        for (tid, scale) in &ts {
+            let want = (6.0 * *scale as f64).round() as u64;
+            assert_eq!(read_tfdt_base(&body, *tid), Some(want), "轨 {tid} tfdt 应改为累计 6s");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn init_timescales_reads_each_track() {
+        // moov = mvhd + trak(id1,ts12800) + trak(id2,ts44100)
+        let mut moov = mp4_box(b"mvhd", &mvhd_v0(1000, 1000));
+        moov.extend_from_slice(&trak(1, 12800));
+        moov.extend_from_slice(&trak(2, 44100));
+        let init = {
+            let mut v = mp4_box(b"ftyp", b"isom");
+            v.extend_from_slice(&mp4_box(b"moov", &moov));
+            v
+        };
+        assert_eq!(init_timescales(&init), vec![(1, 12800), (2, 44100)]);
+    }
+
+    #[test]
+    fn patch_tfdt_sets_cumulative_base_and_strips_mfra() {
+        // 自包含分片:ftyp + moov(2 轨)+ moof(2 traf,base=0)+ mdat + mfra(末尾,应被剔除)
+        let mut moov = mp4_box(b"mvhd", &mvhd_v0(1000, 1000));
+        moov.extend_from_slice(&trak(1, 12800));
+        moov.extend_from_slice(&trak(2, 44100));
+        let mut moof_payload = mp4_box(b"mfhd", &[0u8; 8]);
+        moof_payload.extend_from_slice(&traf(1, 0));
+        moof_payload.extend_from_slice(&traf(2, 0));
+        let mut full = mp4_box(b"ftyp", b"isom");
+        full.extend_from_slice(&mp4_box(b"moov", &moov));
+        full.extend_from_slice(&mp4_box(b"moof", &moof_payload));
+        full.extend_from_slice(&mp4_box(b"mdat", &[0u8; 32]));
+        let with_mfra_len = {
+            full.extend_from_slice(&mp4_box(b"mfra", &[0u8; 16]));
+            full.len()
+        };
+
+        let moof = first_moof_offset(&full).expect("应找到 moof");
+        let ts = init_timescales(&full[..moof]);
+        assert_eq!(ts, vec![(1, 12800), (2, 44100)]);
+
+        let end = moof_segment_end(&full, moof);
+        assert!(end < with_mfra_len, "段体应截到 mdat 末尾、剔除尾部 mfra");
+
+        let mut body = full[moof..end].to_vec();
+        patch_segment_tfdt(&mut body, &ts, 6.0);
+        // 6.0s × timescale:视频 6×12800=76800,音频 6×44100=264600
+        assert_eq!(read_tfdt_base(&body, 1), Some(76_800), "视频轨 tfdt 应改为累计 6s");
+        assert_eq!(read_tfdt_base(&body, 2), Some(264_600), "音频轨 tfdt 应改为累计 6s");
     }
 
     #[test]
