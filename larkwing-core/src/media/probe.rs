@@ -69,6 +69,25 @@ pub fn is_isobmff_ext(path: &Path) -> bool {
     matches!(ext_lower(path).as_deref(), Some("mp4" | "m4v" | "mov"))
 }
 
+/// 是否视频文件(按扩展名)。本地多集续播扫文件夹时,按"同类"过滤(放视频只列视频)。
+/// = ISO BMFF(mp4/m4v/mov)∪ 需转封装容器(mkv/avi…)∪ 浏览器原生(webm/ogv)。
+pub fn is_video_ext(path: &Path) -> bool {
+    is_isobmff_ext(path)
+        || needs_ffmpeg_container(path)
+        || matches!(ext_lower(path).as_deref(), Some("webm" | "ogv"))
+}
+
+/// 是否音频文件(按扩展名)。放歌/听评书的本地多集续播按此过滤(只列音频,不混进视频)。
+pub fn is_audio_ext(path: &Path) -> bool {
+    matches!(
+        ext_lower(path).as_deref(),
+        Some(
+            "mp3" | "m4a" | "m4b" | "aac" | "flac" | "wav" | "ogg" | "oga" | "opus" | "wma"
+                | "ape" | "alac" | "aiff" | "aif"
+        )
+    )
+}
+
 /// **WebView2 容器本身就放不了**、必须经 ffmpeg 转封装成 fMP4 才能播的视频容器(mkv/avi…)。
 /// 这类没有"原生直传"的快车道(本就放不了),所以让它们一律走 ffmpeg:先确保 ffmpeg、再用
 /// `ffmpeg -i` 探编码,兼容的轨 `-c copy`、不兼容的才转。webm / ogv 浏览器能放,不在此列。
@@ -360,6 +379,22 @@ mod tests {
         assert!(needs_ffmpeg_container(Path::new("/x/m.ts")));
         assert!(!needs_ffmpeg_container(Path::new("/x/m.mp4")), "mp4 走 BMFF 快车道");
         assert!(!needs_ffmpeg_container(Path::new("/x/m.webm")), "webm 浏览器原生能放");
+    }
+
+    #[test]
+    fn media_kind_buckets() {
+        // 视频桶:BMFF + 转封装容器 + webm
+        assert!(is_video_ext(Path::new("/x/a.mp4")));
+        assert!(is_video_ext(Path::new("/x/a.MKV")));
+        assert!(is_video_ext(Path::new("/x/a.webm")));
+        assert!(!is_video_ext(Path::new("/x/a.mp3")), "mp3 不是视频");
+        // 音频桶
+        assert!(is_audio_ext(Path::new("/x/a.mp3")));
+        assert!(is_audio_ext(Path::new("/x/a.FLAC")));
+        assert!(is_audio_ext(Path::new("/x/a.m4a")));
+        assert!(!is_audio_ext(Path::new("/x/a.mp4")), "mp4 是视频不是音频");
+        // 字幕/杂项两桶都不收
+        assert!(!is_video_ext(Path::new("/x/a.srt")) && !is_audio_ext(Path::new("/x/a.srt")));
     }
 
     #[test]

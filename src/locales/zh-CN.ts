@@ -149,6 +149,9 @@ export default {
     speed: '倍速',
     fullscreen: '全屏',
     closeVideo: '关闭',
+    prevEp: '上一集',
+    nextEp: '下一集',
+    episodeOf: '第 {cur}/{total} 集',
   },
   chat: {
     placeholder: '跟{name}说点什么…',

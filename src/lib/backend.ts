@@ -282,6 +282,16 @@ export interface TaskView {
   retry?: TaskRetry
 }
 
+/** 多集续播位置(有值 = 当前是 ≥2 集的剧集:B 站合集/分P、本地剧集文件夹)。 */
+export interface PlaylistPos {
+  /** 当前集下标(0 起)。 */
+  index: number
+  /** 总集数(>1)。 */
+  total: number
+  /** 本次是否「接着上次」续播跳转而来(前端忽略,仅供工具叙述)。 */
+  resumed: boolean
+}
+
 export interface NowPlaying {
   kind: 'audio' | 'video'
   title: string
@@ -293,6 +303,8 @@ export interface NowPlaying {
   manifest_url?: string
   page_url: string
   source: string
+  /** 有值 = 多集剧集:UI 显「第N/共M集」+ 上/下一集按钮;ended 时若非末集自动续播。 */
+  playlist?: PlaylistPos
 }
 
 export type MediaEvent =
@@ -722,6 +734,9 @@ export const api = {
   /** 失败任务重试(目前仅影音):按 retry 载体直连重放,进展/结果照常走事件车道。 */
   mediaRetry: (pageUrl: string, audioOnly: boolean) =>
     invoke<void>('media_retry', { pageUrl, audioOnly }),
+  /** 多集续播切集(+1 下一集 / -1 上一集):ended 自动续播、播放器上/下一集按钮直连这里(不绕 LLM)。
+   *  越界(到头/到顶)在 core 内静默(只记日志)。fire-and-forget。 */
+  mediaAdvance: (delta: number) => invoke<void>('media_advance', { delta }),
   /** 回报播放器当下状态给 core(只主窗调):playing/paused 带标题,idle 不带。
    *  core 据此在下个回合喂模型「此刻」背景,修「歌放完了却以为还在播」。fire-and-forget。 */
   reportMediaState: (status: string, title: string | null) =>

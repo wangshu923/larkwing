@@ -150,6 +150,9 @@ export default {
     speed: 'Speed',
     fullscreen: 'Fullscreen',
     closeVideo: 'Close',
+    prevEp: 'Previous',
+    nextEp: 'Next',
+    episodeOf: 'Ep {cur}/{total}',
   },
   chat: {
     placeholder: 'Say something to {name}…',

@@ -128,7 +128,7 @@ function ensureAudio(): HTMLAudioElement {
       if (state.status !== 'idle') state.status = 'paused'
       syncToPeers()
     })
-    audio.addEventListener('ended', stop)
+    audio.addEventListener('ended', onEnded)
     audio.addEventListener('error', () => {
       if (state.current?.kind === 'audio') state.status = 'paused'
     })
@@ -165,7 +165,7 @@ export function registerVideoEl(el: HTMLVideoElement | null) {
     if (state.status !== 'idle') state.status = 'paused'
     syncToPeers()
   })
-  el.addEventListener('ended', stop)
+  el.addEventListener('ended', onEnded)
   // 出错别卡在 loading(否则换台/混流 seek 失败时 spinner 转不停)
   el.addEventListener('error', () => {
     if (state.current?.kind === 'video') state.status = 'paused'
@@ -186,6 +186,9 @@ function play(np: NowPlaying) {
     state.duration = np.duration_seconds ?? 0
     return
   }
+  // 自动续播(同为视频、已在全屏):接着放下一集,**不重做**唤窗/置顶/全屏,videoWasHidden 也保留
+  // (整季放完 stop() 时才据它决定是否藏回托盘)→ 集与集之间无缝、不闪窗口化。
+  const continuation = state.current?.kind === 'video' && np.kind === 'video' && state.fullscreen
   stopElements()
   state.current = np
   state.status = 'loading'
@@ -193,7 +196,7 @@ function play(np: NowPlaying) {
   state.duration = np.duration_seconds ?? 0
   state.rate = 1 // 倍速不跨播放粘住;音量粘住
   videoBase = 0
-  videoWasHidden = false // 每次新播放复位;视频分支再据实际可见性置位
+  if (!continuation) videoWasHidden = false // 新播放复位;续播保留首集起的"是否藏着"
   syncToPeers() // 广播"在放这个"给悬浮窗镜像
   if (np.kind === 'audio') {
     const a = ensureAudio()
@@ -203,17 +206,20 @@ function play(np: NowPlaying) {
   } else if (np.kind === 'video') {
     if (videoEl) void loadVideoInto(videoEl) // 自适应走 shaka,否则原生 src
     // videoEl 还没挂:VideoOverlay 随 current 出现,registerVideoEl 接力起播(同样走 loadVideoInto)。
-    // 视频默认:叫主窗到最前(藏在托盘/别的窗后面时只闻其声)+ 置顶(别被盖住)+ 全屏(用户要求)。
-    // 置位放在 videoEl 守卫外,后挂场景也直接铺满、不窗口化闪一下;.maximized 绑 state.fullscreen,
-    // 浮层挂载瞬间即全屏。此处必是主窗(float 已在函数开头早退)。
-    state.fullscreen = true // 同步置位:.maximized 立即生效,浮层挂载即全屏(不闪窗口化)
-    // 窗口动作串行:读"是否藏着"必须在 show 之前(停时据此藏回托盘),再 show + 置顶 + 全屏。
-    void (async () => {
-      videoWasHidden = await win.isHidden()
-      await win.bringToFront()
-      await win.setAlwaysOnTop(true)
-      await win.setFullscreen(true)
-    })()
+    if (!continuation) {
+      // 首次起播视频:叫主窗到最前(藏在托盘/别的窗后面时只闻其声)+ 置顶(别被盖住)+ 全屏(用户要求)。
+      // 置位放在 videoEl 守卫外,后挂场景也直接铺满、不窗口化闪一下;.maximized 绑 state.fullscreen,
+      // 浮层挂载瞬间即全屏。此处必是主窗(float 已在函数开头早退)。
+      state.fullscreen = true // 同步置位:.maximized 立即生效,浮层挂载即全屏(不闪窗口化)
+      // 窗口动作串行:读"是否藏着"必须在 show 之前(停时据此藏回托盘),再 show + 置顶 + 全屏。
+      void (async () => {
+        videoWasHidden = await win.isHidden()
+        await win.bringToFront()
+        await win.setAlwaysOnTop(true)
+        await win.setFullscreen(true)
+      })()
+    }
+    // continuation:已经全屏置顶,什么都不做(state.fullscreen 维持 true、窗口不动)。
   }
 }
 
@@ -296,6 +302,29 @@ function stop() {
   state.duration = 0
   state.fullscreen = false
   syncToPeers() // 广播"停了"给悬浮窗(修:UI 点停止 / 自然播完时它仍显在放)
+}
+
+/** 一集放完:有下一集 → 自动续播(core 现取现播,publishes Play 接力,保持全屏);否则正常停。
+ *  只在主窗触发(悬浮窗不实际播放、不会冒 ended)。 */
+function onEnded() {
+  const pl = state.current?.playlist
+  if (pl && pl.index < pl.total - 1) {
+    if (isTauri()) {
+      state.status = 'loading' // 续播解析的空档显 spinner(别看着像卡死)
+      void api.mediaAdvance(1).catch(() => stop()) // 切集失败兜底停
+    } else {
+      stop() // 浏览器预览无 core
+    }
+    return
+  }
+  stop() // 末集 / 单集:正常收尾
+}
+
+/** 上/下一集(+1/-1):播放器按钮 + 嘴控都最终汇到 core 的 advance(全局队列);任意窗口可调
+ *  —— 与 play/pause 这类"本地元素操作"不同,切集是 core 现取现播,float 调了也由主窗接力。 */
+function advance(delta: number) {
+  if (!isTauri()) return
+  void api.mediaAdvance(delta).catch(() => {})
 }
 
 /** seek:自适应流(shaka)/ 音频 / 直转单文件走**原生** currentTime(播放器管时间轴,精确 + 同步);
@@ -382,15 +411,32 @@ function wire() {
     return
   }
   const demo = new URLSearchParams(location.search).get('demo') ?? ''
-  if (demo.includes('player')) {
+  if (demo.includes('series')) {
+    // 多集视频(动画片续播)视觉预览:VideoOverlay 的集数指示 + 上/下一集
+    state.current = {
+      kind: 'video',
+      title: '小猪佩奇 第3集 踩泥坑',
+      duration_seconds: 320,
+      stream_url: '',
+      page_url: '#',
+      source: 'local',
+      playlist: { index: 2, total: 12, resumed: false },
+    }
+    state.status = 'playing'
+    state.duration = 320
+    state.position = 88
+    state.fullscreen = false
+  } else if (demo.includes('player')) {
     state.current = {
       kind: 'audio',
-      title: '恭喜发财 刘德华 官方MV',
-      author: '华仔频道',
+      title: '西游记 第7回 收服白龙马',
+      author: '单田芳 评书',
       duration_seconds: 225,
       stream_url: '',
       page_url: '#',
       source: 'bilibili',
+      // 多集音频(评书/儿歌合集):播放条出集数 + 上/下一集
+      playlist: { index: 6, total: 30, resumed: false },
     }
     state.status = 'playing'
     state.duration = 225
@@ -401,5 +447,18 @@ function wire() {
 
 export function useMedia() {
   wire()
-  return { state, toggle, pause, resume, stop, seek, setVolume, setRate, loginNow, dismissLoginHint }
+  return {
+    state,
+    toggle,
+    pause,
+    resume,
+    stop,
+    seek,
+    setVolume,
+    setRate,
+    next: () => advance(1),
+    prev: () => advance(-1),
+    loginNow,
+    dismissLoginHint,
+  }
 }

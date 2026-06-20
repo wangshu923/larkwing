@@ -7,9 +7,11 @@ import { useMedia } from '../composables/useMedia'
 import { fmtClock } from '../lib/fmt'
 
 const { t } = useI18n()
-const { state, toggle, stop, seek, setVolume, loginNow, dismissLoginHint } = useMedia()
+const { state, toggle, stop, seek, setVolume, next, prev, loginNow, dismissLoginHint } = useMedia()
 
 const showBar = computed(() => state.current?.kind === 'audio')
+/** 多集音频(评书/儿歌合集等)才出集数 + 上/下一集。 */
+const playlist = computed(() => state.current?.playlist ?? null)
 const pct = computed(() =>
   state.duration > 0 ? Math.min(100, (state.position / state.duration) * 100) : 0,
 )
@@ -32,16 +34,37 @@ function onVolume(e: Event) {
 
   <div v-if="showBar" class="player">
     <button
+      v-if="playlist"
+      class="pbtn"
+      @click="prev"
+      :disabled="playlist.index <= 0"
+      :title="t('media.prevEp')"
+    >
+      ⏮
+    </button>
+    <button
       class="pbtn"
       @click="toggle"
       :title="state.status === 'playing' ? t('media.pause') : t('media.play')"
     >
       {{ state.status === 'playing' ? '⏸' : '▶' }}
     </button>
+    <button
+      v-if="playlist"
+      class="pbtn"
+      @click="next"
+      :disabled="playlist.index >= playlist.total - 1"
+      :title="t('media.nextEp')"
+    >
+      ⏭
+    </button>
     <div class="mid">
       <div class="title-row">
         <span class="note" :class="{ live: state.status === 'playing' }">♪</span>
         <span class="title">{{ state.current!.title }}</span>
+        <span v-if="playlist" class="ep">{{
+          t('media.episodeOf', { cur: playlist.index + 1, total: playlist.total })
+        }}</span>
         <span class="clock">{{ fmtClock(state.position) }} / {{ fmtClock(state.duration) }}</span>
       </div>
       <input
@@ -86,6 +109,7 @@ function onVolume(e: Event) {
   transition: border-color .15s, background .15s, box-shadow .15s;
 }
 .pbtn:hover { border-color: var(--accent); box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.3); }
+.pbtn:disabled { opacity: .32; cursor: default; border-color: var(--line); box-shadow: none; }
 .pbtn.stop { color: var(--attn); border-color: rgba(var(--attn-rgb), 0.35); }
 .pbtn.stop:hover { border-color: var(--attn); box-shadow: 0 0 12px rgba(var(--attn-rgb), 0.3); }
 
@@ -95,6 +119,11 @@ function onVolume(e: Event) {
 .note.live { animation: bounce 1s ease-in-out infinite; }
 @keyframes bounce { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-2px); } }
 .title { flex: 1; min-width: 0; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ep {
+  flex: none; color: var(--accent); font-size: 10.5px; letter-spacing: .3px;
+  padding: 1px 7px; border-radius: 999px;
+  background: rgba(var(--accent-rgb), 0.12); border: 1px solid rgba(var(--accent-rgb), 0.28);
+}
 .clock { color: var(--text-dim); font: 10.5px/1 ui-monospace, "SF Mono", monospace; letter-spacing: .5px; }
 
 .slider {

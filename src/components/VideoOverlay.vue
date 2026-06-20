@@ -9,7 +9,10 @@ import { win } from '../lib/backend'
 import { fmtClock } from '../lib/fmt'
 
 const { t } = useI18n()
-const { state, toggle, stop, seek, setVolume, setRate } = useMedia()
+const { state, toggle, stop, seek, setVolume, setRate, next, prev } = useMedia()
+
+/** 多集剧集才出集数指示 + 上/下一集按钮(单集/电影为 null,不出现)。 */
+const playlist = computed(() => state.current?.playlist ?? null)
 
 /** 倍速循环挡位(点一下进一档,家庭场景不需要精调)。 */
 const RATES = [1, 1.25, 1.5, 2, 0.75]
@@ -125,13 +128,34 @@ onUnmounted(() => {
     >
       <header class="bar top">
         <span class="title">{{ state.current!.title }}</span>
+        <span v-if="playlist" class="ep">{{
+          t('media.episodeOf', { cur: playlist.index + 1, total: playlist.total })
+        }}</span>
         <button class="vbtn" @click="stop" :title="t('media.closeVideo')">✕</button>
       </header>
       <video ref="video" class="screen" playsinline @dblclick="toggleFullscreen"></video>
       <div v-if="state.status === 'loading'" class="spinner" aria-hidden="true"></div>
       <footer class="bar bottom">
+        <button
+          v-if="playlist"
+          class="vbtn"
+          @click="prev"
+          :disabled="playlist.index <= 0"
+          :title="t('media.prevEp')"
+        >
+          ⏮
+        </button>
         <button class="vbtn" @click="toggle">
           {{ state.status === 'playing' ? '⏸' : '▶' }}
+        </button>
+        <button
+          v-if="playlist"
+          class="vbtn"
+          @click="next"
+          :disabled="playlist.index >= playlist.total - 1"
+          :title="t('media.nextEp')"
+        >
+          ⏭
         </button>
         <span class="clock">{{ fmtClock(displayPos) }} / {{ fmtClock(state.duration) }}</span>
         <input
@@ -219,6 +243,11 @@ onUnmounted(() => {
   color: #d4e6f7; font-size: 13px;
 }
 .title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; letter-spacing: .4px; }
+.ep {
+  flex: none; color: var(--accent); font-size: 11.5px; letter-spacing: .4px;
+  padding: 2px 8px; border-radius: 999px;
+  background: rgba(var(--accent-rgb), 0.12); border: 1px solid rgba(var(--accent-rgb), 0.28);
+}
 .clock { color: var(--text-dim); font: 11px/1 ui-monospace, "SF Mono", monospace; letter-spacing: .5px; flex: none; }
 
 .vbtn {
@@ -227,6 +256,7 @@ onUnmounted(() => {
   background: rgba(var(--accent-rgb), 0.08); color: var(--accent); font-size: 13px;
 }
 .vbtn:hover { border-color: var(--accent); box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.3); }
+.vbtn:disabled { opacity: .32; cursor: default; border-color: rgba(var(--accent-rgb), 0.12); box-shadow: none; }
 
 .slider {
   -webkit-appearance: none; appearance: none; flex: 1; height: 3px; border-radius: 2px;

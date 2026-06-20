@@ -636,10 +636,27 @@ pub fn media_retry(
     audio_only: bool,
 ) -> Result<(), AppError> {
     let media = state.media.clone();
+    let user_id = state.engine.store().users.ensure_default_user()?.id;
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = media.play(&page_url, audio_only).await {
+        // restart=false:重试沿用续播规则(本就是接着之前那次播放)
+        if let Err(e) = media.play(user_id, &page_url, audio_only, false).await {
             // 失败已由 play() 内部 task.fail_retryable 上报 HUD;这里只留日志
             tracing::debug!("重试播放失败(已上报 HUD): {e:#}");
+        }
+    });
+    Ok(())
+}
+
+/// 多集续播切集(PLAN §9 多集续播):前端 `ended` 自动下一集、播放器上/下一集按钮直连这里
+/// (不绕 LLM,同 media_retry / 嘴控按钮哲学 §7.1)。delta = +1 下一集 / -1 上一集。
+/// 越界(到头/到顶)在 advance 内报错,这里只记日志 —— 按钮路径没有模型可叙述。
+#[tauri::command]
+pub fn media_advance(state: State<'_, AppState>, delta: i32) -> Result<(), AppError> {
+    let media = state.media.clone();
+    let user_id = state.engine.store().users.ensure_default_user()?.id;
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = media.advance(user_id, delta).await {
+            tracing::debug!("续播切集结束/失败(可能已到头或到顶): {e:#}");
         }
     });
     Ok(())

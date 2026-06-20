@@ -9,6 +9,7 @@ pub mod chat;
 pub mod cloned_voices;
 pub mod fsops;
 pub mod jobs;
+pub mod media_progress;
 pub mod memory;
 pub mod settings;
 pub mod usage;
@@ -22,6 +23,7 @@ pub use cloned_voices::{ClonedVoice, ClonedVoiceRepo};
 pub use db::Db;
 pub use fsops::{FsOpRepo, FsOpRow};
 pub use jobs::{Job, JobRepo};
+pub use media_progress::{MediaProgressRepo, Progress};
 pub use memory::{Memory, MemoryRepo};
 pub use settings::SettingsRepo;
 pub use usage::{UsageRepo, UsageRound, UsageTotals};
@@ -42,6 +44,7 @@ pub struct Store {
     pub jobs: JobRepo,
     pub fsops: FsOpRepo,
     pub voiceprints: VoiceprintRepo,
+    pub media_progress: MediaProgressRepo,
 }
 
 impl Store {
@@ -59,6 +62,7 @@ impl Store {
             jobs::MIGRATIONS,
             fsops::MIGRATIONS,
             voiceprints::MIGRATIONS,
+            media_progress::MIGRATIONS,
         ]
         .concat();
         db.migrate(&all)?;
@@ -73,7 +77,8 @@ impl Store {
             briefings: BriefingRepo::new(db.clone()),
             jobs: JobRepo::new(db.clone()),
             fsops: FsOpRepo::new(db.clone()),
-            voiceprints: VoiceprintRepo::new(db),
+            voiceprints: VoiceprintRepo::new(db.clone()),
+            media_progress: MediaProgressRepo::new(db),
         })
     }
 }
