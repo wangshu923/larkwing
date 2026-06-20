@@ -416,6 +416,7 @@ async fn hls(State(state): State<Arc<Inner>>, AxPath((token, seg)): AxPath<(Stri
         return bad(StatusCode::NOT_FOUND);
     };
     if seg == "index.m3u8" {
+        tracing::info!(duration = *duration, "HLS:发 manifest(shaka 来取了)");
         return Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/vnd.apple.mpegurl")
@@ -451,8 +452,12 @@ async fn hls(State(state): State<Arc<Inner>>, AxPath((token, seg)): AxPath<(Stri
     } else {
         cmd.arg("-c:a").arg("copy");
     }
-    // 重置时间戳(**不 copyts** —— 带它独立 .ts 段会坏,实测)+ 低 mux 延迟;输出 mpegts。
-    cmd.arg("-muxpreload").arg("0").arg("-muxdelay").arg("0").arg("-f").arg("mpegts").arg("pipe:1");
+    // **关键**:`-output_ts_offset start` 把本段 PTS 落到时间轴位置(N*SEG)→ **跨段连续**(像 DASH),
+    // shaka 才能把各段拼起来。不带它各段都从 0 起 = 时间戳不连续 → shaka 拼不动 → 黑屏(实锤 2026-06-20)。
+    // 仍**不 copyts**(那会把大输入时间戳塞进独立 .ts 把段搞坏);output_ts_offset 是干净的输出端平移。
+    cmd.arg("-output_ts_offset").arg(format!("{start:.3}"))
+        .arg("-muxdelay").arg("0").arg("-f").arg("mpegts").arg("pipe:1");
+    tracing::info!(seg = n, start, "HLS:现切一段");
     stream_ffmpeg(cmd, "video/mp2t", true)
 }
 
