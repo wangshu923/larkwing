@@ -1,36 +1,35 @@
 <script setup lang="ts">
-// 一键更新卡(清单 ⑤·A):发现新版时右下角浮一张非阻塞卡 —— 版本 + 更新说明 + 「更新 / 稍后」;
-// 下载中显进度。只主窗挂(App.vue)。只用语义 token(§6.7),换肤跟随。
+// 一键更新卡(清单 ⑤·A):右下角非阻塞卡。两态 ——
+//   ① 发现新版:版本 + 更新说明 + 「更新 / 稍后」;点「更新」= 起后台下载任务(进度去任务 HUD),卡收起。
+//   ② 已下载:「现在重启更新?」+ 「立即更新 / 稍后」;点「立即更新」= 装 + 重启。
+// 下载进度不在卡里(在任务 HUD,不阻塞操作)。只主窗挂。只用语义 token(§6.7),换肤跟随。
 import { useI18n } from 'vue-i18n'
 import { useUpdater } from '../composables/useUpdater'
 
 const { t } = useI18n()
-const { state, install, dismiss } = useUpdater()
+const { state, download, install, dismiss } = useUpdater()
 </script>
 
 <template>
   <transition name="upd">
-    <div v-if="state.available" class="upd-card" role="dialog">
+    <div v-if="state.downloaded" class="upd-card" role="dialog">
+      <div class="upd-head">
+        <span class="upd-dot"></span>
+        <b>{{ t('update.ready') }}</b>
+      </div>
+      <div class="upd-acts">
+        <button class="upd-btn primary" @click="install">{{ t('update.installNow') }}</button>
+        <button class="upd-btn" @click="dismiss">{{ t('update.later') }}</button>
+      </div>
+    </div>
+    <div v-else-if="state.available" class="upd-card" role="dialog">
       <div class="upd-head">
         <span class="upd-dot"></span>
         <b>{{ t('update.found', { version: state.available.version }) }}</b>
       </div>
-      <p v-if="state.available.notes && !state.downloading" class="upd-notes">{{ state.available.notes }}</p>
-
-      <div v-if="state.downloading" class="upd-prog">
-        <span class="upd-prog-txt">
-          {{ t('update.downloading') }}<template v-if="state.progress >= 0"> {{ state.progress }}%</template>
-        </span>
-        <div class="upd-bar">
-          <div
-            class="upd-fill"
-            :class="{ indet: state.progress < 0 }"
-            :style="state.progress >= 0 ? { width: state.progress + '%' } : {}"
-          ></div>
-        </div>
-      </div>
-      <div v-else class="upd-acts">
-        <button class="upd-btn primary" @click="install">{{ t('update.update') }}</button>
+      <p v-if="state.available.notes" class="upd-notes">{{ state.available.notes }}</p>
+      <div class="upd-acts">
+        <button class="upd-btn primary" @click="download">{{ t('update.update') }}</button>
         <button class="upd-btn" @click="dismiss">{{ t('update.later') }}</button>
       </div>
     </div>
@@ -79,12 +78,6 @@ const { state, install, dismiss } = useUpdater()
 }
 .upd-btn:hover { border-color: var(--accent); }
 .upd-btn.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); font-weight: 600; }
-.upd-prog { margin-top: 12px; }
-.upd-prog-txt { font-size: 12.5px; color: var(--text-dim); }
-.upd-bar { margin-top: 8px; height: 4px; border-radius: 3px; background: rgba(var(--accent-rgb), 0.16); overflow: hidden; }
-.upd-fill { height: 100%; background: var(--accent); border-radius: 3px; transition: width 0.2s ease; }
-.upd-fill.indet { width: 40%; animation: upd-indet 1.1s ease-in-out infinite; }
-@keyframes upd-indet { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
 .upd-enter-active, .upd-leave-active { transition: opacity 0.3s ease, transform 0.3s ease; }
 .upd-enter-from, .upd-leave-to { opacity: 0; transform: translateY(12px); }
 </style>

@@ -49,6 +49,7 @@ export default {
     unknown: '后台小任务',
     resolve: '解析播放地址',
     relocate: '搬家中',
+    update: '下载更新',
     download: {
       ytdlp: '下载解析组件',
       ffmpeg: '下载播放组件',
@@ -232,7 +233,9 @@ export default {
     found: '发现新版本 v{version}',
     update: '更新',
     later: '稍后',
-    downloading: '正在下载更新…',
+    ready: '新版本已下载,现在重启更新?',
+    installNow: '立即更新',
+    installFailed: '更新没装上,过会儿再试?',
     upToDate: '已是最新版本',
     checkFailed: '检查更新失败,等会儿再试?',
   },

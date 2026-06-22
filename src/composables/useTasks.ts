@@ -4,7 +4,7 @@
 // 浏览器预览:?demo=tasks 注入假任务,纯看视觉(UI 优先工作流)。
 
 import { reactive } from 'vue'
-import { isTauri, onAppEvent, type TaskView } from '../lib/backend'
+import { isTauri, onAppEvent, type TaskView, type TextRef } from '../lib/backend'
 
 const state = reactive({
   tasks: [] as TaskView[],
@@ -14,6 +14,15 @@ const state = reactive({
 
 const DONE_LINGER_MS = 1600
 let wired = false
+// 前端自建任务用负 id,与 core 的正 task_id 永不撞(同 useChat localId 套路)。
+let localSeq = 0
+
+/** 前端自驱任务的句柄(progress/done/fail);完成时机即调用方代码路径(无需通用回调总线)。 */
+export interface LocalTaskHandle {
+  progress(fraction?: number, step?: TextRef): void
+  done(): void
+  fail(error?: TextRef): void
+}
 
 function upsert(view: TaskView) {
   const i = state.tasks.findIndex((t) => t.task_id === view.task_id)
@@ -28,6 +37,22 @@ function dismiss(taskId: number) {
   const i = state.tasks.findIndex((t) => t.task_id === taskId)
   if (i >= 0) state.tasks.splice(i, 1)
   if (state.tasks.length <= 1) state.expanded = false
+}
+
+/** 前端自驱一条任务(core 的 task 是后端推、这条由前端跑的活儿驱动,如更新下载)。
+ *  和 core 任务同一份 state.tasks + 同一渲染(TaskView 形状一致),HUD 零改。done 后照常淡出。 */
+function startLocal(init: { kind: string; label: TextRef }): LocalTaskHandle {
+  let view: TaskView = { task_id: --localSeq, kind: init.kind, label: init.label, state: 'running', progress: 0 }
+  upsert(view)
+  const sync = (patch: Partial<TaskView>) => {
+    view = { ...view, ...patch }
+    upsert(view)
+  }
+  return {
+    progress: (fraction, step) => sync({ progress: fraction, step }),
+    done: () => sync({ state: 'done', progress: 1, step: undefined }),
+    fail: (error) => sync({ state: 'failed', error, step: undefined }),
+  }
 }
 
 function wire() {
@@ -82,5 +107,5 @@ function wire() {
 
 export function useTasks() {
   wire()
-  return { state, dismiss }
+  return { state, dismiss, startLocal }
 }

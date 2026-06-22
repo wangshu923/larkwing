@@ -50,6 +50,7 @@ export default {
     unknown: 'Background task',
     resolve: 'Resolving the stream',
     relocate: 'Moving data',
+    update: 'Downloading update',
     download: {
       ytdlp: 'Downloading the parser',
       ffmpeg: 'Downloading the playback component',
@@ -233,7 +234,9 @@ export default {
     found: 'New version v{version} available',
     update: 'Update',
     later: 'Later',
-    downloading: 'Downloading update…',
+    ready: 'Update downloaded — restart to install now?',
+    installNow: 'Restart & install',
+    installFailed: 'Couldn’t install the update — try again later?',
     upToDate: 'You’re on the latest version',
     checkFailed: 'Update check failed — try again later?',
   },
