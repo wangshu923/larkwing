@@ -22,6 +22,7 @@ import { applyLocale, i18n } from '../i18n'
 import { hydrateUserName, onProvidersUsable, useSettings } from './useSettings'
 import { useSpeech } from './useSpeech'
 import { useMedia } from './useMedia'
+import { useToast } from './useToast'
 
 const t = i18n.global.t
 
@@ -759,6 +760,7 @@ async function selectConversation(convId: number) {
     state.mood = 'idle'
   } catch (e) {
     console.error('加载会话失败', e)
+    useToast().error(t('toast.actionFailed'))
   }
 }
 
@@ -780,6 +782,7 @@ async function newConversation(channel?: string) {
     await refreshConversations()
   } catch (e) {
     console.error('新建会话失败', e)
+    useToast().error(t('toast.actionFailed'))
   }
 }
 
@@ -805,6 +808,7 @@ async function renameConversation(convId: number, title: string) {
   } catch (e) {
     console.error('重命名会话失败', e)
     conv.title = prev // 回滚
+    useToast().error(i18n.global.t('toast.actionFailed')) // 注意:此函数内 t 被局部变量(标题)遮蔽,走 i18n.global
   }
 }
 
@@ -822,6 +826,7 @@ async function togglePinConversation(convId: number) {
     console.error('钉住会话失败', e)
     conv.pinned = !next // 回滚
     sortConversations()
+    useToast().error(t('toast.actionFailed'))
   }
 }
 
@@ -838,6 +843,7 @@ async function deleteConversation(convId: number) {
     } catch (e) {
       console.error('删除会话失败', e)
       state.conversations.splice(idx, 0, removed) // 补回
+      useToast().error(t('toast.deleteFailed'))
       return
     }
   }

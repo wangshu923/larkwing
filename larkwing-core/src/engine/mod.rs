@@ -1260,36 +1260,91 @@ impl Engine {
     }
 
     /// 历史回放的「想了想」轨迹:把每回合中途的工具调用(名/入参/结果/状态)+ CoT 原文,
-    /// 归到该回合代表气泡(其后最后一条有内容的 assistant)。全从落库 payload 重建。
+    /// 归到该回合的代表回复气泡(有可见文字的 assistant 行)。全从落库 payload 重建。
     /// live 回合落库后由前端补拉这条(不在 TurnEvent 里塞 args/result,免破流式词汇)。
+    ///
+    /// 锚定与 live 对齐(turn.rs 的 Segment 事件在 ToolUse 之前发):一条**有可见文字**的
+    /// assistant 行封口当前段,收下「上一锚以来声明的工具 + 本轮在封口前流出的 CoT」;**本行
+    /// 自己声明的工具归下一段**(live 里 ToolUse 在封口之后才到、落到新气泡)。一回合的尾部
+    /// 工具(最后一条可见回复之后才声明、整轮再无可见回复)折进该回合最后一个可见气泡。
+    /// **整轮零可见回复**(模型调了工具却一句没说)整段不产出 —— 没有气泡可挂(前端 `visible`
+    /// 本就滤掉空 assistant 行),用户拍板静默回合不补独立药丸(§3 干净默认)。
+    ///
+    /// 三处比旧实现修对:① 结算落在**回合边界 / 循环末尾**,尾部工具不再随下一条 user 行清空被
+    /// 丢(「调了工具但收尾无可见文字」整段丢轨迹的根因);② `idx_by_call` 整段不清 →
+    /// tool 结果行(排在声明它的 assistant 行之后)一定回填得上(旧实现遇「同轮先说话再调工具」
+    /// 当场结算复位、结果丢失);③ 同轮文字 + 工具时工具归下一气泡,与 live 封口顺序一致。
     pub fn conversation_trace(&self, conv_id: i64) -> Result<Vec<TurnTrace>, AppError> {
+        // 收一回合:尾部未封口的工具 / CoT 折进最后一个可见气泡(有锚才折,无锚 = 静默回合,丢弃),
+        // 再把各段非空者落成 TurnTrace。idx 一并清,跨回合不串。
+        fn flush_turn(
+            out: &mut Vec<TurnTrace>,
+            segments: &mut Vec<(i64, Vec<TraceStep>, Vec<String>)>,
+            buf: &mut Vec<TraceStep>,
+            cot: &mut Vec<String>,
+            idx: &mut HashMap<String, usize>,
+        ) {
+            if !buf.is_empty() || !cot.is_empty() {
+                if let Some(last) = segments.last_mut() {
+                    last.1.append(buf);
+                    last.2.append(cot);
+                }
+            }
+            for (anchor, steps, reasoning) in segments.drain(..) {
+                let reasoning = (!reasoning.is_empty()).then(|| reasoning.join("\n\n"));
+                if !steps.is_empty() || reasoning.is_some() {
+                    out.push(TurnTrace { message_id: anchor, steps, reasoning });
+                }
+            }
+            buf.clear();
+            cot.clear();
+            idx.clear();
+        }
+
         let msgs = self.store.chat.recent_messages(conv_id, 200)?;
         let mut out = Vec::new();
-        let mut steps: Vec<TraceStep> = Vec::new();
-        let mut reasoning: Vec<String> = Vec::new();
+        // 当前(未封口)段:buf 整段不清,tool 结果行排在声明它的 assistant 行之后才到 —— 提前清
+        // 就回填不上。封口才把 buf/cot 转入 segments。
+        let mut buf: Vec<TraceStep> = Vec::new();
+        let mut cot: Vec<String> = Vec::new();
         let mut idx_by_call: HashMap<String, usize> = HashMap::new();
-        let reset = |steps: &mut Vec<TraceStep>, r: &mut Vec<String>, idx: &mut HashMap<String, usize>| {
-            steps.clear();
-            r.clear();
-            idx.clear();
-        };
+        // 本回合已封口的段:(锚气泡 id, 步骤, 该段 CoT)。回合边界一次性落成 TurnTrace。
+        let mut segments: Vec<(i64, Vec<TraceStep>, Vec<String>)> = Vec::new();
+
         for m in &msgs {
             match m.role.as_str() {
-                "user" | "event" => reset(&mut steps, &mut reasoning, &mut idx_by_call),
+                "user" | "event" => {
+                    flush_turn(&mut out, &mut segments, &mut buf, &mut cot, &mut idx_by_call)
+                }
                 "assistant" => {
-                    if let Some(p) = m
+                    let payload = m
                         .payload
                         .as_deref()
-                        .and_then(|p| serde_json::from_str::<AssistantPayload>(p).ok())
+                        .and_then(|p| serde_json::from_str::<AssistantPayload>(p).ok());
+                    // 本轮 CoT 先入当前段(对齐 live:思考在封口前流出)。
+                    if let Some(r) = payload
+                        .as_ref()
+                        .and_then(|p| p.reasoning.as_deref())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
                     {
+                        cot.push(r.to_string());
+                    }
+                    // 有可见文字 = 封口当前段到这条回复气泡(本轮工具尚未入 buf → 归下一段)。
+                    if !m.content.trim().is_empty() {
+                        segments.push((m.id, std::mem::take(&mut buf), std::mem::take(&mut cot)));
+                        idx_by_call.clear();
+                    }
+                    // 本轮声明的工具入(封口后可能已是新的)当前段。
+                    if let Some(p) = &payload {
                         for c in &p.tool_calls {
                             let ui_key = self
                                 .tools
                                 .get(&c.name)
                                 .map(|t| t.spec().ui_key.to_string())
                                 .unwrap_or_else(|| "tool.unknown".into());
-                            idx_by_call.insert(c.id.clone(), steps.len());
-                            steps.push(TraceStep {
+                            idx_by_call.insert(c.id.clone(), buf.len());
+                            buf.push(TraceStep {
                                 name: c.name.clone(),
                                 ui_key,
                                 args: c.args.to_string(),
@@ -1297,32 +1352,17 @@ impl Engine {
                                 status: String::new(),
                             });
                         }
-                        if let Some(r) =
-                            p.reasoning.as_deref().map(str::trim).filter(|s| !s.is_empty())
-                        {
-                            reasoning.push(r.to_string());
-                        }
-                    }
-                    // 有内容 = 这回合代表气泡(可见回复):结算并复位
-                    if !m.content.trim().is_empty() {
-                        if !steps.is_empty() || !reasoning.is_empty() {
-                            out.push(TurnTrace {
-                                message_id: m.id,
-                                steps: std::mem::take(&mut steps),
-                                reasoning: (!reasoning.is_empty()).then(|| reasoning.join("\n\n")),
-                            });
-                        }
-                        reset(&mut steps, &mut reasoning, &mut idx_by_call);
                     }
                 }
-                // tool 行:按 call_id 回填结果/状态到对应步骤
+                // tool 行:按 call_id 回填结果/状态到当前段对应步骤。
                 "tool" => {
                     if let Some(tp) = m
                         .payload
                         .as_deref()
                         .and_then(|p| serde_json::from_str::<ToolRowPayload>(p).ok())
                     {
-                        if let Some(step) = idx_by_call.get(&tp.call_id).and_then(|&i| steps.get_mut(i)) {
+                        if let Some(step) = idx_by_call.get(&tp.call_id).and_then(|&i| buf.get_mut(i))
+                        {
                             step.result = m.content.clone();
                             step.status = tp.status;
                         }
@@ -1331,6 +1371,8 @@ impl Engine {
                 _ => {}
             }
         }
+        // 循环末尾再结算一回合(最后一回合没有后续 user 行触发边界)。
+        flush_turn(&mut out, &mut segments, &mut buf, &mut cot, &mut idx_by_call);
         Ok(out)
     }
 
@@ -1781,6 +1823,138 @@ mod tests {
         eng.set_setting("memory.auto_consolidate", "1").unwrap();
         assert!(eng.auto_consolidate_enabled(), "设回 1 = 开");
         assert!(eng.set_setting("memory.auto_consolidate", "2").is_err(), "非 0/1 被拒");
+    }
+
+    // —— conversation_trace（「想了想」历史回放）—— //
+
+    fn conv_with(eng: &Engine) -> i64 {
+        let user = eng.store.users.ensure_default_user().unwrap();
+        eng.store.chat.create_conversation(user.id, "companion").unwrap().id
+    }
+
+    /// 造一条工具轮 assistant 行 payload：calls = (call_id, 工具名)。
+    fn asst(calls: &[(&str, &str)], reasoning: Option<&str>) -> String {
+        let tool_calls = calls
+            .iter()
+            .map(|(id, name)| crate::llm::ToolCall {
+                id: (*id).into(),
+                name: (*name).into(),
+                args: serde_json::json!({}),
+                is_incomplete: false,
+            })
+            .collect();
+        serde_json::to_string(&AssistantPayload {
+            tool_calls,
+            reasoning: reasoning.map(Into::into),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    /// 造一条 tool 结果行 payload。
+    fn toolp(call_id: &str, name: &str, status: &str) -> String {
+        serde_json::to_string(&ToolRowPayload {
+            call_id: call_id.into(),
+            name: name.into(),
+            status: status.into(),
+        })
+        .unwrap()
+    }
+
+    /// 常见形：先静默调几轮工具、最后才说话 → 整回合一个完整药丸，挂在可见回复上，
+    /// 工具结果都回填到位（旧实现「同轮先说话」会丢结果，这里顺带验结果回填）。
+    #[test]
+    fn trace_silent_tool_rounds_then_final_reply_is_one_complete_pill() {
+        let eng = engine("trace-common");
+        let c = conv_with(&eng);
+        let ch = &eng.store.chat;
+        ch.append_message(c, "user", "放首歌").unwrap();
+        ch.append_message_full(c, "assistant", "", Some(&asst(&[("c1", "media_search")], Some("想想放什么")))).unwrap();
+        ch.append_message_full(c, "tool", "找到了《星海漫游》", Some(&toolp("c1", "media_search", "ok"))).unwrap();
+        ch.append_message_full(c, "assistant", "", Some(&asst(&[("c2", "media_play")], None))).unwrap();
+        ch.append_message_full(c, "tool", "开始播放", Some(&toolp("c2", "media_play", "ok"))).unwrap();
+        let final_id = ch.append_message(c, "assistant", "正在为你播放").unwrap().id;
+
+        let out = eng.conversation_trace(c).unwrap();
+        assert_eq!(out.len(), 1, "整回合只一个药丸;得到 {out:?}");
+        let tr = &out[0];
+        assert_eq!(tr.message_id, final_id, "锚在最后那条可见回复");
+        assert_eq!(tr.steps.len(), 2, "两步工具都在");
+        assert_eq!(tr.steps[0].name, "media_search");
+        assert_eq!(tr.steps[0].result, "找到了《星海漫游》", "结果回填得上(旧实现这里会空)");
+        assert_eq!(tr.steps[0].status, "ok");
+        assert_eq!(tr.steps[1].name, "media_play");
+        assert_eq!(tr.steps[1].result, "开始播放");
+        assert_eq!(tr.reasoning.as_deref(), Some("想想放什么"), "工具轮 CoT 归到本回合代表气泡");
+    }
+
+    /// 报告的 bug：调了工具但整轮一句话没说（DeepSeek 真会这样）。Option A：无可见气泡可挂，
+    /// 不补独立药丸 → 产出为空。关键是不再「连前面的也一起丢」/不 panic。
+    #[test]
+    fn trace_fully_silent_turn_yields_no_pill() {
+        let eng = engine("trace-silent");
+        let c = conv_with(&eng);
+        let ch = &eng.store.chat;
+        ch.append_message(c, "user", "记一下我对花生过敏").unwrap();
+        ch.append_message_full(c, "assistant", "", Some(&asst(&[("c1", "remember")], None))).unwrap();
+        ch.append_message_full(c, "tool", "已记住", Some(&toolp("c1", "remember", "ok"))).unwrap();
+        ch.append_message(c, "assistant", "").unwrap(); // 收尾轮:空文字、无工具
+
+        let out = eng.conversation_trace(c).unwrap();
+        assert!(out.is_empty(), "全静默回合不产药丸(Option A);得到 {out:?}");
+    }
+
+    /// 回合边界复位 + 纯文字回合不产药丸（否则会盖掉前端在飞攒的收尾轮 CoT，见 useChat 注释）。
+    #[test]
+    fn trace_resets_between_turns_and_pure_text_turn_has_no_pill() {
+        let eng = engine("trace-reset");
+        let c = conv_with(&eng);
+        let ch = &eng.store.chat;
+        // 回合 1:工具 + 可见收尾
+        ch.append_message(c, "user", "放歌").unwrap();
+        ch.append_message_full(c, "assistant", "", Some(&asst(&[("c1", "media_play")], None))).unwrap();
+        ch.append_message_full(c, "tool", "在放了", Some(&toolp("c1", "media_play", "ok"))).unwrap();
+        let t1 = ch.append_message(c, "assistant", "在放了").unwrap().id;
+        // 回合 2:纯文字(无工具)
+        ch.append_message(c, "user", "你好").unwrap();
+        ch.append_message(c, "assistant", "你好呀").unwrap();
+
+        let out = eng.conversation_trace(c).unwrap();
+        assert_eq!(out.len(), 1, "只回合1有药丸,纯文字回合不产;得到 {out:?}");
+        assert_eq!(out[0].message_id, t1);
+        assert_eq!(out[0].steps.len(), 1, "回合2没串进回合1");
+    }
+
+    /// 同轮先说话再调工具:与 live 一致(Segment 封口在 ToolUse 之前)——该轮工具落到下一个气泡;
+    /// 封口前的本轮 CoT 留在本气泡。回放须对齐,否则「重启后药丸换了个气泡」。
+    #[test]
+    fn trace_same_round_text_and_tools_anchors_tools_to_next_bubble() {
+        let eng = engine("trace-interleaved");
+        let c = conv_with(&eng);
+        let ch = &eng.store.chat;
+        ch.append_message(c, "user", "找电影并播放").unwrap();
+        let a1 = ch.append_message_full(c, "assistant", "让我找找", Some(&asst(&[("c1", "media_search")], Some("先搜一下")))).unwrap().id;
+        ch.append_message_full(c, "tool", "找到了", Some(&toolp("c1", "media_search", "ok"))).unwrap();
+        let a2 = ch.append_message_full(c, "assistant", "开始播放", Some(&asst(&[("c2", "media_play")], None))).unwrap().id;
+        ch.append_message_full(c, "tool", "播放中", Some(&toolp("c2", "media_play", "ok"))).unwrap();
+        let a3 = ch.append_message(c, "assistant", "放好了").unwrap().id;
+
+        let out = eng.conversation_trace(c).unwrap();
+        assert_eq!(out.len(), 3, "三个可见气泡各成一段;得到 {out:?}");
+        // a1「让我找找」:封口前只有本轮 CoT,本轮声明的 search 归下一气泡
+        assert_eq!(out[0].message_id, a1);
+        assert!(out[0].steps.is_empty(), "本轮 search 归下一气泡,不留在 a1");
+        assert_eq!(out[0].reasoning.as_deref(), Some("先搜一下"));
+        // a2「开始播放」:收下 a1 轮声明的 search(结果回填得上)
+        assert_eq!(out[1].message_id, a2);
+        assert_eq!(out[1].steps.len(), 1);
+        assert_eq!(out[1].steps[0].name, "media_search");
+        assert_eq!(out[1].steps[0].result, "找到了");
+        // a3「放好了」:收下 a2 轮声明的 play
+        assert_eq!(out[2].message_id, a3);
+        assert_eq!(out[2].steps.len(), 1);
+        assert_eq!(out[2].steps[0].name, "media_play");
+        assert_eq!(out[2].steps[0].result, "播放中");
     }
 }
 

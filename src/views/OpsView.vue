@@ -6,12 +6,16 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { api, isTauri, type FsOp } from '../lib/backend'
+import { useToast } from '../composables/useToast'
 
 const emit = defineEmits<{ (e: 'close'): void }>()
 const { t, te } = useI18n()
+const toast = useToast()
 
 const ops = ref<FsOp[]>([])
 const loaded = ref(false)
+/** 加载是否出错:与「空着」分开 —— 出错显「没加载出来 + 重试」,而非误导成「还没有记录」。 */
+const error = ref(false)
 /** 正在撤销/重做的行 id(按钮转圈、防连点)。 */
 const busy = ref<number | null>(null)
 
@@ -28,10 +32,12 @@ async function load() {
     loaded.value = true
     return
   }
+  error.value = false
   try {
     ops.value = await api.listFsops()
   } catch (e) {
     console.error('加载操作记录失败', e)
+    error.value = true
   }
   loaded.value = true
 }
@@ -47,6 +53,7 @@ async function undo(o: FsOp) {
     } catch (e) {
       console.error('撤销失败', e)
       o.state = prev
+      toast.error(t('toast.actionFailed'))
     }
   }
   busy.value = null
@@ -63,6 +70,7 @@ async function redo(o: FsOp) {
     } catch (e) {
       console.error('重做失败', e)
       o.state = prev
+      toast.error(t('toast.actionFailed'))
     }
   }
   busy.value = null
@@ -129,7 +137,11 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         </div>
       </TransitionGroup>
 
-      <div v-if="loaded && !total" class="lp-empty">
+      <div v-if="loaded && error" class="lp-error">
+        <p>{{ t('common.loadError') }}</p>
+        <button class="lp-retry" @click="load">{{ t('common.retry') }}</button>
+      </div>
+      <div v-else-if="loaded && !total" class="lp-empty">
         <span class="lp-empty-icon"><svg viewBox="0 0 24 24"><g transform="translate(8 13.5) rotate(-16)"><ellipse cx="0" cy="-1.9" rx="2.1" ry="2.6" /><ellipse cx="-0.1" cy="2.5" rx="1.2" ry="1.5" /></g><g transform="translate(15.6 9) rotate(-16)"><ellipse cx="0" cy="-1.9" rx="2.1" ry="2.6" /><ellipse cx="-0.1" cy="2.5" rx="1.2" ry="1.5" /></g></svg></span>
         <p>{{ t('ops.empty') }}</p>
       </div>

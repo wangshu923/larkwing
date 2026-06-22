@@ -217,6 +217,7 @@
 - ⚠️ **i18n 特殊字符陷阱**(`{ } @ |` 都中招):vue-i18n 消息串有自己的语法,字面写进文案就被当语法解析、编译失败 → 整组件 render 抛错 → 该 tab/视图渲染失败(Vue 保留旧 DOM,表现为「**tab 点了切不过去**」),且**warn 级**难查(Vue 不把真实 Error 给 console)。已踩:① `{ }` 插值——`${中文}` → Message compilation error,`${ENV}` → 静默渲染成空;② `@` linked-message——`@BotFather` 之类直接崩(2026-06 远程渠道 tab 实锤);③ `|` 复数分隔符。**对策**:i18n 文案不写字面 `{` `}` `@` `|`;要展示这类语法就纯文本描述,或把含特殊字符的字面量留模板硬编码、**不进 `t()`**(如 `<button>@BotFather</button>`)。抓这类 render 错最快路 = 设 Vue `app.config.errorHandler` 拦真实错误(比翻 console warn 强)。
 - **非字典硬编码中文也要同步**:协议徽章、星期数组(走 `toLocaleDateString`)、`persona.style` 默认值(需与 Rust `DEFAULT_PERSONA_STYLE` 手工同步)等不在字典里的中文,加语言时易漏。
 - **布局兜底**:英文比中文长 40–100%,定宽控件按 2 字中文做的会撑爆 → 砍装饰大字距 / 给弹性宽度 / 永远留 `flex-wrap` 折行 / ellipsis 截断。
+- **失败别静默(§3.5 的 UI 兑现,2026-06-22 落地)**:用户**主动操作**失败 → `useToast().error(t('toast.*'))` 弹一句友好提示(`composables/useToast.ts` 单例 + 顶层 `ToastHost`,**仅主窗挂**;只用语义 token,换肤跟随;文案仍调用方 `t()` 选好再传,core 不产文案)。⚠️ `useChat.renameConversation` 内局部 `t` 是标题字符串、遮蔽了 i18n 的 `t` → 那一处用 `i18n.global.t`。列表**初载失败**别走空态(会被误读成「没有数据」)→ 走「错误态 + 重试」(共享类 `.lp-error`/`.lp-retry` + `common.loadError`/`common.retry`,见 Memory/Reminders/Ops 三页 `error` ref)。纯**被动**后台刷新(boot / 余额 / trace 补拉)失败可继续 console-only,不必弹。
 
 ### 6.7 多皮肤 / 语义 token 架构(§3.6 兑现)
 - **唯一色源 = `src/style.css`**;组件**只引用语义 token**(`--bg/--surface*/--line/--accent/--text*/--ok/--warn/--attn/--danger`(各带 `-rgb`)/`--bubble-*`/`--veil-*`/悬浮窗 `--f-*`),**绝不**用皮肤专名或内联 `#5fd2ff`;半透一律 `rgba(var(--X-rgb), a)`。

@@ -88,6 +88,11 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 一键更新签名(清单 ⑤·A):createUpdaterArtifacts=true 时 tauri-action 用这把私钥签包 +
+          # 生成 latest.json 上传到 Release。私钥 = 本地 ~/.tauri/larkwing-updater.key 的内容(进仓库 secret);
+          # 本钥无密码 → PASSWORD secret 不设即为空,passwordless 签名照常。丢钥 = 发不出可校验的更新。
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
           releaseName: Larkwing __VERSION__

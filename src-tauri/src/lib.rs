@@ -86,6 +86,11 @@ pub fn run() {
         )?;
       }
 
+      // 一键更新(仅桌面;mobile 不支持该插件)。endpoint/pubkey 走 tauri.conf;代理在前端
+      // check() 运行时按用户设置(net.proxy_*)传(updater 不走 net::Client,见 §4.6 张力注解)。
+      #[cfg(desktop)]
+      app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
+
       // ---- 装配:数据目录 / 日志 / store / provider / engine ----
       // 数据目录「搬家」(datadir):锚点 = OS 默认 app_data_dir(永远找得到、住指针);
       // 真实数据根由锚点的 location.json 指针决定。没搬过家 → 用锚点;搬过 → 用记的路径;
@@ -396,6 +401,7 @@ pub fn run() {
       commands::set_autostart,
       commands::set_tray_menu,
       commands::quit_app,
+      commands::relaunch_app,
       commands::data_location,
       commands::pick_data_folder,
       commands::relocate_precheck,

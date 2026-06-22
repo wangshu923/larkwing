@@ -781,6 +781,13 @@ pub fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
+/// 更新装完后重启(走核心 `app.restart()`,免再拉 plugin-process)。Windows 上 NSIS passive
+/// 装前已自动退出 app、装后由安装器拉起,故这条主要给 mac/兜底用;`-> !` 不返回。
+#[tauri::command]
+pub fn relaunch_app(app: tauri::AppHandle) {
+    app.restart();
+}
+
 // ---- 数据目录「搬家」(datadir;用户决策 2026-06-18) ----
 
 /// 设置页「数据位置」一行 + boot 后检查:当前根 / 待清理旧根 / 失效路径。

@@ -387,7 +387,7 @@ onUnmounted(() => stopMoved())
 /* 区小标题:正在进行 / 最近消息(多条时分得清) */
 .ptag {
   font-size: 11px;
-  color: #6f8eaa;
+  color: var(--f-txt2);
   letter-spacing: 0.03em;
   padding: 2px 2px 0;
 }

@@ -192,7 +192,7 @@ onUnmounted(() => {
 .veil {
   position: fixed; inset: 0; z-index: 30;
   display: flex; align-items: center; justify-content: center;
-  background: rgba(3, 8, 18, 0.6);
+  background: rgba(var(--veil-rgb, 0 0 0), 0.6); /* 模态暗罩:同 App.vue 数据弹窗约定,各皮一致地压暗背景 */
   backdrop-filter: blur(5px); -webkit-backdrop-filter: blur(5px);
 }
 .panel {
@@ -200,7 +200,7 @@ onUnmounted(() => {
   width: min(80vw, 980px);
   display: flex; flex-direction: column;
   border-radius: 14px; overflow: hidden;
-  background: rgba(8, 18, 36, 0.92);
+  background: var(--surface); /* 窗口模式机框随皮肤(科幻=玻璃,护眼/暖萌=近不透明);全屏下被 #000 覆盖 */
   border: 1px solid rgba(var(--accent-rgb), 0.22);
   box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55), 0 0 30px rgba(var(--accent-rgb), 0.08);
 }
@@ -240,8 +240,12 @@ onUnmounted(() => {
 .bar {
   display: flex; align-items: center; gap: 10px;
   padding: 9px 13px;
-  color: #d4e6f7; font-size: 13px;
+  color: var(--text); font-size: 13px;
 }
+/* 全屏 = 控制条覆盖在视频画面上(黑底渐变) → 文字/时钟恒亮:这是「覆盖媒体」豁免(同 #000 视频底),
+   不随皮肤,否则浅皮的深色字压在视频上读不清。 */
+.panel.maximized .bar { color: #eaf2fb; }
+.panel.maximized .clock { color: rgba(234, 242, 251, 0.72); }
 .title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; letter-spacing: .4px; }
 .ep {
   flex: none; color: var(--accent); font-size: 11.5px; letter-spacing: .4px;

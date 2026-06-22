@@ -11,9 +11,12 @@ import VideoOverlay from './components/VideoOverlay.vue'
 import WindowControls from './components/WindowControls.vue'
 import FloatWindow from './components/FloatWindow.vue'
 import ContextMenu from './components/ContextMenu.vue'
+import ToastHost from './components/ToastHost.vue'
+import UpdateCard from './components/UpdateCard.vue'
 import { useBoot } from './composables/useBoot'
 import { useChat } from './composables/useChat'
 import { useSettings } from './composables/useSettings'
+import { useUpdater } from './composables/useUpdater'
 import {
   api,
   isTauri,
@@ -107,6 +110,8 @@ if (!isFloat && isTauri()) {
     shown = null
     void syncOwnFs()
   })
+  // 一键更新(清单 ⑤·A):启动查一次(每日节流)+ 每 6h 复查;有新版右下角弹更新卡。失败静默。
+  useUpdater().startAutoCheck()
   // boot 后查一次数据位置:失效 → 恢复弹窗;有旧数据残留 → 清理弹窗(主动来找用户,不用回设置页)。
   onMounted(async () => {
     try {
@@ -169,6 +174,10 @@ if (!isFloat && isTauri()) {
         </div>
       </div>
     </transition>
+    <!-- 操作反馈提示(失败 / 完成):顶层浮现,替代静默 catch(§3.5) -->
+    <ToastHost />
+    <!-- 一键更新卡(发现新版时右下角浮现) -->
+    <UpdateCard />
   </template>
 </template>
 
@@ -185,7 +194,7 @@ if (!isFloat && isTauri()) {
 .skip-hint {
   position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 50;
   font: 12px/1 ui-monospace, "SF Mono", monospace; letter-spacing: 2px;
-  color: rgba(150, 210, 255, 0.55); pointer-events: none; user-select: none;
+  color: rgba(var(--accent-rgb), 0.5); pointer-events: none; user-select: none;
 }
 .boot-hint-enter-active, .boot-hint-leave-active { transition: opacity .4s ease; }
 .boot-hint-enter-from, .boot-hint-leave-to { opacity: 0; }

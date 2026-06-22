@@ -218,6 +218,25 @@ export default {
     network: 'Stardust blocked the signal for a moment… give it a sec and try again?',
     fallback: 'Something hiccupped on my end — mind telling me again in a moment?',
   },
+  // cross-view: fallback when a list fails to load (distinct from "empty") + retry
+  common: {
+    loadError: 'Couldn’t load this page… tap below to try again?',
+    retry: 'Reload',
+  },
+  // action feedback (toast): a friendly line when something fails (§3.5 no silent failures)
+  toast: {
+    deleteFailed: 'Couldn’t delete that… try again?',
+    actionFailed: 'That didn’t go through… try again?',
+  },
+  // one-click update (backlog ⑤·A): the "new version" card + manual-check feedback
+  update: {
+    found: 'New version v{version} available',
+    update: 'Update',
+    later: 'Later',
+    downloading: 'Downloading update…',
+    upToDate: 'You’re on the latest version',
+    checkFailed: 'Update check failed — try again later?',
+  },
   nav: {
     chat: 'Chat',
     reminders: 'Reminders',

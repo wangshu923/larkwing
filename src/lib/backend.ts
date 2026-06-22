@@ -814,6 +814,8 @@ export const api = {
   setTrayMenu: (open: string, showFloat: string, quit: string) =>
     invoke<void>('set_tray_menu', { open, showFloat, quit }),
   quitApp: () => invoke<void>('quit_app'),
+  /** 更新装完后重启(走核心 app.restart;Win 多由安装器拉起、此路主要给 mac/兜底)。 */
+  relaunchApp: () => invoke<void>('relaunch_app'),
   // ---- 数据目录「搬家」(datadir) ----
   /** 当前数据根 / 待清理旧根 / 失效路径(设置页一行 + boot 检查)。 */
   dataLocation: () => invoke<DataLocation>('data_location'),

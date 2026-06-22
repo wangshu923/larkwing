@@ -6,12 +6,16 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { api, isTauri, type Reminder } from '../lib/backend'
+import { useToast } from '../composables/useToast'
 
 const emit = defineEmits<{ (e: 'close'): void }>()
 const { t, te, locale } = useI18n()
+const toast = useToast()
 
 const items = ref<Reminder[]>([])
 const loaded = ref(false)
+/** 加载是否出错:与「空着」分开 —— 出错显「没加载出来 + 重试」,而非误导成「还没有提醒」。 */
+const error = ref(false)
 /** 正在取消的行 id(按钮转圈、防连点)。 */
 const busy = ref<number | null>(null)
 
@@ -29,10 +33,12 @@ async function load() {
     loaded.value = true
     return
   }
+  error.value = false
   try {
     items.value = await api.listReminders()
   } catch (e) {
     console.error('加载提醒失败', e)
+    error.value = true
   }
   loaded.value = true
 }
@@ -49,6 +55,7 @@ async function cancel(r: Reminder) {
       await api.cancelReminder(r.id)
     } catch (e) {
       console.error('取消提醒失败', e)
+      toast.error(t('toast.actionFailed'))
       busy.value = null
       return
     }
@@ -120,7 +127,11 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         </div>
       </TransitionGroup>
 
-      <div v-if="loaded && !total" class="lp-empty">
+      <div v-if="loaded && error" class="lp-error">
+        <p>{{ t('common.loadError') }}</p>
+        <button class="lp-retry" @click="load">{{ t('common.retry') }}</button>
+      </div>
+      <div v-else-if="loaded && !total" class="lp-empty">
         <span class="lp-empty-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="13" r="8" /><path d="M12 9v4l2.5 1.5" /><path d="M5 4.5 8 7M19 4.5 16 7" /></svg></span>
         <p>{{ t('reminders.empty') }}</p>
       </div>

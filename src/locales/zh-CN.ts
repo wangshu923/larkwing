@@ -217,6 +217,25 @@ export default {
     network: '信号被星尘挡了一下…缓一缓再试一次?',
     fallback: '我这边出了点小状况,等一下再跟我说一次好不好?',
   },
+  // 跨页通用:列表加载失败的兜底(区别于「空着」)+ 重试
+  common: {
+    loadError: '这一页没加载出来…点下面再试一次?',
+    retry: '重新加载',
+  },
+  // 操作反馈提示(toast):失败时一句友好话(§3.5 不静默失败)
+  toast: {
+    deleteFailed: '没删掉,再试一下?',
+    actionFailed: '刚才那下没成功,再试一次?',
+  },
+  // 一键更新(清单 ⑤·A):发现新版的卡片 + 手动检查的反馈
+  update: {
+    found: '发现新版本 v{version}',
+    update: '更新',
+    later: '稍后',
+    downloading: '正在下载更新…',
+    upToDate: '已是最新版本',
+    checkFailed: '检查更新失败,等会儿再试?',
+  },
   nav: {
     chat: '对话',
     reminders: '提醒',

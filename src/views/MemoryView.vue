@@ -7,12 +7,14 @@ import { useI18n } from 'vue-i18n'
 import { api, isTauri, type Briefing, type Memory } from '../lib/backend'
 import { useContextMenu } from '../composables/useContextMenu'
 import { useSettings } from '../composables/useSettings'
+import { useToast } from '../composables/useToast'
 import { copyText } from '../lib/clipboard'
 
 const emit = defineEmits<{ (e: 'close'): void }>()
 const { t } = useI18n()
 const { openMenu } = useContextMenu()
 const settings = useSettings()
+const toast = useToast()
 
 /** 自动记住开关(memory.auto_consolidate,默认开):回忆页是记忆的唯一用户触点(§7.3),
  *  开关安在它产出的记忆上方,因果一目了然。关掉只停后台自动提炼,手动/对话里记不受影响。 */
@@ -24,6 +26,8 @@ function toggleAuto() {
 const memories = ref<Memory[]>([])
 const briefings = ref<Briefing[]>([])
 const loaded = ref(false)
+/** 加载是否出错:与「空着」分开 —— 出错显「没加载出来 + 重试」,而非误导成「还没有记忆」。 */
+const error = ref(false)
 /** 两步删除:第一次点变"确定删?",再点才真删;键带前缀区分两组(m-1 / b-1)。 */
 const arming = ref<string | null>(null)
 
@@ -42,12 +46,14 @@ async function load() {
     loaded.value = true
     return
   }
+  error.value = false
   try {
     const [m, b] = await Promise.all([api.listMemories(), api.listBriefings()])
     memories.value = m
     briefings.value = b
   } catch (e) {
     console.error('加载回忆页失败', e)
+    error.value = true
   }
   loaded.value = true
 }
@@ -62,6 +68,7 @@ async function doRemoveMemory(m: Memory) {
   } catch (e) {
     console.error('删除记忆失败', e)
     if (idx >= 0) memories.value.splice(idx, 0, m)
+    toast.error(t('toast.deleteFailed'))
   }
 }
 
@@ -83,6 +90,7 @@ async function doRemoveBriefing(b: Briefing) {
   } catch (e) {
     console.error('删除备忘失败', e)
     if (idx >= 0) briefings.value.splice(idx, 0, b)
+    toast.error(t('toast.deleteFailed'))
   }
 }
 
@@ -204,7 +212,11 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         </div>
       </TransitionGroup>
 
-      <div v-if="loaded && !total" class="lp-empty">
+      <div v-if="loaded && error" class="lp-error">
+        <p>{{ t('common.loadError') }}</p>
+        <button class="lp-retry" @click="load">{{ t('common.retry') }}</button>
+      </div>
+      <div v-else-if="loaded && !total" class="lp-empty">
         <span class="lp-empty-icon"><svg viewBox="0 0 24 24"><path d="M7 4h10v16l-5-3-5 3z" /></svg></span>
         <p>{{ t('memory.empty') }}</p>
       </div>

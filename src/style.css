@@ -265,5 +265,13 @@ input, textarea, [contenteditable="true"] {
    随皮肤的 --accent 走;不再用满色 emoji(在科幻/玻璃底上太跳)。 */
 .lp-empty-icon { display: block; width: 30px; height: 30px; margin: 0 auto 12px; }
 .lp-empty-icon svg { width: 100%; height: 100%; fill: none; stroke: var(--accent); stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; opacity: .5; }
+/* 加载失败态(回忆·记录·提醒共用):与空态分开 —— 出错给「没加载出来 + 重试」,别误导成「没有数据」 */
+.lp-error { padding: 42px 0; text-align: center; color: var(--text-dim); font-size: 13.5px; line-height: 1.8; }
+.lp-retry {
+  margin-top: 12px; padding: 7px 18px; border-radius: 9px;
+  border: 1px solid var(--line); background: transparent; color: var(--accent);
+  font-size: 12.5px; cursor: pointer; transition: border-color .15s, background .15s;
+}
+.lp-retry:hover { border-color: var(--accent); background: rgba(var(--accent-rgb), 0.08); }
 .lp-leave-to { opacity: 0; transform: translateX(12px); }
 .lp-leave-active { transition: all .22s ease; }

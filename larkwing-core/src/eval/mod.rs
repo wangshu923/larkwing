@@ -187,10 +187,11 @@ fn temp_db(tag: &str, run: u32) -> std::path::PathBuf {
     p
 }
 
-/// 从落库消息直接重建工具轨迹 —— **不走 `engine.conversation_trace`**:后者只在该回合有
-/// 可见回复(非空 content)时才结算轨迹、且 loop 末不补 flush,于是「调了工具但收尾没出可见
-/// 文字」的回合会被静默丢掉(实测 DeepSeek 会这样)。eval 要的是「工具到底跑没跑」,所以直接
-/// 读 assistant 行的 tool_calls + tool 行的 status(eval 在 crate 内,pub(crate) payload 可见)。
+/// 从落库消息直接重建工具轨迹 —— **不走 `engine.conversation_trace`**:后者是 UI 用、把轨迹
+/// 锚到**有可见文字的回复气泡**上,整轮零可见回复的回合(模型调了工具却一句没说,实测 DeepSeek
+/// 会这样)按设计不产出(无气泡可挂,Option A)。eval 要的是「工具到底跑没跑」,与有没有可见
+/// 回复无关,所以直接读 assistant 行的 tool_calls + tool 行的 status(eval 在 crate 内,
+/// pub(crate) payload 可见)。
 fn collect_trace(store: &Store, conv_id: i64) -> Vec<TraceStep> {
     let msgs = store.chat.recent_messages(conv_id, 300).unwrap_or_default();
     let mut steps: Vec<TraceStep> = Vec::new();
@@ -585,8 +586,9 @@ mod tests {
         assert_eq!(r.passed, 1, "提炼落库且含歌手该过;失败项={:?}", r.failed_checks);
     }
 
-    // 回归:模型调完工具后**收尾没出可见文字** → `conversation_trace` 会漏(只在有可见回复时
-    // 结算),`collect_trace` 直接读 payload 不漏。真机 capture-allergy 的「有记忆没轨迹」就是这个。
+    // 回归:模型调完工具后**收尾没出可见文字** → 整轮无可见气泡,UI 用的 `conversation_trace`
+    // 按设计不产出(锚到可见回复;Option A 静默回合不补独立药丸),`collect_trace` 直读 payload
+    // 不漏。真机 capture-allergy 的「有记忆没轨迹」就是这个。
     #[tokio::test(flavor = "multi_thread")]
     async fn tool_detected_even_when_final_reply_is_empty() {
         let sc = Scenario::turn("t-empty-final")
