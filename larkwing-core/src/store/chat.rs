@@ -319,8 +319,7 @@ impl ChatRepo {
             return Ok(vec![]);
         }
         // 转义 LIKE 通配符,让用户查的 % _ \ 当字面量(配 SQL 里 ESCAPE '\')。
-        let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
-        let pattern = format!("%{escaped}%");
+        let pattern = format!("%{}%", super::like_escape(q));
         let ql = q.to_lowercase();
         self.db.with(|c| {
             let mut stmt = c.prepare(

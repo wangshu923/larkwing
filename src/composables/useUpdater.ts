@@ -2,8 +2,10 @@
 // 下完弹「立即更新?」→ 装(Windows 装前自动退出 app)+ 重启。
 // 决策(2026-06-22 用户拍板):依赖用户代理(不自建镜像)· 每日查 · 仅 Windows 本期。
 //
-// 代理:updater 自带 HTTP,**不走 §4.6 的 net::Client**,故读 app 的 net.proxy_* 传给 check({proxy})
-// (同一把用户代理 + 尊重「总开关关=直连」)。
+// 代理:updater 自带 HTTP,**不走 §4.6 的 net::Client**,故读 app 的 net.proxy_* 传给 check({proxy})。
+// ⚠️ 与 net::Client 不同(2026-06-23 厘清):关代理时只是「不传我们的地址」,插件底层 reqwest 仍可能读
+// 系统代理环境变量 —— 做不到 §4.6「关=纯直连、连 env 都不读」那么严(插件 check API 无 no_proxy 旋钮)。
+// GitHub 走系统代理通常正合用户意,本期接受;真要纯直连需插件支持或自走 net::Client(后置)。
 // 下载做成**前端自驱任务**(useTasks.startLocal):进度进 HUD、非阻塞;下载完成的「回调」=
 // download() 这个 await 返回之后的代码(无需在任务系统里加通用回调总线)。
 // 静默失败:自动查失败只 console(被动 §3.5);下载/安装失败给任务红条 / toast。
@@ -29,7 +31,8 @@ let pending: Update | null = null
 let checking = false
 let downloading = false
 
-/** 生效代理:总开关开 + 地址非空才用,否则直连。与 §4.6 引擎侧 resolve 同向。 */
+/** 生效代理:总开关开 + 地址非空 → 用它;否则 undefined = 不传我们的代理(插件用默认,可能含系统 env)。
+ *  ⚠️ 这不是 §4.6 的「纯直连」(见文件头注释),只是「不主动加我们配置的代理」。 */
 function effectiveProxy(): string | undefined {
   const s = useSettings()
   const enabled = s.get('net.proxy_enabled') === '1'
@@ -87,6 +90,9 @@ async function download() {
   } catch (e) {
     console.error('下载更新失败', e)
     task.fail({ key: 'task.err.download' })
+  } finally {
+    // 成功 / 失败都复位:否则下载成功后 downloading 永为 true,长驻进程里第二次更新点「更新」
+    // 会在入口 `if (!pending || downloading) return` 静默早退、按钮无反应(破「不静默失败」§3.5)。
     downloading = false
   }
 }

@@ -63,16 +63,19 @@ async function loadShaka(): Promise<any> {
   }
   return shakaLib
 }
-async function destroyShaka() {
+// 串行化所有 shaka 拆除:装新 player 前必等这条链跑完。
+// 修竞态(2026-06-23):stopElements 里 `void destroyShaka()` 是 fire-and-forget(同步把 shakaPlayer
+// 置 null、p.destroy() 脱钩跑),会让 loadVideoInto 里本该串行的 `await destroyShaka()` 空转 —— 随即
+// 在旧 player 仍 destroy 中的同一 <video> 上 attach 新 player(WebView2/MSE 易炸,§8.1)。改成把每次
+// 拆除串到链尾、destroyShaka 返回链尾;loadVideoInto `await destroyShaka()` 即等到在飞的拆除真正跑完。
+let shakaTeardown: Promise<void> = Promise.resolve()
+function destroyShaka(): Promise<void> {
   const p = shakaPlayer
   shakaPlayer = null
   if (p) {
-    try {
-      await p.destroy()
-    } catch {
-      /* 已销毁/未挂载 */
-    }
+    shakaTeardown = shakaTeardown.then(() => p.destroy().catch(() => {})) // 已销毁/未挂载也吞掉
   }
+  return shakaTeardown
 }
 /** 把当前视频装进 <video>:自适应流(manifest_url)走 shaka(MSE);否则原生 src(直传/本地混流)。
  *  play() 与 registerVideoEl(后挂场景)都走它。异步加载期间若已切走/停了,据 state.current 比对退出。 */
@@ -189,9 +192,12 @@ function play(np: NowPlaying) {
     state.duration = np.duration_seconds ?? 0
     return
   }
-  // 自动续播(同为视频、已在全屏):接着放下一集,**不重做**唤窗/置顶/全屏,videoWasHidden 也保留
-  // (整季放完 stop() 时才据它决定是否藏回托盘)→ 集与集之间无缝、不闪窗口化。
-  const continuation = state.current?.kind === 'video' && np.kind === 'video' && state.fullscreen
+  // 续播 / 换片:已有视频在放、又来一个视频(自动切下一集 / 手动换片)= 接力,**不重做**唤窗/置顶/
+  // 全屏,videoWasHidden 也保留(整季放完 stop() 时才据它决定是否藏回托盘)→ 无缝、不闪窗口化,
+  // 且**尊重用户当前窗口模式**:窗口化看剧时切下一集不该被强行拽回全屏。
+  // (原误用 `&& state.fullscreen` 当判据 → 用户退全屏成窗口播放后,下一集 continuation=false →
+  //  强行 bringToFront+全屏,每个集边界都拽一次,是 bug。)只有「从无到有」起播视频才叫窗到前 + 全屏。
+  const continuation = state.current?.kind === 'video' && np.kind === 'video'
   stopElements()
   state.current = np
   state.status = 'loading'

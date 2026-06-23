@@ -21,6 +21,13 @@ pub use channels::ChannelRepo;
 pub use chat::{ChatRepo, Conversation, Message, SearchHit};
 pub use cloned_voices::{ClonedVoice, ClonedVoiceRepo};
 pub use db::Db;
+pub(crate) use db::now_ms; // 给 engine/consolidate 跑维护轮时取 now(db 模块本身私有)
+
+/// 转义 LIKE 通配符(`% _ \`)让查询串当字面量匹配(配 SQL 里 `ESCAPE '\'`)。
+/// 单源:chat 搜索、memory 纠错替换共用,改转义规则只动这里(§6.3 一处真相)。
+pub(crate) fn like_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
 pub use fsops::{FsOpRepo, FsOpRow};
 pub use jobs::{Job, JobRepo};
 pub use media_progress::{MediaProgressRepo, Progress};

@@ -97,5 +97,36 @@ pub fn suite() -> Vec<Scenario> {
                         c.contains("歌手") || c.contains("艺人") || c.contains("演唱者")
                     })
             })),
+        // ── 工具选择守卫(§16.3 扩面:把 §7.4 各能力域的「该用哪个工具」变回归)──
+        // 定时提醒该走 reminder_set(说人话、模型用 now 推时间;cron 概念不暴露 §7.4)。
+        Scenario::turn("reminder-sets-job")
+            .note("「明早提醒我吃药」→ reminder_set(§7.4 提醒三件套)")
+            .say("明天早上八点提醒我吃药")
+            .check(tool_called("reminder_set")),
+        // 时效性信息该上网查证,不硬编瞎答(§7.4 web 搜索即抓取)。
+        Scenario::turn("web-for-fresh-info")
+            .note("时效性信息 → web_search,不硬答(§7.4)")
+            .say("帮我搜一下今天有什么国内大新闻")
+            .check(tool_called("web_search")),
+        // 问天气走专用 weather 工具,不该退化成网页搜索(各司其职;§7.4)。
+        Scenario::turn("weather-uses-weather-tool")
+            .note("问天气 → weather 工具(不是 web_search)")
+            .say("上海明天天气怎么样,要不要带伞?")
+            .check(tool_called("weather")),
+        // ── Phase 3 激进维护:LLM 纠错替换的行为守卫(2026-06-23)──
+        // 用户明确纠正了已记得的旧偏好 → 提炼器应发 replaces 指令走 supersede,产出一条
+        // source=correction 的新记忆(覆盖旧的)。删除侧由 supersede 单测保;这里验**模型认不认纠正、
+        // 走没走纠错路**(source=correction 只可能由 supersede 产生 → 与「plain add 没认出纠正」区分开)。
+        Scenario::consolidate("correction-supersedes")
+            .note("明确纠正旧记忆 → 提炼出 source=correction 的替换(LLM 纠错行为,Phase 3)")
+            .seed(|s, u| {
+                let _ = s.memory.add(u, "fact", "用户喜欢喝美式咖啡", "explicit");
+            })
+            .line("user", "我现在不喝美式了,改喝拿铁,以后别给我推荐美式")
+            .line("assistant", "好的,记住啦,以后都按拿铁来~")
+            .check(distilled_at_least(1))
+            .check(custom("产出一条 source=correction 的纠错替换", |o| {
+                o.memories.iter().any(|m| m.source == "correction")
+            })),
     ]
 }
