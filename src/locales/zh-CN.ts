@@ -238,6 +238,8 @@ export default {
     installFailed: '更新没装上,过会儿再试?',
     upToDate: '已是最新版本',
     checkFailed: '检查更新失败,等会儿再试?',
+    check: '检查更新',
+    checking: '检查中…',
   },
   nav: {
     chat: '对话',

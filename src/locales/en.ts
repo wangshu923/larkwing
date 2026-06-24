@@ -239,6 +239,8 @@ export default {
     installFailed: 'Couldn’t install the update — try again later?',
     upToDate: 'You’re on the latest version',
     checkFailed: 'Update check failed — try again later?',
+    check: 'Check for updates',
+    checking: 'Checking…',
   },
   nav: {
     chat: 'Chat',
@@ -461,6 +463,7 @@ export default {
       calibStart: 'Calibrate',
       calibAgain: 'Again',
       calibCancel: 'Cancel',
+      calibPreparing: 'Getting ready… (first run downloads a small model)',
       calibRound: 'Say it clearly — {n}/{total}…',
       calibAmbient: 'Quiet for a moment — recording the room…',
       calibComputing: 'Working out the best setting for you…',

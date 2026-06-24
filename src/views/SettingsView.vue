@@ -7,6 +7,8 @@ import { api, appVersion, emitWakeChanged, isTauri, openExternal, setFloatVisibl
 import { applyLocale } from '../i18n'
 import { useChat } from '../composables/useChat'
 import { useSettings } from '../composables/useSettings'
+import { useUpdater } from '../composables/useUpdater'
+import { useToast } from '../composables/useToast'
 import { useWakeCalib } from '../composables/useWakeCalib'
 import { audioFileToWavBase64 } from '../composables/useAudioDecode'
 
@@ -29,6 +31,21 @@ const tab = ref<TabId>('general')
 
 // 关于·版本:真身读 tauri.conf.json(x.y.z),只在系统 tab 拉一次
 const appVer = ref('')
+
+// 主动「检查更新」:复用 useUpdater().check()(自动每日检查的手动入口,文案/逻辑早备好只差按钮)。
+// true=有新版 → UpdateCard 因 state.available 自动弹,不重复 toast;false=已最新;null=失败 → 各自反馈(§3.5 不静默)。
+const updChecking = ref(false)
+async function checkUpdate() {
+  if (updChecking.value) return
+  updChecking.value = true
+  try {
+    const r = await useUpdater().check()
+    if (r === false) useToast().info(t('update.upToDate'))
+    else if (r === null) useToast().error(t('update.checkFailed'))
+  } finally {
+    updChecking.value = false
+  }
+}
 
 // —— 声音 tab(PLAN §11):第一层 音色+自动朗读;高级 语速/耐心/音量/麦克风/组件状态 ——
 const voiceInfo = ref<VoiceStatus | null>(null)
@@ -1324,7 +1341,12 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         <p class="section">{{ t('settings.system.about') }}</p>
         <div class="row">
           <span class="label">{{ t('settings.system.version') }}</span>
-          <span class="s-mono">v{{ appVer || '0.1.0' }} · {{ t('settings.system.selfId') }}</span>
+          <span class="key-state">
+            <span class="s-mono">v{{ appVer || '0.1.0' }} · {{ t('settings.system.selfId') }}</span>
+            <button class="link" :disabled="updChecking" @click="checkUpdate">
+              {{ updChecking ? t('update.checking') : t('update.check') }}
+            </button>
+          </span>
         </div>
       </div>
     </div>

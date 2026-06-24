@@ -1037,15 +1037,22 @@ impl Engine {
     /// 这是**手动 / 命令入口**(按 conv_user 提炼);**自动触发**走 `spawn_consolidate`
     /// (`send_message` 每 `CONSOLIDATE_EVERY_TURNS` 个用户回合后台跑、按说话人提炼,2026-06-18 接上)。
     pub async fn consolidate_conversation(&self, conv_id: i64) -> Result<usize, AppError> {
-        // 锁内只取主选 provider 的 Arc 快照,await 在锁外(RwLock guard 不跨 await)
-        let provider = {
-            let candidates = self.llm.read().expect("llm lock poisoned");
-            candidates.first().map(|(_, p)| p.clone())
-        };
-        let Some(provider) = provider else { return Ok(0) };
+        // cheap-model 路由(§13.6 变体 A):后台提炼走**最便宜档** provider,不烧聊天主选的钱。
+        // helper 锁内只取 Arc 快照即放锁,await 在锁外(RwLock guard 不跨 await)。
+        let Some(provider) = self.consolidation_provider() else { return Ok(0) };
         let Some(conv) = self.store.chat.get_conversation(conv_id)? else { return Ok(0) };
         let added = consolidate::run(&provider, &self.store, conv.user_id, conv_id, 50).await?;
         Ok(added)
+    }
+
+    /// 后台记忆活儿(提炼 / 维护)选哪个 provider:在已建候选里挑**最便宜的一档**(catalog tier 最低),
+    /// 与用户聊天「用脑策略」(`llm.strategy`)**解耦** —— 后台蒸馏不该烧旗舰模型的钱
+    /// (§4.4「钥匙是用户的、路由是产品的」+ §13.6 cheap-model 路由,2026-06-24 变体 A)。
+    /// 复用现有档位目录(`catalog::tier_of`),**不新增模型名 / 设置项**(不触发 §4.11、守 §3 收口)。
+    /// 单 provider 用户 = 选到它本身 = 与主选一致(**零回归**)。锁内只取 Arc 快照,await 在锁外。
+    fn consolidation_provider(&self) -> Option<Arc<dyn LlmProvider>> {
+        let candidates = self.llm.read().expect("llm lock poisoned");
+        cheapest_candidate(&candidates).cloned()
     }
 
     /// 累加该会话「自上次提炼以来的用户回合数」,到阈值则归零并返回 true(该后台提炼了)。
@@ -1075,7 +1082,8 @@ impl Engine {
 
     /// 后台提炼一次该会话(PLAN §13 Phase 3 自动触发):尽力件 —— 开关关 / 没 provider / 上次还在跑
     /// 则跳过,错误只记日志,绝不影响主对话。写到说话人 `user_id`(记忆归人 §6)。
-    /// cheap-model 路由仍后置(用主 provider);触发频率见 `CONSOLIDATE_EVERY_TURNS`。
+    /// cheap-model 路由已接(§13.6 变体 A,2026-06-24):走 `consolidation_provider`(最便宜档);
+    /// 触发频率见 `CONSOLIDATE_EVERY_TURNS`。
     fn spawn_consolidate(&self, conv_id: i64, user_id: i64) {
         // 用户在设置关掉了自动提炼 = 直接不跑(手动入口不受影响)
         if !self.auto_consolidate_enabled() {
@@ -1089,8 +1097,8 @@ impl Engine {
         if flag.swap(true, Ordering::AcqRel) {
             return;
         }
-        let provider = self.llm.read().expect("llm lock poisoned").first().map(|(_, p)| p.clone());
-        let Some(provider) = provider else {
+        // cheap-model 路由(§13.6 变体 A):后台提炼走最便宜档 provider,与聊天主选解耦。
+        let Some(provider) = self.consolidation_provider() else {
             flag.store(false, Ordering::Release);
             return;
         };
@@ -1780,6 +1788,18 @@ impl Engine {
     }
 }
 
+/// 候选里最便宜的一档(catalog tier 最低;`Light < Balanced < Smart`)。同档并列保持候选序
+/// (`min_by_key` 取首个最小项 → 沿用用户排的顺序,行为可预期)。抽成自由函数 → 可脱 Engine 单测。
+/// 与 `registry::candidates(Strategy::Thrifty)` 同义(都按 `tier_of(model)` 排),只是作用在已建好的 provider 上。
+fn cheapest_candidate(
+    candidates: &[(String, Arc<dyn LlmProvider>)],
+) -> Option<&Arc<dyn LlmProvider>> {
+    candidates
+        .iter()
+        .min_by_key(|(_, p)| crate::llm::catalog::tier_of(p.model_id()))
+        .map(|(_, p)| p)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1823,6 +1843,40 @@ mod tests {
         eng.set_setting("memory.auto_consolidate", "1").unwrap();
         assert!(eng.auto_consolidate_enabled(), "设回 1 = 开");
         assert!(eng.set_setting("memory.auto_consolidate", "2").is_err(), "非 0/1 被拒");
+    }
+
+    /// cheap-model 路由(§13.6 变体 A):后台提炼挑**最便宜档** provider,无视候选序(聊天用脑策略);
+    /// 同档并列取首个(沿用候选序);单 provider 选它自己(零回归);空 → None。
+    #[test]
+    fn cheapest_candidate_picks_lowest_tier() {
+        let build = |id: &str, model: &str| -> (String, Arc<dyn LlmProvider>) {
+            let spec = ProviderSpec {
+                id: id.into(),
+                name: id.into(),
+                api_key: "sk-test".into(),
+                model: model.into(),
+                ..Default::default()
+            };
+            (id.into(), spec.build())
+        };
+        // 候选按「聪明优先」排(旗舰在前)→ 仍应挑出最便宜的 flash(Light)
+        let cands = vec![
+            build("smart", "claude-opus-4-8"),   // Smart
+            build("mid", "deepseek-v4"),          // Balanced
+            build("cheap", "deepseek-v4-flash"),  // Light
+        ];
+        assert_eq!(
+            cheapest_candidate(&cands).unwrap().model_id(),
+            "deepseek-v4-flash",
+            "挑最低档,无视候选序"
+        );
+        // 同档并列 → 取首个(min_by_key 取首个最小项,可预期)
+        let ties = vec![build("a", "deepseek-v4"), build("b", "deepseek-chat")];
+        assert_eq!(cheapest_candidate(&ties).unwrap().model_id(), "deepseek-v4", "并列取首个");
+        // 单 provider → 选它自己(与主选一致,零回归);空候选 → None
+        let one = vec![build("solo", "claude-opus-4-8")];
+        assert_eq!(cheapest_candidate(&one).unwrap().model_id(), "claude-opus-4-8");
+        assert!(cheapest_candidate(&[]).is_none());
     }
 
     // —— conversation_trace（「想了想」历史回放）—— //
