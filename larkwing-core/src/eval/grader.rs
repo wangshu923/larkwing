@@ -13,8 +13,14 @@ use crate::store::memory::Memory;
 pub struct Observed {
     /// 本次运行所有回合的工具步(扁平化;`TraceStep` 含 name/args/result/status)。
     pub trace: Vec<TraceStep>,
-    /// 本次驱动**新写入**的记忆(已剔除 seed 预置的,只看这一跑产生的)。
+    /// 本次驱动**新写入**的记忆(按 id 差集剔除 seed 预置的,只看这一跑新增的)。
+    /// ⚠️ 测不了「删+重插」类操作(supersede / maintain):SQLite 删唯一行后插入会**复用 rowid**,
+    /// 新条 id 撞回 seed 的 id → 被差集漏掉(2026-06-23 correction-supersedes 0/5 假阴的根因)。
+    /// 删除 / 替换侧请看 `all_memories`。
     pub memories: Vec<Memory>,
+    /// 运行后**全量**记忆快照(不做 id 差集):supersede / maintain 这类删+重插、硬清、合并操作,
+    /// 只有全量快照才看得到(配 `memory_with_source` / `memory_absent` 组合子)。
+    pub all_memories: Vec<Memory>,
     /// 本次驱动**新写入**的需知。
     pub briefings: Vec<Briefing>,
     /// consolidate 新增条数(turn 类驱动恒 0)。
@@ -108,6 +114,33 @@ pub fn no_memory_contains(s: &str) -> Check {
     })
 }
 
+/// 运行后**全量**记忆里存在一条 `source=指定值`(可选再限定内容子串)。
+/// 看 `all_memories` 而非 `memories` —— 专为 supersede / maintain 这类「删+重插」:rowid 复用会让
+/// id 差集(`memories`)漏看新条(2026-06-23 correction-supersedes 教训)。`source="correction"` 即
+/// 走了纠错替换路(与普通 `distilled` 新增区分开)。
+pub fn memory_with_source(source: &str, contains: Option<&str>) -> Check {
+    let source = source.to_string();
+    let contains = contains.map(str::to_string);
+    let label = match &contains {
+        Some(c) => format!("全量记忆有 source={source} 且含「{c}」的一条"),
+        None => format!("全量记忆有 source={source} 的一条"),
+    };
+    Check::new(label, move |o| {
+        o.all_memories
+            .iter()
+            .any(|m| m.source == source && contains.as_deref().map_or(true, |c| m.content.contains(c)))
+    })
+}
+
+/// 运行后**全量**记忆里没有任何一条含某子串(验删除 / 替换侧:旧内容真没了、硬清真清掉了)。
+/// 区别于 `no_memory_contains`(只看本次新写入)—— 这个看全量,能抓 seed 旧条是否被替换 / 删除。
+pub fn memory_absent(s: &str) -> Check {
+    let s = s.to_string();
+    Check::new(format!("全量记忆里没有含「{s}」的"), move |o| {
+        !o.all_memories.iter().any(|m| m.content.contains(&s))
+    })
+}
+
 /// 本次新写入了某域需知,内容含子串。
 pub fn briefing_written(domain: &str, contains: &str) -> Check {
     let (domain, contains) = (domain.to_string(), contains.to_string());
@@ -169,7 +202,8 @@ mod tests {
     }
 
     fn obs(trace: Vec<TraceStep>, memories: Vec<Memory>, distilled: usize) -> Observed {
-        Observed { trace, memories, briefings: vec![], distilled, outcome: Outcome::Done }
+        let all_memories = memories.clone();
+        Observed { trace, memories, all_memories, briefings: vec![], distilled, outcome: Outcome::Done }
     }
 
     #[test]
@@ -217,5 +251,28 @@ mod tests {
             matches!(o.trace.first().map(|s| s.name.as_str()), Some("fs_find" | "media_play"))
         });
         assert!(first_is_local.eval(&o));
+    }
+
+    #[test]
+    fn full_list_combinators_catch_supersede_that_id_diff_misses() {
+        // 复刻 correction-supersedes 的真实情形:supersede 删+重插复用 rowid → 新条落回 pre_mem、
+        // 被 id 差集漏掉 → memories(差集)为空,但 all_memories(全量)有这条 source=correction。
+        let correction = Memory { source: "correction".into(), ..mem("fact", "用户改喝拿铁了") };
+        let o = Observed {
+            trace: vec![],
+            memories: vec![], // 差集为空 —— 正是 rowid 复用导致的漏检
+            all_memories: vec![correction],
+            briefings: vec![],
+            distilled: 1,
+            outcome: Outcome::Done,
+        };
+        assert!(memory_with_source("correction", None).eval(&o), "全量里有 correction 条");
+        assert!(memory_with_source("correction", Some("拿铁")).eval(&o));
+        assert!(!memory_with_source("distilled", None).eval(&o), "source 不符不算");
+        assert!(!memory_with_source("correction", Some("美式")).eval(&o), "内容不含则不算");
+        assert!(memory_absent("美式").eval(&o), "全量里没有含美式的");
+        assert!(!memory_absent("拿铁").eval(&o));
+        // 旧组合子看差集(空)→ 看不到 —— 正是当初 correction-supersedes 0/5 假阴的原因。
+        assert!(no_memory_contains("拿铁").eval(&o), "差集为空 → 旧组合子漏检");
     }
 }

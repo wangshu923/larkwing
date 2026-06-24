@@ -24,8 +24,8 @@ use crate::store::Store;
 
 pub use grader::{
     briefing_written, custom, distilled_at_least, distilled_contains, distilled_empty,
-    memory_written, no_memory_contains, no_tool_calls, tool_called, tool_not_called, tool_status,
-    Check, Observed, Outcome,
+    memory_absent, memory_with_source, memory_written, no_memory_contains, no_tool_calls,
+    tool_called, tool_not_called, tool_status, Check, Observed, Outcome,
 };
 
 /// 驱动方式:一串用户消息(各排到回合收尾)/ 预置一段历史后调 consolidate。
@@ -330,13 +330,11 @@ where
         };
 
         let trace = collect_trace(&store, conv.id);
-        let memories: Vec<_> = store
-            .memory
-            .list(user.id)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|m| !pre_mem.contains(&m.id))
-            .collect();
+        // 全量快照 + 由它派生「本次新写入」差集。supersede / maintain 删+重插会复用 rowid,差集会漏看
+        // (correction-supersedes 0/5 假阴);删除 / 替换侧的断言走 all_memories(memory_with_source 等)。
+        let all_memories = store.memory.list(user.id).unwrap_or_default();
+        let memories: Vec<_> =
+            all_memories.iter().filter(|m| !pre_mem.contains(&m.id)).cloned().collect();
         let briefings: Vec<_> = store
             .briefings
             .list_for(user.id)
@@ -351,7 +349,7 @@ where
         }
 
         let observed =
-            Observed { trace, memories, briefings, distilled, outcome: outcome.clone() };
+            Observed { trace, memories, all_memories, briefings, distilled, outcome: outcome.clone() };
 
         let mut all_ok = matches!(outcome, Outcome::Done);
         if !all_ok {

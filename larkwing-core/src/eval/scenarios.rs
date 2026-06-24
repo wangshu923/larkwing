@@ -117,6 +117,9 @@ pub fn suite() -> Vec<Scenario> {
         // 用户明确纠正了已记得的旧偏好 → 提炼器应发 replaces 指令走 supersede,产出一条
         // source=correction 的新记忆(覆盖旧的)。删除侧由 supersede 单测保;这里验**模型认不认纠正、
         // 走没走纠错路**(source=correction 只可能由 supersede 产生 → 与「plain add 没认出纠正」区分开)。
+        // 断言走 all_memories(全量),不走 memories(id 差集)—— supersede 删+重插复用 rowid 会让
+        // 新条撞回 seed 的 id、被差集漏看(2026-06-23:此场景一度 0/5 假阴,verbose 实锤 supersede
+        // 其实触发了、判官看不见;改 memory_with_source 看全量快照即真。见 grader 同源自测)。
         Scenario::consolidate("correction-supersedes")
             .note("明确纠正旧记忆 → 提炼出 source=correction 的替换(LLM 纠错行为,Phase 3)")
             .seed(|s, u| {
@@ -125,8 +128,6 @@ pub fn suite() -> Vec<Scenario> {
             .line("user", "我现在不喝美式了,改喝拿铁,以后别给我推荐美式")
             .line("assistant", "好的,记住啦,以后都按拿铁来~")
             .check(distilled_at_least(1))
-            .check(custom("产出一条 source=correction 的纠错替换", |o| {
-                o.memories.iter().any(|m| m.source == "correction")
-            })),
+            .check(memory_with_source("correction", None)),
     ]
 }
