@@ -52,3 +52,16 @@ tokio-tungstenite = { version = "0.26", default-features = false, features = ["c
 tracing = "0.1"
 # ffmpeg 发行包是 zip(yt-dlp 是裸二进制不经它)
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# 系统音量(tools/desktop.rs 的 system_volume):Windows 走 Core Audio(IAudioEndpointVolume)。
+# 仅 Windows 编译(Mac 走 osascript、Linux 不支持,都不需要);windows 0.61 与 src-tauri 同版本,
+# 不引入新版本。开「打开」工具不需要 windows crate(走进程 start/open),只音量用它。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Media_Audio",            # IMMDeviceEnumerator / eRender / eConsole
+  "Win32_Media_Audio_Endpoints",  # IAudioEndpointVolume(音量接口本体,单独 feature)
+  "Win32_System_Com",             # CoCreateInstance / CoInitializeEx / CLSCTX
+  "Win32_System_Com_StructuredStorage", # IMMDevice::Activate 用 PROPVARIANT(与 Variant 同为门控)
+  "Win32_System_Variant",         # IMMDevice::Activate 的另一半门控(缺它 Activate 方法不生成)
+] }

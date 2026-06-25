@@ -20,6 +20,8 @@ export default {
     media_search: '翻翻片库…',
     media_play: '准备开播…',
     media_control: '拨弄播放器…',
+    open: '这就打开…',
+    system_volume: '拧音量旋钮…',
     fs_list: '看看文件夹…',
     fs_find: '找找文件…',
     fs_read_text: '读读这个文件…',

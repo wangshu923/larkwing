@@ -4,6 +4,7 @@
 //! job 型不另设 trait:就是一个秒回"已启动"的阻塞工具(JobRunner 后置,见 PLAN §8)。
 
 mod briefing;
+mod desktop;
 mod fs;
 mod media_control;
 mod media_play;
@@ -120,6 +121,8 @@ impl Tools {
         tools.register(Arc::new(media_search::MediaSearch::new()));
         tools.register(Arc::new(media_play::MediaPlay::new()));
         tools.register(Arc::new(media_control::MediaControl::new()));
+        tools.register(Arc::new(desktop::Open::new()));
+        tools.register(Arc::new(desktop::SystemVolume::new()));
         tools.register(Arc::new(fs::FsList::new()));
         tools.register(Arc::new(fs::FsFind::new()));
         tools.register(Arc::new(fs::FsReadText::new()));

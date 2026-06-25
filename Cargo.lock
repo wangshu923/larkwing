@@ -2696,7 +2696,7 @@ dependencies = [
 
 [[package]]
 name = "larkwing"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "ctrlc",
  "flate2",
@@ -2724,7 +2724,7 @@ dependencies = [
 
 [[package]]
 name = "larkwing-core"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2757,6 +2757,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "trash",
+ "windows 0.61.3",
  "zip 2.4.2",
 ]
 

@@ -21,6 +21,8 @@ export default {
     media_search: 'Digging through the library…',
     media_play: 'Cueing it up…',
     media_control: 'Working the player…',
+    open: 'Opening it up…',
+    system_volume: 'Turning the volume knob…',
     fs_list: 'Peeking into the folder…',
     fs_find: 'Hunting for the file…',
     fs_read_text: 'Reading the file…',
