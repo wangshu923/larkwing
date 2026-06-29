@@ -23,6 +23,7 @@ export default {
     media_control: 'Working the player…',
     open: 'Opening it up…',
     system_volume: 'Turning the volume knob…',
+    power: 'Reaching for the power switch…',
     fs_list: 'Peeking into the folder…',
     fs_find: 'Hunting for the file…',
     fs_read_text: 'Reading the file…',
@@ -182,6 +183,12 @@ export default {
       s4: 'What’s the weather today?',
       s5: 'Just chat with me',
       s6: 'What can you do?',
+    },
+    // Scene-triggered chips (currently: follow-ups while music is playing)
+    ctx: {
+      moreLike: 'Play another like this',
+      calmer: 'Something calmer',
+      somethingElse: 'Just play something else',
     },
   },
   // “Thought it through” reveal (PLAN §9): clean collapsed pill; expand shows technical detail (tool name/args/result + raw CoT)
@@ -495,9 +502,11 @@ export default {
       // recognition model (exposed 2026-06): SenseVoice fast by default; Whisper steadier on kids/accents; FireRed sharpest Chinese
       asrModel: 'Recognition model',
       asr_standard: 'Standard · fast (default)',
+      asr_lite: 'Lightweight · smallest (~100MB, rougher)',
       asr_kids: 'Better with kids · Whisper (~370MB, a bit slower)',
+      asr_accurate: 'More accurate · Whisper (~950MB, much slower)',
       asr_zh: 'Sharpest Chinese · FireRed (~740MB)',
-      asrModelHint: 'If it struggles to understand a child, “Better with kids” usually helps (steadier on kids and accents, at the cost of a little speed). Switching downloads that model on first use; recognition stays fully on this machine.',
+      asrModelHint: 'If it struggles to understand a child, “Better with kids” usually helps (steadier on kids and accents, at the cost of a little speed); if that is still not enough, try “More accurate” (large and clearly slower). On an old machine or one short on memory, pick “Lightweight” (smallest, a bit rougher). Switching downloads that model on first use; recognition stays fully on this machine.',
       component: 'Voice components',
       compReady: 'Ready',
       compMissing: 'Not downloaded · prepared automatically on first use',

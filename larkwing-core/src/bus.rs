@@ -40,6 +40,9 @@ pub enum TaskState {
 pub enum TaskRetry {
     /// 重放一次影音播放:入参 = 当初 media_play 的 page_url + audio_only。
     MediaPlay { page_url: String, audio_only: bool },
+    /// 重下一个组件(yt-dlp / ffmpeg…):入参 = 组件名;前端按钮直连 `retry_download`。
+    /// 把「下载」这类 job 也纳入「失败可重试」(原仅影音);未来别的下载照此加分支。
+    Download { component: String },
 }
 
 /// 任务进度快照(HUD 的词汇):前端按 task_id upsert,每条事件都是全量快照,

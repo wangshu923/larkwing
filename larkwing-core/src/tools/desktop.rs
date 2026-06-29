@@ -339,6 +339,196 @@ fn win_set_mute(muted: bool) -> anyhow::Result<()> {
     })
 }
 
+// ───────────────────────── power:电源 / 屏幕(锁屏 / 睡眠 / 息屏 / 关机 / 重启) ─────────────────────────
+
+/// 关机 / 重启倒计时秒数(用户 2026-06-29 拍板 60s)。OS 自带可取消倒计时:用户说「取消」
+/// 期间调 cancel 即停 —— 用对话兜底,不建 Tool::risk 人在环中闸门(§0.2.0)。
+const SHUTDOWN_DELAY_SECS: u32 = 60;
+
+pub(super) struct Power {
+    spec: ToolSpec,
+}
+
+impl Power {
+    pub(super) fn new() -> Power {
+        Power {
+            spec: ToolSpec {
+                name: "power",
+                description: "控制这台电脑的电源 / 屏幕。action:lock 锁屏 / sleep 让电脑睡眠 / \
+                              display_off 关掉屏幕(息屏,电脑还醒着)/ shutdown 关机 / restart 重启 / \
+                              cancel 取消还没执行的关机或重启。关机和重启**不是立刻执行**——会留 60 秒\
+                              倒计时,这期间用户说「取消 / 别关了 / 停」时你就用 action:cancel 停下。\
+                              锁屏 / 睡眠 / 息屏是即时且可逆的,直接做。用户说「锁屏 / 睡一下 / 把屏幕关了 / \
+                              关机 / 重启电脑 / 取消关机」时用。",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["lock", "sleep", "display_off", "shutdown", "restart", "cancel"]
+                        }
+                    },
+                    "required": ["action"]
+                }),
+                timeout: std::time::Duration::from_secs(10),
+                ui_key: "tool.power",
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for Power {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn run(&self, args: serde_json::Value, _ctx: &ToolCtx) -> anyhow::Result<String> {
+        let action = args
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .ok_or_else(|| anyhow::anyhow!("缺少 action 参数"))?;
+        match action {
+            "lock" => {
+                power_lock().await?;
+                Ok("已锁屏".into())
+            }
+            "sleep" => {
+                power_sleep().await?;
+                Ok("已让电脑睡眠".into())
+            }
+            "display_off" => {
+                power_display_off().await?;
+                Ok("已关屏(电脑还醒着)".into())
+            }
+            "shutdown" => {
+                power_shutdown(false).await?;
+                Ok(format!("已安排 {SHUTDOWN_DELAY_SECS} 秒后关机;用户要是改主意说取消,就用 cancel 停下"))
+            }
+            "restart" => {
+                power_shutdown(true).await?;
+                Ok(format!("已安排 {SHUTDOWN_DELAY_SECS} 秒后重启;用户要是改主意说取消,就用 cancel 停下"))
+            }
+            "cancel" => {
+                power_cancel().await?;
+                Ok("已取消待执行的关机 / 重启".into())
+            }
+            other => anyhow::bail!("未知的 action:{other}(支持 lock/sleep/display_off/shutdown/restart/cancel)"),
+        }
+    }
+}
+
+// ── macOS(开发机:CGSession / pmset / osascript)──
+#[cfg(target_os = "macos")]
+async fn power_lock() -> anyhow::Result<()> {
+    let mut c = tokio::process::Command::new(
+        "/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession",
+    );
+    c.arg("-suspend");
+    spawn_and_check(c, "锁屏").await
+}
+#[cfg(target_os = "macos")]
+async fn power_sleep() -> anyhow::Result<()> {
+    let mut c = tokio::process::Command::new("pmset");
+    c.arg("sleepnow");
+    spawn_and_check(c, "睡眠").await
+}
+#[cfg(target_os = "macos")]
+async fn power_display_off() -> anyhow::Result<()> {
+    let mut c = tokio::process::Command::new("pmset");
+    c.arg("displaysleepnow");
+    spawn_and_check(c, "息屏").await
+}
+#[cfg(target_os = "macos")]
+async fn power_shutdown(restart: bool) -> anyhow::Result<()> {
+    // Mac 开发机:无 sudo 不能定时关机 → osascript 走正常关机流程(会按系统设置弹保存提示);
+    // 可取消倒计时是 Windows(目标平台)特性,Mac 即时执行,cancel 在 Mac 无待取消项。
+    let verb = if restart { "restart" } else { "shut down" };
+    let mut c = tokio::process::Command::new("osascript");
+    c.arg("-e").arg(format!("tell application \"System Events\" to {verb}"));
+    spawn_and_check(c, if restart { "重启" } else { "关机" }).await
+}
+#[cfg(target_os = "macos")]
+async fn power_cancel() -> anyhow::Result<()> {
+    // Mac 这条没有可取消的定时关机(上面是即时);如实告知,不假装。
+    anyhow::bail!("Mac 上的关机是即时的,没有待取消的倒计时")
+}
+
+// ── Windows(目标平台:rundll32 / shutdown / SendMessage,真机验)──
+#[cfg(windows)]
+async fn power_lock() -> anyhow::Result<()> {
+    let mut c = tokio::process::Command::new("rundll32.exe");
+    c.args(["user32.dll,LockWorkStation"]);
+    spawn_and_check(c, "锁屏").await
+}
+#[cfg(windows)]
+async fn power_sleep() -> anyhow::Result<()> {
+    // 注:若系统启用了休眠,SetSuspendState 会休眠而非睡眠(Windows 行为,真机调优项)。
+    let mut c = tokio::process::Command::new("rundll32.exe");
+    c.args(["powrprof.dll,SetSuspendState", "0,1,0"]);
+    spawn_and_check(c, "睡眠").await
+}
+#[cfg(windows)]
+async fn power_display_off() -> anyhow::Result<()> {
+    // 息屏 = 给所有窗口广播 WM_SYSCOMMAND/SC_MONITORPOWER(关)。无干净 CLI → 走 windows crate。
+    tokio::task::spawn_blocking(win_display_off).await?
+}
+#[cfg(windows)]
+fn win_display_off() -> anyhow::Result<()> {
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SendMessageW, HWND_BROADCAST, SC_MONITORPOWER, WM_SYSCOMMAND,
+    };
+    // HWND_BROADCAST 给所有顶层窗口;wParam=SC_MONITORPOWER,lParam=2(关屏,1=低功耗、-1=开)。
+    unsafe {
+        SendMessageW(
+            HWND(HWND_BROADCAST.0),
+            WM_SYSCOMMAND,
+            Some(WPARAM(SC_MONITORPOWER as usize)),
+            Some(LPARAM(2)),
+        );
+    }
+    Ok(())
+}
+#[cfg(windows)]
+async fn power_shutdown(restart: bool) -> anyhow::Result<()> {
+    // OS 自带可取消倒计时:shutdown /s|/r /t 60;cancel = shutdown /a。
+    let flag = if restart { "/r" } else { "/s" };
+    let secs = SHUTDOWN_DELAY_SECS.to_string();
+    let mut c = tokio::process::Command::new("shutdown");
+    c.args([flag, "/t", &secs]);
+    spawn_and_check(c, if restart { "重启" } else { "关机" }).await
+}
+#[cfg(windows)]
+async fn power_cancel() -> anyhow::Result<()> {
+    let mut c = tokio::process::Command::new("shutdown");
+    c.arg("/a");
+    spawn_and_check(c, "取消关机").await
+}
+
+// ── 其它系统:不支持 ──
+#[cfg(all(not(target_os = "macos"), not(windows)))]
+async fn power_lock() -> anyhow::Result<()> {
+    anyhow::bail!("这个系统暂不支持电源控制")
+}
+#[cfg(all(not(target_os = "macos"), not(windows)))]
+async fn power_sleep() -> anyhow::Result<()> {
+    anyhow::bail!("这个系统暂不支持电源控制")
+}
+#[cfg(all(not(target_os = "macos"), not(windows)))]
+async fn power_display_off() -> anyhow::Result<()> {
+    anyhow::bail!("这个系统暂不支持电源控制")
+}
+#[cfg(all(not(target_os = "macos"), not(windows)))]
+async fn power_shutdown(_restart: bool) -> anyhow::Result<()> {
+    anyhow::bail!("这个系统暂不支持电源控制")
+}
+#[cfg(all(not(target_os = "macos"), not(windows)))]
+async fn power_cancel() -> anyhow::Result<()> {
+    anyhow::bail!("这个系统暂不支持电源控制")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -267,7 +267,9 @@ export interface TextRef {
 
 /** 失败任务的重放载体(tagged,镜像 Rust TaskRetry);只在可重试的 failed 任务上有。
  *  点重试 → 按入参直连重放,不绕 LLM(§7.1 按钮直连哲学)。 */
-export type TaskRetry = { type: 'media_play'; data: { page_url: string; audio_only: boolean } }
+export type TaskRetry =
+  | { type: 'media_play'; data: { page_url: string; audio_only: boolean } }
+  | { type: 'download'; data: { component: string } }
 
 /** 任务进度快照:按 task_id upsert,每条都是全量,错过即追平。 */
 export interface TaskView {
@@ -736,6 +738,8 @@ export const api = {
   /** 失败任务重试(目前仅影音):按 retry 载体直连重放,进展/结果照常走事件车道。 */
   mediaRetry: (pageUrl: string, audioOnly: boolean) =>
     invoke<void>('media_retry', { pageUrl, audioOnly }),
+  /** 失败下载重试:重下一个组件(yt-dlp/ffmpeg…),直连不绕 LLM。 */
+  retryDownload: (component: string) => invoke<void>('retry_download', { component }),
   /** 多集续播切集(+1 下一集 / -1 上一集):ended 自动续播、播放器上/下一集按钮直连这里(不绕 LLM)。
    *  越界(到头/到顶)在 core 内静默(只记日志)。fire-and-forget。 */
   mediaAdvance: (delta: number) => invoke<void>('media_advance', { delta }),

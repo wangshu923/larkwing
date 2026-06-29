@@ -647,6 +647,14 @@ pub fn media_retry(
     Ok(())
 }
 
+/// 失败下载「重试」(PLAN §10):重下一个组件(yt-dlp/ffmpeg…),直连不绕 LLM。
+/// 把「下载」这类 job 也纳入失败可重试(原仅影音);重下自带 HUD 任务(成功 done / 再败再冒重试卡)。
+#[tauri::command]
+pub fn retry_download(state: State<'_, AppState>, component: String) -> Result<(), AppError> {
+    state.media.retry_component(&component);
+    Ok(())
+}
+
 /// 多集续播切集(PLAN §9 多集续播):前端 `ended` 自动下一集、播放器上/下一集按钮直连这里
 /// (不绕 LLM,同 media_retry / 嘴控按钮哲学 §7.1)。delta = +1 下一集 / -1 上一集。
 /// 越界(到头/到顶)在 advance 内报错,这里只记日志 —— 按钮路径没有模型可叙述。

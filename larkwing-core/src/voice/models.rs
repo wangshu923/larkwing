@@ -89,7 +89,69 @@ pub const ASR_WHISPER_SMALL: ModelSpec = ModelSpec {
     ],
 };
 
-/// 可选 ASR ②:小红书 FireRedASR2-CTC int8(单文件 ~740MB)。CTC 在 CPU 上快(RTF~0.17),
+/// 可选 ASR ②:Whisper-tiny 多语版(弱机/轻量档,encoder+decoder+tokens,int8 ~100MB)。
+/// 体积最小、占内存最少,给**很老 / 内存紧张**的机器留条退路;同 Whisper 架构(与 small/medium
+/// 共用构造分支)。代价 = 自回归、对中文识别明显比 SenseVoice 糙(故定位「轻量」非「最准」)。
+pub const ASR_WHISPER_TINY: ModelSpec = ModelSpec {
+    id: "whisper-tiny-multi",
+    label_key: "task.download.voice_asr",
+    files: &[
+        ModelFile {
+            name: "tiny-encoder.int8.onnx",
+            urls: &[
+                "https://hf-mirror.com/csukuangfj/sherpa-onnx-whisper-tiny/resolve/main/tiny-encoder.int8.onnx",
+                "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-tiny/resolve/main/tiny-encoder.int8.onnx",
+            ],
+        },
+        ModelFile {
+            name: "tiny-decoder.int8.onnx",
+            urls: &[
+                "https://hf-mirror.com/csukuangfj/sherpa-onnx-whisper-tiny/resolve/main/tiny-decoder.int8.onnx",
+                "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-tiny/resolve/main/tiny-decoder.int8.onnx",
+            ],
+        },
+        ModelFile {
+            name: "tiny-tokens.txt",
+            urls: &[
+                "https://hf-mirror.com/csukuangfj/sherpa-onnx-whisper-tiny/resolve/main/tiny-tokens.txt",
+                "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-tiny/resolve/main/tiny-tokens.txt",
+            ],
+        },
+    ],
+};
+
+/// 可选 ASR ③:Whisper-medium 多语版(encoder+decoder+tokens,int8 ~950MB)。比 small 对
+/// 儿童 / 口音更准一档;代价 = autoregressive + 大,CPU 上**明显慢**(可能等几秒到十几秒)。
+/// 仅在 small 还不够准时再上(同 Whisper 架构,共用构造分支)。
+pub const ASR_WHISPER_MEDIUM: ModelSpec = ModelSpec {
+    id: "whisper-medium-multi",
+    label_key: "task.download.voice_asr",
+    files: &[
+        ModelFile {
+            name: "medium-encoder.int8.onnx",
+            urls: &[
+                "https://hf-mirror.com/csukuangfj/sherpa-onnx-whisper-medium/resolve/main/medium-encoder.int8.onnx",
+                "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-medium/resolve/main/medium-encoder.int8.onnx",
+            ],
+        },
+        ModelFile {
+            name: "medium-decoder.int8.onnx",
+            urls: &[
+                "https://hf-mirror.com/csukuangfj/sherpa-onnx-whisper-medium/resolve/main/medium-decoder.int8.onnx",
+                "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-medium/resolve/main/medium-decoder.int8.onnx",
+            ],
+        },
+        ModelFile {
+            name: "medium-tokens.txt",
+            urls: &[
+                "https://hf-mirror.com/csukuangfj/sherpa-onnx-whisper-medium/resolve/main/medium-tokens.txt",
+                "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-medium/resolve/main/medium-tokens.txt",
+            ],
+        },
+    ],
+};
+
+/// 可选 ASR ④:小红书 FireRedASR2-CTC int8(单文件 ~740MB)。CTC 在 CPU 上快(RTF~0.17),
 /// 标准普通话**最准一档**;但对儿童**无实证**(成人 SOTA ≠ 对孩子最好,AGENT §7.5)——作为
 /// 「中文最准」选项给用户,孩子那条仍主推 Whisper。备用源 = GitHub release 同名 .tar.bz2(已验)。
 pub const ASR_FIRERED_CTC: ModelSpec = ModelSpec {
@@ -118,7 +180,9 @@ pub const ASR_FIRERED_CTC: ModelSpec = ModelSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AsrModel {
     SenseVoice,
+    WhisperTiny,
     WhisperSmall,
+    WhisperMedium,
     FireRedCtc,
 }
 
@@ -126,7 +190,9 @@ impl AsrModel {
     /// setting 值 → 档(空 / 未知一律回落默认 SenseVoice;值是契约,与前端/engine 校验同源)。
     pub fn from_setting(s: &str) -> AsrModel {
         match s {
+            "whisper-tiny" => AsrModel::WhisperTiny,
             "whisper-small" => AsrModel::WhisperSmall,
+            "whisper-medium" => AsrModel::WhisperMedium,
             "firered-ctc" => AsrModel::FireRedCtc,
             _ => AsrModel::SenseVoice,
         }
@@ -136,7 +202,9 @@ impl AsrModel {
     pub fn spec(self) -> &'static ModelSpec {
         match self {
             AsrModel::SenseVoice => &ASR_SENSE_VOICE,
+            AsrModel::WhisperTiny => &ASR_WHISPER_TINY,
             AsrModel::WhisperSmall => &ASR_WHISPER_SMALL,
+            AsrModel::WhisperMedium => &ASR_WHISPER_MEDIUM,
             AsrModel::FireRedCtc => &ASR_FIRERED_CTC,
         }
     }
@@ -500,15 +568,24 @@ mod tests {
 
     #[test]
     fn specs_have_files_and_sources() {
-        for spec in [&SILERO_VAD, &ASR_SENSE_VOICE, &ASR_WHISPER_SMALL, &ASR_FIRERED_CTC] {
+        for spec in [
+            &SILERO_VAD,
+            &ASR_SENSE_VOICE,
+            &ASR_WHISPER_TINY,
+            &ASR_WHISPER_SMALL,
+            &ASR_WHISPER_MEDIUM,
+            &ASR_FIRERED_CTC,
+        ] {
             assert!(!spec.files.is_empty());
             for f in spec.files {
                 assert!(!f.urls.is_empty(), "{}/{} 没有下载源", spec.id, f.name);
             }
         }
-        // 三档 ASR 与 from_setting 的值一一对应(契约同步:前端 option / engine 校验同此三值)。
+        // 五档 ASR 与 from_setting 的值一一对应(契约同步:前端 option / engine 校验同此五值)。
         assert_eq!(AsrModel::from_setting("sense-voice").spec().id, ASR_SENSE_VOICE.id);
+        assert_eq!(AsrModel::from_setting("whisper-tiny").spec().id, ASR_WHISPER_TINY.id);
         assert_eq!(AsrModel::from_setting("whisper-small").spec().id, ASR_WHISPER_SMALL.id);
+        assert_eq!(AsrModel::from_setting("whisper-medium").spec().id, ASR_WHISPER_MEDIUM.id);
         assert_eq!(AsrModel::from_setting("firered-ctc").spec().id, ASR_FIRERED_CTC.id);
         assert_eq!(AsrModel::from_setting("").spec().id, ASR_SENSE_VOICE.id, "空=默认");
         assert_eq!(AsrModel::from_setting("bogus").spec().id, ASR_SENSE_VOICE.id, "未知=默认");

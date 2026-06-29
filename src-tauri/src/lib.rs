@@ -362,6 +362,7 @@ pub fn run() {
       commands::remove_provider,
       commands::media_login,
       commands::media_retry,
+      commands::retry_download,
       commands::media_advance,
       commands::report_media_state,
       commands::remote_status,

@@ -123,6 +123,7 @@ impl Tools {
         tools.register(Arc::new(media_control::MediaControl::new()));
         tools.register(Arc::new(desktop::Open::new()));
         tools.register(Arc::new(desktop::SystemVolume::new()));
+        tools.register(Arc::new(desktop::Power::new()));
         tools.register(Arc::new(fs::FsList::new()));
         tools.register(Arc::new(fs::FsFind::new()));
         tools.register(Arc::new(fs::FsReadText::new()));

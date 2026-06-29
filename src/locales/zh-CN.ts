@@ -22,6 +22,7 @@ export default {
     media_control: '拨弄播放器…',
     open: '这就打开…',
     system_volume: '拧音量旋钮…',
+    power: '动一下电源开关…',
     fs_list: '看看文件夹…',
     fs_find: '找找文件…',
     fs_read_text: '读读这个文件…',
@@ -181,6 +182,12 @@ export default {
       s4: '今天天气怎么样?',
       s5: '陪我聊会儿天',
       s6: '你都会做什么?',
+    },
+    // 场景触发气泡(目前:正在放歌时的跟进)
+    ctx: {
+      moreLike: '再来一首类似的',
+      calmer: '换个安静点的',
+      somethingElse: '随便放点别的',
     },
   },
   // 「想了想」漏出(PLAN §9):折叠药丸干净默认,展开露技术细节(工具名/入参/结果 + CoT 原文)
@@ -494,9 +501,11 @@ export default {
       // 识别模型档(2026-06 放出来选):默认 SenseVoice 快;Whisper 对小孩/口音更稳;FireRed 中文最准
       asrModel: '识别模型',
       asr_standard: '标准 · 快(默认)',
+      asr_lite: '弱机轻量 · 最小(约 100MB,识别略糙)',
       asr_kids: '听小孩更准 · Whisper(约 370MB,稍慢)',
+      asr_accurate: '更准更慢 · Whisper(约 950MB,明显慢)',
       asr_zh: '中文最准 · 小红书 FireRed(约 740MB)',
-      asrModelHint: '听不清小朋友说话时,选「听小孩更准」多半会好些(它对小孩、口音更稳,代价是慢一点点)。换了之后第一次用会自动下载对应模型,识别全程只在本机。',
+      asrModelHint: '听不清小朋友说话时,选「听小孩更准」多半会好些(它对小孩、口音更稳,代价是慢一点点);还不够准可再上「更准更慢」(大、明显慢)。机器很老或内存紧张选「弱机轻量」(最小,识别糙些)。换了之后第一次用会自动下载对应模型,识别全程只在本机。',
       component: '语音组件',
       compReady: '已就绪',
       compMissing: '未下载 · 首次使用时自动准备',

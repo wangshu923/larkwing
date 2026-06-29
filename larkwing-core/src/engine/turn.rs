@@ -194,6 +194,7 @@ impl Turn {
                 seen_calls.clear();
                 request.tool_choice = ToolChoice::Auto;
                 round_start = std::time::Instant::now();
+                super::context::cap_messages_tail(&mut request.messages); // 防溢出安全阀(注入后)
                 match provider.chat_stream(request.clone()).await {
                     Ok(next) => rx = next,
                     Err(e) => {
@@ -316,6 +317,8 @@ impl Turn {
             // 再开流,粘住同一 provider。此处建连失败不切换:半截对话已经发生,
             // 换人重说会精神分裂 —— 走 Failed 友好兜底(铁律 §3.5)。
             round_start = std::time::Instant::now(); // 2+ 轮计时:从本轮建连起
+            // 防溢出安全阀:工具轮累积 ToolResult(单条可达 4 万字)会撑大 request → 开流前封顶。
+            super::context::cap_messages_tail(&mut request.messages);
             match provider.chat_stream(request.clone()).await {
                 Ok(next) => rx = next,
                 Err(e) => {

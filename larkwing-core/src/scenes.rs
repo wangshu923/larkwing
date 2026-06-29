@@ -156,7 +156,7 @@ mod tests {
         // remember/briefing 三件套是常驻基础工具,白名单只声明场景特有的
         assert_eq!(
             s.tools,
-            ["now", "weather", "media_search", "media_play", "media_control", "open", "system_volume",
+            ["now", "weather", "media_search", "media_play", "media_control", "open", "system_volume", "power",
              "fs_list", "fs_find",
              "fs_read_text", "fs_move", "fs_copy", "fs_mkdir", "fs_trash", "fs_write_text",
              "fs_append", "fs_edit", "fs_undo",

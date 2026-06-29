@@ -7,6 +7,7 @@ import { onTranscribed, useVoice } from '../composables/useVoice'
 import { useSpeech } from '../composables/useSpeech'
 import { useContextMenu } from '../composables/useContextMenu'
 import { useCharacter } from '../composables/useCharacter'
+import { useMedia } from '../composables/useMedia'
 import { fmtMs, fmtTokens, fmtUsd } from '../lib/fmt'
 import { openExternal, api, type SearchHit } from '../lib/backend'
 import { renderMarkdown } from '../lib/md'
@@ -334,6 +335,19 @@ function sendSuggestion(text: string) {
   chatSend(text, 'typed')
 }
 
+// 场景触发建议气泡(§3.3 发现性):跟着当下状态走、替用户说下一句。当前接「正在放歌」一档——
+// 在播音频时给几条自然跟进(发现模型能「搜了再放」的能力,不是重复播放条按钮)。点一下=正常发送。
+// 扩展点:以后别的场景(刚整理完文件等)按同样形状各加一档即可。
+const { state: media } = useMedia()
+const contextSuggestions = computed<string[]>(() => {
+  if (!chat.ready || !chat.hasApiKey) return []
+  // 正在放歌(音频形态):给音乐跟进建议
+  if (media.current?.kind === 'audio' && (media.status === 'playing' || media.status === 'paused')) {
+    return [t('chat.ctx.moreLike'), t('chat.ctx.calmer'), t('chat.ctx.somethingElse')]
+  }
+  return []
+})
+
 // 用户消息 hover 的精确时刻:当天显 HH:MM,跨天加日期(比相对时间更"看时间")
 function fmtClock(ts?: number): string {
   if (!ts) return ''
@@ -623,6 +637,10 @@ watch(messages, () => nextTick(() => {
         </div>
         <!-- 播放条 + 登录建议气泡(音频形态;视频走全局 VideoOverlay) -->
         <PlayerBar />
+        <!-- 场景触发建议气泡(§3.3):跟着当下状态(目前=正在放歌)给跟进 chips,点一下替你发出去 -->
+        <div v-if="contextSuggestions.length" class="suggest suggest-ctx">
+          <button v-for="(s, si) in contextSuggestions" :key="si" class="suggest-chip" @click="sendSuggestion(s)">{{ s }}</button>
+        </div>
         <!-- 排队区(Phase A):7274 还在说时你发的消息,攒这儿,说完一起发;可逐条划掉 -->
         <div v-if="chat.queue.length" class="queue">
           <div class="q-head">
@@ -663,7 +681,7 @@ watch(messages, () => nextTick(() => {
             type="file"
             multiple
             class="file-hidden"
-            accept="image/*,.pdf,.docx,.txt,.md,.markdown,.json,.csv,.log,.rs,.py,.js,.ts,.vue,.html,.css,.yaml,.yml"
+            accept="image/*,.pdf,.docx,.pptx,.xlsx,.txt,.md,.markdown,.json,.csv,.log,.rs,.py,.js,.ts,.vue,.html,.css,.yaml,.yml"
             @change="onPick"
           />
           <button class="attach-btn" @click="openPicker" :title="t('chat.attach')">

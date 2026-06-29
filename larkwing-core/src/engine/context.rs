@@ -90,6 +90,96 @@ pub(super) fn anchored_start(total: usize) -> usize {
     (total - WINDOW_MAX).div_ceil(WINDOW_CHUNK) * WINDOW_CHUNK
 }
 
+/// 尾部字数预算上限(字符,§0.2.0 上下文安全阀)。DeepSeek 级上下文 ~64K token;稳定前缀
+/// (persona + 法条 + 记忆≤`RESIDENT_BUDGET_CHARS` + 需知 + few-shot≤800tok)已写时执法有界,
+/// 故把**易变尾**也压在此预算内,总量就稳在窗口下。中文最坏 ~1 token/字时 4.8 万字 ≈ 3.2 万
+/// token,加前缀仍宽裕;英文更省。起步值,真用可调(§13.7 同款「只能真用才能调」)。
+pub(super) const TAIL_BUDGET_CHARS: usize = 48_000;
+
+/// 尾部字数安全阀:从最新往回累加 content+payload 字数,返回「装配尾部应从哪条起」的下标。
+/// 历史窗口已按条数锚定(caller `anchored_start`),但**单条消息大小不设限**——`fs_read_text`
+/// 单次可达 4 万字、web 抓取 6 千字,几坨大结果攒在窗口里就能把上下文撑爆(provider 400
+/// `context_length_exceeded`,且大消息卡在窗口内每轮重建都超大 → 会话卡死)。这里按字数封顶。
+/// 不变量:① 预算够(总字数 ≤ 预算)→ 返回 0 → 与无安全阀等价 → **前缀缓存零损伤**(常态走这);
+/// ② 永不裁掉最后一轮(末个 user/event 起点之后整段恒保留,哪怕它自己就超预算——没法再省,
+/// 交 provider / per-tool 上限兜)。snap 边界由 build_context 在此之后做。
+fn tail_budget_start(history: &[Message]) -> usize {
+    let msg_chars = |m: &Message| {
+        m.content.chars().count() + m.payload.as_deref().map_or(0, |p| p.chars().count())
+    };
+    let total: usize = history.iter().map(&msg_chars).sum();
+    if total <= TAIL_BUDGET_CHARS {
+        return 0; // 常态:不触发 → 起点 0 → 缓存稳定
+    }
+    // 最后一轮的起点(末个 user/event 边界):预算线绝不越过它(不变量 ②)。
+    let last_round = history
+        .iter()
+        .rposition(|m| m.role == "user" || m.role == "event")
+        .unwrap_or(0);
+    // 从末尾往回累加,找到仍在预算内的最早下标。
+    let mut acc = 0usize;
+    let mut keep = history.len();
+    for (i, m) in history.iter().enumerate().rev() {
+        acc += msg_chars(m);
+        if acc > TAIL_BUDGET_CHARS {
+            break;
+        }
+        keep = i;
+    }
+    keep.min(last_round)
+}
+
+/// 单条 ChatMessage 的字数成本(估 token 用):content + reasoning + tool_calls(name+args)。
+/// parts(图)不计——视觉块按 provider 自己的图 token 算,不在文本预算里。
+fn message_chars(m: &ChatMessage) -> usize {
+    match m {
+        ChatMessage::User { content, .. } => content.chars().count(),
+        ChatMessage::Assistant { content, reasoning, tool_calls, .. } => {
+            content.chars().count()
+                + reasoning.as_deref().map_or(0, |r| r.chars().count())
+                + tool_calls
+                    .iter()
+                    .map(|c| c.name.chars().count() + c.args.to_string().chars().count())
+                    .sum::<usize>()
+        }
+        ChatMessage::ToolResult { content, .. } => content.chars().count(),
+    }
+}
+
+/// 就地封顶(§0.2.0 安全阀的活动期一半):`build_context` 的尾部安全阀只管**初始装配**,但
+/// ① 工具循环里 `request.messages` 每轮累积 ToolResult(单条 `fs_read_text` 可达 4 万字)、
+/// ② 文档附件在 build_context **之后**才注入到末条 user(绕过初始安全阀)——两条都会让 messages
+/// 持续变大撑爆上下文。故在**每次开流前**再兜一道:就地把过老消息从前面整轮丢到字数预算内。
+/// 不变量:cut 落在 User 边界(首条保持 User → 不留孤儿 ToolResult / 悬空 tool_calls 轮);绝不丢
+/// 最后一条 User(当前任务);system 前缀不在 messages 里、永不动;常态不超预算 → no-op → 缓存不破。
+pub(super) fn cap_messages_tail(messages: &mut Vec<ChatMessage>) {
+    let total: usize = messages.iter().map(message_chars).sum();
+    if total <= TAIL_BUDGET_CHARS {
+        return; // 常态:不触发 → 不动 messages → 前缀缓存零损伤
+    }
+    let is_user = |m: &ChatMessage| matches!(m, ChatMessage::User { .. });
+    // 最后一条 User(当前任务):cut 绝不越过它(不变量 ②)。
+    let last_user = messages.iter().rposition(is_user).unwrap_or(0);
+    // 从末尾往回累加,找仍在预算内的最早下标。
+    let mut acc = 0usize;
+    let mut keep = messages.len();
+    for (i, m) in messages.iter().enumerate().rev() {
+        acc += message_chars(m);
+        if acc > TAIL_BUDGET_CHARS {
+            break;
+        }
+        keep = i;
+    }
+    let keep = keep.min(last_user);
+    // 向后吸附到 User 边界:首条保持 User,不留孤儿 ToolResult / 悬空 tool_calls 轮。
+    let snap = messages[keep..].iter().position(is_user).unwrap_or(0);
+    let cut = keep + snap;
+    if cut > 0 {
+        messages.drain(0..cut);
+        tracing::warn!(dropped = cut, "上下文逼近上限,丢弃最老的整轮消息(安全阀)");
+    }
+}
+
 pub(super) fn build_context(
     scene: &Scene,
     user_name: Option<&str>,
@@ -132,14 +222,16 @@ pub(super) fn build_context(
         }
     }
 
-    // 锚点吸附 user/event 边界:窗口起点若落在工具轮中间,向后推进到第一条回合起点行,
+    // 尾部字数安全阀(§0.2.0 防溢出):先按字数把过老的整轮压掉(常态不触发 → 返回 0)。
+    let budget_start = tail_budget_start(history);
+    // 锚点吸附 user/event 边界:起点若落在工具轮中间,向后推进到第一条回合起点行,
     // 保证窗口内 tool_call/result 永远成对(吸附量 ≤ 一个工具轮,有界)。
-    // event 也是合法回合起点(任务专属会话里没有 user 行)。
-    let first_user = history
+    // event 也是合法回合起点(任务专属会话里没有 user 行)。budget_start=0 时 = 原 first_user 吸附。
+    let snap = history[budget_start..]
         .iter()
         .position(|m| m.role == "user" || m.role == "event")
         .unwrap_or(0);
-    let history = &history[first_user..];
+    let history = &history[budget_start + snap..];
 
     // few-shot 在真实历史之前:按场景静态 → 字节级稳定 → 吃前缀缓存(PLAN §8)
     let mut messages: Vec<ChatMessage> = scene.few_shots.clone();
@@ -294,6 +386,97 @@ mod tests {
         for total in (WINDOW_MAX + 1)..(WINDOW_MAX + WINDOW_CHUNK) {
             assert_eq!(anchored_start(total), base);
         }
+    }
+
+    #[test]
+    fn tail_budget_noop_under_budget() {
+        // 常态:普通短消息远在预算内 → 起点 0 → 与无安全阀等价(前缀缓存不破)。
+        let h = vec![
+            msg(1, "user", "你好", None),
+            msg(2, "assistant", "嗨", None),
+            msg(3, "user", "今天天气?", None),
+        ];
+        assert_eq!(tail_budget_start(&h), 0);
+    }
+
+    #[test]
+    fn tail_budget_trims_old_rounds_when_over() {
+        // 三轮,每轮一个超大 user(各 ~预算的 0.7)→ 总量超预算 → 丢最老、保最新。
+        let big = "图".repeat(TAIL_BUDGET_CHARS * 7 / 10);
+        let h = vec![
+            msg(1, "user", &big, None), // 最老,应被丢
+            msg(2, "assistant", "ok1", None),
+            msg(3, "user", &big, None),
+            msg(4, "assistant", "ok2", None),
+            msg(5, "user", &big, None), // 最新一轮,必保
+            msg(6, "assistant", "ok3", None),
+        ];
+        let start = tail_budget_start(&h);
+        assert!(start > 0, "超预算必须裁");
+        // 起点落在某条 user/event 边界上(或其前),保最后一轮完整
+        assert!(start <= 4, "最后一轮(下标4起)必须整段保留");
+        // 被保留段字数在预算内(末轮单独超标的情形除外,这里每轮 0.7×预算两轮就超)
+        let kept: usize = h[start..]
+            .iter()
+            .map(|m| m.content.chars().count())
+            .sum();
+        assert!(kept <= TAIL_BUDGET_CHARS, "保留段应压在预算内: {kept}");
+    }
+
+    #[test]
+    fn tail_budget_keeps_last_round_even_if_oversized() {
+        // 不变量 ②:最后一轮自己就超预算也不裁(没法再省)→ 起点 = 末轮起点,不越过它。
+        let huge = "字".repeat(TAIL_BUDGET_CHARS * 2);
+        let h = vec![
+            msg(1, "user", "旧", None),
+            msg(2, "assistant", "旧答", None),
+            msg(3, "user", &huge, None), // 末轮 user 单条就 2× 预算
+            msg(4, "assistant", "答", None),
+        ];
+        // 末个 user/event = 下标 2(huge user) → 起点 = 2,不越过它(保末轮 user 头)
+        assert_eq!(tail_budget_start(&h), 2);
+    }
+
+    #[test]
+    fn cap_messages_noop_under_budget() {
+        // 常态:短消息 → 不动 messages(前缀缓存不破)。
+        let mut m = vec![
+            ChatMessage::user("你好"),
+            ChatMessage::assistant("嗨"),
+            ChatMessage::user("放首歌"),
+        ];
+        let before = m.clone();
+        cap_messages_tail(&mut m);
+        assert_eq!(m.len(), before.len());
+    }
+
+    #[test]
+    fn cap_messages_drops_old_rounds_and_snaps_to_user() {
+        // 工具循环累积:老 user + 一坨超大 ToolResult,再来新 user → 超预算丢老的、首条保 User。
+        let big = "果".repeat(TAIL_BUDGET_CHARS * 8 / 10);
+        let mut m = vec![
+            ChatMessage::user("旧任务"),
+            ChatMessage::Assistant {
+                content: String::new(),
+                reasoning: None,
+                tool_calls: vec![],
+                reasoning_state: None,
+            },
+            ChatMessage::ToolResult { call_id: "c1".into(), content: big.clone() },
+            ChatMessage::user("新任务"),
+            ChatMessage::ToolResult { call_id: "c2".into(), content: big },
+        ];
+        cap_messages_tail(&mut m);
+        // 首条必须是 User(无孤儿 ToolResult);且最后一条 User「新任务」保留。
+        assert!(matches!(m.first(), Some(ChatMessage::User { .. })), "首条须为 User");
+        assert!(
+            m.iter().any(|x| matches!(x, ChatMessage::User { content, .. } if content == "新任务")),
+            "当前任务 user 必保"
+        );
+        assert!(
+            !m.iter().any(|x| matches!(x, ChatMessage::User { content, .. } if content == "旧任务")),
+            "超预算的老轮应被丢"
+        );
     }
 
     #[test]

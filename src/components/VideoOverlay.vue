@@ -61,13 +61,53 @@ async function toggleFullscreen() {
   await win.setFullscreen(next)
 }
 
-/** Esc 退全屏:tao 原生全屏在 Windows 不可靠响应 Esc,自己接管。 */
+/** 看片快捷键:空格=播放/暂停、↑↓=音量、←→=快进退 20s、Esc=退全屏。
+ * 在输入框打字时不抢键;空格/方向键会 preventDefault(否则页面滚动/翻页)。 */
+const SEEK_STEP = 20 // 秒
+const VOL_STEP = 0.1
 function onKey(e: KeyboardEvent) {
+  // Esc 退全屏:tao 原生全屏在 Windows 不可靠响应 Esc,自己接管。
   if (e.key === 'Escape' && state.fullscreen) {
     e.preventDefault()
     e.stopPropagation()
     void toggleFullscreen()
+    return
   }
+  // 正在输入框/可编辑区打字 → 让位,别抢键
+  const t = e.target as HTMLElement | null
+  if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return
+  // 带修饰键的组合留给系统/其它快捷键
+  if (e.ctrlKey || e.metaKey || e.altKey) return
+  // 没有在播放的内容就不接管(避免在别的视图误吞键)
+  if (!state.current) return
+  switch (e.key) {
+    case ' ':
+    case 'Spacebar': // 老 Edge/IE 的空格键名
+      e.preventDefault()
+      toggle()
+      break
+    case 'ArrowUp':
+      e.preventDefault()
+      setVolume(state.volume + VOL_STEP)
+      break
+    case 'ArrowDown':
+      e.preventDefault()
+      setVolume(state.volume - VOL_STEP)
+      break
+    case 'ArrowLeft':
+      e.preventDefault()
+      seek(Math.max(0, state.position - SEEK_STEP))
+      break
+    case 'ArrowRight': {
+      e.preventDefault()
+      const cap = state.duration > 0 ? state.duration : state.position + SEEK_STEP
+      seek(Math.min(cap, state.position + SEEK_STEP))
+      break
+    }
+    default:
+      return
+  }
+  showControls() // 调整后让控制条/OSD 浮现一下(全屏态)
 }
 
 // 全屏 = 影院视图:控制条覆盖在画面上,播放中 2.8s 无操作自动隐藏(鼠标一动即现);

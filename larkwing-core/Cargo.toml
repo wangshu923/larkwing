@@ -50,8 +50,12 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "linux-
 # 不重蹈 ring/aws-lc 之争。只收消息走 WS,回复走 sessionWebhook(HTTP/net::Client)。
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tracing = "0.1"
-# ffmpeg 发行包是 zip(yt-dlp 是裸二进制不经它)
+# ffmpeg 发行包是 zip(yt-dlp 是裸二进制不经它);docx/pptx/xlsx 也是 zip(OOXML)走它解。
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# PDF 文字层抽取(attach.rs;扫描件无文字层 → 返回空,栅格化转图是 0.2.0 stretch 另说)。
+pdf-extract = "0.9"
+# xlsx → CSV(attach.rs):用成熟读取器处理共享串/类型/日期,比手撸单元格解析稳。pptx 仍走 zip+strip。
+calamine = "0.26"
 
 # 系统音量(tools/desktop.rs 的 system_volume):Windows 走 Core Audio(IAudioEndpointVolume)。
 # 仅 Windows 编译(Mac 走 osascript、Linux 不支持,都不需要);windows 0.61 与 src-tauri 同版本,
@@ -64,4 +68,5 @@ windows = { version = "0.61", features = [
   "Win32_System_Com",             # CoCreateInstance / CoInitializeEx / CLSCTX
   "Win32_System_Com_StructuredStorage", # IMMDevice::Activate 用 PROPVARIANT(与 Variant 同为门控)
   "Win32_System_Variant",         # IMMDevice::Activate 的另一半门控(缺它 Activate 方法不生成)
+  "Win32_UI_WindowsAndMessaging", # SendMessageW / WM_SYSCOMMAND / SC_MONITORPOWER(power 息屏)
 ] }

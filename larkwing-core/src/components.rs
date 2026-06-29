@@ -93,6 +93,15 @@ impl Component {
             Component::Ffmpeg => "ffmpeg",
         }
     }
+
+    /// 组件名 → 枚举(retry_download 重试用;未知名 = None)。与 `path_name` 互为逆。
+    pub fn from_name(s: &str) -> Option<Component> {
+        match s {
+            "yt-dlp" => Some(Component::YtDlp),
+            "ffmpeg" => Some(Component::Ffmpeg),
+            _ => None,
+        }
+    }
 }
 
 /// 镜像前缀列表(数据,settings `media.gh_mirrors` 可覆盖):对 github.com 直链做
@@ -145,7 +154,12 @@ impl Components {
                 Ok(managed)
             }
             Err(e) => {
-                task.fail("task.err.download", serde_json::Value::Null);
+                // 下载失败可重试(原仅影音):带组件名,前端「重试」直连 retry_download 重下。
+                task.fail_retryable(
+                    "task.err.download",
+                    serde_json::Value::Null,
+                    crate::bus::TaskRetry::Download { component: c.path_name().into() },
+                );
                 Err(e)
             }
         }

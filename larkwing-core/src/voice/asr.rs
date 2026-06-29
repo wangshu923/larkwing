@@ -22,7 +22,10 @@ impl SherpaAsr {
     pub fn load(model: AsrModel, model_dir: &Path, lang: &str) -> Result<SherpaAsr> {
         match model {
             AsrModel::SenseVoice => Self::sense_voice(model_dir, lang),
-            AsrModel::WhisperSmall => Self::whisper_small(model_dir, lang),
+            // tiny / small / medium 同 Whisper 架构,只差文件名前缀(与 models.rs spec 对齐)。
+            AsrModel::WhisperTiny => Self::whisper(model_dir, lang, "tiny"),
+            AsrModel::WhisperSmall => Self::whisper(model_dir, lang, "small"),
+            AsrModel::WhisperMedium => Self::whisper(model_dir, lang, "medium"),
             AsrModel::FireRedCtc => Self::fire_red_ctc(model_dir),
         }
     }
@@ -42,22 +45,23 @@ impl SherpaAsr {
         Ok(SherpaAsr { rec })
     }
 
-    /// Whisper 形(多语 small):encoder/decoder 在 `whisper` 子结构,tokens 在 model_config 顶层。
+    /// Whisper 形(多语 tiny/small/medium):encoder/decoder 在 `whisper` 子结构,tokens 在
+    /// model_config 顶层;文件名前缀按档(`{size}-encoder.int8.onnx` 等,与 models.rs spec 对齐)。
     /// language 指定中文(避免自动语言检测的歧义);task 留默认 = transcribe(转写,不翻译)。
     /// `num_threads` 上调 = Whisper autoregressive 吃 CPU,多线程缓解延迟(真机调优项,AGENT §8.1)。
-    pub fn whisper_small(model_dir: &Path, lang: &str) -> Result<SherpaAsr> {
+    pub fn whisper(model_dir: &Path, lang: &str, size: &str) -> Result<SherpaAsr> {
         let mut cfg = sherpa_onnx::OfflineRecognizerConfig::default();
         cfg.model_config.whisper.encoder =
-            Some(model_dir.join("small-encoder.int8.onnx").to_string_lossy().into_owned());
+            Some(model_dir.join(format!("{size}-encoder.int8.onnx")).to_string_lossy().into_owned());
         cfg.model_config.whisper.decoder =
-            Some(model_dir.join("small-decoder.int8.onnx").to_string_lossy().into_owned());
+            Some(model_dir.join(format!("{size}-decoder.int8.onnx")).to_string_lossy().into_owned());
         cfg.model_config.whisper.language = Some(lang.to_string());
         cfg.model_config.tokens =
-            Some(model_dir.join("small-tokens.txt").to_string_lossy().into_owned());
+            Some(model_dir.join(format!("{size}-tokens.txt")).to_string_lossy().into_owned());
         cfg.model_config.num_threads = 4;
         let t0 = std::time::Instant::now();
         let rec = sherpa_onnx::OfflineRecognizer::create(&cfg).context("ASR 模型加载失败")?;
-        tracing::info!(ms = t0.elapsed().as_millis() as u64, "ASR 模型加载完成(Whisper-small)");
+        tracing::info!(ms = t0.elapsed().as_millis() as u64, size, "ASR 模型加载完成(Whisper)");
         Ok(SherpaAsr { rec })
     }
 

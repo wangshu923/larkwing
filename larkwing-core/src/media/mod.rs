@@ -351,6 +351,19 @@ impl MediaRuntime {
         (p.at.elapsed() <= PENDING_PLAY_TTL).then_some(p)
     }
 
+    /// 失败重下一个组件(前端「重试」按钮直连,§7.1 不绕 LLM)。按组件名找枚举,后台重跑
+    /// `ensure`(自带 HUD 任务:成功 done、再失败仍 fail_retryable 冒新卡)。不阻塞调用方。
+    pub fn retry_component(&self, name: &str) {
+        let Some(c) = Component::from_name(name) else {
+            tracing::warn!(component = name, "retry_download:未知组件名,忽略");
+            return;
+        };
+        let this = self.clone();
+        tokio::spawn(async move {
+            let _ = this.inner.components.ensure(c, &this.mirrors()).await;
+        });
+    }
+
     /// 组件就绪(分离 spawn:回合被取消/超时,下载在 HUD 里继续走完,下次直接命中)。
     async fn ensure_component(&self, c: Component) -> Result<PathBuf> {
         let this = self.clone();

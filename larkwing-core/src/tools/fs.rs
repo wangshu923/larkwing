@@ -354,8 +354,10 @@ impl FsReadText {
         FsReadText {
             spec: ToolSpec {
                 name: "fs_read_text",
-                description: "读一个文本文件的内容拿来看(总结文档、念清单、看说明书之类)。\
-                              只读文本;二进制或太大的会被拒或只给前一部分。",
+                description: "读一个文件的内容拿来看(总结文档、念清单、看说明书、看账单表之类)。\
+                              支持纯文本/源码,以及 Word(.docx)、PowerPoint(.pptx)、\
+                              Excel(.xlsx,会转成表格文本)、PDF(文字版;扫描成图的 PDF 读不出字)。\
+                              老格式 .doc/.xls/.ppt、或太大的会被拒或只给前一部分。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -381,8 +383,21 @@ impl Tool for FsReadText {
         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let p = Path::new(&path);
             anyhow::ensure!(p.is_file(), "{path} 不是文件或不存在");
-            let full = std::fs::read_to_string(p)
-                .map_err(|_| anyhow::anyhow!("这看起来不是文本文件,读不了内容"))?;
+            // 文档类(docx/pptx/xlsx/pdf)走抽取器(同聊天上传那条路);纯文本直读。
+            let lower = path.to_ascii_lowercase();
+            let full = if lower.ends_with(".docx")
+                || lower.ends_with(".pptx")
+                || lower.ends_with(".xlsx")
+                || lower.ends_with(".pdf")
+            {
+                let bytes = std::fs::read(p).map_err(|_| anyhow::anyhow!("读不了这个文件"))?;
+                crate::attach::extract_doc_text(&path, "", &bytes).ok_or_else(|| {
+                    anyhow::anyhow!("这个文档没抽出文字(可能是扫描成图的 PDF,或是老格式 .doc/.xls/.ppt)")
+                })?
+            } else {
+                std::fs::read_to_string(p)
+                    .map_err(|_| anyhow::anyhow!("这看起来不是文本文件,读不了内容"))?
+            };
             let mut out: String = full.chars().take(READ_TEXT_MAX_CHARS).collect();
             if out.len() < full.len() {
                 out.push_str("\n…(文件较长,只读了前一部分)");

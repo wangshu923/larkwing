@@ -1095,7 +1095,9 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             @change="onAsrModel"
           >
             <option value="sense-voice">{{ t('settings.voice.asr_standard') }}</option>
+            <option value="whisper-tiny">{{ t('settings.voice.asr_lite') }}</option>
             <option value="whisper-small">{{ t('settings.voice.asr_kids') }}</option>
+            <option value="whisper-medium">{{ t('settings.voice.asr_accurate') }}</option>
             <option value="firered-ctc">{{ t('settings.voice.asr_zh') }}</option>
           </select>
         </div>

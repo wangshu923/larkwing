@@ -816,11 +816,14 @@ impl Engine {
                 Ok(())
             }
             // 中文 ASR 模型档(app 级,机器属性,2026-06 用户要求放出来选,AGENT §7.5):
-            // sense-voice(快,默认)/ whisper-small(对孩子/口音更稳,稍慢,~370MB)/
+            // sense-voice(快,默认)/ whisper-tiny(弱机轻量,最小 ~100MB,略糙)/
+            // whisper-small(对孩子/口音更稳,稍慢,~370MB)/ whisper-medium(更准更慢,~950MB)/
             // firered-ctc(小红书,中文最准,~740MB)。模型用时下载;开着唤醒时前端会重启
             // 循环让新模型生效(同 sensitivity)。漏了这条 → 写被白名单拒 → 前端乐观写回滚。
             "voice.asr.model" => {
-                if !["sense-voice", "whisper-small", "firered-ctc"].contains(&value) {
+                if !["sense-voice", "whisper-tiny", "whisper-small", "whisper-medium", "firered-ctc"]
+                    .contains(&value)
+                {
                     return Err(invalid("未知的识别模型档"));
                 }
                 self.store.settings.set(None, key, value)?;
@@ -1601,10 +1604,13 @@ impl Engine {
         conv_id: i64,
         user_id: i64,
         candidates: Vec<(String, Arc<dyn LlmProvider>)>,
-        request: crate::llm::ChatRequest,
+        mut request: crate::llm::ChatRequest,
         tool_subset: Vec<Arc<dyn crate::tools::Tool>>,
         user_msg_id: i64,
     ) -> Result<mpsc::Receiver<TurnEvent>, AppError> {
+        // 防溢出安全阀:文档附件 / 背景状态在 build_context 之后才注入(绕过尾部安全阀),
+        // 单个附件文档可达数万字 → 开流前对累积的 messages 再封顶一道(§0.2.0)。
+        context::cap_messages_tail(&mut request.messages);
         let mut opened = None;
         let mut first_err: Option<LlmError> = None;
         for (id, provider) in &candidates {
