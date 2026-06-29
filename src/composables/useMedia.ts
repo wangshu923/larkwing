@@ -40,6 +40,20 @@ let audio: HTMLAudioElement | null = null
 let videoEl: HTMLVideoElement | null = null
 /** 混流视频 seek = 换 src 重启,这里记基准秒数,显示时间 = base + currentTime。 */
 let videoBase = 0
+// 唤醒避让(duck):语音交互期间把播放压低,让 7274 的话被听见。`state.volume` 是**基准**
+// (用户意图音量),实时元素音量 = 基准 × (ducked ? 0.2 : 1)。duck 期间用户调音量改的是基准,
+// 恢复时新基准生效 —— 修「50%→喊→压低→大点声→恢复又被无脑还原成 50%、改动丢失」的 bug。
+const DUCK_RATIO = 0.2
+let ducked = false
+/** 实时元素音量 = 基准(state.volume)按是否避让折算。 */
+function liveVolume(): number {
+  return ducked ? state.volume * DUCK_RATIO : state.volume
+}
+/** 把当前实时音量刷到两个元素(切音频/视频不丢)。 */
+function applyVolume() {
+  if (audio) audio.volume = liveVolume()
+  if (videoEl) videoEl.volume = liveVolume()
+}
 /** 视频起播前主窗是否藏在托盘:停时据此藏回去(别看完视频凭空冒出主界面)。 */
 let videoWasHidden = false
 let wired = false
@@ -83,7 +97,7 @@ async function loadVideoInto(el: HTMLVideoElement) {
   const cur = state.current
   if (!cur || cur.kind !== 'video') return
   el.playbackRate = 1
-  el.volume = state.volume
+  el.volume = liveVolume()
   if (!cur.manifest_url) {
     el.src = cur.stream_url
     void el.play().catch(() => (state.status = 'paused'))
@@ -139,7 +153,7 @@ function ensureAudio(): HTMLAudioElement {
       if (state.current?.kind === 'audio') state.status = 'paused'
     })
   }
-  audio.volume = state.volume
+  audio.volume = liveVolume()
   return audio
 }
 
@@ -176,7 +190,7 @@ export function registerVideoEl(el: HTMLVideoElement | null) {
   el.addEventListener('error', () => {
     if (state.current?.kind === 'video') state.status = 'paused'
   })
-  el.volume = state.volume
+  el.volume = liveVolume()
   el.playbackRate = state.rate
   if (state.current?.kind === 'video') {
     void loadVideoInto(el) // 后挂场景:接力起播(自适应走 shaka,否则原生 src)
@@ -251,11 +265,19 @@ function toggle() {
   state.status === 'playing' ? pause() : resume()
 }
 
-/** 音量 0–1:作用到两个元素(切音频/视频不丢),跨播放粘住。 */
+/** 音量 0–1:设的是**基准**(用户意图),跨播放粘住;实时元素音量按是否避让折算。
+ *  duck 期间调音量也是改基准 → 恢复后新音量生效(不再被无脑还原冲掉)。 */
 function setVolume(v: number) {
   state.volume = Math.min(1, Math.max(0, v))
-  if (audio) audio.volume = state.volume
-  if (videoEl) videoEl.volume = state.volume
+  applyVolume()
+}
+
+/** 唤醒避让开关(useVoice 调):on=语音交互期压低,off=恢复。改的是折算系数,基准不动 →
+ *  期间 louder/softer 改基准、恢复时生效。幂等。 */
+function setDucked(on: boolean) {
+  if (ducked === on) return
+  ducked = on
+  applyVolume()
 }
 
 /** 倍速 0.25–3:作用到当前元素;新播放复位 1。 */
@@ -464,6 +486,7 @@ export function useMedia() {
     stop,
     seek,
     setVolume,
+    setDucked,
     setRate,
     next: () => advance(1),
     prev: () => advance(-1),

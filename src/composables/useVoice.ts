@@ -32,20 +32,15 @@ export function onTranscribed(cb: (text: string, via: 'mic' | 'wake', speaker?: 
 
 let wired = false
 let media: ReturnType<typeof useMedia> | null = null
-let duckSaved: number | null = null
 let endHintTimer: ReturnType<typeof setTimeout> | undefined
 
-/** 听写窗口压低自家播放器到 20%,收摊恢复原值(robot 验证比例,锁死)。 */
+/** 听写窗口压低自家播放器到 20%(robot 验证比例,锁死);收摊恢复。压低/恢复只切折算系数,
+ *  不动基准音量 → 期间用户「大点声」改的是基准、恢复后生效(不再被无脑还原冲掉)。幂等。 */
 function duck() {
-  if (!media || duckSaved != null) return
-  duckSaved = media.state.volume
-  media.setVolume(duckSaved * 0.2)
+  media?.setDucked(true)
 }
 function restoreDuck() {
-  if (media && duckSaved != null) {
-    media.setVolume(duckSaved)
-    duckSaved = null
-  }
+  media?.setDucked(false)
 }
 
 function applyPhase(p: VoicePhase) {
