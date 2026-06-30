@@ -393,6 +393,7 @@ pub fn run() {
       commands::delete_voice_clone,
       commands::list_memories,
       commands::delete_memory,
+      commands::memory_maintenance_log,
       commands::list_briefings,
       commands::delete_briefing,
       commands::list_reminders,

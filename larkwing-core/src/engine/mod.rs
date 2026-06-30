@@ -1105,6 +1105,15 @@ impl Engine {
         Ok(self.store.memory.list(user.id)?)
     }
 
+    /// 最近的记忆维护流水(§13.7 调阈值用:回看「淡出/合并是否过激」)。归当前用户。
+    pub fn list_memory_maintenance(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<crate::store::MaintenanceLog>, AppError> {
+        let user = self.store.users.ensure_default_user()?;
+        Ok(self.store.memory.recent_maintenance(user.id, limit)?)
+    }
+
     /// 记忆提炼 / 反思(PLAN §13 Phase 3):把一段会话蒸馏成耐久记忆。**保守**——只增不删、
     /// 提炼条目进按需层(不污染前缀)、近重复跳过(详见 `consolidate`)。后台尽力件:没配
     /// provider / 会话不存在 = 返回 0,不报错。返回新增条数。

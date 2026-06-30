@@ -26,6 +26,21 @@ pub const MIGRATIONS: &[Migration] = &[
          ALTER TABLE memories ADD COLUMN source       TEXT    NOT NULL DEFAULT 'explicit';
          ALTER TABLE memories ADD COLUMN last_used_at INTEGER;",
     ),
+    // 维护可观测化(§13.7 调阈值的前提):每轮激进维护(衰减/下沉/升层/合并/硬清)做了多少事落一行
+    // (流水只进不改,§6.4 观测进库),供真实使用反推「淡出/合并是否过激」。只在 touched() 时写、省空行。
+    m(
+        "0016_memory_maintenance",
+        "CREATE TABLE memory_maintenance (
+            id         INTEGER PRIMARY KEY,
+            user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            decayed    INTEGER NOT NULL,
+            demoted    INTEGER NOT NULL,
+            promoted   INTEGER NOT NULL,
+            merged     INTEGER NOT NULL,
+            expired    INTEGER NOT NULL,
+            created_at INTEGER NOT NULL
+        );",
+    ),
 ];
 
 /// 常驻·画像区预算(字符数;§13 公理 2「注得窄」)。超额的新条目自动降为按需层,
@@ -107,6 +122,18 @@ impl MaintenanceReport {
     pub fn touched(&self) -> bool {
         self.decayed + self.demoted + self.promoted + self.merged + self.expired > 0
     }
+}
+
+/// 一行维护观测(回看用;§6.4 流水只进不改)。给前端/调试看「淡出·合并是否过激」(§13.7)。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceLog {
+    pub decayed: i64,
+    pub demoted: i64,
+    pub promoted: i64,
+    pub merged: i64,
+    pub expired: i64,
+    pub created_at: i64,
 }
 
 #[derive(Clone)]
@@ -318,8 +345,49 @@ impl MemoryRepo {
                    AND (?4 - COALESCE(last_used_at, created_at)) > ?5",
                 rusqlite::params![user, KIND_IDENTITY, COLD_SALIENCE, now, EXPIRE_IDLE_MS],
             )?;
+            // 落观测行(§6.4 只进不改):仅当这轮真动过记忆才记,省空行;与维护同事务(中途崩则一并回滚)。
+            if rep.touched() {
+                tx.execute(
+                    "INSERT INTO memory_maintenance
+                       (user_id, decayed, demoted, promoted, merged, expired, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![
+                        user,
+                        rep.decayed as i64,
+                        rep.demoted as i64,
+                        rep.promoted as i64,
+                        rep.merged as i64,
+                        rep.expired as i64,
+                        now
+                    ],
+                )?;
+            }
             tx.commit()?;
             Ok(rep)
+        })
+    }
+
+    /// 最近 N 条维护观测(新→旧),供调阈值时回看「淡出/合并是否过激」(§13.7;只读流水)。
+    pub fn recent_maintenance(&self, user: i64, limit: i64) -> Result<Vec<MaintenanceLog>> {
+        self.db.with(|c| {
+            let mut st = c.prepare(
+                "SELECT decayed, demoted, promoted, merged, expired, created_at
+                   FROM memory_maintenance WHERE user_id = ?1
+                  ORDER BY id DESC LIMIT ?2",
+            )?;
+            let rows = st
+                .query_map(rusqlite::params![user, limit], |r| {
+                    Ok(MaintenanceLog {
+                        decayed: r.get(0)?,
+                        demoted: r.get(1)?,
+                        promoted: r.get(2)?,
+                        merged: r.get(3)?,
+                        expired: r.get(4)?,
+                        created_at: r.get(5)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
         })
     }
 
@@ -733,6 +801,22 @@ mod tests {
         let rep = store.memory.maintain(me, m.created_at + 2 * DAY_MS).unwrap();
         assert_eq!(rep.decayed, 0, "没过宽限不衰减");
         assert_eq!(rep.demoted, 0);
+    }
+
+    #[test]
+    fn maintenance_logged_only_when_touched() {
+        let (store, me) = store("maint-log");
+        let (m, _) = store.memory.add(me, KIND_FACT, "偶尔提一句的事", "explicit").unwrap();
+        // no-op 轮(没过宽限)→ 不落观测行
+        store.memory.maintain(me, m.created_at + 2 * DAY_MS).unwrap();
+        assert!(store.memory.recent_maintenance(me, 50).unwrap().is_empty(), "no-op 不落行");
+        // touched 轮(衰减+下沉)→ 落一行,计数与 report 对得上
+        let rep = store.memory.maintain(me, m.created_at + 8 * DAY_MS).unwrap();
+        assert!(rep.touched());
+        let logs = store.memory.recent_maintenance(me, 50).unwrap();
+        assert_eq!(logs.len(), 1, "touched 落且只落一行");
+        assert_eq!(logs[0].decayed, rep.decayed as i64);
+        assert_eq!(logs[0].demoted, rep.demoted as i64);
     }
 
     #[test]

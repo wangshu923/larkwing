@@ -243,6 +243,15 @@ pub fn delete_memory(state: State<'_, AppState>, id: i64) -> Result<(), AppError
     state.engine.delete_memory(id)
 }
 
+/// 记忆维护流水(§13.7 调阈值用:回看每轮衰减/下沉/升层/合并/硬清了多少)。limit 缺省 50。
+#[tauri::command]
+pub fn memory_maintenance_log(
+    state: State<'_, AppState>,
+    limit: Option<i64>,
+) -> Result<Vec<larkwing_core::store::MaintenanceLog>, AppError> {
+    state.engine.list_memory_maintenance(limit.unwrap_or(50).clamp(1, 500))
+}
+
 /// 回忆页「家里的事」分组:家庭备忘(任务需知)。
 #[tauri::command]
 pub fn list_briefings(state: State<'_, AppState>) -> Result<Vec<Briefing>, AppError> {

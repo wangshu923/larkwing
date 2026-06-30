@@ -113,6 +113,15 @@ pub fn suite() -> Vec<Scenario> {
             .note("问天气 → weather 工具(不是 web_search)")
             .say("上海明天天气怎么样,要不要带伞?")
             .check(tool_called("weather")),
+        // 环境/资源事实(资源放哪)→ 需知 briefing_write(§7.3 三路路由)。换「工作文档」资源
+        // (few-shot 演示的是「电影」)验路由泛化,不照抄示范。
+        // ⚠️ 只断言「调了 briefing_write」,不断言「没调 remember」:资源位置同时也算一条关于用户的事实、
+        // 记进小本本不算错(初版加了 tool_not_called(remember) → 实测假阳性:模型很合理地 briefing 记位置
+        // + experience 记「以后怎么做」的程序性偏好,§13.2)。守住「资源事实进了 briefing 渠道」这个本质即可。
+        Scenario::turn("briefing-routes-resource")
+            .note("「我的工作文档放在 E:\\Docs」→ briefing_write(环境/资源进需知,§7.3 三路)")
+            .say("我的工作文档都放在 E:\\Docs 这个文件夹")
+            .check(tool_called("briefing_write")),
         // ── Phase 3 激进维护:LLM 纠错替换的行为守卫(2026-06-23)──
         // 用户明确纠正了已记得的旧偏好 → 提炼器应发 replaces 指令走 supersede,产出一条
         // source=correction 的新记忆(覆盖旧的)。删除侧由 supersede 单测保;这里验**模型认不认纠正、

@@ -67,6 +67,16 @@ export interface Memory {
   updated_at: number
 }
 
+/** 一行记忆维护观测(§13.7 调阈值用;后端 camelCase 序列化)。 */
+export interface MaintenanceLog {
+  decayed: number
+  demoted: number
+  promoted: number
+  merged: number
+  expired: number
+  createdAt: number
+}
+
 /** 家庭备忘一条(任务需知,PLAN §9):scope 'home' | 'user:<id>'。 */
 export interface Briefing {
   id: number
@@ -833,6 +843,9 @@ export const api = {
   deleteVoiceClone: (cloneId: string) => invoke<void>('delete_voice_clone', { cloneId }),
   listMemories: () => invoke<Memory[]>('list_memories'),
   deleteMemory: (id: number) => invoke<void>('delete_memory', { id }),
+  // 记忆维护流水(§13.7 调阈值用:回看每轮衰减/下沉/升层/合并/硬清了多少)。
+  memoryMaintenanceLog: (limit?: number) =>
+    invoke<MaintenanceLog[]>('memory_maintenance_log', { limit }),
   listBriefings: () => invoke<Briefing[]>('list_briefings'),
   deleteBriefing: (id: number) => invoke<void>('delete_briefing', { id }),
   /** 提醒页:当前用户待触发的提醒 + 取消(jobs 域,按时间升序)。 */

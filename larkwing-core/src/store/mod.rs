@@ -31,7 +31,7 @@ pub(crate) fn like_escape(s: &str) -> String {
 pub use fsops::{FsOpRepo, FsOpRow};
 pub use jobs::{Job, JobRepo};
 pub use media_progress::{MediaProgressRepo, Progress};
-pub use memory::{Memory, MemoryRepo};
+pub use memory::{MaintenanceLog, Memory, MemoryRepo};
 pub use settings::SettingsRepo;
 pub use usage::{UsageRepo, UsageRound, UsageTotals};
 pub use users::{User, UserRepo};
