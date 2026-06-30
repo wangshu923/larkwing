@@ -230,11 +230,31 @@ async function onAsrModel(e: Event) {
 // 自定义音色:选本地音频文件 → 前端解码/重采样成 16k → 后端转写出草稿 → 起名/改稿 → 保存。
 const cloneFile = ref<HTMLInputElement | null>(null)
 const cloneBusy = ref(false)
+const cloneRecording = ref(false) // 现场录音中(命令 await 到 VAD 静音自动收尾)
 const cloneErr = ref('')
 const cloneDraft = ref<{ cloneId: string; name: string; transcript: string } | null>(null)
 function pickCustomVoice() {
   cloneErr.value = ''
   cloneFile.value?.click()
+}
+// 现场录一段参考音:走麦克风(后端 VAD 自动起止、截到上限、转写出草稿),与导入同样进 cloneDraft。
+// 录音期间后端已挂起唤醒监听;命令 await 到录完+转写才返回。名字留空(没文件名)→ 占位提示填。
+async function recordClone() {
+  if (cloneBusy.value) return
+  cloneErr.value = ''
+  cloneDraft.value = null
+  cloneBusy.value = true
+  cloneRecording.value = true
+  try {
+    const d = await api.voiceCloneRecord()
+    cloneDraft.value = { cloneId: d.cloneId, name: '', transcript: d.transcript }
+  } catch (e) {
+    console.error('录音克隆失败', e)
+    cloneErr.value = t('settings.voice.cloneRecordFailed')
+  } finally {
+    cloneRecording.value = false
+    cloneBusy.value = false
+  }
 }
 async function onCustomFile(ev: Event) {
   const input = ev.target as HTMLInputElement
@@ -1035,8 +1055,11 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
                 @click="removeClone(sp.id)"
               >{{ cloneArm === sp.id ? t('settings.voice.cloneDeleteArm') : '✕' }}</button>
             </template>
+            <button class="chip sp custom" :class="{ recording: cloneRecording }" :disabled="cloneBusy" @click="recordClone">
+              {{ cloneRecording ? t('settings.voice.cloneRecording') : '🎙 ' + t('settings.voice.cloneRecord') }}
+            </button>
             <button class="chip sp custom" :disabled="cloneBusy" @click="pickCustomVoice">
-              {{ cloneBusy && !cloneDraft ? t('settings.voice.cloneImporting') : '+ ' + t('settings.voice.customAdd') }}
+              {{ cloneBusy && !cloneRecording && !cloneDraft ? t('settings.voice.cloneImporting') : '+ ' + t('settings.voice.customAdd') }}
             </button>
             <input ref="cloneFile" type="file" accept="audio/*" class="hidden-file" @change="onCustomFile" />
           </span>
@@ -1613,4 +1636,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .calib-live.pulse { animation: led 1.2s ease-in-out infinite; }
 .calib-done { color: var(--text-dim); font-size: 12.5px; }
 .calib-done.ok { color: var(--ok); }
+
+/* 现场录音中:辉光脉冲提示「在听」(复用 led 动画) */
+.chip.sp.custom.recording { color: var(--attn); border-color: rgba(var(--attn-rgb), 0.6); animation: led 1.2s ease-in-out infinite; }
 </style>
