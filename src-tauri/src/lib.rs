@@ -328,6 +328,10 @@ pub fn run() {
       if std::env::args().any(|a| a == "--autostart") {
         if let Some(win) = app.get_webview_window("main") {
           let _ = win.hide();
+          // 权威告知前端「此刻隐藏」(与 show_window 的 true 成对)。不发的话前端只能靠
+          // document.hidden(透明窗会误报可见)+ 异步 isHidden 竞态判断初值,一旦误判可见就会在隐藏
+          // 窗里排下永不触发的 rAF、之后 show 不再翻转 → 动画冻住(开机自启 bug 根因之一)。
+          let _ = win.emit("lw:win-visible", false);
         }
       }
 

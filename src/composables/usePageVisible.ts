@@ -14,14 +14,21 @@ import { isTauri, onWinVisible, win } from '../lib/backend'
 
 const visible = ref(typeof document === 'undefined' ? true : !document.hidden)
 
-if (typeof document !== 'undefined') {
-  document.addEventListener('visibilitychange', () => {
-    visible.value = document.visibilityState === 'visible'
-  })
+// 收到过权威可见性信号(visibilitychange / 壳层 lw:win-visible)后,异步初值查询不再覆盖它 ——
+// 否则慢一拍 resolve 的 isHidden() 会把已生效的 show 信号冲回旧值(自启 hidden→show 竞态)。
+let settled = false
+const apply = (v: boolean) => {
+  settled = true
+  visible.value = v
 }
-onWinVisible((v) => (visible.value = v))
-// 初值兜底:透明窗在自启静默藏窗时 document.hidden 可能仍报 false → 查 OS 真相纠正
-if (isTauri()) void win.isHidden().then((h) => (visible.value = !h))
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => apply(document.visibilityState === 'visible'))
+}
+onWinVisible(apply)
+// 初值兜底:透明窗在自启静默藏窗时 document.hidden 可能仍报 false → 查 OS 真相纠正。
+// 仅在还没收到权威事件时采用(settled 守卫),防 stale 覆盖已到达的 show/hide 信号。
+if (isTauri()) void win.isHidden().then((h) => { if (!settled) visible.value = !h })
 
 /** 返回全局可见性 ref(单例;隐藏 = false)。 */
 export function usePageVisible() {

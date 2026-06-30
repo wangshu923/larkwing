@@ -27,7 +27,13 @@ export function useRafLoop(fn: (ts: number) => void, opts?: { fps?: number }) {
     }
   }
   onMounted(start)
-  watch(visible, (v) => (v ? start() : stop())) // 可见性翻转即停/续
+  // 可见性翻转:**先 stop() 清掉旧 raf id 再按需 start()**。先清后排是关键 —— 隐藏期排过的 rAF
+  // 在 WebView 里可能被丢弃却留下非 0 的 raf id,直接 start() 会被 `!raf` 守卫挡住、永不重排
+  // (开机自启 hidden→show 后只剩静态画面、动画冻住、头像点了不切的根因)。先归零再排即可。
+  watch(visible, (v) => {
+    stop()
+    if (v) start()
+  })
   onUnmounted(stop)
   return { start, stop }
 }
