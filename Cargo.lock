@@ -2808,7 +2808,7 @@ dependencies = [
 
 [[package]]
 name = "larkwing"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ctrlc",
  "flate2",
@@ -2836,7 +2836,7 @@ dependencies = [
 
 [[package]]
 name = "larkwing-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",

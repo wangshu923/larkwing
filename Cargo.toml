@@ -5,4 +5,4 @@ members = ["larkwing-core", "src-tauri"]
 # 版本号单一真源(Rust 侧):两个成员 crate 用 `version.workspace = true` 继承。
 # 改版本走 `scripts/bump-version.sh X.Y.Z`(它一并改 package.json / tauri.conf.json + 同步 Cargo.lock)。
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
