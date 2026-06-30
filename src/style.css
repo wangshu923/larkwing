@@ -197,9 +197,10 @@ input, textarea, [contenteditable="true"] {
 /* —— 视图外壳(设置 / 回忆 / 记录 / 提醒共用)——
    表头(+设置 tab)放在滚动区**外**:内容再长,标题/返回键/可拖拽区/tab 都不随之滚走。
    .view-scroll 收窄并留稳定槽:滚动条贴着内容列右沿,不再飘在最右窗沿与内容脱节(P0)。 */
-.view-shell { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+/* 居中:表头与内容列都限宽 712 一起居中(宽窗口不右空一块;与设置页 .settings 同构) */
+.view-shell { flex: 1; display: flex; flex-direction: column; min-width: 0; align-items: center; }
 .view-head {
-  flex: 0 0 auto;
+  flex: 0 0 auto; width: 100%; max-width: 712px;
   display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
   padding: 16px 26px 12px; padding-right: 84px;   /* 右留白避开右上角窗控三键 */
 }

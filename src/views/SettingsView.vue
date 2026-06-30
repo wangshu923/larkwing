@@ -3,7 +3,7 @@
 // 暗 tab 可点、进 teaser 页 —— 能点的必有反应(铁律3),绝不放灰掉的死控件。
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { api, appVersion, emitWakeChanged, isTauri, openExternal, setFloatVisible, type ProviderView, type RemoteChannelView, type VoiceStatus } from '../lib/backend'
+import { api, appVersion, emitWakeChanged, isTauri, openExternal, setFloatVisible, type ModelMeta, type ModelOverride, type ModelTier, type ProviderView, type RemoteChannelView, type VoiceStatus } from '../lib/backend'
 import { applyLocale } from '../i18n'
 import { useChat } from '../composables/useChat'
 import { useSettings } from '../composables/useSettings'
@@ -219,7 +219,7 @@ function onTtsBackend(b: string) {
   refreshAckPrompts()
 }
 
-// 识别模型档(sense-voice/whisper-small/firered-ctc):写库 → 开着唤醒就重启循环让新模型生效
+// 识别模型档(sense-voice 默认 / firered-ctc 更准):写库 → 开着唤醒就重启循环让新模型生效
 // (同 sensitivity;新模型首次会用时下载)→ 刷状态行(组件就绪反映的是当前选中的模型)。
 async function onAsrModel(e: Event) {
   await settings.set('voice.asr.model', (e.target as HTMLSelectElement).value)
@@ -679,6 +679,64 @@ function protoLabel(p: ProviderView) {
   return t('settings.brain.compat', { vendor })
 }
 
+// 「高级」:按模型纠正档位/价格/上下文窗口(空 = 用目录猜测)。按 provider 折叠,展开时懒取 meta。
+const advOpen = reactive<Record<string, boolean>>({})
+const modelMeta = reactive<Record<string, ModelMeta>>({}) // 键 = model id
+// 浏览器预览没有后端:给个保守假 meta(纯目录未知态),让面板照样能渲染/点
+const FAKE_META: ModelMeta = { guess: { tier: 'balanced', inUsdPerM: null, outUsdPerM: null, ctxWindowTokens: null, billing: 'cached' }, over: null }
+async function fetchMeta(model: string) {
+  if (!model) return
+  modelMeta[model] = isTauri() ? await api.modelMeta(model) : { ...FAKE_META }
+}
+function toggleAdv(p: ProviderView) {
+  advOpen[p.id] = !advOpen[p.id]
+  if (advOpen[p.id] && !modelMeta[p.model]) fetchMeta(p.model)
+}
+// 占位提示:目录猜测值(null = 目录也不知道)
+function autoHint(v: number | null): string {
+  return t('settings.brain.auto', { v: v == null ? '—' : String(v) })
+}
+// 窗口以 K 为单位展示(存的是原始 token);占位猜测也折成 K
+function guessWinHint(v: number | null): string {
+  return t('settings.brain.auto', { v: v == null ? '—' : `${Math.round(v / 1000)}K` })
+}
+function ovWinK(over: ModelOverride | null): number | '' {
+  return over?.ctxWindowTokens ? Math.round(over.ctxWindowTokens / 1000) : ''
+}
+function tierLabel(tier: ModelTier): string {
+  return t(`settings.brain.tier_${tier}`)
+}
+// 改一格 → 合并进该模型的覆盖,空值删该格;后端空壳自动删整条
+async function saveOv(p: ProviderView, field: keyof ModelOverride, ev: Event) {
+  const meta = modelMeta[p.model]
+  if (!meta) return
+  const cur: ModelOverride = { model: p.model, ...(meta.over ?? {}) }
+  const raw = (ev.target as HTMLInputElement | HTMLSelectElement).value.trim()
+  if (field === 'tier' || field === 'billing') {
+    if (raw) (cur as unknown as Record<string, unknown>)[field] = raw
+    else delete cur[field]
+  } else if (raw === '') {
+    delete cur[field]
+  } else if (field === 'ctxWindowTokens') {
+    const k = parseInt(raw, 10) // 输入是 K,存原始 token
+    if (Number.isFinite(k) && k > 0) cur.ctxWindowTokens = k * 1000
+    else return
+  } else {
+    const n = parseFloat(raw)
+    if (Number.isFinite(n) && n >= 0) (cur as unknown as Record<string, unknown>)[field] = n
+    else return
+  }
+  if (isTauri()) {
+    try {
+      await api.setModelOverride(cur)
+    } catch {
+      useToast().error(t('toast.actionFailed'))
+      return
+    }
+  }
+  await fetchMeta(p.model) // 回读(后端可能把空壳删了)
+}
+
 // 自定义卡:「自己接一个大脑」
 const adding = ref(false)
 const custom = reactive({ name: '', protocol: 'openai_compat', baseUrl: '', model: '', key: '' })
@@ -865,6 +923,42 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             <input class="s-input s-mono-input" :value="p.baseUrl" @change="saveField(p, 'baseUrl', $event)" />
             <label>{{ t('settings.brain.model') }}</label>
             <input class="s-input s-mono-input" :value="p.model" @change="saveField(p, 'model', $event)" />
+          </div>
+          <!-- 高级:按模型纠正档位/价格/上下文窗口(空 = 用目录猜测,纠错而非配置 §3) -->
+          <button class="link adv-toggle" @click="toggleAdv(p)">
+            {{ t('settings.brain.advanced') }} {{ advOpen[p.id] ? '▴' : '▾' }}
+          </button>
+          <div v-if="advOpen[p.id] && modelMeta[p.model]" class="p-grid adv-grid">
+            <label>{{ t('settings.brain.tier') }}</label>
+            <select class="s-input" :value="modelMeta[p.model].over?.tier ?? ''" @change="saveOv(p, 'tier', $event)">
+              <option value="">{{ t('settings.brain.tierAuto', { tier: tierLabel(modelMeta[p.model].guess.tier) }) }}</option>
+              <option value="light">{{ t('settings.brain.tier_light') }}</option>
+              <option value="balanced">{{ t('settings.brain.tier_balanced') }}</option>
+              <option value="smart">{{ t('settings.brain.tier_smart') }}</option>
+            </select>
+            <label>{{ t('settings.brain.ctxWindow') }}</label>
+            <input class="s-input s-mono-input" type="number" min="1"
+              :value="ovWinK(modelMeta[p.model].over)"
+              :placeholder="guessWinHint(modelMeta[p.model].guess.ctxWindowTokens)"
+              @change="saveOv(p, 'ctxWindowTokens', $event)" />
+            <label>{{ t('settings.brain.priceIn') }}</label>
+            <input class="s-input s-mono-input" type="number" min="0" step="0.01"
+              :value="modelMeta[p.model].over?.inUsdPerM ?? ''"
+              :placeholder="autoHint(modelMeta[p.model].guess.inUsdPerM)"
+              @change="saveOv(p, 'inUsdPerM', $event)" />
+            <label>{{ t('settings.brain.priceOut') }}</label>
+            <input class="s-input s-mono-input" type="number" min="0" step="0.01"
+              :value="modelMeta[p.model].over?.outUsdPerM ?? ''"
+              :placeholder="autoHint(modelMeta[p.model].guess.outUsdPerM)"
+              @change="saveOv(p, 'outUsdPerM', $event)" />
+            <label>{{ t('settings.brain.billing') }}</label>
+            <select class="s-input" :value="modelMeta[p.model].over?.billing ?? ''" @change="saveOv(p, 'billing', $event)">
+              <option value="">{{ t('settings.brain.billingAuto') }}</option>
+              <option value="cached">{{ t('settings.brain.billing_cached') }}</option>
+              <option value="uncached">{{ t('settings.brain.billing_uncached') }}</option>
+              <option value="percall">{{ t('settings.brain.billing_percall') }}</option>
+            </select>
+            <p class="adv-hint">{{ t('settings.brain.advHint') }}</p>
           </div>
         </div>
 
@@ -1095,10 +1189,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             @change="onAsrModel"
           >
             <option value="sense-voice">{{ t('settings.voice.asr_standard') }}</option>
-            <option value="whisper-tiny">{{ t('settings.voice.asr_lite') }}</option>
-            <option value="whisper-small">{{ t('settings.voice.asr_kids') }}</option>
-            <option value="whisper-medium">{{ t('settings.voice.asr_accurate') }}</option>
-            <option value="firered-ctc">{{ t('settings.voice.asr_zh') }}</option>
+            <option value="firered-ctc">{{ t('settings.voice.asr_accurate') }}</option>
           </select>
         </div>
         <p class="hint">{{ t('settings.voice.asrModelHint') }}</p>
@@ -1377,16 +1468,17 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .relocate-card .spinner { width: 30px; height: 30px; border: 3px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: relocate-spin 0.8s linear infinite; }
 @keyframes relocate-spin { to { transform: rotate(360deg); } }
 /* 滚动交给 .view-scroll(全局);.settings 只当竖向骨架,表头/tab 钉在滚动区外 */
-.settings { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+/* 居中:标题/tab/内容体都限宽 712 一起居中,宽窗口不再右边空一大块(共用壳 .view-shell 同步) */
+.settings { flex: 1; display: flex; flex-direction: column; min-width: 0; align-items: center; }
 /* padding-right 让「回去聊天」避开右上角窗控三键(二轮真机修复:不再重叠) */
-.s-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 16px 26px 12px; padding-right: 84px; }
+.s-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 16px 26px 12px; padding-right: 84px; width: 100%; max-width: 712px; }
 .s-title b { font-size: 16px; color: var(--text); }
 .s-title small { display: block; margin-top: 3px; font-size: 12px; color: var(--text-dim); }
 .s-mono { font-family: ui-monospace, "SF Mono", monospace; font-size: 10px; letter-spacing: 2px; color: var(--text-dim); margin-left: 8px; }
 .s-back { background: none; border: 1px solid var(--line); border-radius: 9px; color: var(--text-dim); cursor: pointer; padding: 5px 10px; font-size: 12px; }
 .s-back:hover { color: var(--accent); border-color: var(--accent); }
 
-.s-tabs { display: flex; gap: 7px; border-bottom: 1px solid var(--line); padding: 0 26px 10px; margin-bottom: 0; flex-wrap: wrap; }
+.s-tabs { display: flex; gap: 7px; border-bottom: 1px solid var(--line); padding: 0 26px 10px; margin-bottom: 0; flex-wrap: wrap; width: 100%; max-width: 712px; }
 .s-tab {
   position: relative; background: rgba(var(--accent-rgb), 0.04); border: 1px solid var(--line); border-radius: 10px;
   color: var(--text-dim); cursor: pointer; padding: 7px 14px; font-size: 13px;
@@ -1467,6 +1559,10 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .p-grid { display: grid; grid-template-columns: 52px minmax(0, 1fr); gap: 8px 12px; align-items: center; margin-top: 11px; font-size: 12.5px; }
 .p-grid label { color: var(--text-dim); }
 .p-grid .s-input { width: 100%; min-width: 0; }
+/* 高级折叠:档位/价/窗口纠错。标签更长 → 加宽标签列;提示占满两列 */
+.adv-toggle { margin-top: 10px; font-size: 12px; color: var(--text-dim); }
+.adv-grid { grid-template-columns: 96px minmax(0, 1fr); margin-top: 8px; padding-top: 10px; border-top: 1px dashed var(--line); }
+.adv-grid .adv-hint { grid-column: 1 / -1; margin: 2px 0 0; color: var(--text-dim); font-size: 11.5px; }
 .s-mono-input { font-family: ui-monospace, "SF Mono", monospace; font-size: 12px; }
 /* 全局应用公钥框:多行 PEM,占满宽、不可拽缩、整段可读(给用户复制到服务控制台) */
 .pubkey-box { display: block; width: 100%; min-width: 0; resize: none; margin-top: 4px; line-height: 1.45; white-space: pre-wrap; word-break: break-all; color: var(--text-dim); }

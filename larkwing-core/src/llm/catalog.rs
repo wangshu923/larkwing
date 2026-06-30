@@ -7,10 +7,15 @@
 //! - 价格存疑就不装懂:没把握的条目价格留 None,记账层只报 token 不报钱。
 //! 价格为编写时快照(USD / 百万 token),发版前人工校对;将来要保鲜再加远程目录刷新。
 
+use std::sync::RwLock;
+
+use serde::{Deserialize, Serialize};
+
 use super::Usage;
 
 /// 能力档位:粗分三档是刻意的 —— 档位背后的映射可随版本重调而 UI/数据不变。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Tier {
     /// 麻利:轻量快速,闲聊够用
     Light,
@@ -18,6 +23,74 @@ pub enum Tier {
     Balanced,
     /// 聪明:旗舰/深思
     Smart,
+}
+
+/// 计价方式 —— **影响压缩**(该不该为省钱少留上下文),不改记账数字(记账仍按 token 估、见
+/// est_cost_usd)。当前所有列出的 provider 都有前缀缓存 → 默认 `Cached`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BillingMode {
+    /// 按量 + 有前缀缓存(重发上下文便宜)→ 多留(默认,DeepSeek/Anthropic/Gemini… 都是)。
+    #[default]
+    Cached,
+    /// 按量、无缓存(每轮全价重发上下文)→ 少留、勤压。
+    Uncached,
+    /// 按调用次数(token 不计较)→ 多留。
+    PerCall,
+}
+
+/// 用户对某个具体模型的覆盖(「高级」里改的)。键 = 用户在「模型」框填的那个 id,精确匹配
+/// (不做模糊 —— 用户填什么覆盖什么)。各字段 None = 该项用目录猜测(纠错语义,非配置 §3)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOverride {
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<Tier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_usd_per_m: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_usd_per_m: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ctx_window_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing: Option<BillingMode>,
+}
+
+impl ModelOverride {
+    /// 没有任何覆盖字段 = 空壳(删除该条的判据,让模型回落纯目录)。
+    pub fn is_empty(&self) -> bool {
+        self.tier.is_none()
+            && self.in_usd_per_m.is_none()
+            && self.out_usd_per_m.is_none()
+            && self.ctx_window_tokens.is_none()
+            && self.billing.is_none()
+    }
+}
+
+/// 用户覆盖层(进程级,读多写极少):engine 在 boot + 用户改后 `set_overrides` 推入,查找时先看它。
+/// catalog 本身**不依赖 store**(数据由 engine 喂进来,守 §6.1);overlay 只是「目录之上的纠错层」。
+static OVERRIDES: RwLock<Vec<ModelOverride>> = RwLock::new(Vec::new());
+
+/// engine 调用:用最新覆盖表整体替换 overlay(boot / 用户保存后)。
+pub fn set_overrides(overrides: Vec<ModelOverride>) {
+    *OVERRIDES.write().expect("catalog overrides lock poisoned") = overrides;
+}
+
+/// 当前覆盖表快照(给设置页回读 / 测试)。
+pub fn overrides() -> Vec<ModelOverride> {
+    OVERRIDES.read().expect("catalog overrides lock poisoned").clone()
+}
+
+/// 按 model id 精确(大小写不敏感)取覆盖。用户填什么键什么 → 不模糊匹配。
+fn override_for(model_id: &str) -> Option<ModelOverride> {
+    let id = model_id.to_ascii_lowercase();
+    OVERRIDES
+        .read()
+        .expect("catalog overrides lock poisoned")
+        .iter()
+        .find(|o| o.model.to_ascii_lowercase() == id)
+        .cloned()
 }
 
 #[derive(Debug, Clone)]
@@ -28,6 +101,9 @@ pub struct ModelInfo {
     /// USD / 百万 token;None = 价格未知,记账只报 token。
     pub in_usd_per_m: Option<f64>,
     pub out_usd_per_m: Option<f64>,
+    /// 上下文窗口(token);None = 未知(本地/未登记)→ 上下文预算回落默认值。
+    /// 喂给 `engine::context::tail_budget_chars` 算尾部字数预算(大窗口装文档、小窗口防溢出)。
+    pub ctx_window_tokens: Option<u32>,
 }
 
 const fn m(
@@ -35,36 +111,38 @@ const fn m(
     tier: Tier,
     in_usd_per_m: Option<f64>,
     out_usd_per_m: Option<f64>,
+    ctx_window_tokens: Option<u32>,
 ) -> ModelInfo {
-    ModelInfo { family, tier, in_usd_per_m, out_usd_per_m }
+    ModelInfo { family, tier, in_usd_per_m, out_usd_per_m, ctx_window_tokens }
 }
 
 /// 顺序即匹配优先级:特异条目(-flash/-mini)必须排在其宽泛家族(deepseek-v4)之前。
+/// 第 5 列 = 上下文窗口(token,2026-06 采集快照,全部 200K–1M;发版前可校)。
 const CATALOG: &[ModelInfo] = &[
-    // DeepSeek(默认供应商;v4 价沿 v3.2 官价代位,发版前校对)
-    m("deepseek-v4-flash", Tier::Light, None, None),
-    m("deepseek-v4", Tier::Balanced, Some(0.28), Some(0.42)),
-    m("deepseek-chat", Tier::Balanced, Some(0.28), Some(0.42)), // 旧名,2026-07 弃用前仍可能遇到
-    m("deepseek-reasoner", Tier::Smart, Some(0.28), Some(0.42)),
-    // Anthropic
-    m("claude-opus", Tier::Smart, Some(5.0), Some(25.0)),
-    m("claude-sonnet", Tier::Smart, Some(3.0), Some(15.0)),
-    m("claude-haiku", Tier::Light, Some(1.0), Some(5.0)),
+    // DeepSeek(默认供应商;V4 全系 1M 窗口。flash = 廉价档,v4 = Pro 牌价)
+    m("deepseek-v4-flash", Tier::Light, Some(0.14), Some(0.28), Some(1_000_000)),
+    m("deepseek-v4", Tier::Balanced, Some(1.74), Some(3.48), Some(1_000_000)), // V4-Pro 实价
+    m("deepseek-chat", Tier::Balanced, Some(0.28), Some(0.42), Some(1_000_000)), // 旧名,2026-07-24 弃用前仍可能遇到
+    m("deepseek-reasoner", Tier::Smart, Some(0.28), Some(0.42), Some(1_000_000)),
+    // Anthropic(Opus/Sonnet 1M,Haiku 200K)
+    m("claude-opus", Tier::Smart, Some(5.0), Some(25.0), Some(1_000_000)),
+    m("claude-sonnet", Tier::Smart, Some(3.0), Some(15.0), Some(1_000_000)),
+    m("claude-haiku", Tier::Light, Some(1.0), Some(5.0), Some(200_000)),
     // 其他常见(经 OpenAI 兼容端点/中转可达)
-    m("gpt-5-mini", Tier::Light, Some(0.25), Some(2.0)),
-    m("gpt-5", Tier::Smart, Some(1.25), Some(10.0)),
-    m("kimi-k2", Tier::Balanced, None, None),
-    m("qwen-max", Tier::Balanced, None, None),
+    m("gpt-5-mini", Tier::Light, Some(0.25), Some(2.0), Some(400_000)),
+    m("gpt-5", Tier::Smart, Some(0.625), Some(5.0), Some(400_000)),
+    m("kimi-k2", Tier::Balanced, None, None, Some(256_000)),
+    m("qwen-max", Tier::Balanced, None, None, Some(256_000)), // 3.6-Max 256K(3.7-Max 已 1M,保守取低)
     // Google Gemini(经官方 OpenAI 兼容端点;牌价随版本浮动、存疑就不装懂 → 留 None 只报 token)。
-    // 特异在前、通配在后(子串匹配按顺序)。
-    m("gemini-2.5-flash", Tier::Light, None, None),
-    m("gemini-2.0-flash", Tier::Light, None, None),
-    m("gemini-flash", Tier::Light, None, None), // gemini-flash-latest 等
-    m("gemini-2.5-pro", Tier::Smart, None, None),
-    m("gemini-3", Tier::Smart, None, None), // gemini-3-pro 等
-    m("gemini", Tier::Balanced, None, None), // 通配兜底:未列出的 gemini 版本
+    // 特异在前、通配在后(子串匹配按顺序)。窗口全系 1M。
+    m("gemini-2.5-flash", Tier::Light, None, None, Some(1_000_000)),
+    m("gemini-2.0-flash", Tier::Light, None, None, Some(1_000_000)),
+    m("gemini-flash", Tier::Light, None, None, Some(1_000_000)), // gemini-flash-latest 等
+    m("gemini-2.5-pro", Tier::Smart, None, None, Some(1_000_000)),
+    m("gemini-3", Tier::Smart, None, None, Some(1_000_000)), // gemini-3-pro 等
+    m("gemini", Tier::Balanced, None, None, Some(1_000_000)), // 通配兜底:未列出的 gemini 版本
     // Ollama 本地模型(llama/qwen/mistral/…):名字千变万化且本地零计费,故意不列 ——
-    // 命中目录兜底规则(未知 → 均衡档 + 不报钱),正合"本地、免费"的语义。
+    // 命中目录兜底规则(未知 → 均衡档 + 不报钱 + 窗口 None → 预算回落默认),正合"本地、免费"的语义。
 ];
 
 /// 模糊匹配:归一小写后,目录家族子串出现在模型 id 里即命中(吃掉中转前缀/版本后缀)。
@@ -73,16 +151,43 @@ pub fn lookup(model_id: &str) -> Option<&'static ModelInfo> {
     CATALOG.iter().find(|info| id.contains(info.family))
 }
 
-/// 兜底规则:未知模型按均衡档对待。
+/// 兜底规则:未知模型按均衡档对待。用户覆盖优先(「高级」里改过的档位)。
 pub fn tier_of(model_id: &str) -> Tier {
+    if let Some(t) = override_for(model_id).and_then(|o| o.tier) {
+        return t;
+    }
     lookup(model_id).map(|i| i.tier).unwrap_or(Tier::Balanced)
+}
+
+/// 上下文窗口(token)。用户覆盖优先;否则查目录;None = 未知(本地模型)→ 调用方(engine 上下文
+/// 预算)回落保守默认。绑机制不绑模型名(§4.4):新模型未列也不罢工,只是回落默认预算。
+pub fn ctx_window_of(model_id: &str) -> Option<u32> {
+    if let Some(o) = override_for(model_id) {
+        if o.ctx_window_tokens.is_some() {
+            return o.ctx_window_tokens;
+        }
+    }
+    lookup(model_id).and_then(|i| i.ctx_window_tokens)
+}
+
+/// 计价方式:用户覆盖优先,否则默认「按量 + 缓存」(目录无此列 —— 当前 provider 都有前缀缓存)。
+/// 喂给 `engine::context::tail_budget_chars` 决定上下文留多少(无缓存 → 少留勤压)。
+pub fn billing_of(model_id: &str) -> BillingMode {
+    override_for(model_id).and_then(|o| o.billing).unwrap_or_default()
 }
 
 /// 按目录牌价估算一轮成本(USD)。None = 模型未知或价格未知 —— 调用方只报 token,不报钱。
 /// 缓存命中部分不另算折扣价(各家折扣率不一),按全价估,宁可高估不低估。
 pub fn est_cost_usd(model_id: &str, usage: &Usage) -> Option<f64> {
-    let info = lookup(model_id)?;
-    let (input, output) = (info.in_usd_per_m?, info.out_usd_per_m?);
+    // 覆盖价仅当进/出**都**给了才用(避免半价混算);否则整体回落目录。
+    let (input, output) = match override_for(model_id).and_then(|o| o.in_usd_per_m.zip(o.out_usd_per_m))
+    {
+        Some(pair) => pair,
+        None => {
+            let info = lookup(model_id)?;
+            (info.in_usd_per_m?, info.out_usd_per_m?)
+        }
+    };
     Some((usage.input_tokens as f64 * input + usage.output_tokens as f64 * output) / 1_000_000.0)
 }
 
@@ -119,7 +224,19 @@ mod tests {
         let usage =
             Usage { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_hit_tokens: 0 };
         let cost = est_cost_usd("deepseek-v4-pro", &usage).unwrap();
-        assert!((cost - 0.70).abs() < 1e-9, "0.28 + 0.42 = 0.70,实际 {cost}");
+        assert!((cost - 5.22).abs() < 1e-9, "1.74 + 3.48 = 5.22,实际 {cost}");
+    }
+
+    #[test]
+    fn ctx_window_by_family_and_unknown_is_none() {
+        // 模糊匹配照样吃前缀/后缀;全部 200K–1M
+        assert_eq!(ctx_window_of("anthropic/claude-opus-4-8"), Some(1_000_000));
+        assert_eq!(ctx_window_of("claude-haiku-4-5"), Some(200_000));
+        assert_eq!(ctx_window_of("deepseek-v4-pro"), Some(1_000_000));
+        assert_eq!(ctx_window_of("gpt-5-mini-2026-01"), Some(400_000));
+        // 本地/未登记 → None(预算回落默认)
+        assert_eq!(ctx_window_of("llama3.2"), None);
+        assert_eq!(ctx_window_of("totally-unknown-llm"), None);
     }
 
     #[test]
@@ -139,6 +256,42 @@ mod tests {
         // Gemini 牌价存疑:只报 token 不报钱
         let usage = Usage { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_hit_tokens: 0 };
         assert!(est_cost_usd("gemini-2.5-flash", &usage).is_none());
+    }
+
+    #[test]
+    fn user_override_wins_over_catalog_then_clears() {
+        // 用唯一 model id,避免与并行测试争用进程级 overlay(精确匹配 → 其他 id 不受影响)。
+        let id = "ov-test-only-model";
+        // 未设覆盖:未知模型 → 均衡档 + 无价 + 无窗口(目录兜底)
+        assert_eq!(tier_of(id), Tier::Balanced);
+        assert_eq!(ctx_window_of(id), None);
+        assert_eq!(billing_of(id), BillingMode::Cached, "默认计价 = 按量+缓存");
+        set_overrides(vec![ModelOverride {
+            model: id.into(),
+            tier: Some(Tier::Smart),
+            in_usd_per_m: Some(2.0),
+            out_usd_per_m: Some(8.0),
+            ctx_window_tokens: Some(32_000),
+            billing: Some(BillingMode::Uncached),
+        }]);
+        assert_eq!(tier_of(id), Tier::Smart, "覆盖档位生效");
+        assert_eq!(ctx_window_of(id), Some(32_000), "覆盖窗口生效");
+        assert_eq!(billing_of(id), BillingMode::Uncached, "覆盖计价方式生效");
+        let usage = Usage { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_hit_tokens: 0 };
+        assert!((est_cost_usd(id, &usage).unwrap() - 10.0).abs() < 1e-9, "覆盖价 2+8=10");
+        // 半价覆盖(只给进价)→ 整体回落目录;未知模型目录无价 → None
+        set_overrides(vec![ModelOverride {
+            model: id.into(),
+            tier: None,
+            in_usd_per_m: Some(2.0),
+            out_usd_per_m: None,
+            ctx_window_tokens: None,
+            billing: None,
+        }]);
+        assert!(est_cost_usd(id, &usage).is_none(), "半价覆盖不生效,回落目录(无价)");
+        assert_eq!(tier_of(id), Tier::Balanced, "tier 未覆盖 → 回落");
+        set_overrides(vec![]); // 收尾清空,不泄漏给其他测试
+        assert_eq!(tier_of(id), Tier::Balanced);
     }
 
     #[test]

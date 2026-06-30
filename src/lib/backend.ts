@@ -162,6 +162,35 @@ export interface ProviderPatch {
   apiKey?: string
 }
 
+export type ModelTier = 'light' | 'balanced' | 'smart'
+/** 计价方式:cached=按量+缓存(默认)/ uncached=按量无缓存 / percall=按次。影响压缩(留多少上下文)。 */
+export type BillingMode = 'cached' | 'uncached' | 'percall'
+
+/** 「高级」里某模型的用户覆盖;省略字段 = 用目录猜测(纠错语义,非配置)。 */
+export interface ModelOverride {
+  model: string
+  tier?: ModelTier
+  inUsdPerM?: number
+  outUsdPerM?: number
+  ctxWindowTokens?: number
+  billing?: BillingMode
+}
+
+/** 目录对某模型的猜测(给「高级」占位用;null = 目录也不知道)。 */
+export interface ModelGuess {
+  tier: ModelTier
+  inUsdPerM: number | null
+  outUsdPerM: number | null
+  ctxWindowTokens: number | null
+  billing: BillingMode
+}
+
+/** 设置页「高级」一格全貌:目录猜测(占位)+ 当前覆盖(值)。 */
+export interface ModelMeta {
+  guess: ModelGuess
+  over: ModelOverride | null
+}
+
 /** 一轮 LLM 调用的消耗摘要;cost_usd null = 模型/价格未知,只报 token。 */
 export interface UsageDigest {
   input_tokens: number
@@ -733,6 +762,8 @@ export const api = {
   listProviders: () => invoke<ProviderView[]>('list_providers'),
   saveProvider: (patch: ProviderPatch) => invoke<ProviderView[]>('save_provider', { patch }),
   removeProvider: (id: string) => invoke<ProviderView[]>('remove_provider', { id }),
+  modelMeta: (model: string) => invoke<ModelMeta>('model_meta', { model }),
+  setModelOverride: (over: ModelOverride) => invoke<void>('set_model_override', { over }),
   /** 扫码登录窗口;title 从字典取(原生窗口标题没法事后翻译)。 */
   mediaLogin: (source: string, title: string) => invoke<void>('media_login', { source, title }),
   /** 失败任务重试(目前仅影音):按 retry 载体直连重放,进展/结果照常走事件车道。 */

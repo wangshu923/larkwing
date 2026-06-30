@@ -73,60 +73,84 @@ pub(super) fn event_injection(content: &str) -> String {
     )
 }
 
-/// 窗口内最多消息数。
-pub(super) const WINDOW_MAX: usize = 48;
-/// 锚点一次推进的整块大小。
+/// 历史装载的 I/O 上界(条):caller 一次最多从库取这么多最近消息,真正的窗口由下面的
+/// **字数预算**在其中裁定。远大于任何字数预算能留的条数 → 只防"超长会话每轮拉上万行",
+/// 不构成语义窗口(原 `WINDOW_MAX=48` 的条数窗口已废,改由字数预算 + model-aware 决定)。
+pub(super) const HISTORY_PAGE_MAX: usize = 800;
+/// 窗口起点的整块推进粒度(条)。起点只按 `WINDOW_CHUNK` 的**绝对**倍数跳 —— 一个 chunk 内
+/// 字节稳定吃 DeepSeek 自动前缀缓存(原 anchored_start 的稳定性机制,现由字数预算驱动)。
 pub(super) const WINDOW_CHUNK: usize = 16;
 
-/// 窗口锚定:返回历史的起始下标。
-/// 不每轮滑一条 —— 锚点只按整块推进,保证前缀字节级稳定,吃 DeepSeek 自动前缀缓存。
-/// 不变量:start 是 CHUNK 的倍数,且 total - start ∈ (WINDOW_MAX - WINDOW_CHUNK, WINDOW_MAX]。
-/// 注意:整块起点可能落在工具轮中间 —— build_context 内再向后吸附到 user 边界,
-/// 防 tool_call/result 配对被拆散(OpenAI 系孤儿 tool 消息会 400)。
-pub(super) fn anchored_start(total: usize) -> usize {
-    if total <= WINDOW_MAX {
-        return 0;
+/// 尾部字数预算:**未知窗口**(本地/未登记模型)的回落值。= 历史值 → 对这些模型零行为变化。
+pub(super) const DEFAULT_TAIL_BUDGET_CHARS: usize = 48_000;
+/// 大窗口模型的字数预算上限(≈30 万字):装得下文档 + 多轮,又不至于每轮重建过大。
+pub(super) const MAX_TAIL_BUDGET_CHARS: usize = 300_000;
+/// 预算 = 上下文窗口的 1/N(其余 1−1/N 留给稳定前缀 + 输出 + thinking)。
+pub(super) const TAIL_RESERVE_DEN: u32 = 2;
+
+/// 由模型上下文窗口(token)+ 计价方式算尾部字数预算(§0.2.0 安全阀 model-aware + 计价感知)。
+/// - 窗口:`None`(本地/未登记)→ 保守 `DEFAULT`;`Some(w)` → `min(MAX, w / TAIL_RESERVE_DEN)`
+///   (CJK 最坏 ~1 token/字 → token 数当字数上界 = 安全。小窗口缩防溢出;大窗口在 [默认, MAX] 间装文档)。
+/// - 计价方式:**无缓存**(每轮全价重发尾巴)→ 封到 `DEFAULT`、少留勤压;**有缓存 / 按次**
+///   (重用便宜 / token 不计较)→ 按窗口放大(常态)。
+/// 只缩或在 [默认, MAX] 间放大,绝不无界增长。起步值,真用可调(§13.7「只能真用才能调」)。
+pub(super) fn tail_budget_chars(
+    window_tokens: Option<u32>,
+    billing: crate::llm::catalog::BillingMode,
+) -> usize {
+    let base = match window_tokens {
+        None => DEFAULT_TAIL_BUDGET_CHARS,
+        Some(w) => ((w / TAIL_RESERVE_DEN) as usize).min(MAX_TAIL_BUDGET_CHARS),
+    };
+    match billing {
+        // 无缓存:重发整条尾巴每轮全价 → 别留超过默认(小窗口已被 base 缩得更小)。
+        crate::llm::catalog::BillingMode::Uncached => base.min(DEFAULT_TAIL_BUDGET_CHARS),
+        // 有缓存 / 按次:多留(装文档、保连续性),代价走缓存 / 与 token 无关。
+        crate::llm::catalog::BillingMode::Cached | crate::llm::catalog::BillingMode::PerCall => base,
     }
-    (total - WINDOW_MAX).div_ceil(WINDOW_CHUNK) * WINDOW_CHUNK
 }
 
-/// 尾部字数预算上限(字符,§0.2.0 上下文安全阀)。DeepSeek 级上下文 ~64K token;稳定前缀
-/// (persona + 法条 + 记忆≤`RESIDENT_BUDGET_CHARS` + 需知 + few-shot≤800tok)已写时执法有界,
-/// 故把**易变尾**也压在此预算内,总量就稳在窗口下。中文最坏 ~1 token/字时 4.8 万字 ≈ 3.2 万
-/// token,加前缀仍宽裕;英文更省。起步值,真用可调(§13.7 同款「只能真用才能调」)。
-pub(super) const TAIL_BUDGET_CHARS: usize = 48_000;
-
-/// 尾部字数安全阀:从最新往回累加 content+payload 字数,返回「装配尾部应从哪条起」的下标。
-/// 历史窗口已按条数锚定(caller `anchored_start`),但**单条消息大小不设限**——`fs_read_text`
-/// 单次可达 4 万字、web 抓取 6 千字,几坨大结果攒在窗口里就能把上下文撑爆(provider 400
-/// `context_length_exceeded`,且大消息卡在窗口内每轮重建都超大 → 会话卡死)。这里按字数封顶。
-/// 不变量:① 预算够(总字数 ≤ 预算)→ 返回 0 → 与无安全阀等价 → **前缀缓存零损伤**(常态走这);
-/// ② 永不裁掉最后一轮(末个 user/event 起点之后整段恒保留,哪怕它自己就超预算——没法再省,
-/// 交 provider / per-tool 上限兜)。snap 边界由 build_context 在此之后做。
-fn tail_budget_start(history: &[Message]) -> usize {
-    let msg_chars = |m: &Message| {
+/// 历史窗口:返回 `history` 中保留窗口的起始下标(已吸附到 user/event 回合边界)。
+/// 统一了原 `anchored_start`(整块锚定保缓存)+ `tail_budget_start`(字数封顶防溢出)+ 边界吸附:
+/// - `base` = `history[0]` 在整段会话里的**绝对**下标(给整块锚定一个稳定参照,缓存才稳)。
+/// - 常态(总字数 ≤ `budget`)→ 返回 0(留全部 page),**前缀缓存零损伤**(绝大多数回合走这)。
+/// - 超预算 → 起点前进到第一个「`WINDOW_CHUNK` 的绝对倍数 且 其后字数 ≤ budget」处;total 在一个
+///   chunk 内增长时该绝对起点不变 → 字节稳定(原 anchored 的稳定性,现以字数为触发)。
+/// - 不变量:永不裁掉最后一轮(末个 user/event 起点之后整段恒保留,哪怕它自己就超预算——
+///   没法再省,交 provider / per-tool 上限兜)。
+pub(super) fn windowed_start(history: &[Message], base: usize, budget: usize) -> usize {
+    if history.is_empty() {
+        return 0;
+    }
+    let chars = |m: &Message| {
         m.content.chars().count() + m.payload.as_deref().map_or(0, |p| p.chars().count())
     };
-    let total: usize = history.iter().map(&msg_chars).sum();
-    if total <= TAIL_BUDGET_CHARS {
-        return 0; // 常态:不触发 → 起点 0 → 缓存稳定
+    let total: usize = history.iter().map(&chars).sum();
+    if total <= budget {
+        return 0; // 常态:留全部 → 前缀缓存稳定
     }
-    // 最后一轮的起点(末个 user/event 边界):预算线绝不越过它(不变量 ②)。
-    let last_round = history
-        .iter()
-        .rposition(|m| m.role == "user" || m.role == "event")
-        .unwrap_or(0);
-    // 从末尾往回累加,找到仍在预算内的最早下标。
-    let mut acc = 0usize;
-    let mut keep = history.len();
-    for (i, m) in history.iter().enumerate().rev() {
-        acc += msg_chars(m);
-        if acc > TAIL_BUDGET_CHARS {
+    // 末轮起点(末个 user/event 边界):窗口起点绝不越过它(不变量)。
+    let last_round =
+        history.iter().rposition(|m| m.role == "user" || m.role == "event").unwrap_or(0);
+    // 从前往后找第一个「绝对下标是 WINDOW_CHUNK 倍数 且 其后字数 ≤ budget」的起点。
+    // suffix = chars(history[i..]) 单调递减;首个满足者即「装得下的最大窗口」的对齐起点。
+    let mut suffix = total;
+    let mut chosen = last_round; // 兜底:至少保末轮
+    let mut i = 0usize;
+    while i <= last_round {
+        if (base + i) % WINDOW_CHUNK == 0 && suffix <= budget {
+            chosen = i;
             break;
         }
-        keep = i;
+        suffix -= chars(&history[i]);
+        i += 1;
     }
-    keep.min(last_round)
+    // 吸附到 user/event 边界(对齐点可能落在工具轮中间 → 向后推到回合起点行),不越过末轮。
+    let snap = history[chosen..=last_round]
+        .iter()
+        .position(|m| m.role == "user" || m.role == "event")
+        .unwrap_or(0);
+    (chosen + snap).min(last_round)
 }
 
 /// 单条 ChatMessage 的字数成本(估 token 用):content + reasoning + tool_calls(name+args)。
@@ -152,9 +176,9 @@ fn message_chars(m: &ChatMessage) -> usize {
 /// 持续变大撑爆上下文。故在**每次开流前**再兜一道:就地把过老消息从前面整轮丢到字数预算内。
 /// 不变量:cut 落在 User 边界(首条保持 User → 不留孤儿 ToolResult / 悬空 tool_calls 轮);绝不丢
 /// 最后一条 User(当前任务);system 前缀不在 messages 里、永不动;常态不超预算 → no-op → 缓存不破。
-pub(super) fn cap_messages_tail(messages: &mut Vec<ChatMessage>) {
+pub(super) fn cap_messages_tail(messages: &mut Vec<ChatMessage>, budget: usize) {
     let total: usize = messages.iter().map(message_chars).sum();
-    if total <= TAIL_BUDGET_CHARS {
+    if total <= budget {
         return; // 常态:不触发 → 不动 messages → 前缀缓存零损伤
     }
     let is_user = |m: &ChatMessage| matches!(m, ChatMessage::User { .. });
@@ -165,7 +189,7 @@ pub(super) fn cap_messages_tail(messages: &mut Vec<ChatMessage>) {
     let mut keep = messages.len();
     for (i, m) in messages.iter().enumerate().rev() {
         acc += message_chars(m);
-        if acc > TAIL_BUDGET_CHARS {
+        if acc > budget {
             break;
         }
         keep = i;
@@ -187,6 +211,8 @@ pub(super) fn build_context(
     memories: &[Memory],
     briefings: &[Briefing],
     history: &[Message],
+    history_base: usize,
+    budget: usize,
     tool_defs: &[ToolDef],
 ) -> ChatRequest {
     // 稳定层:persona(性格)→ 法条(底座纪律)→ 性格设定 → 记忆 → 任务需知
@@ -222,16 +248,11 @@ pub(super) fn build_context(
         }
     }
 
-    // 尾部字数安全阀(§0.2.0 防溢出):先按字数把过老的整轮压掉(常态不触发 → 返回 0)。
-    let budget_start = tail_budget_start(history);
-    // 锚点吸附 user/event 边界:起点若落在工具轮中间,向后推进到第一条回合起点行,
-    // 保证窗口内 tool_call/result 永远成对(吸附量 ≤ 一个工具轮,有界)。
-    // event 也是合法回合起点(任务专属会话里没有 user 行)。budget_start=0 时 = 原 first_user 吸附。
-    let snap = history[budget_start..]
-        .iter()
-        .position(|m| m.role == "user" || m.role == "event")
-        .unwrap_or(0);
-    let history = &history[budget_start + snap..];
+    // 历史窗口:字数预算(model-aware,防溢出 + 装文档)+ 整块锚定(保前缀缓存)+ 边界吸附
+    // (起点落在工具轮中间则向后推到回合起点,保 tool_call/result 成对,防 OpenAI 系 400)。
+    // 常态字数 ≤ 预算 → start=0 → 与无窗口等价、缓存零损伤。统一了原 anchored_start + 安全阀。
+    let start = windowed_start(history, history_base, budget);
+    let history = &history[start..];
 
     // few-shot 在真实历史之前:按场景静态 → 字节级稳定 → 吃前缀缓存(PLAN §8)
     let mut messages: Vec<ChatMessage> = scene.few_shots.clone();
@@ -334,13 +355,27 @@ mod tests {
         }
     }
 
+    /// 测试便捷包装:history_base=0 + 宽预算(不触发裁剪)→ 专注前缀/渲染逻辑;
+    /// 窗口裁剪的逻辑由 `windowed_start`/`tail_budget_chars` 的专项测试覆盖。
+    fn bc(
+        scene: &Scene,
+        name: Option<&str>,
+        style: Option<&str>,
+        mems: &[Memory],
+        briefs: &[Briefing],
+        history: &[Message],
+        tools: &[ToolDef],
+    ) -> ChatRequest {
+        build_context(scene, name, style, mems, briefs, history, 0, MAX_TAIL_BUDGET_CHARS, tools)
+    }
+
     #[test]
     fn laws_and_briefings_join_system_in_stable_order() {
         let scenes = Scenes::builtin();
         let scene = scenes.default_scene();
         let briefs =
             vec![brief(1, "appliance", "路由器在电视柜"), brief(2, "media", "电影在 NAS")];
-        let req = build_context(scene, None,None, &[], &briefs, &[], &[]);
+        let req = bc(scene, None, None, &[], &briefs, &[], &[]);
 
         // 法条紧跟 persona(底座纪律,人格中立)
         let laws_at = req.system.find("## 怎么记事").expect("法条必须进 system");
@@ -353,88 +388,99 @@ mod tests {
         assert!(req.system.find("## 任务需知").unwrap() < a && a < m);
 
         // 无需知 = 无该节,且前缀与再次构造字节级一致(golden)
-        let none = build_context(scene, None,None, &[], &[], &[], &[]);
+        let none = bc(scene, None, None, &[], &[], &[], &[]);
         assert!(!none.system.contains("## 任务需知"));
-        assert_eq!(none.system, build_context(scene, None,None, &[], &[], &[], &[]).system);
+        assert_eq!(none.system, bc(scene, None, None, &[], &[], &[], &[]).system);
     }
 
     #[test]
-    fn anchor_is_zero_until_window_full() {
-        for total in 0..=WINDOW_MAX {
-            assert_eq!(anchored_start(total), 0);
-        }
+    fn tail_budget_scales_by_window() {
+        use crate::llm::catalog::BillingMode::{Cached, PerCall, Uncached};
+        // 未知窗口(本地/未登记)→ 回落默认(零行为变化)
+        assert_eq!(tail_budget_chars(None, Cached), DEFAULT_TAIL_BUDGET_CHARS);
+        // 大窗口 → 在 [默认, 上限] 间放大(装文档);1M → 取 MAX 封顶
+        assert_eq!(tail_budget_chars(Some(1_000_000), Cached), MAX_TAIL_BUDGET_CHARS);
+        assert_eq!(tail_budget_chars(Some(200_000), Cached), 100_000); // 200K/2,未触顶
+        // 小窗口 → 缩到默认以下(防溢出);8K 本地模型 → 4K
+        assert_eq!(tail_budget_chars(Some(8_000), Cached), 4_000);
+        assert!(tail_budget_chars(Some(64_000), Cached) < DEFAULT_TAIL_BUDGET_CHARS, "64K 窗口预算应缩到默认以下");
+        // 计价感知:无缓存 → 大窗口也封到默认(少留勤压);按次 = 同有缓存(多留)
+        assert_eq!(tail_budget_chars(Some(1_000_000), Uncached), DEFAULT_TAIL_BUDGET_CHARS, "无缓存封顶默认");
+        assert_eq!(tail_budget_chars(Some(1_000_000), PerCall), MAX_TAIL_BUDGET_CHARS, "按次 = 多留");
+        // 小窗口下无缓存不会反而放大:仍取较小者
+        assert_eq!(tail_budget_chars(Some(8_000), Uncached), 4_000, "小窗口无缓存仍按窗口缩");
     }
 
     #[test]
-    fn anchor_moves_in_whole_chunks_and_keeps_window_bounded() {
-        let mut prev = 0;
-        for total in (WINDOW_MAX + 1)..400 {
-            let start = anchored_start(total);
-            assert_eq!(start % WINDOW_CHUNK, 0, "锚点必须是整块倍数");
-            let window = total - start;
-            assert!(window <= WINDOW_MAX, "窗口超上限: total={total}");
-            assert!(window > WINDOW_MAX - WINDOW_CHUNK, "窗口缩得过小: total={total}");
-            assert!(start >= prev, "锚点只能前进");
-            prev = start;
-        }
-    }
-
-    #[test]
-    fn anchor_stable_within_a_chunk_of_turns() {
-        // 前缀稳定的本体:同一锚段内连续多轮,start 不变
-        let base = anchored_start(WINDOW_MAX + 1);
-        for total in (WINDOW_MAX + 1)..(WINDOW_MAX + WINDOW_CHUNK) {
-            assert_eq!(anchored_start(total), base);
-        }
-    }
-
-    #[test]
-    fn tail_budget_noop_under_budget() {
-        // 常态:普通短消息远在预算内 → 起点 0 → 与无安全阀等价(前缀缓存不破)。
+    fn windowed_start_noop_under_budget() {
+        // 常态:短消息远在预算内 → 起点 0 → 与无窗口等价(前缀缓存不破)。
         let h = vec![
             msg(1, "user", "你好", None),
             msg(2, "assistant", "嗨", None),
             msg(3, "user", "今天天气?", None),
         ];
-        assert_eq!(tail_budget_start(&h), 0);
+        assert_eq!(windowed_start(&h, 0, DEFAULT_TAIL_BUDGET_CHARS), 0);
     }
 
     #[test]
-    fn tail_budget_trims_old_rounds_when_over() {
-        // 三轮,每轮一个超大 user(各 ~预算的 0.7)→ 总量超预算 → 丢最老、保最新。
-        let big = "图".repeat(TAIL_BUDGET_CHARS * 7 / 10);
-        let h = vec![
-            msg(1, "user", &big, None), // 最老,应被丢
-            msg(2, "assistant", "ok1", None),
-            msg(3, "user", &big, None),
-            msg(4, "assistant", "ok2", None),
-            msg(5, "user", &big, None), // 最新一轮,必保
-            msg(6, "assistant", "ok3", None),
-        ];
-        let start = tail_budget_start(&h);
+    fn windowed_start_trims_over_budget_to_chunk_boundary() {
+        // 40 条(20 轮)小消息,总量约 2× 预算 → 必须裁到预算内。
+        let budget = 4_000usize;
+        let per = "字".repeat(budget / 10); // 每条约 0.1 预算 → 20 轮约 2× 预算
+        let mut h = Vec::new();
+        for i in 0..20 {
+            h.push(msg(2 * i + 1, "user", &per, None));
+            h.push(msg(2 * i + 2, "assistant", &per, None));
+        }
+        let start = windowed_start(&h, 0, budget);
         assert!(start > 0, "超预算必须裁");
-        // 起点落在某条 user/event 边界上(或其前),保最后一轮完整
-        assert!(start <= 4, "最后一轮(下标4起)必须整段保留");
-        // 被保留段字数在预算内(末轮单独超标的情形除外,这里每轮 0.7×预算两轮就超)
-        let kept: usize = h[start..]
-            .iter()
-            .map(|m| m.content.chars().count())
-            .sum();
-        assert!(kept <= TAIL_BUDGET_CHARS, "保留段应压在预算内: {kept}");
+        // 起点对齐 WINDOW_CHUNK 的绝对倍数(base=0)或吸附后落在末轮(边界兜底)
+        let last_round = h.iter().rposition(|m| m.role == "user").unwrap();
+        assert!(start % WINDOW_CHUNK == 0 || start == last_round, "起点应整块对齐或为末轮");
+        // 起点落在 user 边界(不劈开工具配对/回合)
+        assert_eq!(h[start].role, "user", "窗口起点须为回合起点(user)");
+        // 保留段在预算内
+        let kept: usize = h[start..].iter().map(|m| m.content.chars().count()).sum();
+        assert!(kept <= budget, "保留段应压在预算内: {kept}");
     }
 
     #[test]
-    fn tail_budget_keeps_last_round_even_if_oversized() {
-        // 不变量 ②:最后一轮自己就超预算也不裁(没法再省)→ 起点 = 末轮起点,不越过它。
-        let huge = "字".repeat(TAIL_BUDGET_CHARS * 2);
+    fn windowed_start_keeps_last_round_even_if_oversized() {
+        // 不变量:最后一轮自己就超预算也不裁 → 起点 = 末轮起点,不越过它。
+        let huge = "字".repeat(10_000);
         let h = vec![
             msg(1, "user", "旧", None),
             msg(2, "assistant", "旧答", None),
-            msg(3, "user", &huge, None), // 末轮 user 单条就 2× 预算
+            msg(3, "user", &huge, None), // 末轮 user 单条就远超预算
             msg(4, "assistant", "答", None),
         ];
-        // 末个 user/event = 下标 2(huge user) → 起点 = 2,不越过它(保末轮 user 头)
-        assert_eq!(tail_budget_start(&h), 2);
+        assert_eq!(windowed_start(&h, 0, 4_000), 2, "起点=末轮起点(下标2),保末轮 user 头");
+    }
+
+    #[test]
+    fn windowed_start_advances_in_chunks_not_every_turn() {
+        // 前缀缓存稳定的本体:模拟会话逐轮增长,起点应**按整块跳、不每轮 creep**。
+        // 预算留 >> WINDOW_CHUNK 轮(真实预算的常态),起点才落在整块对齐点、有迟滞。
+        let per = 10usize; // 每条 10 字 → 每轮 20 字
+        let budget = 30 * per * 2; // 约留 30 轮(> WINDOW_CHUNK=16)
+        let mut h = Vec::new();
+        for i in 0..60 {
+            // 先铺 60 轮(已超预算)
+            h.push(msg(2 * i + 1, "user", &"字".repeat(per), None));
+            h.push(msg(2 * i + 2, "assistant", &"字".repeat(per), None));
+        }
+        let mut starts = Vec::new();
+        for i in 60..100 {
+            // 再逐轮追加 40 轮,每轮记一次窗口起点(base=0:总数 < 页上界,与生产一致)
+            h.push(msg(2 * i + 1, "user", &"字".repeat(per), None));
+            h.push(msg(2 * i + 2, "assistant", &"字".repeat(per), None));
+            starts.push(windowed_start(&h, 0, budget));
+        }
+        // 单调不减(锚点只前进)
+        assert!(starts.windows(2).all(|w| w[0] <= w[1]), "锚点只能前进: {starts:?}");
+        // 大多数相邻轮起点**相同**(整块迟滞 → 一个 chunk 内不动 → 缓存稳定;creep 的话几乎轮轮都变)
+        let stable = starts.windows(2).filter(|w| w[0] == w[1]).count();
+        assert!(stable > starts.len() / 2, "起点应按整块跳、不每轮 creep:仅 {stable}/{} 轮持平", starts.len() - 1);
     }
 
     #[test]
@@ -446,14 +492,14 @@ mod tests {
             ChatMessage::user("放首歌"),
         ];
         let before = m.clone();
-        cap_messages_tail(&mut m);
+        cap_messages_tail(&mut m, DEFAULT_TAIL_BUDGET_CHARS);
         assert_eq!(m.len(), before.len());
     }
 
     #[test]
     fn cap_messages_drops_old_rounds_and_snaps_to_user() {
         // 工具循环累积:老 user + 一坨超大 ToolResult,再来新 user → 超预算丢老的、首条保 User。
-        let big = "果".repeat(TAIL_BUDGET_CHARS * 8 / 10);
+        let big = "果".repeat(DEFAULT_TAIL_BUDGET_CHARS * 8 / 10);
         let mut m = vec![
             ChatMessage::user("旧任务"),
             ChatMessage::Assistant {
@@ -466,7 +512,7 @@ mod tests {
             ChatMessage::user("新任务"),
             ChatMessage::ToolResult { call_id: "c2".into(), content: big },
         ];
-        cap_messages_tail(&mut m);
+        cap_messages_tail(&mut m, DEFAULT_TAIL_BUDGET_CHARS);
         // 首条必须是 User(无孤儿 ToolResult);且最后一条 User「新任务」保留。
         assert!(matches!(m.first(), Some(ChatMessage::User { .. })), "首条须为 User");
         assert!(
@@ -489,8 +535,8 @@ mod tests {
             msg(2, "alien", "{}", None),
             msg(3, "assistant", "汪!", None),
         ];
-        let a = build_context(scene, None,None, &memories, &[], &history, &[]);
-        let b = build_context(scene, None,None, &memories, &[], &history, &[]);
+        let a = bc(scene, None, None, &memories, &[], &history, &[]);
+        let b = bc(scene, None, None, &memories, &[], &history, &[]);
         assert_eq!(a.system, b.system, "同输入必须同前缀(golden)");
         let n_few = scene.few_shots.len();
         assert_eq!(a.messages.len(), n_few + 2, "未知角色被过滤,few-shot 打头");
@@ -508,20 +554,20 @@ mod tests {
             resident: true, salience: 1.0, source: "explicit".into(), last_used_at: None,
             created_at: 0, updated_at: 0,
         };
-        let req = build_context(scene, None,Some(" 贫嘴但靠谱,偶尔冒东北话 "), &[mem], &[], &[], &[]);
+        let req = bc(scene, None, Some(" 贫嘴但靠谱,偶尔冒东北话 "), &[mem], &[], &[], &[]);
         let style_at = req.system.find("贫嘴但靠谱").expect("性格设定必须进 system");
         let mem_at = req.system.find("花生").expect("记忆必须进 system");
         assert!(style_at > scene.persona.len(), "性格设定在出厂人设之后(叠加在中性底座上)");
         assert!(style_at < mem_at, "性格设定在记忆之前(按稳定度排序保前缀)");
         // 空白设定 = 不注入,前缀与无设定时字节级一致(用户清空 = 纯出厂人设)
-        let none = build_context(scene, None,None, &[], &[], &[], &[]);
-        let blank = build_context(scene, None,Some("   "), &[], &[], &[], &[]);
+        let none = bc(scene, None, None, &[], &[], &[], &[]);
+        let blank = bc(scene, None, Some("   "), &[], &[], &[], &[]);
         assert_eq!(none.system, blank.system);
 
         // 出厂默认 = 空:默认保持中性,不注入"性格设定"层 → 与无设定字节级一致
         // (想要性格的用户自己在设置里写;留空是产品决策,见 DEFAULT_PERSONA_STYLE 注释)
         assert!(DEFAULT_PERSONA_STYLE.trim().is_empty(), "默认人设保持中性:默认句留空,不预设性格倾向");
-        let dflt = build_context(scene, None,Some(DEFAULT_PERSONA_STYLE), &[], &[], &[], &[]);
+        let dflt = bc(scene, None, Some(DEFAULT_PERSONA_STYLE), &[], &[], &[], &[]);
         assert_eq!(dflt.system, none.system, "默认句为空 = 纯出厂人设(不注入性格层)");
     }
 
@@ -530,12 +576,12 @@ mod tests {
         let scenes = Scenes::builtin();
         let scene = scenes.default_scene();
         // 设了名字 = 直接填进 persona 的「你是 {name}」身份句,逐字出现、无残留占位符
-        let named = build_context(scene, Some(" 小布 "), None, &[], &[], &[], &[]);
+        let named = bc(scene, Some(" 小布 "), None, &[], &[], &[], &[]);
         assert!(named.system.contains("你是 小布"), "名字直接进 persona 身份句");
         assert!(!named.system.contains("{name}"), "占位符必须被替换干净");
         // 没设/空白 = 回落出厂默认名,与显式传默认名字节级一致(前缀稳定、出厂 persona 原样)
-        let none = build_context(scene, None, None, &[], &[], &[], &[]);
-        let blank = build_context(scene, Some("   "), None, &[], &[], &[], &[]);
+        let none = bc(scene, None, None, &[], &[], &[], &[]);
+        let blank = bc(scene, Some("   "), None, &[], &[], &[], &[]);
         assert_eq!(none.system, blank.system, "空名回落默认,前缀字节稳定");
         assert!(none.system.contains(&format!("你是 {DEFAULT_NAME}")), "默认名填入身份句");
         assert!(!none.system.contains("{name}"), "默认也不留占位符");
@@ -561,7 +607,7 @@ mod tests {
             msg(1, "user", "今晚吃什么好", None),
             msg(2, "assistant", "番茄锅怎么样?不放香菜,蘸料也帮你避开花生~", None),
         ];
-        let req = build_context(scene, None,Some(DEFAULT_PERSONA_STYLE), &memories, &briefs, &history, &defs);
+        let req = bc(scene, None, Some(DEFAULT_PERSONA_STYLE), &memories, &briefs, &history, &defs);
         println!("\n========== system(OpenAI 系翻成首条 system 消息) ==========\n{}", req.system);
         println!("\n========== messages = few-shot(稳定前缀) + 锚定窗口历史 ==========");
         for m in &req.messages {
@@ -580,13 +626,13 @@ mod tests {
             msg(2, "assistant", "三点一刻啦", None),
             msg(3, "user", "谢啦", None),
         ];
-        let req = build_context(scene, None,None, &[], &[], &history, &[]);
+        let req = bc(scene, None, None, &[], &[], &history, &[]);
         let tail = &req.messages[scene.few_shots.len()..];
         assert_eq!(tail[0], ChatMessage::user("〔语音〕现在几点"), "speak 行加标记");
         assert_eq!(tail[2], ChatMessage::user("谢啦"), "无标记照旧,历史零膨胀");
         // 说话守则住底座 LAWS(静态):模式怎么翻转都不碰前缀
         assert!(req.system.contains("## 说话守则"));
-        let again = build_context(scene, None,None, &[], &[], &history, &[]);
+        let again = bc(scene, None, None, &[], &[], &history, &[]);
         assert_eq!(req.messages, again.messages, "同输入同翻译(前缀稳定 golden)");
     }
 
@@ -594,7 +640,7 @@ mod tests {
     fn window_snaps_to_user_boundary_and_replays_tool_rounds() {
         let scenes = Scenes::builtin();
         let scene = scenes.default_scene();
-        // 窗口起点落在工具轮中间:行 1(孤儿 tool)必须被吸附/跳过
+        // 历史以孤儿 tool 行开头(行 1):渲染时按 open_calls 配对跳过(防 400)。
         let history = vec![
             msg(1, "tool", "ok", Some(r#"{"call_id":"call_z","name":"now","status":"ok"}"#)),
             msg(2, "user", "今天几号", None),
@@ -607,9 +653,9 @@ mod tests {
             msg(4, "tool", r#"{"now":"2026-06-12 21:00"}"#, Some(r#"{"call_id":"call_a","name":"now","status":"ok"}"#)),
             msg(5, "assistant", "今天 6 月 12 号~", None),
         ];
-        let req = build_context(scene, None,None, &[], &[], &history, &[]);
+        let req = bc(scene, None, None, &[], &[], &history, &[]);
         let tail = &req.messages[scene.few_shots.len()..];
-        assert_eq!(tail.len(), 4, "孤儿 tool 行被吸附掉");
+        assert_eq!(tail.len(), 4, "孤儿 tool 行被跳过");
         assert_eq!(tail[0], ChatMessage::user("今天几号"));
         match &tail[1] {
             ChatMessage::Assistant { tool_calls, reasoning, .. } => {
@@ -626,7 +672,7 @@ mod tests {
         let scenes = Scenes::builtin();
         let scene = scenes.default_scene();
         let history = vec![msg(1, "user", "放点啥", None)];
-        let mut req = build_context(scene, None, None, &[], &[], &history, &[]);
+        let mut req = bc(scene, None, None, &[], &[], &history, &[]);
         let sys_before = req.system.clone();
         let n_before = req.messages.len();
         attach_ambient(&mut req, "播放器现在空闲,没有在播放任何内容");

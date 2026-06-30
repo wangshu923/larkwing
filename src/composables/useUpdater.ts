@@ -1,11 +1,14 @@
 // 一键更新(清单 ⑤·A):app 内查新版 → 点「更新」后台下载(进任务 HUD,**不阻塞操作**)→
 // 下完弹「立即更新?」→ 装(Windows 装前自动退出 app)+ 重启。
-// 决策(2026-06-22 用户拍板):依赖用户代理(不自建镜像)· 每日查 · 仅 Windows 本期。
+// 决策(2026-06-22)· 每日查 · 仅 Windows 本期。
 //
-// 代理:updater 自带 HTTP,**不走 §4.6 的 net::Client**,故读 app 的 net.proxy_* 传给 check({proxy})。
-// ⚠️ 与 net::Client 不同(2026-06-23 厘清):关代理时只是「不传我们的地址」,插件底层 reqwest 仍可能读
-// 系统代理环境变量 —— 做不到 §4.6「关=纯直连、连 env 都不读」那么严(插件 check API 无 no_proxy 旋钮)。
-// GitHub 走系统代理通常正合用户意,本期接受;真要纯直连需插件支持或自走 net::Client(后置)。
+// 选路(2026-06-30 用户拍板,§6.9 镜像同理):endpoint 列表 = **gh 镜像优先 + 官方兜底**
+// (tauri.conf;顺序故障转移,第一个通的用——tauri 不支持并发竞速)。check 两阶段:**先直连**
+// 这串 endpoint;**全够不到才看代理开关**,开了带 `check({proxy})` 再试一次(代理那趟覆盖检查+下载)。
+// ⚠️ ① updater 自带 HTTP,**不走 §4.6 的 net::Client**;② 关代理时只是「不传我们的地址」,插件底层
+// reqwest 仍可能读系统代理 env(check API 无 no_proxy 旋钮),做不到 §4.6「连 env 都不读」那么严。
+// ⚠️ 镜像只加速**检查**(拉 manifest);latest.json 里的**下载地址仍是 github**(tauri-action 生成),
+// 镜像管不到下载那步 → 国内下 exe 要快靠代理。彻底镜像下载需 CI 改写 manifest 资产 URL(后置)。
 // 下载做成**前端自驱任务**(useTasks.startLocal):进度进 HUD、非阻塞;下载完成的「回调」=
 // download() 这个 await 返回之后的代码(无需在任务系统里加通用回调总线)。
 // 静默失败:自动查失败只 console(被动 §3.5);下载/安装失败给任务红条 / toast。
@@ -40,20 +43,38 @@ function effectiveProxy(): string | undefined {
   return enabled && addr ? addr : undefined
 }
 
-/** 查一次。true=有新版 / false=已最新 / null=查失败(调用方区分)。 */
+/** 把 check() 结果落到 state;有新版返 true,够得到但无更新返 false。 */
+function adopt(update: Update | null): boolean {
+  if (update) {
+    pending = update
+    state.available = { version: update.version, notes: update.body ?? '' }
+    return true
+  }
+  return false
+}
+
+/** 查一次。true=有新版 / false=已最新 / null=查失败(调用方区分)。
+ *  策略(2026-06-30 用户拍板):**先直连**——走 tauri.conf 的 endpoint 列表(gh 镜像优先 + 官方兜底,
+ *  顺序故障转移、第一个通的用;tauri 不支持并发竞速,short timeout 让失败快速翻篇)。直连**全够不到**
+ *  (throw)且**代理开关开** → 带代理再试一次(代理那趟同时覆盖检查 + 后续下载)。代理关 = 不兜,如实失败。 */
 async function runCheck(): Promise<boolean | null> {
   if (!isTauri() || checking) return false
   checking = true
   try {
-    const update = await check({ proxy: effectiveProxy(), timeout: 30_000 })
-    if (update) {
-      pending = update
-      state.available = { version: update.version, notes: update.body ?? '' }
-      return true
+    // 1) 直连:镜像 + 官方逐个试(不传我们的代理)
+    try {
+      return adopt(await check({ timeout: 12_000 }))
+    } catch (eDirect) {
+      // 2) 直连全失败 → 代理开关开就带代理重试(否则放弃,§3.5 如实失败)
+      const proxy = effectiveProxy()
+      if (!proxy) {
+        console.error('检查更新失败(直连,未开代理)', eDirect)
+        return null
+      }
+      return adopt(await check({ proxy, timeout: 12_000 }))
     }
-    return false
   } catch (e) {
-    console.error('检查更新失败', e)
+    console.error('检查更新失败(代理回退也失败)', e)
     return null
   } finally {
     checking = false

@@ -360,6 +360,8 @@ pub fn run() {
       commands::list_providers,
       commands::save_provider,
       commands::remove_provider,
+      commands::model_meta,
+      commands::set_model_override,
       commands::media_login,
       commands::media_retry,
       commands::retry_download,

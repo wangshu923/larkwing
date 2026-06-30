@@ -14,9 +14,10 @@ use larkwing_core::datadir::{self, Pointer};
 use larkwing_core::tasks::Tasks;
 
 use larkwing_core::engine::{
-    AppError, BootSnapshot, DayUsage, Engine, FloatIdle, MsgStats, ProviderPatch, ProviderView,
-    SettingEntry, TurnEvent,
+    AppError, BootSnapshot, DayUsage, Engine, FloatIdle, ModelMeta, MsgStats, ProviderPatch,
+    ProviderView, SettingEntry, TurnEvent,
 };
+use larkwing_core::llm::catalog::ModelOverride;
 use larkwing_core::llm::AccountBalance;
 use larkwing_core::media::{CookieRec, MediaRuntime};
 use larkwing_core::store::{
@@ -347,6 +348,21 @@ pub fn remove_provider(
     id: String,
 ) -> Result<Vec<ProviderView>, AppError> {
     state.engine.remove_provider(&id)
+}
+
+/// 设置页「高级」:某模型的目录猜测 + 当前用户覆盖。
+#[tauri::command]
+pub fn model_meta(state: State<'_, AppState>, model: String) -> Result<ModelMeta, AppError> {
+    Ok(state.engine.model_meta(&model))
+}
+
+/// 设置页「高级」:upsert 一条模型覆盖(空壳 = 删该条)。
+#[tauri::command]
+pub fn set_model_override(
+    state: State<'_, AppState>,
+    over: ModelOverride,
+) -> Result<(), AppError> {
+    state.engine.set_model_override(over)
 }
 
 /// 开听写会话(PLAN §11 A 期):立即返回,进展全走 app_event 的 Voice 车道

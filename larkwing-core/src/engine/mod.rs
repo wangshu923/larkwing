@@ -269,6 +269,25 @@ impl ProviderView {
     }
 }
 
+/// 某模型的目录猜测(「高级」里给占位用:None = 目录也不知道)。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelGuess {
+    pub tier: crate::llm::catalog::Tier,
+    pub in_usd_per_m: Option<f64>,
+    pub out_usd_per_m: Option<f64>,
+    pub ctx_window_tokens: Option<u32>,
+    pub billing: crate::llm::catalog::BillingMode,
+}
+
+/// 设置页「高级」一格的全貌:目录猜测(占位)+ 当前用户覆盖(值)。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelMeta {
+    pub guess: ModelGuess,
+    pub over: Option<crate::llm::catalog::ModelOverride>,
+}
+
 /// 保存供应商卡的入参:None = 不动;api_key 空串视同 None(掩码回显防误存)。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -525,6 +544,8 @@ impl Engine {
     /// 解析顺序:LARKWING_FAKE_LLM → llm.providers JSON → 单 DeepSeek 兜底
     /// (key: env DEEPSEEK_API_KEY → llm.api_key)。坏 JSON 走兜底并记日志,绝不让 app 哑掉。
     pub fn reload_providers(&self) -> Result<(), AppError> {
+        // 模型覆盖(「高级」里改的档位/价/窗口)推入 catalog overlay —— boot 与任何配置变更都刷新一次。
+        crate::llm::catalog::set_overrides(self.load_model_overrides());
         if std::env::var("LARKWING_FAKE_LLM").ok().as_deref() == Some("1") {
             tracing::info!("LARKWING_FAKE_LLM=1,使用假 provider");
             self.set_provider(Some(Arc::new(crate::llm::fake::FakeLlm::default())));
@@ -816,14 +837,11 @@ impl Engine {
                 Ok(())
             }
             // 中文 ASR 模型档(app 级,机器属性,2026-06 用户要求放出来选,AGENT §7.5):
-            // sense-voice(快,默认)/ whisper-tiny(弱机轻量,最小 ~100MB,略糙)/
-            // whisper-small(对孩子/口音更稳,稍慢,~370MB)/ whisper-medium(更准更慢,~950MB)/
-            // firered-ctc(小红书,中文最准,~740MB)。模型用时下载;开着唤醒时前端会重启
-            // 循环让新模型生效(同 sensitivity)。漏了这条 → 写被白名单拒 → 前端乐观写回滚。
+            // sense-voice(快,默认)/ firered-ctc(更准·听不清/孩子选这个;大陆原生简体、普通话
+            // SOTA,~740MB)。模型用时下载;开着唤醒时前端会重启循环让新模型生效(同 sensitivity)。
+            // 漏了这条 → 写被白名单拒 → 前端乐观写回滚。(原 whisper-* 三档已移除,见 asr.rs。)
             "voice.asr.model" => {
-                if !["sense-voice", "whisper-tiny", "whisper-small", "whisper-medium", "firered-ctc"]
-                    .contains(&value)
-                {
+                if !["sense-voice", "firered-ctc"].contains(&value) {
                     return Err(invalid("未知的识别模型档"));
                 }
                 self.store.settings.set(None, key, value)?;
@@ -986,6 +1004,59 @@ impl Engine {
         )
         .map_err(AppError::internal)?;
         self.reload_providers()
+    }
+
+    /// 读用户模型覆盖表(明文 settings,非秘密 → 不进 keyring/白名单)。坏 JSON → 空表(容错)。
+    fn load_model_overrides(&self) -> Vec<crate::llm::catalog::ModelOverride> {
+        self.store
+            .settings
+            .get(None, "llm.model_overrides")
+            .ok()
+            .flatten()
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default()
+    }
+
+    /// 设置页「高级」一格:目录猜测(占位)+ 当前用户覆盖(值)。
+    pub fn model_meta(&self, model: &str) -> ModelMeta {
+        let g = crate::llm::catalog::lookup(model);
+        let guess = ModelGuess {
+            tier: g.map(|i| i.tier).unwrap_or(crate::llm::catalog::Tier::Balanced),
+            in_usd_per_m: g.and_then(|i| i.in_usd_per_m),
+            out_usd_per_m: g.and_then(|i| i.out_usd_per_m),
+            ctx_window_tokens: g.and_then(|i| i.ctx_window_tokens),
+            // 目录无计价列(当前 provider 都有前缀缓存)→ 猜测恒为默认「按量+缓存」。
+            billing: crate::llm::catalog::BillingMode::default(),
+        };
+        let over = self
+            .load_model_overrides()
+            .into_iter()
+            .find(|o| o.model.eq_ignore_ascii_case(model));
+        ModelMeta { guess, over }
+    }
+
+    /// upsert 一条模型覆盖(空壳 = 删该条,回落纯目录)。持久化 + 刷新 overlay + 按新档位重排候选
+    /// (档位影响路由顺序)。键 = 用户填的 model id;不在白名单、明文存。
+    pub fn set_model_override(
+        &self,
+        over: crate::llm::catalog::ModelOverride,
+    ) -> Result<(), AppError> {
+        let model = over.model.trim().to_string();
+        if model.is_empty() {
+            return Ok(()); // 没指定模型 = 无事可做
+        }
+        let mut all = self.load_model_overrides();
+        all.retain(|o| !o.model.eq_ignore_ascii_case(&model));
+        let entry = crate::llm::catalog::ModelOverride { model, ..over };
+        if !entry.is_empty() {
+            all.push(entry);
+        }
+        let json = serde_json::to_string(&all).map_err(AppError::internal)?;
+        self.store
+            .settings
+            .set(None, "llm.model_overrides", &json)
+            .map_err(AppError::internal)?;
+        self.reload_providers() // 刷新 overlay + 档位变了重排候选
     }
 
     // ---- 多用户 / 家人(PLAN §11 D;会话管理类一等公民,§4 永不委托可插拔层) ----
@@ -1450,13 +1521,17 @@ impl Engine {
         let tool_subset = self.tools.subset(&scene.tools);
         let tool_defs: Vec<ToolDef> = tool_subset.iter().map(|t| t.spec().def()).collect();
 
+        // 本回合上下文尾部字数预算(按主候选窗口算,model-aware)
+        let budget = tail_budget(&candidates);
+
         // 落用户消息 + 取上下文原料 + 单一装配权出 ChatRequest(阻塞 IO 下沉线程池)
         let store = self.store.clone();
         let conv_user = conversation.user_id;
         let (mut request, user_msg_id, mem_user) = tokio::task::spawn_blocking(
             move || -> anyhow::Result<(crate::llm::ChatRequest, i64, i64)> {
-            // 入站附件(媒体输入 PLAN §9):图 → image_url 当轮注入;文档 → 抽文字当轮注入;
-            // 只把小票(AttachmentRef)落 payload,附件本体不进持久前缀(省 token/体积)。与插队共用
+            // 入站附件(媒体输入 PLAN §9):图 → image_url 当轮注入(不落库,vision 重复计费);
+            // 文档**文字**并进落库的 user 消息内容 → 进 history,多轮追问还在、且落可缓存前缀
+            // (§9 收窄:仅图当轮,文档持久化)。只把小票(AttachmentRef)落 payload。与插队共用
             let (image_parts, doc_text, att_refs) = process_attachments(&attachments);
 
             // 语音会话模式(PLAN §11)+ 附件小票:非默认形态物化进 payload(真相在库)
@@ -1465,8 +1540,15 @@ impl Engine {
             let payload = (!eff_meta.is_default())
                 .then(|| serde_json::to_string(&eff_meta))
                 .transpose()?;
-            let user_msg =
-                store.chat.append_message_full(conv_id, "user", &text, payload.as_deref())?;
+            // 文档文字并进落库内容(图不并:仍当轮)。doc_text 自带「〔附件:…〕」分隔。
+            let stored_content =
+                if doc_text.is_empty() { text } else { format!("{text}{doc_text}") };
+            let user_msg = store.chat.append_message_full(
+                conv_id,
+                "user",
+                &stored_content,
+                payload.as_deref(),
+            )?;
             // 记忆归人(§6):声纹识别出且确属真实用户 → 本回合用 TA;否则会话归属者
             // (访客/电视声识别不出 → fallback,绝不误记到家人名下,robot 同款立场)
             let mem_user = match eff_meta.speaker_user {
@@ -1503,9 +1585,14 @@ impl Engine {
             // 没设过/空 = 出厂名,build_context 不注入
             let pet_name = store.settings.get(Some(conv_user), "ui.pet_name")?;
             let total = store.chat.count_messages(conv_id)? as usize;
-            let start = context::anchored_start(total);
-            let history =
-                store.chat.messages_page(conv_id, start as i64, (total - start) as i64)?;
+            // I/O 上界分页:最多取 HISTORY_PAGE_MAX 条,真窗口由 build_context 内字数预算裁;
+            // page_base = 该页首条的绝对下标,喂 windowed_start 做整块锚定(缓存稳定)。
+            let page_base = total.saturating_sub(context::HISTORY_PAGE_MAX);
+            let history = store.chat.messages_page(
+                conv_id,
+                page_base as i64,
+                (total - page_base) as i64,
+            )?;
             let mut request = context::build_context(
                 &scene,
                 pet_name.as_deref(),
@@ -1513,18 +1600,19 @@ impl Engine {
                 &memories,
                 &briefings,
                 &history,
+                page_base,
+                budget,
                 &tool_defs,
             );
-            // 当轮注入附件(图 parts + 文档文字):挂到最后一条 user 消息上,持久前缀
-            // (few-shot/历史)字节不动 → 缓存不破,也不为历史里的旧图反复付 vision 费
-            if !image_parts.is_empty() || !doc_text.is_empty() {
-                if let Some(crate::llm::ChatMessage::User { content, parts }) = request
+            // 当轮注入图片 parts:挂到最后一条 user 消息上,持久前缀(few-shot/历史)字节不动 →
+            // 缓存不破,也不为历史里的旧图反复付 vision 费(图当轮;文档文字已并进落库内容)。
+            if !image_parts.is_empty() {
+                if let Some(crate::llm::ChatMessage::User { parts, .. }) = request
                     .messages
                     .iter_mut()
                     .rev()
                     .find(|m| matches!(m, crate::llm::ChatMessage::User { .. }))
                 {
-                    content.push_str(&doc_text);
                     parts.extend(image_parts);
                 }
             }
@@ -1608,9 +1696,9 @@ impl Engine {
         tool_subset: Vec<Arc<dyn crate::tools::Tool>>,
         user_msg_id: i64,
     ) -> Result<mpsc::Receiver<TurnEvent>, AppError> {
-        // 防溢出安全阀:文档附件 / 背景状态在 build_context 之后才注入(绕过尾部安全阀),
-        // 单个附件文档可达数万字 → 开流前对累积的 messages 再封顶一道(§0.2.0)。
-        context::cap_messages_tail(&mut request.messages);
+        // 防溢出安全阀(model-aware):工具循环累积的 ToolResult / 背景状态在 build_context 之后
+        // 才注入(绕过初始窗口),单条可达数万字 → 开流前对累积的 messages 再按预算封顶一道(§0.2.0)。
+        context::cap_messages_tail(&mut request.messages, tail_budget(&candidates));
         let mut opened = None;
         let mut first_err: Option<LlmError> = None;
         for (id, provider) in &candidates {
@@ -1680,6 +1768,7 @@ impl Engine {
         if candidates.is_empty() {
             return Err(AppError { kind: ErrorKind::NoApiKey, message: "还没有配置 API key".into() });
         }
+        let budget = tail_budget(&candidates);
 
         // 会话兜底:原会话被删 → 该用户最新会话 → 新建(boot 同款链)
         let store = self.store.clone();
@@ -1748,6 +1837,8 @@ impl Engine {
                     &memories,
                     &briefings,
                     &[],
+                    0,
+                    budget,
                     &tool_defs,
                 );
                 request
@@ -1804,6 +1895,22 @@ fn cheapest_candidate(
         .iter()
         .min_by_key(|(_, p)| crate::llm::catalog::tier_of(p.model_id()))
         .map(|(_, p)| p)
+}
+
+/// 本回合的上下文尾部字数预算:按**主候选**(首位 = 主选,99% 会服务它)的上下文窗口算
+/// (model-aware:大窗口装文档、小窗口防溢出)。窗口未知 → 回落默认。极少数主选挂、回落到
+/// 更小模型且 request 偏大时,开流 400 走既有 Failed 兜底(不静默,§3.5),不为罕见复合失败牺牲常路。
+fn tail_budget(candidates: &[(String, Arc<dyn LlmProvider>)]) -> usize {
+    match candidates.first() {
+        Some((_, p)) => {
+            let m = p.model_id();
+            context::tail_budget_chars(
+                crate::llm::catalog::ctx_window_of(m),
+                crate::llm::catalog::billing_of(m),
+            )
+        }
+        None => context::tail_budget_chars(None, crate::llm::catalog::BillingMode::default()),
+    }
 }
 
 #[cfg(test)]

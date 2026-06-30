@@ -97,6 +97,11 @@ impl Turn {
             mut rx,
             inject,
         } = self;
+        // 本回合防溢出预算:按**实际服务的** provider 的窗口算(可能是 fallback,故比建连前的主候选更准)。
+        let budget = super::context::tail_budget_chars(
+            crate::llm::catalog::ctx_window_of(provider.model_id()),
+            crate::llm::catalog::billing_of(provider.model_id()),
+        );
         // mood 上总线(PLAN §12 修订):悬浮窗据此显「正在想/正在说」;
         // Guard 在任一出口(done/failed/cancelled/落库失败/建连失败)收回 Idle。
         let bus = media.bus().clone();
@@ -194,7 +199,7 @@ impl Turn {
                 seen_calls.clear();
                 request.tool_choice = ToolChoice::Auto;
                 round_start = std::time::Instant::now();
-                super::context::cap_messages_tail(&mut request.messages); // 防溢出安全阀(注入后)
+                super::context::cap_messages_tail(&mut request.messages, budget); // 防溢出安全阀(注入后)
                 match provider.chat_stream(request.clone()).await {
                     Ok(next) => rx = next,
                     Err(e) => {
@@ -318,7 +323,7 @@ impl Turn {
             // 换人重说会精神分裂 —— 走 Failed 友好兜底(铁律 §3.5)。
             round_start = std::time::Instant::now(); // 2+ 轮计时:从本轮建连起
             // 防溢出安全阀:工具轮累积 ToolResult(单条可达 4 万字)会撑大 request → 开流前封顶。
-            super::context::cap_messages_tail(&mut request.messages);
+            super::context::cap_messages_tail(&mut request.messages, budget);
             match provider.chat_stream(request.clone()).await {
                 Ok(next) => rx = next,
                 Err(e) => {
@@ -378,7 +383,11 @@ async fn apply_injection(
     request: &mut ChatRequest,
     it: super::InjectReady,
 ) {
-    if let Some(id) = persist_row(store, conv_id, "user", &it.display, it.payload.as_deref()).await {
+    // 落库用 llm_content(含文档文字)→ 注入的文档也进 history、多轮还在(与主发送路径一致,§9);
+    // UI 事件仍用 display(用户原文,不灌文档正文)。无文档时 llm_content == display,行为不变。
+    if let Some(id) =
+        persist_row(store, conv_id, "user", &it.llm_content, it.payload.as_deref()).await
+    {
         let _ = tx
             .send(TurnEvent::Injected { message_id: id, text: it.display, attachments: it.refs })
             .await;
