@@ -165,6 +165,7 @@ export default {
     micCancelTitle: '取消(Esc)',
     attach: '加图片或文件',
     attRemove: '移除',
+    dropHint: '松手,把文件交给旺财',
     copy: '复制',
     queueHint: '排队中 · 说完一起发',
     queueAtt: '(附件)',

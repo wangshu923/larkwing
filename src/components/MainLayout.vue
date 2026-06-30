@@ -151,7 +151,9 @@ function addFiles(files: FileList | File[]) {
       const dataUrl = String(reader.result)
       const base64 = dataUrl.slice(dataUrl.indexOf(',') + 1)
       const mime = f.type || ''
-      pending.value.push({ kind: mime.startsWith('image/') ? 'image' : 'doc', name: f.name, mime, dataUrl, base64 })
+      // 截图/粘贴的 blob 偶尔无名 → 派生个中性名(展示标签,§6.5 豁免),免空白小票
+      const name = f.name || `clip.${mime.split('/')[1] || 'png'}`
+      pending.value.push({ kind: mime.startsWith('image/') ? 'image' : 'doc', name, mime, dataUrl, base64 })
     }
     reader.readAsDataURL(f)
   }
@@ -159,15 +161,52 @@ function addFiles(files: FileList | File[]) {
 function removePending(i: number) {
   pending.value.splice(i, 1)
 }
+// 从 clipboard/drag 的 DataTransfer 收文件:既看 .files(从文件管理器复制的文件多在此),
+// 也扫 .items 里 kind==='file' 的——**截图/复制的图片走 items、.files 常为空**(头号坑),
+// 按 名+大小 去重(两边都报同一文件时)。
+function collectFiles(dt: DataTransfer): File[] {
+  const out: File[] = []
+  const seen = new Set<string>()
+  const push = (f: File | null) => {
+    if (!f) return
+    const k = `${f.name}|${f.size}`
+    if (seen.has(k)) return
+    seen.add(k)
+    out.push(f)
+  }
+  for (const f of Array.from(dt.files)) push(f)
+  for (const it of Array.from(dt.items)) if (it.kind === 'file') push(it.getAsFile())
+  return out
+}
 function onPaste(e: ClipboardEvent) {
-  const files = e.clipboardData?.files
-  if (files && files.length) {
+  if (!e.clipboardData) return
+  const files = collectFiles(e.clipboardData)
+  if (files.length) {
     addFiles(files)
     e.preventDefault() // 只在真有文件时拦,纯文本粘贴照常
   }
 }
+
+// 拖入高亮:整块聊天区都当 drop 区(不只输入行)。enter/leave 用计数,避免划过子元素时 leave 冒泡导致闪烁。
+const dragging = ref(false)
+let dragDepth = 0
+function dragHasFiles(e: DragEvent) {
+  return Array.from(e.dataTransfer?.types ?? []).includes('Files')
+}
+function onDragEnter(e: DragEvent) {
+  if (!dragHasFiles(e)) return // 拖文本/选区进来不亮(只对文件)
+  dragDepth++
+  dragging.value = true
+}
+function onDragLeave() {
+  dragDepth = Math.max(0, dragDepth - 1)
+  if (dragDepth === 0) dragging.value = false
+}
 function onDrop(e: DragEvent) {
-  if (e.dataTransfer?.files?.length) addFiles(e.dataTransfer.files)
+  dragDepth = 0
+  dragging.value = false
+  const files = e.dataTransfer ? collectFiles(e.dataTransfer) : []
+  if (files.length) addFiles(files)
 }
 
 // —— 语音(PLAN §11):听写(mic,UI 交互不念)与唤醒(wake,语音会话必念)
@@ -533,7 +572,16 @@ watch(messages, () => nextTick(() => {
     <RemindersView v-if="activeRail === 'reminders'" @close="activeRail = 'chat'" />
 
     <!-- 右:对话主体 -->
-    <main class="chat" v-show="activeRail !== 'settings' && activeRail !== 'memory' && activeRail !== 'ops' && activeRail !== 'reminders'">
+    <main
+      class="chat"
+      v-show="activeRail !== 'settings' && activeRail !== 'memory' && activeRail !== 'ops' && activeRail !== 'reminders'"
+      @dragenter.prevent="onDragEnter"
+      @dragover.prevent
+      @dragleave="onDragLeave"
+      @drop.prevent="onDrop"
+    >
+      <!-- 拖文件进来时整块聊天区高亮(pointer-events:none → 不抢 drop/leave 事件) -->
+      <div v-if="dragging" class="drop-veil"><span>{{ t('chat.dropHint') }}</span></div>
       <header class="chat-head" data-tauri-drag-region>
         <button v-if="!panelOpen" class="reopen" @click="panelOpen = true" :title="t('recents.expand')">›</button>
         <img :src="pack.idle[0]" class="head-av" :alt="petName" :title="t('avatar.switchTitle')" style="height: 46px; width: auto; cursor: pointer;" @click="switchCharacter" @contextmenu="openPetMenu($event)" />
@@ -674,7 +722,7 @@ watch(messages, () => nextTick(() => {
           </div>
           <button class="send cancel-listen" @click="voice.stop(false)" :title="t('chat.micCancelTitle')">✕</button>
         </div>
-        <div v-else class="input-row" @drop.prevent="onDrop" @dragover.prevent>
+        <div v-else class="input-row">
           <!-- 加图片/文件:隐藏 input + 小回形针(界面优先,附件是轻量入口) -->
           <input
             ref="fileInput"
@@ -828,6 +876,17 @@ watch(messages, () => nextTick(() => {
 .chat::before {
   content: ""; position: absolute; inset: 0; z-index: 0; pointer-events: none;
   background: linear-gradient(180deg, var(--veil-top), var(--veil-bottom));
+}
+/* 拖文件进来的高亮蒙层:盖住整块聊天区,虚线框 + 居中提示;pointer-events:none 不抢 drop/leave */
+.drop-veil {
+  position: absolute; inset: 10px; z-index: 6; pointer-events: none;
+  display: flex; align-items: center; justify-content: center;
+  border: 2px dashed rgba(var(--accent-rgb), 0.7); border-radius: 14px;
+  background: rgba(var(--accent-rgb), 0.1);
+}
+.drop-veil span {
+  padding: 10px 18px; border-radius: 10px;
+  background: var(--surface); color: var(--accent); font-size: 15px; letter-spacing: .5px;
 }
 /* 右内边距留出右上角窗控三键的位置(无边框补窗控,PLAN §12) */
 .chat-head { display: flex; align-items: center; gap: 10px; padding: 14px 84px 14px 20px; border-bottom: 1px solid var(--line); }

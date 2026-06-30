@@ -166,6 +166,7 @@ export default {
     micCancelTitle: 'Cancel (Esc)',
     attach: 'Attach image or file',
     attRemove: 'Remove',
+    dropHint: 'Drop to hand the file to Larkwing',
     copy: 'Copy',
     queueHint: 'Queued · sends when it’s done',
     queueAtt: '(attachment)',
