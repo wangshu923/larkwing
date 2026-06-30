@@ -49,10 +49,38 @@ let ducked = false
 function liveVolume(): number {
   return ducked ? state.volume * DUCK_RATIO : state.volume
 }
-/** 把当前实时音量刷到两个元素(切音频/视频不丢)。 */
+/** 把当前实时音量刷到两个元素(切音频/视频不丢)。即时设置 = 抢占进行中的渐变。 */
 function applyVolume() {
+  cancelFade()
   if (audio) audio.volume = liveVolume()
   if (videoEl) videoEl.volume = liveVolume()
+}
+
+// 避让恢复用渐变(逐渐爬回基准),不一下子轰回来 —— 压低仍即时(让 7274 的话马上被听见)。
+const DUCK_RESTORE_FADE_MS = 700
+let fadeTimer: ReturnType<typeof setInterval> | undefined
+function cancelFade() {
+  if (fadeTimer) {
+    clearInterval(fadeTimer)
+    fadeTimer = undefined
+  }
+}
+/** 把两个元素音量在 ms 内从各自当前值平滑爬到目标(liveVolume);新的音量改动/压低会抢占。 */
+function fadeToLive(ms: number) {
+  cancelFade()
+  const els = [audio, videoEl].filter(Boolean) as HTMLMediaElement[]
+  if (!els.length) return
+  const target = liveVolume()
+  const from = els.map((e) => e.volume)
+  const STEP_MS = 40
+  const steps = Math.max(1, Math.round(ms / STEP_MS))
+  let i = 0
+  fadeTimer = setInterval(() => {
+    i += 1
+    const k = Math.min(1, i / steps)
+    els.forEach((e, idx) => (e.volume = from[idx] + (target - from[idx]) * k))
+    if (k >= 1) cancelFade()
+  }, STEP_MS)
 }
 /** 视频起播前主窗是否藏在托盘:停时据此藏回去(别看完视频凭空冒出主界面)。 */
 let videoWasHidden = false
@@ -277,7 +305,10 @@ function setVolume(v: number) {
 function setDucked(on: boolean) {
   if (ducked === on) return
   ducked = on
-  applyVolume()
+  // 压低:即时(applyVolume 内部已 cancelFade),让 7274 的话马上被听见;
+  // 恢复:渐变爬回基准,避免一下子轰回来很突兀。
+  if (on) applyVolume()
+  else fadeToLive(DUCK_RESTORE_FADE_MS)
 }
 
 /** 倍速 0.25–3:作用到当前元素;新播放复位 1。 */
