@@ -1,8 +1,14 @@
 name: build
 
 # 触发:
-#   - 手动(Actions 页面点 "Run workflow"):macOS + Windows 都编,安装包作为 artifact 上传,随时下载。
-#   - 打 tag v*(如 v0.1.0):macOS + Windows 都编,并创建一个 draft Release,安装包作为附件。
+#   - 手动(Actions 页面点 "Run workflow"):macOS + Windows 都编,安装包作为 artifact 上传(不建 Release)。
+#   - 打 tag v*(如 v0.2.2):**先建唯一草稿 Release**(create-release job)→ 两平台 build 都上传到
+#     **同一个** release(tauri-action 自动合并 mac+win 的 latest.json)→ finalize 把下载 url 改成镜像。
+#
+# ⚠️ 为什么要 create-release 先行(2026-06-30 v0.2.2 实锤教训):旧版让 matrix 两平台各自带
+#   tagName + releaseDraft 去建 Release —— **竞态出俩草稿**、latest.json 只剩最后写的那个平台
+#  (没合并)、finalize 按 tag 改到了「另一个」草稿 → 既没合并 mac/win、镜像也没落到实际那份。
+#   官方多平台范式 = 单 job 建一个 release、其余 job 用 releaseId 往里塞,根治竞态 + 自动合并 manifest。
 on:
   workflow_dispatch:
   push:
@@ -10,10 +16,58 @@ on:
       - "v*"
 
 permissions:
-  contents: write # 打 tag 时创建 Release 需要
+  contents: write # 建 / 改 Release 需要
 
 jobs:
+  # 打 tag 时先建**唯一**草稿,输出 release_id 给 build 复用(手动触发时本 job 被 skip)。
+  create-release:
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # 从 CHANGELOG.md 抽「本版本那一节」当 Release 正文(以后发版自动带说明,不用手填)。
+      # 取 tag(v0.2.2)去 v → 0.2.2,匹配 `## 0.2.2 …` 到下一个 `## 数字` 之间;抽不到兜底一句。
+      - name: 取本版本更新日志
+        id: notes
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          VER_RE="${VERSION//./\\.}"
+          BODY="$(awk -v ver="$VER_RE" '$0 ~ ("^## " ver "( |$)"){f=1;next} f&&/^## [0-9]/{exit} f{print}' CHANGELOG.md)"
+          if [ -z "$BODY" ]; then BODY="下载下方对应平台的安装包安装即可。"; fi
+          {
+            echo "body<<__LW_NOTES_EOF__"
+            echo "$BODY"
+            echo "__LW_NOTES_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 建唯一草稿 Release
+        id: create
+        uses: actions/github-script@v7
+        env:
+          NOTES_BODY: ${{ steps.notes.outputs.body }}
+        with:
+          script: |
+            const tag = process.env.GITHUB_REF_NAME
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              name: `Larkwing ${tag.replace(/^v/, '')}`,
+              body: process.env.NOTES_BODY,
+              draft: true,
+              prerelease: false,
+            })
+            core.setOutput('release_id', data.id)
+
   build:
+    needs: create-release
+    # 手动触发(workflow_dispatch)时 create-release 被 skip → 仍要让 build 跑(出 artifact)。
+    # always() + 显式放行 success/skipped:tag 时拿到 release_id,手动时 release_id 为空。
+    if: ${{ always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') }}
     strategy:
       fail-fast: false # 一个平台挂了,其余照常出包(首轮排错时尤其有用)
       matrix:
@@ -63,43 +117,23 @@ jobs:
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
 
-      # 从 CHANGELOG.md 抽「本版本那一节」作为 Release 正文(以后发版自动带说明,不用手填)。
-      # 取 tag(v0.1.1)去掉 v → 0.1.1,匹配 `## 0.1.1 …` 到下一个 `## 数字` 之间的内容。
-      # shell: bash 让 mac/windows 同一套脚本;非 tag(手动触发)抽不到 → 兜底一句。
-      - name: 取本版本更新日志
-        id: notes
-        shell: bash
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          VER_RE="${VERSION//./\\.}"
-          BODY="$(awk -v ver="$VER_RE" '$0 ~ ("^## " ver "( |$)"){f=1;next} f&&/^## [0-9]/{exit} f{print}' CHANGELOG.md)"
-          if [ -z "$BODY" ]; then BODY="下载下方对应平台的安装包安装即可。"; fi
-          {
-            echo "body<<__LW_NOTES_EOF__"
-            echo "$BODY"
-            echo "__LW_NOTES_EOF__"
-          } >> "$GITHUB_OUTPUT"
-
-      # tauri-action 会:跑 beforeBuildCommand(pnpm build)→ cargo build → 打安装包。
-      # 给了 --target,产物统一落在 target/<triple>/release/bundle/ 下,便于下面上传。
-      # 打 tag 时(tagName 非空)顺带创建 draft Release 并上传安装包;非 tag 时 tagName 为空,只编译。
+      # tauri-action 会:跑 beforeBuildCommand(pnpm build)→ cargo build → 打安装包 + 签名 + 生成 latest.json。
+      # **releaseId 非空(tag 触发)→ 上传到 create-release 建好的唯一草稿**,两平台都往这一个塞、
+      #   tauri-action 自动**合并** latest.json(mac + win 都在)。releaseId 为空(手动触发)→ 只编译、
+      #   不碰 Release,安装包由下面 artifact 步骤收。
       - name: Build Tauri app
         id: build
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # 一键更新签名(清单 ⑤·A):createUpdaterArtifacts=true 时 tauri-action 用这把私钥签包 +
-          # 生成 latest.json 上传到 Release。私钥 = 本地 ~/.tauri/larkwing-updater.key 的内容(进仓库 secret);
+          # 生成 latest.json。私钥 = 本地 ~/.tauri/larkwing-updater.key 的内容(进仓库 secret);
           # 本钥无密码 → PASSWORD secret 不设即为空,passwordless 签名照常。丢钥 = 发不出可校验的更新。
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
-          releaseName: Larkwing __VERSION__
-          # 正文取自上一步(CHANGELOG 本版本节);非 tag 触发时 tauri-action 不建 Release,此值被忽略
-          releaseBody: ${{ steps.notes.outputs.body }}
-          releaseDraft: true
-          prerelease: false
+          # 上传到唯一草稿(tag 触发);手动触发时为空 → 不建/不传 Release。
+          releaseId: ${{ needs.create-release.outputs.release_id }}
           args: --target ${{ matrix.target }}
 
       # 手动触发(非 tag)时,把安装包当 artifact 传上去,直接在 run 页面下载
@@ -114,18 +148,16 @@ jobs:
             target/${{ matrix.target }}/release/bundle/nsis/*.exe
           if-no-files-found: warn
 
-  # 一键更新·下载走镜像(2026-06-30,清单 ⑤·A 收尾):tauri-action 生成的 latest.json 里
-  # 资产下载 url 是 github.com 直链——国内无代理用户「查得到、下不动」(镜像只加速了 updater
-  # 检查端点,下载这步管不到)。本 job 在 build matrix 完成后,把 draft Release 的 latest.json
-  # 下下来,把每个平台的 url 前缀成镜像(ghfast.top)再传回。tauri updater 每平台只认一个 url、
-  # 不支持下载故障转移,故只能写一个镜像;前端 download() 失败时已有「开了代理就带代理重下」兜底
-  # (useUpdater.ts)。换镜像 = 改下面 MIRROR 一处。仅 tag 触发(非 tag 不建 Release)。
+  # 一键更新·下载走镜像(2026-06-30,清单 ⑤·A 收尾):tauri-action 生成的 latest.json 里资产下载 url
+  # 是 github.com 直链——国内无代理用户「查得到、下不动」(镜像只加速了 updater 检查端点,下载管不到)。
+  # 本 job 在两平台 build 都传完(latest.json 已合并)后,把它下下来、把每个平台的 url 前缀成镜像
+  #(ghfast.top)再传回。tauri updater 每平台只认一个 url、不支持下载故障转移,故只写一个镜像;前端
+  # download() 失败时已有「开了代理就带代理重下」兜底(useUpdater.ts)。换镜像 = 改下面 MIRROR 一处。
+  # ⚠️ 现在是**单草稿**(create-release 先建),gh release ... 按 tag 解析唯一、不再像 v0.2.2 那样改错草稿。
   finalize-manifest:
-    needs: build
+    needs: [create-release, build]
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # 改写并重传 Release 资产
     steps:
       - name: 把 latest.json 下载地址改写成镜像
         env:
@@ -134,7 +166,7 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
-          # draft Release 也能下(token 有 contents:write);抓合并后的最终 manifest
+          # 单草稿,按 tag 唯一命中;draft 也能下(token 有 contents:write)
           gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p latest.json --clobber
           # 只给 github.com 直链加镜像前缀(幂等:已是镜像/其它源不动)
           jq --arg m "$MIRROR" \
