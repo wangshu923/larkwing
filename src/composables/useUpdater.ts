@@ -7,8 +7,9 @@
 // 这串 endpoint;**全够不到才看代理开关**,开了带 `check({proxy})` 再试一次(代理那趟覆盖检查+下载)。
 // ⚠️ ① updater 自带 HTTP,**不走 §4.6 的 net::Client**;② 关代理时只是「不传我们的地址」,插件底层
 // reqwest 仍可能读系统代理 env(check API 无 no_proxy 旋钮),做不到 §4.6「连 env 都不读」那么严。
-// ⚠️ 镜像只加速**检查**(拉 manifest);latest.json 里的**下载地址仍是 github**(tauri-action 生成),
-// 镜像管不到下载那步 → 国内下 exe 要快靠代理。彻底镜像下载需 CI 改写 manifest 资产 URL(后置)。
+// ⚠️ 镜像加速**检查**(拉 manifest)的同时,**下载**也走镜像了(2026-06-30):CI 的 finalize-manifest
+// job 把 latest.json 的资产 url 前缀成 ghfast.top(release.yml);tauri updater 每平台只认一个 url、
+// 不支持下载故障转移,故 download() 失败时由下面「开了代理就带代理重下一次」兜底(check 那趟同款)。
 // 下载做成**前端自驱任务**(useTasks.startLocal):进度进 HUD、非阻塞;下载完成的「回调」=
 // download() 这个 await 返回之后的代码(无需在任务系统里加通用回调总线)。
 // 静默失败:自动查失败只 console(被动 §3.5);下载/安装失败给任务红条 / toast。
@@ -89,23 +90,37 @@ async function download() {
   const task = useTasks().startLocal({ kind: 'download', label: { key: 'task.update' } })
   let total = 0
   let got = 0
+  const onEvent = (ev: DownloadEvent) => {
+    if (ev.event === 'Started') {
+      total = ev.data.contentLength ?? 0
+      task.progress(total ? 0 : undefined)
+    } else if (ev.event === 'Progress') {
+      got += ev.data.chunkLength ?? 0
+      task.progress(
+        total ? Math.min(1, got / total) : undefined,
+        total
+          ? { key: 'step.download', params: { done: +(got / 1e6).toFixed(1), total: +(total / 1e6).toFixed(1) } }
+          : undefined,
+      )
+    } else if (ev.event === 'Finished') {
+      task.progress(1)
+    }
+  }
   try {
-    await pending.download((ev: DownloadEvent) => {
-      if (ev.event === 'Started') {
-        total = ev.data.contentLength ?? 0
-        task.progress(total ? 0 : undefined)
-      } else if (ev.event === 'Progress') {
-        got += ev.data.chunkLength ?? 0
-        task.progress(
-          total ? Math.min(1, got / total) : undefined,
-          total
-            ? { key: 'step.download', params: { done: +(got / 1e6).toFixed(1), total: +(total / 1e6).toFixed(1) } }
-            : undefined,
-        )
-      } else if (ev.event === 'Finished') {
-        task.progress(1)
-      }
-    })
+    // 1) 直下:url 已是镜像(CI 改写,见文件头)→ 国内无代理也能下
+    try {
+      await pending.download(onEvent)
+    } catch (eDirect) {
+      // 2) 镜像下载失败 → 开了代理就 check({proxy}) 拿到绑代理的 Update 重下一次(否则如实失败 §3.5)
+      const proxy = effectiveProxy()
+      if (!proxy) throw eDirect
+      const u = await check({ proxy, timeout: 12_000 })
+      if (!u) throw eDirect
+      pending = u
+      total = 0
+      got = 0 // 重置进度,重下从头算
+      await u.download(onEvent)
+    }
     task.done()
     state.downloaded = true
   } catch (e) {
