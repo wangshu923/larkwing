@@ -159,18 +159,24 @@ jobs:
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     steps:
-      - name: 把 latest.json 下载地址改写成镜像
+      - uses: actions/checkout@v6 # 读 CHANGELOG 给 latest.json 注入 notes(下方)
+      - name: 改写 latest.json:镜像下载 url + 注入更新说明
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MIRROR: https://ghfast.top/
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
+          # releaseId 模式下 tauri-action 不把 release 正文写进 latest.json 的 notes(app 内「发现新版本」
+          # 弹窗就空着)→ 这里从 CHANGELOG 抽本版本节补进去(与 create-release 的 Release 正文同源)。
+          VERSION="${TAG#v}"; VER_RE="${VERSION//./\\.}"
+          NOTES="$(awk -v ver="$VER_RE" '$0 ~ ("^## " ver "( |$)"){f=1;next} f&&/^## [0-9]/{exit} f{print}' CHANGELOG.md)"
           # 单草稿,按 tag 唯一命中;draft 也能下(token 有 contents:write)
           gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p latest.json --clobber
-          # 只给 github.com 直链加镜像前缀(幂等:已是镜像/其它源不动)
-          jq --arg m "$MIRROR" \
-            '.platforms |= map_values(.url |= (if startswith("https://github.com/") then $m + . else . end))' \
+          # ① 给 github.com 直链加镜像前缀(幂等:已是镜像/其它源不动)② 非空才覆盖 notes(防抽不到反清空)
+          jq --arg m "$MIRROR" --arg notes "$NOTES" \
+            '(.platforms |= map_values(.url |= (if startswith("https://github.com/") then $m + . else . end)))
+             | (if $notes != "" then .notes = $notes else . end)' \
             latest.json > latest.json.new
           mv latest.json.new latest.json
           echo "改写后的 latest.json:"; cat latest.json
