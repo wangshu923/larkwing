@@ -218,6 +218,10 @@ const APP_SETTING_KEYS: &[&str] = &[
     "net.proxy",
     "net.proxy_enabled",
     "memory.auto_consolidate",
+    "audio.leveling",
+    "audio.night_mode",
+    "audio.night_start",
+    "audio.night_end",
 ];
 
 /// 语音的用户级设置(PLAN §11 逐键放行,不开 voice.* 通配——同前缀跨两个 scope)。
@@ -897,6 +901,40 @@ impl Engine {
             "memory.auto_consolidate" => {
                 if !["0", "1"].contains(&value) {
                     return Err(invalid("开关需为 0 或 1"));
+                }
+                self.store.settings.set(None, key, value)?;
+                Ok(())
+            }
+            // 响度均衡 / 夜间模式(app 级,机器属性;客户端 Web Audio 消费,见 useAudioGraph.ts):
+            // leveling 0/1 = 总开关(关 = 不接管播放、原样输出,兼作 Web Audio 兜底关);night_mode
+            // off/on/auto;night_start/end = "HH:MM"(auto 生效时段,可跨零点)。现读即生效,无需重启。
+            "audio.leveling" => {
+                if !["0", "1"].contains(&value) {
+                    return Err(invalid("开关需为 0 或 1"));
+                }
+                self.store.settings.set(None, key, value)?;
+                Ok(())
+            }
+            "audio.night_mode" => {
+                if !["off", "on", "auto"].contains(&value) {
+                    return Err(invalid("未知的夜间模式档位"));
+                }
+                self.store.settings.set(None, key, value)?;
+                Ok(())
+            }
+            "audio.night_start" | "audio.night_end" => {
+                let ok = {
+                    let mut it = value.splitn(2, ':');
+                    match (
+                        it.next().and_then(|h| h.parse::<u32>().ok()),
+                        it.next().and_then(|m| m.parse::<u32>().ok()),
+                    ) {
+                        (Some(h), Some(m)) => h < 24 && m < 60,
+                        _ => false,
+                    }
+                };
+                if !ok {
+                    return Err(invalid("时间需为 HH:MM"));
                 }
                 self.store.settings.set(None, key, value)?;
                 Ok(())

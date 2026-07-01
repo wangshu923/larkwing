@@ -463,6 +463,14 @@ async fn hls(State(state): State<Arc<Inner>>, AxPath((token, seg)): AxPath<(Stri
     bytes_response(body, "video/mp4")
 }
 
+/// 音频统一响度:先下混到立体声、整段统一提量、再限幅防削顶 —— 修「转码后整段偏小(人声+音效一起小)」。
+/// 做的是「整段一起抬」,**不挑人声**(与用户讨论:不是对白被埋,是整体衰减 —— 5.1→立体声下混归一化
+/// 约 −8dB + AC3/DTS 的 DRC 被 ffmpeg 套上)。`volume` 必须在下混**之后**提量才有效(故都塞进 `-af`,
+/// 别用 `-ac 2`——那是输出选项、在滤镜之后跑,会把提过的量又除回去);`alimiter` 只削最尖的峰值
+/// (防「系统音量开太大被吓到」),音效整体力度保留。**值是真机可调项**:实际增益/限幅只能
+/// Windows 真机 + 真 5.1 片验(§8.1),这里给保守起点。改这一处即改全部转码音频。
+const AUDIO_LOUDNESS_AF: &str = "aformat=channel_layouts=stereo,volume=8dB,alimiter=limit=0.95";
+
 /// 构建「区间 [start, start+dur) 的自包含分片 mp4」命令(ftyp+moov+moof+mdat 吐 stdout)。
 /// HLS 的 init(取 0.1s)与各段(取 HLS_SEG)都用它。
 ///
@@ -472,8 +480,9 @@ async fn hls(State(state): State<Arc<Inner>>, AxPath((token, seg)): AxPath<(Stri
 ///    段间重叠/错位;转码则每段从干净 IDR 起、恰好 dur 秒、编码配置(avcC)跨段一致 → MSE 拼得上。
 /// ② **音频必转码**:视频转码 + 音频 `copy` 时,fragmented muxer 把样本时长写成 2×(段被拉长一倍,
 ///    实测),两轨都转码即消失。
-/// ③ **下混立体声 `-ac 2`**:多声道 AAC 若声道布局不明确(AC3/DTS 转 AAC 常见)→ MSE **拒绝 append**
-///    整个 init(报在 video 轨上,正是用户「video:2 code=3014 黑屏」),立体声永远能 append。
+/// ③ **下混立体声 + 统一响度(`-af AUDIO_LOUDNESS_AF`)**:多声道 AAC 声道布局不明确会被 MSE **拒绝 append**
+///    整个 init(报在 video 轨上,正是用户「video:2 code=3014 黑屏」)→ aformat 下混立体声永远能 append;
+///    顺带整段提量 + 限幅,修「转码后整段偏小」(替掉原来的 `-ac 2`,见 AUDIO_LOUDNESS_AF 说明)。
 /// 代价 = 已是 H.264 的片子(仅因容器 mkv / 音轨 AC3 才进 HLS)也被重编视频,弱机吃 CPU;
 /// 但这些片子当前本就黑屏(mpegts 链路),不是回退。后续可给「视频已兼容」者走整文件 copy-remux→DASH 省 CPU。
 fn build_frag_cmd(ffmpeg: &Path, path: &Path, start: f64, dur: f64) -> tokio::process::Command {
@@ -486,7 +495,7 @@ fn build_frag_cmd(ffmpeg: &Path, path: &Path, start: f64, dur: f64) -> tokio::pr
     cmd.arg("-map").arg("0:v:0?").arg("-map").arg("0:a:0?");
     cmd.arg("-c:v").arg("libx264").arg("-preset").arg("veryfast").arg("-crf").arg("23")
         .arg("-pix_fmt").arg("yuv420p");
-    cmd.arg("-c:a").arg("aac").arg("-ac").arg("2").arg("-b:a").arg("256k");
+    cmd.arg("-c:a").arg("aac").arg("-af").arg(AUDIO_LOUDNESS_AF).arg("-b:a").arg("256k");
     // 单 moof/段:`-frag_duration` 给个远超段长(600s)的值 → ffmpeg 不在段内再分片,整段就一个
     // moof+mdat,便于把 tfdt 改成累计值(见 probe::patch_segment_tfdt)。default_base_moof 让 trun
     // 数据偏移相对 moof → 切掉 init 后偏移仍对。
@@ -592,6 +601,10 @@ async fn file(
             .header("content-type", ctype)
             .header("content-length", len)
             .header("accept-ranges", "bytes")
+            // CORS:响度均衡以 crossorigin 接管 <audio>/<video> 时 /f/ 也要放行,否则设了 crossOrigin
+            // 的元素会加载失败(与 /dash/ /s/ 一致)。本地文件/TTS/试听都走 /f/。
+            .header("access-control-allow-origin", "*")
+            .header("access-control-expose-headers", "Content-Length, Content-Range, Accept-Ranges")
             .body(Body::from_stream(tokio_util::io::ReaderStream::new(f)))
             .unwrap_or_else(|_| bad(StatusCode::INTERNAL_SERVER_ERROR)),
         RangeSpec::Span(start, end) => {
@@ -605,6 +618,9 @@ async fn file(
                 .header("content-length", end - start + 1)
                 .header("content-range", format!("bytes {start}-{end}/{len}"))
                 .header("accept-ranges", "bytes")
+                // CORS:同上(媒体元素首个 `Range: bytes=0-` 请求走这条 206,crossorigin 下必须放行)。
+                .header("access-control-allow-origin", "*")
+                .header("access-control-expose-headers", "Content-Length, Content-Range, Accept-Ranges")
                 .body(Body::from_stream(tokio_util::io::ReaderStream::new(take)))
                 .unwrap_or_else(|_| bad(StatusCode::INTERNAL_SERVER_ERROR))
         }
@@ -666,7 +682,8 @@ async fn remux(
                 cmd.arg("-c:v").arg("copy"); // 视频兼容:原样搬,不掉画质、CPU 近零
             }
             if *transcode_audio {
-                cmd.arg("-c:a").arg("aac").arg("-b:a").arg("256k");
+                // 下混立体声(源可能 5.1,直出多声道 AAC 浏览器放不了)+ 统一响度(修转码后整段偏小)。
+                cmd.arg("-c:a").arg("aac").arg("-af").arg(AUDIO_LOUDNESS_AF).arg("-b:a").arg("256k");
             } else {
                 cmd.arg("-c:a").arg("copy");
             }
@@ -682,7 +699,8 @@ async fn remux(
         .arg("-f")
         .arg("mp4")
         .arg("pipe:1");
-    stream_ffmpeg(cmd, "video/mp4", false)
+    // cors=true:crossorigin 接管 <video> 做响度均衡时,/m/(本地混流/网络 DASH 混流)也要放行。
+    stream_ffmpeg(cmd, "video/mp4", true)
 }
 
 /// 给一个**已配好程序+参数+输出格式(`-f … pipe:1`)**的 ffmpeg 命令收口 stdio、起进程、把

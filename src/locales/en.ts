@@ -450,6 +450,17 @@ export default {
       addSoon: '＋ Add family · coming soon',
       addSoonHint: 'Multi-member bays are under construction — soon everyone gets their own memories.',
     },
+    audio: {
+      leveling: 'Volume leveling',
+      on: 'On',
+      off: 'Off',
+      nightMode: 'Night mode',
+      night_off: 'Off',
+      night_on: 'On',
+      night_auto: 'Auto',
+      nightWindow: 'Auto window',
+      hint: 'Keeps movie and music volume steady and tames scary peaks; night mode flattens big dynamics further so late-night audio won’t wake the household. Movies and music duck automatically while the assistant is speaking.',
+    },
     voice: {
       speaker: 'Its voice',
       preview: 'Preview',
@@ -470,6 +481,7 @@ export default {
       cloneSaveFailed: 'Save failed — fill in both the name and transcript, then retry.',
       // preview line goes to core via voice_preview for synthesis (core produces no copy; precedent = login window title)
       previewLine: 'Hi there — this is the voice I’ll keep you company with from now on.',
+      previewFailed: 'No sound — could not synthesize this voice just now. Please try again in a moment.',
       wake: 'Wake by name',
       wakeOn: 'On',
       wakeOff: 'Off',

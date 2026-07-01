@@ -8,6 +8,7 @@
 import { reactive } from 'vue'
 import { api, isTauri } from '../lib/backend'
 import { useSettings } from './useSettings'
+import { attachTts } from './useAudioGraph'
 
 // ---- 跑道切分锁死参数(PLAN §11) ----
 const CPS_ZH = 4.5 // 中文语速估算:字/秒(拿到音频元数据后用真实时长校正)
@@ -79,6 +80,7 @@ function audioPair(): [HTMLAudioElement, HTMLAudioElement] {
     const mk = () => {
       const a = new Audio()
       a.preload = 'auto'
+      attachTts(a) // 响度均衡:旺财嗓音也进链(恒日间档、不被夜间压),须在设 src 前设 crossorigin
       a.addEventListener('ended', advance)
       a.addEventListener('error', advance) // 单句坏了跳过,不卡整条队列
       return a

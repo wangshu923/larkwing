@@ -449,6 +449,17 @@ export default {
       addSoon: '＋ 添加家人 · 装载中',
       addSoonHint: '多成员舱位建造中,很快每个人都有自己的专属记忆。',
     },
+    audio: {
+      leveling: '音量均衡',
+      on: '开',
+      off: '关',
+      nightMode: '夜间模式',
+      night_off: '关',
+      night_on: '开',
+      night_auto: '自动',
+      nightWindow: '自动时段',
+      hint: '让电影、音乐音量稳一些、不忽大忽小、峰值不吓人;夜间模式会把大动态再压平些,深夜不吵到家人。旺财说话时会自动压低影视。',
+    },
     voice: {
       speaker: '它的声音',
       preview: '试听',
@@ -469,6 +480,7 @@ export default {
       cloneSaveFailed: '没存上 —— 名字和文字稿都填了再试一次。',
       // 试听句经 voice_preview 传给 core 合成(core 不产文案,先例 = 登录窗标题)
       previewLine: '你好呀,以后我就用这个声音陪你说话啦。',
+      previewFailed: '试听没出声,可能这个声音一时合成不出来,过一会儿再试试。',
       wake: '喊名字唤醒',
       wakeOn: '打开',
       wakeOff: '关掉',

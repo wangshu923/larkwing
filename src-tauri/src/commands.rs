@@ -510,8 +510,16 @@ pub async fn voice_preview(
     speaker: String,
     text: String,
 ) -> Result<String, AppError> {
-    let path = state.voice.preview(&speaker, &text).await.map_err(AppError::internal)?;
-    state.media.file_url(path).await.map_err(AppError::internal)
+    // 试听失败以前只在前端 console 冒(正式版无 devtools)→ 日志里查不到真因。这里落 warn,
+    // 让「合成报错 / 参考音坏 / 模型没下全」在 logs/larkwing.log 里现形(§3.5)。
+    let path = state.voice.preview(&speaker, &text).await.map_err(|e| {
+        tracing::warn!(speaker = %speaker, err = %format!("{e:#}"), "试听合成失败");
+        AppError::internal(e)
+    })?;
+    state.media.file_url(path).await.map_err(|e| {
+        tracing::warn!(speaker = %speaker, err = %format!("{e:#}"), "试听 URL 生成失败");
+        AppError::internal(e)
+    })
 }
 
 // ---- 音色克隆(PLAN §11 D-clone) ----

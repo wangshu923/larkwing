@@ -17,6 +17,7 @@ import {
   type NowPlaying,
 } from '../lib/backend'
 import { i18n } from '../i18n'
+import { attachMedia, detachAudio } from './useAudioGraph'
 
 export type PlayStatus = 'idle' | 'loading' | 'playing' | 'paused'
 
@@ -160,6 +161,7 @@ async function loadVideoInto(el: HTMLVideoElement) {
 function ensureAudio(): HTMLAudioElement {
   if (!audio) {
     audio = new Audio()
+    attachMedia(audio) // 响度均衡:设 crossorigin + 挂处理链(须在设 src 前;总开关关则原样播放)
     audio.addEventListener('timeupdate', () => {
       if (state.current?.kind === 'audio') state.position = audio!.currentTime
     })
@@ -187,11 +189,13 @@ function ensureAudio(): HTMLAudioElement {
 
 /** VideoOverlay 挂载/卸载时登记播放元素(全 app 只有一个)。 */
 export function registerVideoEl(el: HTMLVideoElement | null) {
+  if (videoEl && videoEl !== el) detachAudio(videoEl) // 换/卸载旧 <video>:释放它的响度均衡链,防泄漏/多源争抢
   videoEl = el
   if (!el) {
     void destroyShaka() // 浮层卸载:拆掉 shaka(它接管了那个 <video>)
     return
   }
+  attachMedia(el) // 响度均衡:设 crossorigin + 挂处理链(须在下方 loadVideoInto 设 src 前)
   el.addEventListener('timeupdate', () => {
     if (state.current?.kind === 'video') state.position = videoBase + el.currentTime
   })

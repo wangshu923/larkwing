@@ -55,6 +55,12 @@ const DEFAULTS: Record<string, string> = {
   'ui.float.opacity': '0.8', // 0.4–1.0
   'ui.float.pos': '', // 拖动后记住的位置 "x,y"(物理像素);空 = 默认右下角
   'ui.float.show_usage': '0', // 待机轮播是否带"今日花费/余额"(opt-in;默认家庭脸不显)
+  // 响度均衡 / 夜间模式(app 级;客户端 Web Audio 消费,见 useAudioGraph.ts)。Rust APP_SETTING_KEYS
+  // + set_setting 逐键对应(§6.8 两边各加一行)。leveling 关 = 不接管播放(Web Audio 兜底关);夜间自动时段可跨零点。
+  'audio.leveling': '1', // '1' 开 / '0' 关(默认开:电影/音乐音量稳、不炸)
+  'audio.night_mode': 'auto', // off / on / auto(默认自动:到点自动压低大动态,不吵人)
+  'audio.night_start': '22:00', // auto 起(HH:MM,24h)
+  'audio.night_end': '07:00', // auto 止(可跨零点)
 }
 
 // 浏览器预览的供应商假数据:与后端 effective_specs 同构(预设漏出、预填、钥匙空)

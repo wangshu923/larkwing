@@ -9,6 +9,7 @@ import { useChat } from '../composables/useChat'
 import { useSettings } from '../composables/useSettings'
 import { useUpdater } from '../composables/useUpdater'
 import { useToast } from '../composables/useToast'
+import { refreshAudioMode } from '../composables/useAudioGraph'
 import { useWakeCalib } from '../composables/useWakeCalib'
 import { audioFileToWavBase64 } from '../composables/useAudioDecode'
 
@@ -219,6 +220,23 @@ function onTtsBackend(b: string) {
   refreshAckPrompts()
 }
 
+// 响度均衡 / 夜间模式(客户端 Web Audio,见 useAudioGraph):改设置即持久化 + 让已挂的处理链现读现调档
+// (常态即时生效;总开关关→旁路,某机器彻底恢复需重启)。app 级 audio.* 键,§6.8 两边各加一行。
+function onLeveling(v: string) {
+  void settings.set('audio.leveling', v)
+  refreshAudioMode()
+}
+function onNightMode(v: string) {
+  void settings.set('audio.night_mode', v)
+  refreshAudioMode()
+}
+function onNightTime(key: string, ev: Event) {
+  const v = (ev.target as HTMLInputElement).value // 原生 time 输入回 "HH:MM"
+  if (!v) return
+  void settings.set(key, v)
+  refreshAudioMode()
+}
+
 // 识别模型档(sense-voice 默认 / firered-ctc 更准):写库 → 开着唤醒就重启循环让新模型生效
 // (同 sensitivity;新模型首次会用时下载)→ 刷状态行(组件就绪反映的是当前选中的模型)。
 async function onAsrModel(e: Event) {
@@ -312,32 +330,57 @@ async function removeClone(speakerId: string) {
 
 const previewing = ref('')
 let previewAudio: HTMLAudioElement | null = null
+// 试听合成兜底超时:克隆走本地 ZipVoice(CPU 慢、冷启十几秒)给足 45s;在线/离线 TTS 12s。
+// 与 useSpeech 的 SYNTH_TIMEOUT_* 同源意图(那边流式念话、这里设置页试听),值保持一致。
+const PREVIEW_TIMEOUT_MS = 12000
+const PREVIEW_TIMEOUT_CLONE_MS = 45000
 async function previewSpeaker(id: string) {
   settings.set('voice.speaker', id)
   refreshAckPrompts() // 换音色 → 后台重建唤醒应答音(问题1-B,不重启唤醒)
   if (!isTauri()) return
-  // 换试听:先停掉上一条。原来若上一条还在放就 `return` 吞掉本次点击 —— 表现成"有的音色
-  // 点了不出声"(其实是被前一条挡住),连点几个时每隔一个就哑。改成"后点覆盖先点"。
+  // 换试听:先停掉上一条(后点覆盖先点;原来在放就 return 会吞掉本次点击)。
   if (previewAudio) {
     previewAudio.pause()
     previewAudio = null
   }
   previewing.value = id
+  // 失败/超时都给一句提示,别再静默(§3.5):合成报错 / 参考音坏 / 播不出来时,用户先前只看到
+  // chip 一直转或什么都没有;现在明确告知,后端 voice_preview 也会把真实错误落 logs/larkwing.log。
+  let settled = false
+  const finish = (failed: boolean, e?: unknown) => {
+    if (settled) return
+    settled = true
+    if (previewing.value === id) previewing.value = ''
+    if (failed) {
+      console.error('试听失败', e)
+      useToast().error(t('settings.voice.previewFailed'))
+    }
+  }
+  const ms = id.startsWith('clone:') ? PREVIEW_TIMEOUT_CLONE_MS : PREVIEW_TIMEOUT_MS
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('preview-timeout')), ms)
+  })
+  const req = api.voicePreview(id, t('settings.voice.previewLine'))
+  req.catch(() => {}) // 超时先行时,别让它稍后 reject 冒成未处理拒绝
   try {
-    const url = await api.voicePreview(id, t('settings.voice.previewLine'))
+    const url = await Promise.race([req, timeout])
+    clearTimeout(timer)
     if (previewing.value !== id) return // 合成期间又点了别的:只认最后那次
     const a = new Audio(url)
     previewAudio = a
-    const clear = () => {
+    a.addEventListener('ended', () => {
       if (previewAudio === a) previewAudio = null
-      if (previewing.value === id) previewing.value = ''
-    }
-    a.addEventListener('ended', clear)
-    a.addEventListener('error', clear)
-    void a.play()
+      finish(false)
+    })
+    a.addEventListener('error', () => {
+      if (previewAudio === a) previewAudio = null
+      finish(true, new Error('audio-error')) // 合成出了 URL 却播不出来(空音频/格式)也算失败
+    })
+    void a.play().catch((e) => finish(true, e))
   } catch (e) {
-    console.error('试听失败', e)
-    if (previewing.value === id) previewing.value = ''
+    clearTimeout(timer)
+    finish(true, e)
   }
 }
 function setMic(ev: Event) {
@@ -1226,6 +1269,49 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
              其它声音压 80%,app 改不了,只能引导用户改系统设置 -->
         <p class="hint">{{ t('settings.voice.winDuckHint') }}</p>
         <p class="hint">{{ t('settings.voice.winMicHint') }}</p>
+        <!-- 播放响度均衡 / 夜间模式(客户端 Web Audio;电影/歌一起稳、不炸,夜间自动压平大动态)。
+             旺财嗓音也进链但恒日间档、不被夜间压(晚上你正跟它说话)。总开关关=不接管、原样播放。 -->
+        <div class="row">
+          <span class="label">{{ t('settings.audio.leveling') }}</span>
+          <span class="seg">
+            <button
+              v-for="v in ['1', '0']"
+              :key="v"
+              :class="{ on: (settings.get('audio.leveling') || '1') === v }"
+              @click="onLeveling(v)"
+            >{{ t(v === '1' ? 'settings.audio.on' : 'settings.audio.off') }}</button>
+          </span>
+        </div>
+        <div class="row">
+          <span class="label">{{ t('settings.audio.nightMode') }}</span>
+          <span class="seg">
+            <button
+              v-for="v in ['off', 'on', 'auto']"
+              :key="v"
+              :class="{ on: (settings.get('audio.night_mode') || 'auto') === v }"
+              @click="onNightMode(v)"
+            >{{ t(`settings.audio.night_${v}`) }}</button>
+          </span>
+        </div>
+        <div v-if="(settings.get('audio.night_mode') || 'auto') === 'auto'" class="row">
+          <span class="label">{{ t('settings.audio.nightWindow') }}</span>
+          <span class="v-night">
+            <input
+              class="s-input v-time"
+              type="time"
+              :value="settings.get('audio.night_start') || '22:00'"
+              @change="onNightTime('audio.night_start', $event)"
+            />
+            <span class="v-time-sep">–</span>
+            <input
+              class="s-input v-time"
+              type="time"
+              :value="settings.get('audio.night_end') || '07:00'"
+              @change="onNightTime('audio.night_end', $event)"
+            />
+          </span>
+        </div>
+        <p class="hint">{{ t('settings.audio.hint') }}</p>
       </div>
 
       <!-- 远程渠道:手机上跟旺财对话(Telegram/钉钉 bot)。凭证写得进读不回(同供应商 key) -->
@@ -1639,4 +1725,9 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 
 /* 现场录音中:辉光脉冲提示「在听」(复用 led 动画) */
 .chip.sp.custom.recording { color: var(--attn); border-color: rgba(var(--attn-rgb), 0.6); animation: led 1.2s ease-in-out infinite; }
+
+/* 夜间模式自动时段:两个原生 time 输入 + 分隔号,横排紧凑(别被 .s-input 撑满整行) */
+.v-night { display: inline-flex; align-items: center; gap: 8px; }
+.v-time { width: auto; min-width: 0; }
+.v-time-sep { color: var(--text-dim); }
 </style>
