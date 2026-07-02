@@ -126,6 +126,33 @@ pub struct ZipVoiceTts {
     resolve: CloneResolver,
 }
 
+/// sherpa `OfflineTts::create` 只回 None、不给缘由 → 自己核一遍必需文件,把线索塞进加载错误(§3.5)。
+/// 头号疑点 = 单独下载的 vocos_24khz.onnx(~54MB,非主 tar)。返回「(…)」附在错误信息后,便于日志区分
+/// 「缺文件/没下全(→ 自愈重下能救)」还是「文件都在却加载失败(→ 格式/运行时问题,重下没用)」。
+fn zipvoice_dir_hint(dir: &Path) -> String {
+    let mut bad = Vec::new();
+    for (name, min) in [
+        ("encoder.int8.onnx", 1u64 << 20),
+        ("decoder.int8.onnx", 1u64 << 20),
+        ("vocos_24khz.onnx", 1u64 << 20),
+        ("tokens.txt", 1u64),
+    ] {
+        match std::fs::metadata(dir.join(name)) {
+            Ok(m) if m.len() >= min => {}
+            Ok(m) => bad.push(format!("{name}={}B(过小)", m.len())),
+            Err(_) => bad.push(format!("{name} 缺失")),
+        }
+    }
+    if !dir.join("espeak-ng-data").is_dir() {
+        bad.push("espeak-ng-data 目录缺失".into());
+    }
+    if bad.is_empty() {
+        "(文件齐全,疑似格式/运行时问题,非缺文件)".into()
+    } else {
+        format!("(不完整:{})", bad.join("、"))
+    }
+}
+
 impl ZipVoiceTts {
     /// 加载 ZipVoice 模型(encoder/decoder/vocoder/tokens + espeak-ng-data 目录 + lexicon)。
     /// feat_scale/t_shift/target_rms/guidance_scale 取自 sherpa-onnx 官方 `zipvoice_tts` 例子
@@ -149,8 +176,8 @@ impl ZipVoiceTts {
         // 2 太保守(实测 77 字 ~19s),提到 6(留核给 ASR/LLM/UI)。配短参考音一起降延迟。
         cfg.model.num_threads = 6;
         let t0 = std::time::Instant::now();
-        let tts =
-            sherpa_onnx::OfflineTts::create(&cfg).ok_or_else(|| anyhow!("音色克隆模型加载失败"))?;
+        let tts = sherpa_onnx::OfflineTts::create(&cfg)
+            .ok_or_else(|| anyhow!("音色克隆模型加载失败{}", zipvoice_dir_hint(model_dir)))?;
         tracing::info!(ms = t0.elapsed().as_millis() as u64, "音色克隆模型加载完成(zipvoice)");
         Ok(ZipVoiceTts { tts, resolve })
     }

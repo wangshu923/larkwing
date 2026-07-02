@@ -13,7 +13,7 @@
 //! 形状是纯函数(`build_request` / `parse`,可单测)+ 一个编排(`run`,FakeLlm 可端到端测)。
 //! **自动触发已接(2026-06-18)**:`Engine::send_message` 每 `CONSOLIDATE_EVERY_TURNS` 个用户回合
 //! 后台 spawn 一次(`Engine::spawn_consolidate`:尽力件、防并发、不阻塞回合、写到说话人)。
-//! cheap-model 路由已接(2026-06-24,§13.6 变体 A):调用方(engine `consolidation_provider`)挑**最便宜档**
+//! cheap-model 路由已接(2026-06-24,§13.6 变体 A):调用方(engine `background_provider`)挑**最便宜档**
 //! provider 传进来,与聊天主选解耦、复用 tier 目录不新增模型名;`run` 本身对此无感(只认传入的 provider)。
 //! 提炼 / 维护**质量**只能真模型 + 真对话验,Mac 验不了。
 

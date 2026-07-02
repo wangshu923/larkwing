@@ -167,6 +167,14 @@ pub enum Mood {
     Speaking,
 }
 
+/// 会话被后台重新定题(engine/title.rs LLM 命名落库后):前端原位改列表项文字。
+/// 只是标题变了,**不是**「会话有动静」—— 不打 badge、不重排(set_title_if 不动 updated_at)。
+#[derive(Debug, Clone, Serialize)]
+pub struct ConvTitle {
+    pub conv_id: i64,
+    pub title: String,
+}
+
 /// 总线事件:tagged 编码,加变体对前端是增量(未知 type 忽略,与 TurnEvent 同约定)。
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
@@ -174,6 +182,7 @@ pub enum AppEvent {
     Task(TaskView),
     Media(MediaEvent),
     Conversation(ConversationActivity),
+    ConvTitle(ConvTitle),
     Voice(VoiceEvent),
     /// 回合 mood(悬浮窗显示「正在想 / 正在说」;主窗不消费,用自己的 per-turn mood)。
     Mood(Mood),

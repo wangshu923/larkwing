@@ -2,6 +2,7 @@
 
 mod consolidate;
 mod context;
+mod title;
 mod turn;
 mod usage;
 
@@ -1160,18 +1161,18 @@ impl Engine {
     pub async fn consolidate_conversation(&self, conv_id: i64) -> Result<usize, AppError> {
         // cheap-model 路由(§13.6 变体 A):后台提炼走**最便宜档** provider,不烧聊天主选的钱。
         // helper 锁内只取 Arc 快照即放锁,await 在锁外(RwLock guard 不跨 await)。
-        let Some(provider) = self.consolidation_provider() else { return Ok(0) };
+        let Some(provider) = self.background_provider() else { return Ok(0) };
         let Some(conv) = self.store.chat.get_conversation(conv_id)? else { return Ok(0) };
         let added = consolidate::run(&provider, &self.store, conv.user_id, conv_id, 50).await?;
         Ok(added)
     }
 
-    /// 后台记忆活儿(提炼 / 维护)选哪个 provider:在已建候选里挑**最便宜的一档**(catalog tier 最低),
-    /// 与用户聊天「用脑策略」(`llm.strategy`)**解耦** —— 后台蒸馏不该烧旗舰模型的钱
-    /// (§4.4「钥匙是用户的、路由是产品的」+ §13.6 cheap-model 路由,2026-06-24 变体 A)。
+    /// 后台活儿(记忆提炼 / 维护 / 会话定题)选哪个 provider:在已建候选里挑**最便宜的一档**
+    /// (catalog tier 最低),与用户聊天「用脑策略」(`llm.strategy`)**解耦** —— 后台杂活不该烧
+    /// 旗舰模型的钱(§4.4「钥匙是用户的、路由是产品的」+ §13.6 cheap-model 路由,2026-06-24 变体 A)。
     /// 复用现有档位目录(`catalog::tier_of`),**不新增模型名 / 设置项**(不触发 §4.11、守 §3 收口)。
     /// 单 provider 用户 = 选到它本身 = 与主选一致(**零回归**)。锁内只取 Arc 快照,await 在锁外。
-    fn consolidation_provider(&self) -> Option<Arc<dyn LlmProvider>> {
+    fn background_provider(&self) -> Option<Arc<dyn LlmProvider>> {
         let candidates = self.llm.read().expect("llm lock poisoned");
         cheapest_candidate(&candidates).cloned()
     }
@@ -1203,7 +1204,7 @@ impl Engine {
 
     /// 后台提炼一次该会话(PLAN §13 Phase 3 自动触发):尽力件 —— 开关关 / 没 provider / 上次还在跑
     /// 则跳过,错误只记日志,绝不影响主对话。写到说话人 `user_id`(记忆归人 §6)。
-    /// cheap-model 路由已接(§13.6 变体 A,2026-06-24):走 `consolidation_provider`(最便宜档);
+    /// cheap-model 路由已接(§13.6 变体 A,2026-06-24):走 `background_provider`(最便宜档);
     /// 触发频率见 `CONSOLIDATE_EVERY_TURNS`。
     fn spawn_consolidate(&self, conv_id: i64, user_id: i64) {
         // 用户在设置关掉了自动提炼 = 直接不跑(手动入口不受影响)
@@ -1219,7 +1220,7 @@ impl Engine {
             return;
         }
         // cheap-model 路由(§13.6 变体 A):后台提炼走最便宜档 provider,与聊天主选解耦。
-        let Some(provider) = self.consolidation_provider() else {
+        let Some(provider) = self.background_provider() else {
             flag.store(false, Ordering::Release);
             return;
         };
@@ -1237,6 +1238,37 @@ impl Engine {
                 }
             }
             flag.store(false, Ordering::Release);
+        });
+    }
+
+    /// 后台给新会话起标题(engine/title.rs,方案 A):非流式调**最便宜档** provider(与提炼同一条
+    /// cheap-model 路由),`set_title_if` CAS 替换截断占位 —— 用户已重命名绝不覆盖;成功后广播
+    /// `AppEvent::ConvTitle`,前端原位改字。尽力件:没 provider / 失败 = 占位保留,只记日志。
+    /// 每会话至多一次(只有「标题为空」的那次 send 才有 seed),无需防并发闸。
+    /// **匿名 provider(model_id 空)不起**:空 = 目录不认识的未知形(fake/脚本),记账链路同款降级
+    /// 语义;这同时兜住 eval / 引擎测试 —— FakeLlm 的剧本队列是共享弹出(fake.rs),后台杂活
+    /// 若也去弹会偷走脚本回合、破坏确定性(spawn_consolidate 靠 12 回合阈值天然躲开,这里必须显式挡)。
+    fn spawn_title(&self, conv_id: i64, seed: String) {
+        let Some(provider) = self.background_provider() else { return };
+        if provider.model_id().is_empty() {
+            return;
+        }
+        let store = self.store.clone();
+        let bus = self.bus.clone();
+        tokio::spawn(async move {
+            match title::run(&provider, &store, conv_id, &seed).await {
+                Ok(Some(t)) => {
+                    tracing::debug!(target: "larkwing::chat", conv = conv_id, title = %t, "会话已定题");
+                    bus.publish(crate::bus::AppEvent::ConvTitle(crate::bus::ConvTitle {
+                        conv_id,
+                        title: t,
+                    }));
+                }
+                Ok(None) => {} // 模型没给出可用标题 / 用户已改名 → 占位保留,不吵
+                Err(e) => {
+                    tracing::debug!(target: "larkwing::chat", conv = conv_id, "会话定题失败(尽力件): {e:#}")
+                }
+            }
         });
     }
 
@@ -1574,8 +1606,10 @@ impl Engine {
         // 落用户消息 + 取上下文原料 + 单一装配权出 ChatRequest(阻塞 IO 下沉线程池)
         let store = self.store.clone();
         let conv_user = conversation.user_id;
-        let (mut request, user_msg_id, mem_user) = tokio::task::spawn_blocking(
-            move || -> anyhow::Result<(crate::llm::ChatRequest, i64, i64)> {
+        // 标题还空 = 本次 append 会写下截断占位 → 回头后台给它起个正经名(engine/title.rs)
+        let needs_title = conversation.title.is_empty();
+        let (mut request, user_msg_id, mem_user, title_seed) = tokio::task::spawn_blocking(
+            move || -> anyhow::Result<(crate::llm::ChatRequest, i64, i64, Option<String>)> {
             // 入站附件(媒体输入 PLAN §9):图 → image_url 当轮注入(不落库,vision 重复计费);
             // 文档**文字**并进落库的 user 消息内容 → 进 history,多轮追问还在、且落可缓存前缀
             // (§9 收窄:仅图当轮,文档持久化)。只把小票(AttachmentRef)落 payload。与插队共用
@@ -1596,6 +1630,10 @@ impl Engine {
                 &stored_content,
                 payload.as_deref(),
             )?;
+            // 定题种子 = 落库内容前缀(文档附件会把消息撑到几万字,title.rs 只吃开头;
+            // 占位可由它重算 —— 占位只由首行前 24 字决定,这个截断必然覆盖)
+            let title_seed = needs_title
+                .then(|| stored_content.chars().take(title::INPUT_MAX_CHARS).collect::<String>());
             // 记忆归人(§6):声纹识别出且确属真实用户 → 本回合用 TA;否则会话归属者
             // (访客/电视声识别不出 → fallback,绝不误记到家人名下,robot 同款立场)
             let mem_user = match eff_meta.speaker_user {
@@ -1674,7 +1712,7 @@ impl Engine {
             if thinking != crate::llm::Thinking::Off {
                 request.options.thinking = Some(thinking);
             }
-            Ok((request, user_msg.id, mem_user))
+            Ok((request, user_msg.id, mem_user, title_seed))
         })
         .await
         .map_err(AppError::internal)??;
@@ -1683,6 +1721,12 @@ impl Engine {
         // 写到说话人(mem_user,记忆归人 §6);用户消息已落库,蒸馏读得到这段历史。
         if self.bump_consolidate_due(conv_id) {
             self.spawn_consolidate(conv_id, mem_user);
+        }
+
+        // 会话 LLM 命名(engine/title.rs,2026-07-02):新会话首条消息 → 后台起正经标题替换截断占位。
+        // 与回合并行、尽力件,不阻塞首回合一个字。
+        if let Some(seed) = title_seed {
+            self.spawn_title(conv_id, seed);
         }
 
         // 「此刻」背景状态(播放器在不在放…)挂到末条 user,喂模型当下真相(不落库、不破缓存)

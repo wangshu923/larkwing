@@ -84,7 +84,22 @@ pub struct SearchHit {
 }
 
 /// 标题默认 = 首条用户消息截断(字符数,不花 LLM)。
-const TITLE_MAX_CHARS: usize = 24;
+/// LLM 命名(engine/title.rs)以此为占位:后台生成好再 `set_title_if` 静默替换。
+pub(crate) const TITLE_MAX_CHARS: usize = 24;
+
+/// 从消息内容派生占位标题:取首行、截到第一个句末标点(别切半句),再按字符数封顶。
+/// 纯派生展示标签(§6.2 豁免),不是数据;engine 的 CAS 替换靠它可重算出同一占位。
+pub(crate) fn derive_title(content: &str) -> String {
+    let first_line = content.trim().lines().next().unwrap_or("").trim();
+    let cut = first_line
+        .char_indices()
+        .find(|(_, c)| matches!(c, '。' | '！' | '？' | '!' | '?'))
+        .map(|(i, _)| first_line[..i].trim_end())
+        .unwrap_or(first_line);
+    // 首字符就是标点(cut 为空)→ 退回整行,别产出空标题
+    let base = if cut.is_empty() { first_line } else { cut };
+    base.chars().take(TITLE_MAX_CHARS).collect()
+}
 
 #[derive(Clone)]
 pub struct ChatRepo {
@@ -226,10 +241,9 @@ impl ChatRepo {
                         r.get(0)
                     })?;
                 if title.is_empty() {
-                    let t: String = content.chars().take(TITLE_MAX_CHARS).collect();
                     tx.execute(
                         "UPDATE conversations SET title = ?2 WHERE id = ?1",
-                        rusqlite::params![conv, t],
+                        rusqlite::params![conv, derive_title(content)],
                     )?;
                 }
             }
@@ -253,6 +267,18 @@ impl ChatRepo {
                 rusqlite::params![conv, title],
             )?;
             Ok(())
+        })
+    }
+
+    /// 条件定题(CAS):仅当现值仍是 `expected` 才写(后台 LLM 命名用 —— 用户已重命名就绝不覆盖)。
+    /// 返回是否真写了。不动 updated_at(改标题不算"有新活动",列表不重排)。
+    pub fn set_title_if(&self, conv: i64, expected: &str, title: &str) -> Result<bool> {
+        self.db.with(|c| {
+            let n = c.execute(
+                "UPDATE conversations SET title = ?2 WHERE id = ?1 AND title = ?3",
+                rusqlite::params![conv, title, expected],
+            )?;
+            Ok(n > 0)
         })
     }
 
@@ -393,4 +419,60 @@ fn row_to_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         created_at: r.get(4)?,
         payload: r.get(5)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+
+    fn store(tag: &str) -> (Store, i64) {
+        let dir = std::env::temp_dir().join(format!("lw-chat-test-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(dir.join("t.db"));
+        let store = Store::open(&dir.join("t.db")).unwrap();
+        let me = store.users.ensure_default_user().unwrap();
+        (store, me.id)
+    }
+
+    #[test]
+    fn derive_title_cuts_at_sentence_end_not_midway() {
+        assert_eq!(derive_title("帮我放个电影。最好是科幻的"), "帮我放个电影");
+        assert_eq!(derive_title("明天早上八点,提醒我交水电费"), "明天早上八点,提醒我交水电费"); // 逗号不切
+        assert_eq!(derive_title("在吗?想问个事"), "在吗");
+        assert_eq!(derive_title("  第一行\n第二行"), "第一行");
+    }
+
+    #[test]
+    fn derive_title_clamps_and_survives_edge_cases() {
+        let long: String = "长".repeat(40);
+        assert_eq!(derive_title(&long).chars().count(), TITLE_MAX_CHARS);
+        assert_eq!(derive_title("。。。"), "。。。"); // 首字符即标点 → 退回整行,不出空标题
+        assert_eq!(derive_title(""), "");
+    }
+
+    #[test]
+    fn first_user_message_sets_smart_placeholder() {
+        let (store, user) = store("placeholder");
+        let conv = store.chat.create_conversation(user, "companion").unwrap();
+        store.chat.append_message(conv.id, "user", "放首儿歌吧!孩子想听").unwrap();
+        let got = store.chat.get_conversation(conv.id).unwrap().unwrap();
+        assert_eq!(got.title, "放首儿歌吧");
+        // 第二条不再改题
+        store.chat.append_message(conv.id, "user", "换一首。").unwrap();
+        assert_eq!(store.chat.get_conversation(conv.id).unwrap().unwrap().title, "放首儿歌吧");
+    }
+
+    #[test]
+    fn set_title_if_is_compare_and_swap() {
+        let (store, user) = store("cas");
+        let conv = store.chat.create_conversation(user, "companion").unwrap();
+        store.chat.append_message(conv.id, "user", "帮我整理下载文件夹").unwrap();
+        let placeholder = derive_title("帮我整理下载文件夹");
+        // 占位仍在 → 替换成功
+        assert!(store.chat.set_title_if(conv.id, &placeholder, "整理下载文件夹").unwrap());
+        // 占位已不在(等价于用户已重命名)→ 绝不覆盖
+        assert!(!store.chat.set_title_if(conv.id, &placeholder, "别的").unwrap());
+        assert_eq!(store.chat.get_conversation(conv.id).unwrap().unwrap().title, "整理下载文件夹");
+    }
 }

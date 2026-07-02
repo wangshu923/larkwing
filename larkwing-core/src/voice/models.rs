@@ -300,7 +300,24 @@ impl VoiceModels {
 
     pub fn is_tree_ready(&self, spec: &TreeModelSpec) -> bool {
         let dir = self.dir.join(spec.id);
-        spec.ready.iter().all(|f| dir.join(f).exists())
+        spec.ready.iter().all(|f| {
+            // 目录只需存在;文件必须非空 —— 0 字节 = 上次下载/写入坏了,判未就绪 → 重下,不放行坏模型
+            // (sherpa 加载坏文件只回 None 不报错,放行了就成「点了不出声」;检测自愈的第一道)。
+            match std::fs::metadata(dir.join(f)) {
+                Ok(m) => m.is_dir() || m.len() > 0,
+                Err(_) => false,
+            }
+        })
+    }
+
+    /// 清掉一棵模型树(自愈用:加载失败 = 文件坏 / 没下全 → 删掉整树,下次 ensure_tar_tree 重下)。
+    pub fn reset_tree(&self, spec: &TreeModelSpec) -> Result<()> {
+        let dir = self.dir.join(spec.id);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)
+                .with_context(|| format!("清模型树失败: {}", dir.display()))?;
+        }
+        Ok(())
     }
 
     /// 目录保留式整包就绪:下载(gh 镜像候选)→ strip-components=1 解包(跳过 skip 子目录)

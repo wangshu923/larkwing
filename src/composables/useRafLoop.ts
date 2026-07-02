@@ -2,7 +2,7 @@
 // 传入的 fn 每帧调一次 —— 不要在 fn 里自己再 requestAnimationFrame,调度与暂停都归本 helper。
 // 解决主窗藏托盘后 RAF 仍 60fps 空跑烧 CPU(根因见 usePageVisible)。
 import { onMounted, onUnmounted, watch } from 'vue'
-import { usePageVisible } from './usePageVisible'
+import { onRevive, usePageVisible } from './usePageVisible'
 
 export function useRafLoop(fn: (ts: number) => void, opts?: { fps?: number }) {
   const visible = usePageVisible()
@@ -34,6 +34,15 @@ export function useRafLoop(fn: (ts: number) => void, opts?: { fps?: number }) {
     stop()
     if (v) start()
   })
-  onUnmounted(stop)
+  // 「窗口变可见」脉冲:即便 visible 没翻转(自启期误判可见 → 隐藏窗里排了死 rAF id、watch 不触发),
+  // 也强制先清死 id 再重排 —— 修「开机自启后打开主窗,遛弯桌宠/背景仍冻住、头像点了不切」(§8.1)。
+  const offRevive = onRevive(() => {
+    stop()
+    if (visible.value) start()
+  })
+  onUnmounted(() => {
+    offRevive()
+    stop()
+  })
   return { start, stop }
 }

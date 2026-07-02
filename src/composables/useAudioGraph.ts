@@ -17,7 +17,7 @@ import { useSettings } from './useSettings'
 const settings = useSettings()
 
 // —— 处理参数(真机可调项 §8.1;linear makeup:1.25≈+2dB,1.5≈+3.5dB) ——
-const DAY = { threshold: -20, knee: 24, ratio: 2.5, attack: 0.02, release: 0.28, makeup: 1.25 }
+const DAY = { threshold: -20, knee: 24, ratio: 2.5, attack: 0.02, release: 0.28, makeup: 1.2 }
 const NIGHT = { threshold: -34, knee: 20, ratio: 8, attack: 0.004, release: 0.4, makeup: 1.5 }
 // 限幅器:近砖墙(高比率、低阈值、极快启动),只削最尖的峰值防「系统音量开大被吓到」。
 const LIMITER = { threshold: -1.5, knee: 0, ratio: 20, attack: 0.002, release: 0.12 }

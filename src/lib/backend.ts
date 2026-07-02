@@ -461,6 +461,8 @@ export type AppEvent =
   // 自启回合(提醒/定时)完成:某会话有动静,UI 刷新列表/重拉当前会话。
   // outcome = 回合终态(done/failed):用户不在该会话时,前端据此在列表项打彩色标。
   | { type: 'conversation'; data: { conv_id: number; kind: string; outcome: 'done' | 'failed' } }
+  // 后台 LLM 给新会话起好标题(替换截断占位):原位改列表项文字,不打 badge、不重排
+  | { type: 'conv_title'; data: { conv_id: number; title: string } }
   | { type: 'voice'; data: VoiceEvent }
   // 回合 mood(PLAN §12 修订):悬浮窗显「正在想/正在说」;主窗用自己的 per-turn mood,忽略这条
   | { type: 'mood'; data: 'idle' | 'thinking' | 'speaking' }

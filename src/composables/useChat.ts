@@ -378,6 +378,12 @@ async function boot() {
 
   // 自启回合(提醒/定时)完成的动静:开着该会话且空闲就重拉消息,列表顺手刷新
   onAppEvent((ev) => {
+    // 后台起好的会话标题:原位改字即可 —— 不刷列表、不打 badge、不重排(updated_at 未动)
+    if (ev.type === 'conv_title') {
+      const conv = state.conversations.find((c) => c.id === ev.data.conv_id)
+      if (conv) conv.title = ev.data.title
+      return
+    }
     if (ev.type !== 'conversation') return
     refreshConversations()
     // 不在该会话界面:列表项按终态打标(完成 / 失败),进入会话即清(selectConversation)

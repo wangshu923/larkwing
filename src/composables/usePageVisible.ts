@@ -17,9 +17,18 @@ const visible = ref(typeof document === 'undefined' ? true : !document.hidden)
 // 收到过权威可见性信号(visibilitychange / 壳层 lw:win-visible)后,异步初值查询不再覆盖它 ——
 // 否则慢一拍 resolve 的 isHidden() 会把已生效的 show 信号冲回旧值(自启 hidden→show 竞态)。
 let settled = false
+// 「窗口变可见」脉冲:每次收到权威 visible=true 都触发订阅者(**即便 visible 值没发生翻转**)。
+// 给 useRafLoop 兜底 —— 自启期透明窗误判可见 → 隐藏窗里排了永不触发的死 rAF id 时,visible 不会
+// false→true 翻转、watch(visible) 不触发;这条脉冲强制「清死 id 再重排」(§8.1 开机自启冷启动画冻死)。
+const reviveCbs = new Set<() => void>()
+export function onRevive(cb: () => void): () => void {
+  reviveCbs.add(cb)
+  return () => reviveCbs.delete(cb)
+}
 const apply = (v: boolean) => {
   settled = true
   visible.value = v
+  if (v) reviveCbs.forEach((cb) => cb())
 }
 
 if (typeof document !== 'undefined') {

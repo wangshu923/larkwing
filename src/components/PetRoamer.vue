@@ -70,8 +70,14 @@ function roamFrame() {
   if (roamer.value) roamer.value.style.transform = `translate(${dogX}px, ${dogY}px)`
 }
 
-// 换形象:重置步态(免新角色沿用旧相位错帧)
-watch(pack, () => { gaitTick = 0; gaitPhase = 0 })
+// 换形象:重置步态 + **立即换成新角色静止帧**(不等下一帧;rAF 万一没在跑也立刻反映切换,
+// 免「切了没反应」——roamerSrc 平时只在 roamFrame 里更新)。
+watch(pack, () => {
+  gaitTick = 0
+  gaitPhase = 0
+  roamerSrc.value = pack.value.idle[0]
+  roamerFlipped.value = false
+})
 
 useRafLoop(roamFrame) // 页面不可见(藏托盘/最小化)时自动暂停遛弯循环
 </script>

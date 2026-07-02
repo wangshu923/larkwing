@@ -95,6 +95,8 @@ struct Inner {
     tts_offline: tokio::sync::OnceCell<Arc<tts::SherpaVits>>,
     /// 本地音色克隆(ZipVoice):选了 clone:<id> 音色时按需加载一次(PLAN §11 D-clone)。
     tts_clone: tokio::sync::OnceCell<Arc<tts::ZipVoiceTts>>,
+    /// 克隆模型加载失败时「清树重下」自愈,本会话只做一次(避免非下载原因坏时反复重下几百 MB)。
+    clone_reheal: std::sync::atomic::AtomicBool,
     /// 克隆参考音目录(`数据目录/voice/clones/<wav_file>`)。
     clones_dir: PathBuf,
     /// 声纹提取器(CAM++ 26MB):有家人注册声纹时才加载(PLAN §11 D)。
@@ -159,6 +161,7 @@ impl VoiceRuntime {
                 tts_lock: tokio::sync::Mutex::new(()),
                 tts_offline: tokio::sync::OnceCell::new(),
                 tts_clone: tokio::sync::OnceCell::new(),
+                clone_reheal: std::sync::atomic::AtomicBool::new(false),
                 clones_dir: dir.join("clones"),
                 speaker: tokio::sync::OnceCell::new(),
                 wake: std::sync::Mutex::new(None),
@@ -238,6 +241,28 @@ impl VoiceRuntime {
     /// 选了 clone:<id> 音色时:确保 ZipVoice 模型就绪并加载一次。解析闭包现查 cloned_voices
     /// 库拿 (参考音 wav, 文字稿) —— 单一真相源,重录/删改即时生效,引擎不持镜像状态。
     async fn ensure_clone_tts(&self) -> Result<Arc<tts::ZipVoiceTts>> {
+        if let Some(t) = self.inner.tts_clone.get() {
+            return Ok(t.clone());
+        }
+        match self.try_load_clone_tts().await {
+            Ok(t) => Ok(t),
+            Err(e) => {
+                // 自愈:模型加载失败(文件坏 / 没下全 / 镜像没发 Content-Length 漏过完整性校验)→ 清树
+                // 重下一次再试,**免让用户去数据目录手删**。本会话只做一次(swap):重下后仍失败(可能非
+                // 下载问题,如格式/运行时)就不再反复重下几百 MB,直接把带文件线索的错误报上去。
+                if self.inner.clone_reheal.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return Err(e);
+                }
+                tracing::warn!(err = %format!("{e:#}"), "音色克隆加载失败,清模型树重下一次再试(自愈,本会话仅一次)");
+                self.inner.models.reset_tree(&models::TTS_ZIPVOICE).ok();
+                self.try_load_clone_tts().await
+            }
+        }
+    }
+
+    /// 确保 ZipVoice 模型在位 + 加载进 OnceCell 缓存。加载失败不缓存(get_or_try_init 语义),
+    /// 交给 ensure_clone_tts 决定是否清树重下自愈。
+    async fn try_load_clone_tts(&self) -> Result<Arc<tts::ZipVoiceTts>> {
         let mirrors = self.mirrors();
         let dir = self.inner.models.ensure_tar_tree(&models::TTS_ZIPVOICE, &mirrors).await?;
         let store = self.inner.store.clone();
