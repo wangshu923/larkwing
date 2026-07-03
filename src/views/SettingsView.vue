@@ -1734,6 +1734,10 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
   padding: 7px 11px; color: var(--text); font-size: 13px; outline: none; min-width: 220px;
 }
 .s-input:focus { border-color: var(--accent); }
+/* 展开的下拉列表:原生 <option> 是 OS/Chromium 渲染,只有底色/字色吃 CSS(WebView2 认),
+   给它上语义 token 至少和皮肤同色(不再白底默认);高亮行等 popup chrome 系统控、控不全,
+   要像素级贴皮得换自定义下拉组件(见对话记档)。 */
+.s-input option { background: var(--surface-deep); color: var(--text); }
 /* 代理一行:开关 + 地址输入同排,输入框吃满 label 右侧空间;关掉时淡一档(状态可读,地址仍可改) */
 .proxy-line { flex: 1; justify-content: flex-end; min-width: 0; }
 .proxy-line .s-input { flex: 1; min-width: 0; max-width: 320px; }

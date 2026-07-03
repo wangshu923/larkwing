@@ -421,9 +421,15 @@ async function boot() {
           void hydrateTrace(state.convId) // …和「想了想」轨迹
           void resolveThumbs() // 历史图缩略图回填
           // 提醒到点自动开口(PLAN §11 B 期):设备主动叫人,off 档才闭嘴;
-          // 回合没标〔语音〕(屏幕排版),念之前净化兜底。跨会话提醒念话 C 期随唤醒流程
+          // 回合没标〔语音〕(屏幕排版),念之前净化兜底。
+          // ⚠️ 只念**桌面自己的会话**(ui/system):远程渠道(telegram/钉钉)设的提醒到点已由
+          // outbound_loop 推到那台手机上了(A1),桌面就算正开着这个渠道会话也别再 TTS 念一遍
+          // ——那是手机的事、双份打扰(2026-07-04 真机:钉钉设的提醒桌面也响)。
+          const ch = state.conversations.find((c) => c.id === state.convId)?.channel ?? 'ui'
+          const deskConv = ch === 'ui' || ch === 'system'
           const last = msgs.filter(visible).at(-1)
           if (
+            deskConv &&
             ev.data.kind === 'reminder' &&
             last &&
             last.role === 'assistant' &&

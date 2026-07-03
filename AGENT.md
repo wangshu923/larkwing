@@ -226,6 +226,7 @@
 - **形象 / 角色是独立设置 `ui.character`,不随皮肤变**(skin 切观感,character 切谁出镜)。
 - **clip-path 会裁掉挂在元素外沿的浮层(2026-07-04 真机实锤)**:切角气泡把 `clip-path` 加在 `.bubble` 上,贴外沿的 hover 浮层(复制/时间/读数,`top:100%`/`bottom:-19px`)全被裁没——「切角没有 hover、圆角有」。对策 = 形状画在 `::before` 背景层(背景/描边一并搬入),元素本身不裁;`.bubble` 的 backdrop-filter 已构成 stacking context,`::before` z-index:-1 稳在内容下。
 - **关键陷阱**:scoped 规则(`.x[data-v]`)与全局 `[data-skin] .x` 基础特异度相同 → scoped 后加载会赢。要么 token 化(首选),要么给全局覆盖加 `:root` 前缀提权。
+- **原生 `<select>` 下拉弹层无法皮肤化(2026-07-04)**:关闭态的 `.s-input` 已 token 化;但展开的 `<option>` 弹层是 OS/Chromium 渲染,只认**不透明**底色/字色(科幻 `--surface-deep` 带 alpha 会被忽略→ 回落系统白),高亮行等 popup chrome 更控不到。要像素级贴皮得换**自定义下拉组件**(div 模拟 + 键盘/点外关闭),全项目 5 处 select 共用一个。暂只上 best-effort option 底色,记债待做。
 - **列表页共用全局类** `.view-*` / `.lp-*`,新列表页照搬别抄卡片 CSS。**所有滚动容器加 `scrollbar-gutter: stable`**(Windows WebView2 经典条占布局宽,Mac overlay 条看不出 → 真实数据撑满会左移跳动)。
 
 ### 6.8 接线纪律(前后端两边各加一行)
@@ -289,6 +290,7 @@
 - **管线参数 = robot Windows 真机实调终值,锁死进代码不暴露**(采样率 / 帧长 / pre-roll 200ms / hangover 800ms / min_seconds 0.5 反幻觉 / max 12 / silero 阈值 0.5 …)。silero 是唯一 VAD,不留 energy 档(强默认收口)。
 - **TTS 流式切分 = 跑道(runway)驱动自适应**(急 / 稳 / 懒三档 + 停顿 / 收尾兜底);切分器 = `useSpeech.ts` 纯函数,参数锁死;Markdown/代码/URL 净化在切分前。**ffmpeg 全程不在 TTS 链路**。
 - **AEC 明确不做**(家用麦克芯片带硬件 AEC,软件再叠打架);**录音媒体避让 duck** 到 20%(唤醒 → 回合收尾区间);**Windows「通信活动自动压低」**是 OS 设置(app 改不了,放引导卡)。
+- **渠道会话不触发桌面 TTS(2026-07-04 真机)**:「提醒到点自动开口」只对**桌面自己的会话**(channel=ui/system)念;远程渠道(telegram/钉钉)设的提醒到点已由 `outbound_loop` 推到那台手机(§7.7 A1),桌面即便正停在该渠道会话也**不再 TTS 念**——手机的事、双份打扰。前端 gate:当前会话 channel 属 {ui,system} 才念。
 - **听不清两段式有声兜底**(绝不静默失败):没声音 / 没识别出字 → 第一次播追问立即重听;第二次仍空 → 播告退语回待唤醒。机制在 core,**话术 = 人格数据**(场景 JSON,随语言变体)。
 - **i18n** = 一张「语言 →(ASR / TTS / KWS)最强组件」目录表,每语言配该语言最强组件;切语言 = 换模型组件(用时下载)+ 换音色。一期只填中文。
 - **ASR 模型用户可选(2026-06-20 放出选择器;2026-06-30 定为 2 档)**:起因 = 用户实测**小朋友识别率差**。每语言仍有「默认最强组件」(中文 = SenseVoice,快),**额外一个选择器**(设置·声音「识别模型」`voice.asr.model`,app 级,默认 `sense-voice`)给**两档**:`sense-voice`(快,默认)/ `firered-ctc`(小红书 FireRedASR2-CTC int8,~740MB,**大陆原生、简体、普通话 SOTA**,UI = 「更准·听不清/孩子选这个」)。**Whisper 三档(tiny/small/medium)+ fast2s 繁简转换已移除(2026-06-30,用户拍板)**:用户真机发现 Whisper 档**输出繁体 + 效果差**;研究证伪「中文小孩→Whisper」——① 繁体 = 训练/分词偏置非台湾腔(声学照常,本可 fast2s 繁→简贴补丁但治标),② FireRedASR 论文实测比 Whisper-Large-v3 / SenseVoice-L 强 **29–68% CERR**(我们用的 tiny/small 远弱于 large-v3),③ 孩子无现成解(真根治 = 儿童语料微调,本期不做;FireRed 在 19 个口音/方言基准 11.55% CER = 现有最佳代理)。故砍 Whisper(治本去繁体)+ FireRed 当「听不清/孩子」推荐档 + 回 2 档更收敛(§3);代价 = 丢多语种(大陆家庭用不上)。仍守「X=数据」:加档 = `voice/models.rs` 一个 `ModelSpec` + `AsrModel` 一支 + `asr.rs` 一个构造分支(sense_voice / fire_red_asr_ctc 单文件),`transcribe`/trait 面不动;缓存带档身份(换档重建、同档复用),换档+开着唤醒由前端 `restartWakeIfRunning` 生效;旧 `whisper-*` 值回落默认(老用户无感)。UI 友好档名不露模型 ID(§3)。**✅ 2026-06-30 Windows 真机 + 真孩子声验过**:FireRed 对小朋友/口音的识别改善确认明显;HF resolve 直链国内可达(hf-mirror 优先 + gh release .tar.bz2 兜底)。
