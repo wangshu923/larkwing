@@ -53,6 +53,7 @@ export default {
     resolve: '解析播放地址',
     relocate: '搬家中',
     update: '下载更新',
+    remux: '准备视频「{name}」',
     download: {
       ytdlp: '下载解析组件',
       ffmpeg: '下载播放组件',
@@ -69,6 +70,7 @@ export default {
       resolve: '没解析出来',
       auth: '需要登录',
       relocate: '搬家没成功,数据仍在原处',
+      remux: '视频没准备成,已换普通方式播',
     },
   },
   step: {
@@ -184,11 +186,15 @@ export default {
       s5: '陪我聊会儿天',
       s6: '你都会做什么?',
     },
-    // 场景触发气泡(目前:正在放歌时的跟进)
+    // 场景触发气泡(档位:刚整理完文件 / 刚设好提醒 / 正在放歌)
     ctx: {
       moreLike: '再来一首类似的',
       calmer: '换个安静点的',
       somethingElse: '随便放点别的',
+      fsChanged: '这次都改了哪些文件?',
+      fsUndo: '撤销刚才的文件改动',
+      remindList: '看看我现在都有哪些提醒',
+      remindCancel: '取消刚才这个提醒',
     },
   },
   // 「想了想」漏出(PLAN §9):折叠药丸干净默认,展开露技术细节(工具名/入参/结果 + CoT 原文)

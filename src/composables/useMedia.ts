@@ -299,10 +299,12 @@ function toggle() {
 }
 
 /** 音量 0–1:设的是**基准**(用户意图),跨播放粘住;实时元素音量按是否避让折算。
- *  duck 期间调音量也是改基准 → 恢复后新音量生效(不再被无脑还原冲掉)。 */
+ *  duck 期间调音量也是改基准 → 恢复后新音量生效(不再被无脑还原冲掉)。
+ *  调完回报 core:模型的「此刻」背景里音量要跟手(才答得出「现在多大声」)。 */
 function setVolume(v: number) {
   state.volume = Math.min(1, Math.max(0, v))
   applyVolume()
+  reportToCore()
 }
 
 /** 唤醒避让开关(useVoice 调):on=语音交互期压低,off=恢复。改的是折算系数,基准不动 →
@@ -316,11 +318,31 @@ function setDucked(on: boolean) {
   else fadeToLive(DUCK_RESTORE_FADE_MS)
 }
 
-/** 倍速 0.25–3:作用到当前元素;新播放复位 1。 */
+/** 倍速 0.25–3:作用到当前元素;新播放复位 1。调完回报 core(进度外推按倍速算)。 */
 function setRate(v: number) {
   state.rate = Math.min(3, Math.max(0.25, v))
   const el = activeEl()
   if (el) el.playbackRate = state.rate
+  reportToCore()
+}
+
+/** 回报 core 当下播放快照(「此刻」背景的数据源):状态/标题之外带**基准音量、进度、时长、
+ *  倍速** —— 模型据此才能「音量调到 50」「快进 5 分钟」(相对量自己按当前值算)。
+ *  只主窗(真播放位)报;fire-and-forget,非 Tauri(浏览器预览)跳过。
+ *  进度在 core 侧按回报时刻 + 倍速外推,所以这里不必高频报 —— 状态切换/音量/倍速/seek 各报
+ *  一次 + 播放中低频心跳(兜缓冲卡顿的外推漂移)即可。 */
+function reportToCore() {
+  if (isFloat || !isTauri()) return
+  void api
+    .reportMediaState({
+      status: state.status,
+      title: state.current?.title ?? null,
+      volume: Math.round(state.volume * 100),
+      position: state.position,
+      duration: state.duration > 0 ? state.duration : null,
+      rate: state.rate,
+    })
+    .catch(() => {})
 }
 
 /** 主窗(唯一真播放位)把当下播放态广播出去:① 给悬浮窗镜像(被动跟随);② 回报给 core,
@@ -330,8 +352,7 @@ function setRate(v: number) {
 function syncToPeers() {
   if (isFloat) return
   emitNowPlaying(state.current, state.status)
-  // fire-and-forget;非 Tauri(浏览器预览)跳过,失败不打断播放
-  if (isTauri()) void api.reportMediaState(state.status, state.current?.title ?? null).catch(() => {})
+  reportToCore()
 }
 
 function stopElements() {
@@ -401,6 +422,8 @@ function seek(seconds: number) {
   if (!cur) return
   if (cur.kind === 'audio' && audio) {
     audio.currentTime = seconds
+    state.position = seconds // 先置位再回报(timeupdate 还没来,别把旧位置报出去)
+    reportToCore()
     return
   }
   if (cur.kind === 'video' && videoEl) {
@@ -415,6 +438,7 @@ function seek(seconds: number) {
     }
     state.position = seconds
   }
+  reportToCore() // 跳转后位置基准变了,立刻校准 core 的「此刻」进度
 }
 
 function dismissLoginHint() {
@@ -435,6 +459,7 @@ function applyControl(action: string, value?: number) {
   else if (action === 'stop') stop()
   else if (action === 'louder') setVolume(state.volume + 0.2)
   else if (action === 'softer') setVolume(state.volume - 0.2)
+  else if (action === 'volume' && value != null) setVolume(value / 100) // 绝对音量(core 已校验 0–100)
   else if (action === 'speed' && value != null) setRate(value)
   else if (action === 'seek' && value != null) seek(value)
 }
@@ -474,6 +499,11 @@ function wire() {
     } else {
       // 主窗(唯一真播放位):收悬浮窗迷你播控的转发,与嘴控汇到同一执行口
       onMediaControl((action, value) => applyControl(action, value))
+      // 播放中低频心跳回报:core 的进度外推兜不住缓冲卡顿的漂移,15s 校准一次封顶误差
+      //(暂停/空闲不报 —— 状态切换本就各报一次,静止时没有会漂的东西)
+      setInterval(() => {
+        if (state.status === 'playing') reportToCore()
+      }, 15_000)
     }
     return
   }

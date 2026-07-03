@@ -468,8 +468,10 @@ async fn hls(State(state): State<Arc<Inner>>, AxPath((token, seg)): AxPath<(Stri
 /// 约 −8dB + AC3/DTS 的 DRC 被 ffmpeg 套上)。`volume` 必须在下混**之后**提量才有效(故都塞进 `-af`,
 /// 别用 `-ac 2`——那是输出选项、在滤镜之后跑,会把提过的量又除回去);`alimiter` 只削最尖的峰值
 /// (防「系统音量开太大被吓到」),音效整体力度保留。**值是真机可调项**:实际增益/限幅只能
-/// Windows 真机 + 真 5.1 片验(§8.1),这里给保守起点。改这一处即改全部转码音频。
-const AUDIO_LOUDNESS_AF: &str = "aformat=channel_layouts=stereo,volume=8dB,alimiter=limit=0.95";
+/// Windows 真机 + 真 5.1 片验(§8.1),这里给保守起点。改这一处即改全部转码音频
+/// (HLS 段 / /m/ 流式混流 / mod.rs 的整文件 copy-remux 共用)。
+pub(crate) const AUDIO_LOUDNESS_AF: &str =
+    "aformat=channel_layouts=stereo,volume=8dB,alimiter=limit=0.95";
 
 /// 构建「区间 [start, start+dur) 的自包含分片 mp4」命令(ftyp+moov+moof+mdat 吐 stdout)。
 /// HLS 的 init(取 0.1s)与各段(取 HLS_SEG)都用它。
@@ -484,7 +486,8 @@ const AUDIO_LOUDNESS_AF: &str = "aformat=channel_layouts=stereo,volume=8dB,alimi
 ///    整个 init(报在 video 轨上,正是用户「video:2 code=3014 黑屏」)→ aformat 下混立体声永远能 append;
 ///    顺带整段提量 + 限幅,修「转码后整段偏小」(替掉原来的 `-ac 2`,见 AUDIO_LOUDNESS_AF 说明)。
 /// 代价 = 已是 H.264 的片子(仅因容器 mkv / 音轨 AC3 才进 HLS)也被重编视频,弱机吃 CPU;
-/// 但这些片子当前本就黑屏(mpegts 链路),不是回退。后续可给「视频已兼容」者走整文件 copy-remux→DASH 省 CPU。
+/// 但这些片子当前本就黑屏(mpegts 链路),不是回退。「视频已兼容」者现已优先走 mod.rs 的
+/// **整文件 copy-remux 缓存**(v0.2.4,不重编码 + 原生 seek),HLS 只兜「视频轨也不兼容」的重活。
 fn build_frag_cmd(ffmpeg: &Path, path: &Path, start: f64, dur: f64) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(ffmpeg);
     cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin");

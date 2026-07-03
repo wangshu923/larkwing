@@ -186,8 +186,9 @@ pub fn run() {
       // 免手唤醒开机自启(设置开着才会真启动;失败只记日志不挡开机)
       let voice_boot = voice.clone();
       tauri::async_runtime::spawn(async move { voice_boot.boot_wake_if_enabled().await });
-      // 远程渠道(Telegram/钉钉):shell-side 监督器,boot 起启用项(读 settings 决定起哪些)
-      let channels = commands::ChannelSup::new(engine.clone());
+      // 远程渠道(Telegram/钉钉):shell-side 监督器,boot 起启用项(读 settings 决定起哪些)。
+      // voice/media 只为手机语音消息转写(本地 ASR + ffmpeg 解码)——装配在壳层,core 内不互持。
+      let channels = commands::ChannelSup::new(engine.clone(), voice.clone(), media.clone());
       channels.restart();
       app.manage(AppState {
         engine,
@@ -369,6 +370,7 @@ pub fn run() {
       commands::media_login,
       commands::media_retry,
       commands::retry_download,
+      commands::retry_voice_model,
       commands::media_advance,
       commands::report_media_state,
       commands::remote_status,

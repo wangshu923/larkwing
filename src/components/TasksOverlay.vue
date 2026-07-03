@@ -14,13 +14,15 @@ const { state: media } = useMedia()
 const COLLAPSE_AT = 4
 
 // 重试失败任务:按 retry 载体(tagged)直连重放,旧失败卡撤掉(重放会冒新卡)。
-// 影音=重放播放,下载=重下组件;未来别的可重试 job 在此加一支。
+// 影音=重放播放,下载=重下组件,语音模型=重下模型;未来别的可重试 job 在此加一支。
 function retry(task: TaskView) {
   const r = task.retry
   if (r?.type === 'media_play') {
     void api.mediaRetry(r.data.page_url, r.data.audio_only)
   } else if (r?.type === 'download') {
     void api.retryDownload(r.data.component)
+  } else if (r?.type === 'voice_model') {
+    void api.retryVoiceModel(r.data.id)
   }
   dismiss(task.task_id)
 }

@@ -43,6 +43,9 @@ pub enum TaskRetry {
     /// 重下一个组件(yt-dlp / ffmpeg…):入参 = 组件名;前端按钮直连 `retry_download`。
     /// 把「下载」这类 job 也纳入「失败可重试」(原仅影音);未来别的下载照此加分支。
     Download { component: String },
+    /// 重下一个语音模型(ASR/VAD/KWS/离线嗓音/克隆嗓音/声纹):入参 = ModelSpec/TarModelSpec/
+    /// TreeModelSpec 的 `id`;前端按钮直连 `retry_voice_model`(0.2.0 里程碑「留待真需要」项兑现)。
+    VoiceModel { id: String },
 }
 
 /// 任务进度快照(HUD 的词汇):前端按 task_id upsert,每条事件都是全量快照,

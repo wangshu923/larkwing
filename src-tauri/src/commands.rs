@@ -45,14 +45,22 @@ pub struct AppState {
 /// core 的 channels::run 不依赖 tauri)。boot 与"保存配置后"各 restart 一次。
 pub struct ChannelSup {
     engine: Arc<Engine>,
+    voice: larkwing_core::voice::VoiceRuntime,
+    media: larkwing_core::media::MediaRuntime,
     status: ChannelStatus,
     ct: Mutex<CancellationToken>,
 }
 
 impl ChannelSup {
-    pub fn new(engine: Arc<Engine>) -> ChannelSup {
+    pub fn new(
+        engine: Arc<Engine>,
+        voice: larkwing_core::voice::VoiceRuntime,
+        media: larkwing_core::media::MediaRuntime,
+    ) -> ChannelSup {
         ChannelSup {
             engine,
+            voice,
+            media,
             status: ChannelStatus::default(),
             ct: Mutex::new(CancellationToken::new()),
         }
@@ -70,8 +78,9 @@ impl ChannelSup {
             m.clear();
         }
         let (engine, status) = (self.engine.clone(), self.status.clone());
+        let (voice, media) = (self.voice.clone(), self.media.clone());
         tauri::async_runtime::spawn(async move {
-            channels::run(engine, status, new_ct).await;
+            channels::run(engine, voice, media, status, new_ct).await;
         });
     }
 
@@ -712,6 +721,13 @@ pub fn retry_download(state: State<'_, AppState>, component: String) -> Result<(
     Ok(())
 }
 
+/// 失败语音模型下载「重试」(v0.2.4 补齐三型语音模型;同上直连哲学)。
+#[tauri::command]
+pub fn retry_voice_model(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
+    state.voice.retry_model(&id);
+    Ok(())
+}
+
 /// 多集续播切集(PLAN §9 多集续播):前端 `ended` 自动下一集、播放器上/下一集按钮直连这里
 /// (不绕 LLM,同 media_retry / 嘴控按钮哲学 §7.1)。delta = +1 下一集 / -1 上一集。
 /// 越界(到头/到顶)在 advance 内报错,这里只记日志 —— 按钮路径没有模型可叙述。
@@ -728,11 +744,15 @@ pub fn media_advance(state: State<'_, AppState>, delta: i32) -> Result<(), AppEr
 }
 
 /// 前端回报播放器当下状态(播放真相在前端 WebView):playing/paused 时带标题,
-/// ended/stop → idle。core 据此校准快照,下个回合装配时喂模型「此刻」背景
-/// (修「歌放完了模型却以为还在播」)。只主窗(真播放位)回报,悬浮窗是镜像不报。
+/// ended/stop → idle;富字段(音量/进度/时长/倍速)一并回报,core 据此校准快照,
+/// 下个回合装配时喂模型「此刻」背景(修「歌放完了模型却以为还在播」+ 让它知道当前
+/// 音量/进度才能做绝对/相对调整)。只主窗(真播放位)回报,悬浮窗是镜像不报。
 #[tauri::command]
-pub fn report_media_state(state: State<'_, AppState>, status: String, title: Option<String>) {
-    state.media.set_playback(&status, title);
+pub fn report_media_state(
+    state: State<'_, AppState>,
+    report: larkwing_core::media::PlaybackReport,
+) {
+    state.media.set_playback(report);
 }
 
 // ---- 远程渠道(PLAN 远程渠道:Telegram / 钉钉 bot) ----

@@ -374,12 +374,42 @@ function sendSuggestion(text: string) {
   chatSend(text, 'typed')
 }
 
-// 场景触发建议气泡(§3.3 发现性):跟着当下状态走、替用户说下一句。当前接「正在放歌」一档——
-// 在播音频时给几条自然跟进(发现模型能「搜了再放」的能力,不是重复播放条按钮)。点一下=正常发送。
-// 扩展点:以后别的场景(刚整理完文件等)按同样形状各加一档即可。
+// 场景触发建议气泡(§3.3 发现性):跟着当下状态走、替用户说下一句。点一下=正常发送。
+// 档位(specific 先于 ambient):刚整理完文件 > 刚设好提醒 > 正在放歌;回合收尾(idle)才显,
+// 别在旺财还在动手时就催下一句。扩展点:再加档 = 加一个触发判断 + 一组 chips。
 const { state: media } = useMedia()
+// 最新一条旺财消息动过哪些工具(live 与落库回放都带 ui_key;user 之后的新回合会换新气泡)
+const lastWangToolKeys = computed<Set<string>>(() => {
+  const list = messages.value
+  for (let i = list.length - 1; i >= 0; i--) {
+    const m = list[i]
+    if (m.role === 'wang') return new Set((m.trace?.steps ?? []).map((s) => s.ui_key))
+  }
+  return new Set()
+})
+// fs 写原语(动过 = 「刚整理完文件」档;fs_undo 不算触发,撤销完就别再劝撤销)
+const FS_WRITE_KEYS = [
+  'tool.fs_move',
+  'tool.fs_copy',
+  'tool.fs_trash',
+  'tool.fs_write_text',
+  'tool.fs_append',
+  'tool.fs_edit',
+  'tool.fs_mkdir',
+]
 const contextSuggestions = computed<string[]>(() => {
   if (!chat.ready || !chat.hasApiKey) return []
+  // 回合进行中不出气泡(等收尾再给「下一句」建议)
+  if (chat.mood !== 'idle') return []
+  const keys = lastWangToolKeys.value
+  // 刚动过文件:看改了什么 / 撤销(可逆是功能性的,§7.2)
+  if (FS_WRITE_KEYS.some((k) => keys.has(k))) {
+    return [t('chat.ctx.fsChanged'), t('chat.ctx.fsUndo')]
+  }
+  // 刚设好提醒:看全部 / 反悔取消
+  if (keys.has('tool.reminder_set')) {
+    return [t('chat.ctx.remindList'), t('chat.ctx.remindCancel')]
+  }
   // 正在放歌(音频形态):给音乐跟进建议
   if (media.current?.kind === 'audio' && (media.status === 'playing' || media.status === 'paused')) {
     return [t('chat.ctx.moreLike'), t('chat.ctx.calmer'), t('chat.ctx.somethingElse')]

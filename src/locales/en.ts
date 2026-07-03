@@ -54,6 +54,7 @@ export default {
     resolve: 'Resolving the stream',
     relocate: 'Moving data',
     update: 'Downloading update',
+    remux: 'Preparing video “{name}”',
     download: {
       ytdlp: 'Downloading the parser',
       ffmpeg: 'Downloading the playback component',
@@ -70,6 +71,7 @@ export default {
       resolve: 'Couldn’t resolve it',
       auth: 'Sign-in needed',
       relocate: 'Move didn’t finish — data is still in place',
+      remux: 'Video prep failed — played the normal way instead',
     },
   },
   step: {
@@ -185,11 +187,15 @@ export default {
       s5: 'Just chat with me',
       s6: 'What can you do?',
     },
-    // Scene-triggered chips (currently: follow-ups while music is playing)
+    // Scene-triggered chips (tiers: just organized files / just set a reminder / music playing)
     ctx: {
       moreLike: 'Play another like this',
       calmer: 'Something calmer',
       somethingElse: 'Just play something else',
+      fsChanged: 'Which files did you change?',
+      fsUndo: 'Undo those file changes',
+      remindList: 'Show me all my reminders',
+      remindCancel: 'Cancel that reminder',
     },
   },
   // “Thought it through” reveal (PLAN §9): clean collapsed pill; expand shows technical detail (tool name/args/result + raw CoT)

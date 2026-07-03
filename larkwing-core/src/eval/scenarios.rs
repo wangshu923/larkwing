@@ -6,8 +6,13 @@
 use super::*;
 
 /// 第一批场景。覆盖:工具选择 / 记忆该记不该记 + 分类 / few-shot 泄漏回归 / recall 触发 /
-/// 提炼宁缺毋滥 + 正例。
+/// 提炼宁缺毋滥 + 正例 / fs 真实整理 / 超长写入退回后自愈。
 pub fn suite() -> Vec<Scenario> {
+    // fs-organize 的真实临时目录(pid 隔离防并行冲突;seed 每 run 重置 = run 间零串扰)
+    let fs_dir = std::env::temp_dir().join(format!("lw-eval-fs-{}", std::process::id()));
+    let fs_dir_s = fs_dir.to_string_lossy().to_string();
+    let (seed_dir, check_dir) = (fs_dir.clone(), fs_dir);
+
     vec![
         // 闲聊不该动工具(§6.5 反例纪律:不该调工具的对话就别调)。
         Scenario::turn("chitchat-no-tool")
@@ -138,5 +143,45 @@ pub fn suite() -> Vec<Scenario> {
             .line("assistant", "好的,记住啦,以后都按拿铁来~")
             .check(distilled_at_least(1))
             .check(memory_with_source("correction", None)),
+        // ── v0.2.4 扩面 ──
+        // fs 整理 = 直交原语自行组合(§7.2/§5:没有 organize_media 任务工具,模型自己
+        // mkdir+move);断言看**真实磁盘终态**,比只看轨迹硬 —— 挪没挪、挪对没挪对一目了然。
+        Scenario::turn("fs-organize")
+            .note("「把 mp3 挪进 music 子文件夹」→ fs 原语组合真把文件搬对(§7.2)")
+            .seed(move |_s, _u| {
+                let _ = std::fs::remove_dir_all(&seed_dir);
+                let _ = std::fs::create_dir_all(&seed_dir);
+                for f in ["a.mp3", "b.mp3", "c.txt"] {
+                    let _ = std::fs::write(seed_dir.join(f), b"x");
+                }
+            })
+            .say(&format!("把 {fs_dir_s} 这个文件夹里的 mp3 文件都挪到它下面的 music 子文件夹里"))
+            .check(tool_called("fs_move"))
+            .check(custom("mp3 真进了 music/,txt 原地不动", move |_o| {
+                check_dir.join("music").join("a.mp3").is_file()
+                    && check_dir.join("music").join("b.mp3").is_file()
+                    && !check_dir.join("a.mp3").exists()
+                    && !check_dir.join("b.mp3").exists()
+                    && check_dir.join("c.txt").is_file()
+            })),
+        // 超长写入退回后自愈(§6.5:超上限一律 bail 退回、绝不静默截断;FACT_MAX_CHARS=200)。
+        // 模型两条合法出路都算过:①先塞整段 → 被退回 → 精简/拆条重写;②自己先拆几条分别记。
+        // 守的是「长信息最终落成可用记忆、回合正常收尾」,而不是死磕某一条执行路径。
+        Scenario::turn("overlong-note-recovers")
+            .note("超长「记住这段」→ 退回不截断,模型精简/拆条后仍记下要点(§6.5)")
+            .say("帮我原原本本记一下这段话,一点都别丢:我爸妈下个月要从老家过来住一阵子,\
+                他们俩习惯早睡早起,我爸每天早上六点必须去公园打太极拳,风雨无阻,我妈对海鲜过敏,\
+                虾蟹贝类都碰不得,但她特别爱吃素三鲜饺子,尤其是荠菜馅的;给他们住的客房那台空调的\
+                遥控器一直放在电视柜从左数第二个抽屉里,床头柜里有备用的老花镜;他们来的那天我得去\
+                高铁站接,车是上午十点半到站,到时候提醒我提前一个小时出门,顺便把后备箱里的杂物\
+                清一清好放行李,老人家拎着大包小包不方便,别让他们在站里等太久")
+            .check(tool_called("remember"))
+            .check(custom("要点真落进了记忆(过敏/太极/接站任一)", |o| {
+                o.memories.iter().any(|m| {
+                    m.content.contains("过敏")
+                        || m.content.contains("太极")
+                        || m.content.contains("十点半")
+                })
+            })),
     ]
 }

@@ -82,7 +82,8 @@ pub(crate) struct ToolRowPayload {
     pub status: String,
 }
 
-/// user 行:输入来源与朗读意向(PLAN §11 语音会话模式)。input: typed | mic | wake;
+/// user 行:输入来源与朗读意向(PLAN §11 语音会话模式)。input: typed | mic | wake |
+/// voice_msg(手机渠道语音消息转写,speak 恒 false——渠道回复是文字);
 /// speak = 本回合按语音排版并朗读(发送瞬间由 来源×auto_speak 物化——真相在库,
 /// 重启/重算都确定)。打字默认形(typed 不念)不写 payload,历史零膨胀。
 /// pub:壳层 send_message command 直接反序列化它(IPC 词汇)。

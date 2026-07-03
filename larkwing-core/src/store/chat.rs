@@ -188,6 +188,23 @@ impl ChatRepo {
         })
     }
 
+    /// 最近一条 event 行原文(自启回合落的任务语境)。提醒推回手机的 Failed 保底:
+    /// 回合没跑成也把提醒本体送到人手上(§3.5 不静默)。
+    pub fn latest_event_line(&self, conv: i64) -> Result<Option<String>> {
+        self.db.with(|c| {
+            let line: Option<String> = c
+                .query_row(
+                    "SELECT content FROM messages
+                     WHERE conversation_id = ?1 AND role = 'event' AND content != ''
+                     ORDER BY id DESC LIMIT 1",
+                    [conv],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(line)
+        })
+    }
+
     pub fn list_conversations(&self, user: i64) -> Result<Vec<Conversation>> {
         self.db.with(|c| {
             let mut stmt = c.prepare(

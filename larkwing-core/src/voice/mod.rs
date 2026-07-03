@@ -1061,6 +1061,73 @@ impl VoiceRuntime {
         Ok((vad_dir.join("silero_vad.onnx"), asr))
     }
 
+    /// 失败语音模型下载的「重试」直连口(HUD 按钮 → 壳层 `retry_voice_model` → 这里;
+    /// 不绕 LLM §7.1)。按 id 找回三型 spec 重跑对应 ensure(自带 HUD:成功 done、再失败仍
+    /// fail_retryable 冒新卡);未知 id(老版本残卡)只记日志。后台 spawn,不阻塞调用方。
+    pub fn retry_model(&self, id: &str) {
+        let this = self.clone();
+        let id = id.to_string();
+        tokio::spawn(async move {
+            let mirrors = this.mirrors();
+            let m = &this.inner.models;
+            let r = match id.as_str() {
+                i if i == models::SILERO_VAD.id => {
+                    m.ensure(&models::SILERO_VAD, &mirrors).await.map(|_| ())
+                }
+                i if i == models::ASR_SENSE_VOICE.id => {
+                    m.ensure(&models::ASR_SENSE_VOICE, &mirrors).await.map(|_| ())
+                }
+                i if i == models::ASR_FIRERED_CTC.id => {
+                    m.ensure(&models::ASR_FIRERED_CTC, &mirrors).await.map(|_| ())
+                }
+                i if i == models::SPEAKER_CAMPP_ZH.id => {
+                    m.ensure(&models::SPEAKER_CAMPP_ZH, &mirrors).await.map(|_| ())
+                }
+                i if i == models::TTS_VITS_MELO.id => {
+                    m.ensure_tar(&models::TTS_VITS_MELO, &mirrors).await.map(|_| ())
+                }
+                i if i == models::KWS_ZIPFORMER_ZH.id => {
+                    m.ensure_tar(&models::KWS_ZIPFORMER_ZH, &mirrors).await.map(|_| ())
+                }
+                i if i == models::TTS_ZIPVOICE.id => {
+                    m.ensure_tar_tree(&models::TTS_ZIPVOICE, &mirrors).await.map(|_| ())
+                }
+                other => {
+                    tracing::warn!(id = other, "retry_voice_model:未知模型 id,忽略");
+                    return;
+                }
+            };
+            if let Err(e) = r {
+                tracing::warn!(err = %format!("{e:#}"), id = %id, "语音模型重试仍失败");
+            }
+        });
+    }
+
+    /// 选中的 ASR 档已就绪(不触发下载)。渠道语音消息第一次遇到未就绪 → 先回「准备中」
+    /// 提示 + `prefetch_asr` 后台下,绝不让手机那头干等几分钟。
+    pub fn asr_ready(&self) -> bool {
+        self.inner.models.is_ready(self.asr_model().spec())
+    }
+
+    /// 后台预取 ASR(模型下载 + 加载,HUD 进度照常;fire-and-forget,失败留日志)。
+    pub fn prefetch_asr(&self) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = this.ensure_engines().await {
+                tracing::warn!(err = %format!("{e:#}"), "ASR 预取失败");
+            }
+        });
+    }
+
+    /// 16k 单声道 PCM → 文本(渠道语音消息用;与听写/唤醒共用同一份缓存的识别器)。
+    pub async fn transcribe_pcm(&self, samples: Vec<f32>) -> Result<String> {
+        anyhow::ensure!(!samples.is_empty(), "音频数据为空");
+        let (_vad, asr) = self.ensure_engines().await?;
+        tokio::task::spawn_blocking(move || asr.transcribe(&samples))
+            .await
+            .context("转写任务挂了")?
+    }
+
     /// 听写前的准备(含声纹:有家人录过声纹才加载,下载失败降级为不识别)。
     /// 返回 None = 准备期间用户已取消。
     #[allow(clippy::type_complexity)]

@@ -254,7 +254,12 @@ impl VoiceModels {
                 Ok(dir)
             }
             Err(e) => {
-                task.fail("task.err.download", serde_json::Value::Null);
+                // 可重试失败:HUD 显「重试」直连 retry_voice_model(id 即三型 spec 共用的落盘目录名)
+                task.fail_retryable(
+                    "task.err.download",
+                    serde_json::Value::Null,
+                    crate::bus::TaskRetry::VoiceModel { id: spec.id.to_string() },
+                );
                 Err(e)
             }
         }
@@ -288,7 +293,12 @@ impl VoiceModels {
                 Ok(dir)
             }
             Err(e) => {
-                task.fail("task.err.download", serde_json::Value::Null);
+                // 可重试失败:HUD 显「重试」直连 retry_voice_model(id 即三型 spec 共用的落盘目录名)
+                task.fail_retryable(
+                    "task.err.download",
+                    serde_json::Value::Null,
+                    crate::bus::TaskRetry::VoiceModel { id: spec.id.to_string() },
+                );
                 Err(e)
             }
         }
@@ -356,7 +366,12 @@ impl VoiceModels {
                 Ok(dir)
             }
             Err(e) => {
-                task.fail("task.err.download", serde_json::Value::Null);
+                // 可重试失败:HUD 显「重试」直连 retry_voice_model(id 即三型 spec 共用的落盘目录名)
+                task.fail_retryable(
+                    "task.err.download",
+                    serde_json::Value::Null,
+                    crate::bus::TaskRetry::VoiceModel { id: spec.id.to_string() },
+                );
                 Err(e)
             }
         }

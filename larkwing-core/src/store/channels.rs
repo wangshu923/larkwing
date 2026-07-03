@@ -27,6 +27,12 @@ pub const MIGRATIONS: &[Migration] = &[
         "ALTER TABLE channel_threads ADD COLUMN user_id INTEGER;
          ALTER TABLE channel_threads ADD COLUMN label TEXT;",
     ),
+    // 提醒推回手机(A1):平台侧主动推送要的收件地址。TG 用 ext_id(= chat_id)就够,
+    // 钉钉 sessionWebhook 有时效 → 单聊存 senderStaffId 走主动推送 API;群聊不存(不推)。
+    m(
+        "0018_channel_threads_push_id",
+        "ALTER TABLE channel_threads ADD COLUMN push_id TEXT;",
+    ),
 ];
 
 /// 一条渠道会话映射(家人页「谁的对话」列表行;serde 直过 IPC)。
@@ -40,6 +46,9 @@ pub struct ChannelThread {
     pub user_id: Option<i64>,
     /// 平台昵称(TG first_name / 钉钉 senderNick),入站时顺手记下,给绑定 UI 认脸。
     pub label: Option<String>,
+    /// 平台侧主动推送的收件地址(提醒推回手机):钉钉单聊 = senderStaffId;
+    /// TG 不需要(ext_id 即 chat_id);NULL = 该对话推不了(钉钉群聊等)。
+    pub push_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -62,9 +71,26 @@ impl ChannelRepo {
         self.db.with(|c| {
             let t = c
                 .query_row(
-                    "SELECT id, channel, ext_id, conv_id, user_id, label
+                    "SELECT id, channel, ext_id, conv_id, user_id, label, push_id
                      FROM channel_threads WHERE channel = ?1 AND ext_id = ?2",
                     rusqlite::params![channel, ext_id],
+                    row_to_thread,
+                )
+                .optional()?;
+            Ok(t)
+        })
+    }
+
+    /// 反查:这个会话是不是渠道映射会话(提醒推回手机用;桌面会话 → None)。
+    /// 同 conv 理论上只一条映射(bind 是 chat→conv 覆盖式);取最新建的那条兜底。
+    pub fn thread_by_conv(&self, conv_id: i64) -> Result<Option<ChannelThread>> {
+        self.db.with(|c| {
+            let t = c
+                .query_row(
+                    "SELECT id, channel, ext_id, conv_id, user_id, label, push_id
+                     FROM channel_threads WHERE conv_id = ?1
+                     ORDER BY created_at DESC LIMIT 1",
+                    [conv_id],
                     row_to_thread,
                 )
                 .optional()?;
@@ -89,7 +115,7 @@ impl ChannelRepo {
     pub fn list(&self) -> Result<Vec<ChannelThread>> {
         self.db.with(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, channel, ext_id, conv_id, user_id, label
+                "SELECT id, channel, ext_id, conv_id, user_id, label, push_id
                  FROM channel_threads ORDER BY created_at DESC",
             )?;
             let rows =
@@ -104,6 +130,22 @@ impl ChannelRepo {
             c.execute(
                 "UPDATE channel_threads SET user_id = ?2 WHERE id = ?1",
                 rusqlite::params![thread_id, user_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// 记下主动推送收件地址(钉钉单聊 senderStaffId;入站顺手写,空白不写)。
+    pub fn set_push_id(&self, channel: &str, ext_id: &str, push_id: &str) -> Result<()> {
+        let push_id = push_id.trim();
+        if push_id.is_empty() {
+            return Ok(());
+        }
+        self.db.with(|c| {
+            c.execute(
+                "UPDATE channel_threads SET push_id = ?3
+                 WHERE channel = ?1 AND ext_id = ?2 AND (push_id IS NULL OR push_id <> ?3)",
+                rusqlite::params![channel, ext_id, push_id],
             )?;
             Ok(())
         })
@@ -145,6 +187,7 @@ fn row_to_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChannelThread> {
         conv_id: r.get(3)?,
         user_id: r.get(4)?,
         label: r.get(5)?,
+        push_id: r.get(6)?,
     })
 }
 
@@ -204,6 +247,25 @@ mod tests {
         s.channels.bind("telegram", "555", 8).unwrap();
         let t = s.channels.thread_for("telegram", "555").unwrap().unwrap();
         assert_eq!((t.conv_id, t.user_id), (8, Some(42)));
+    }
+
+    #[test]
+    fn push_id_and_conv_reverse_lookup() {
+        let s = store("pushid");
+        assert!(s.channels.thread_by_conv(7).unwrap().is_none(), "桌面会话无映射");
+        s.channels.bind("dingtalk", "cidAAA", 7).unwrap();
+
+        // 反查:conv → 映射行
+        let t = s.channels.thread_by_conv(7).unwrap().unwrap();
+        assert_eq!((t.channel.as_str(), t.ext_id.as_str()), ("dingtalk", "cidAAA"));
+        assert_eq!(t.push_id, None, "新映射无推送地址");
+
+        // 推送地址:去空白落库、空白不覆盖;rebind 保留(UPDATE 不动该列)
+        s.channels.set_push_id("dingtalk", "cidAAA", " staff9 ").unwrap();
+        s.channels.set_push_id("dingtalk", "cidAAA", "   ").unwrap();
+        s.channels.bind("dingtalk", "cidAAA", 9).unwrap();
+        let t = s.channels.thread_by_conv(9).unwrap().unwrap();
+        assert_eq!(t.push_id.as_deref(), Some("staff9"));
     }
 
     #[test]

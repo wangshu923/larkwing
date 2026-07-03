@@ -309,6 +309,7 @@ export interface TextRef {
 export type TaskRetry =
   | { type: 'media_play'; data: { page_url: string; audio_only: boolean } }
   | { type: 'download'; data: { component: string } }
+  | { type: 'voice_model'; data: { id: string } }
 
 /** 任务进度快照:按 task_id upsert,每条都是全量,错过即追平。 */
 export interface TaskView {
@@ -354,6 +355,20 @@ export type MediaEvent =
   | { type: 'auth_required'; data: { source: string } }
   | { type: 'login_hint'; data: { source: string } }
   | { type: 'logged_in'; data: { source: string } }
+
+/** 前端回报 core 的播放器快照(镜像 Rust media::PlaybackReport;「此刻」背景的数据源)。 */
+export interface PlaybackReport {
+  /** playing | paused | idle | loading(其余按 playing)。 */
+  status: string
+  title: string | null
+  /** 基准音量 0–100(用户意图,不含唤醒避让折算)。 */
+  volume?: number
+  /** 播放位置 / 总长(秒);duration 未知传 null。 */
+  position?: number
+  duration?: number | null
+  /** 倍速(缺省当 1)。 */
+  rate?: number
+}
 
 // ---- 语音车道(PLAN §11):听写会话的状态与产出 ----
 
@@ -793,13 +808,14 @@ export const api = {
     invoke<void>('media_retry', { pageUrl, audioOnly }),
   /** 失败下载重试:重下一个组件(yt-dlp/ffmpeg…),直连不绕 LLM。 */
   retryDownload: (component: string) => invoke<void>('retry_download', { component }),
+  retryVoiceModel: (id: string) => invoke<void>('retry_voice_model', { id }),
   /** 多集续播切集(+1 下一集 / -1 上一集):ended 自动续播、播放器上/下一集按钮直连这里(不绕 LLM)。
    *  越界(到头/到顶)在 core 内静默(只记日志)。fire-and-forget。 */
   mediaAdvance: (delta: number) => invoke<void>('media_advance', { delta }),
-  /** 回报播放器当下状态给 core(只主窗调):playing/paused 带标题,idle 不带。
-   *  core 据此在下个回合喂模型「此刻」背景,修「歌放完了却以为还在播」。fire-and-forget。 */
-  reportMediaState: (status: string, title: string | null) =>
-    invoke<void>('report_media_state', { status, title }),
+  /** 回报播放器当下状态给 core(只主窗调):状态/标题之外带基准音量(0–100)、进度/时长(秒)、
+   *  倍速。core 据此在下个回合喂模型「此刻」背景 —— 修「歌放完了却以为还在播」,并让模型知道
+   *  当前音量/进度(才能「调到 50」「快进 5 分钟」)。fire-and-forget。 */
+  reportMediaState: (report: PlaybackReport) => invoke<void>('report_media_state', { report }),
   /** 远程渠道状态(设置页):开关/已配凭证/白名单/连接态(凭证不过桥)。 */
   remoteStatus: () => invoke<RemoteChannelView[]>('remote_status'),
   /** 保存远程渠道配置后调:停旧起新(类比 provider 保存即重建)。 */

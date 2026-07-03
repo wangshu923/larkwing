@@ -15,21 +15,24 @@ impl MediaControl {
             spec: ToolSpec {
                 name: "media_control",
                 description: "控制正在播放的内容:pause 暂停 / resume 继续 / stop 停止 / \
-                              louder 大点声 / softer 小点声 / speed 倍速(value=0.25–3,\
+                              louder 大点声 / softer 小点声(各约一档)/ volume 音量调到指定值\
+                              (value=0–100,「调到一半」=50、「静音」=0)/ speed 倍速(value=0.25–3,\
                               如 1.5)/ seek 定位播放(value=秒,「跳到一分半」=90、\
-                              「快进到十分钟」=600)/ next 下一集 / prev 上一集(多集合集/剧集时,\
-                              用户说「下一集/上一集/换下一集/看上一集」)。用户说「暂停/接着放/别放了/\
-                              大点声/1.5 倍速/跳到第 90 秒/下一集」时用。没有在放东西就别调。",
+                              「快进到十分钟」=600)/ next 下一集 / prev 上一集 / episode 跳到第几集\
+                              (value=集数,「看第五集」=5;多集合集/剧集时可用)。当前音量/播放进度/\
+                              倍速/第几集在〔此刻〕背景注记里,相对要求(「再大一点点」「快进五分钟」)\
+                              按它算出绝对值后用 volume/seek。用户说「暂停/接着放/别放了/大点声/\
+                              音量调到 30/1.5 倍速/跳到第 90 秒/下一集/看第五集」时用。没有在放东西就别调。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["pause", "resume", "stop", "louder", "softer", "speed", "seek", "next", "prev"]
+                            "enum": ["pause", "resume", "stop", "louder", "softer", "volume", "speed", "seek", "next", "prev", "episode"]
                         },
                         "value": {
                             "type": "number",
-                            "description": "speed=倍速(0.25–3);seek=定位到第几秒;其它动作不传"
+                            "description": "volume=音量(0–100);speed=倍速(0.25–3);seek=定位到第几秒;episode=第几集(从 1 数);其它动作不传"
                         }
                     },
                     "required": ["action"]
@@ -53,11 +56,22 @@ impl Tool for MediaControl {
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("缺少 action 参数"))?;
         let value = args.get("value").and_then(serde_json::Value::as_f64);
-        // next/prev = 队列推进(现取现播,异步):走 advance,不是发给前端的嘴控指令。
+        // next/prev/episode = 队列切集(现取现播,异步):走 core 队列,不是发给前端的嘴控指令。
+        // 队列在 core 手里(B 站合集/分P、本地同一套)→ 「第几集」直接定位,模型不碰链接。
         match action {
-            "next" | "prev" => {
-                let delta = if action == "next" { 1 } else { -1 };
-                match ctx.media.advance(ctx.user_id, delta).await? {
+            "next" | "prev" | "episode" => {
+                let outcome = if action == "episode" {
+                    let v = value.ok_or_else(|| anyhow::anyhow!("episode 需要 value(第几集)"))?;
+                    anyhow::ensure!(
+                        v.fract() == 0.0 && v >= 1.0,
+                        "第几集要是从 1 起的整数,收到 {v}"
+                    );
+                    ctx.media.jump_to_episode(ctx.user_id, v as usize).await?
+                } else {
+                    let delta = if action == "next" { 1 } else { -1 };
+                    ctx.media.advance(ctx.user_id, delta).await?
+                };
+                match outcome {
                     crate::media::PlayOutcome::Playing(np) => Ok(match &np.playlist {
                         Some(p) => format!("已切到第{}集《{}》(共{}集)", p.index + 1, np.title, p.total),
                         None => format!("已切到《{}》", np.title),

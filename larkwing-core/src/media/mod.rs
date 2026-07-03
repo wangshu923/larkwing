@@ -179,10 +179,58 @@ struct PendingPlay {
 /// 待重放有效期:超过即作废。
 const PENDING_PLAY_TTL: Duration = Duration::from_secs(600);
 
+/// copy-remux 缓存总量封顶(可重建缓存,超了从旧往新清;电影级产物一部几 GB,16G ≈ 一部剧
+/// 的连播余量 + 几部电影)。起步值,真机按盘大小体感再调(§13.7 同款「真用才能调」)。
+const REMUX_CACHE_MAX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+/// 转封装前要求的最低磁盘余量(产物之外再留的安全垫)。
+const REMUX_FREE_MARGIN_BYTES: u64 = 500 * 1024 * 1024;
+
+/// remux 缓存清理:按 mtime 新→旧累计,超出总量封顶的旧产物删掉(`keep` = 刚出炉的永不删);
+/// 顺手清超过一小时的 `.part` 残件(中断/崩溃留下的)。
+fn prune_remux_cache(dir: &std::path::Path, keep: &std::path::Path) {
+    prune_remux_cache_with_cap(dir, keep, REMUX_CACHE_MAX_BYTES)
+}
+
+/// 拆出 cap 参数只为可单测(生产恒用 `REMUX_CACHE_MAX_BYTES`)。
+fn prune_remux_cache_with_cap(dir: &std::path::Path, keep: &std::path::Path, cap: u64) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
+    for e in rd.flatten() {
+        let Ok(meta) = e.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let p = e.path();
+        let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        match p.extension().and_then(|x| x.to_str()) {
+            Some("mp4") => files.push((p, meta.len(), modified)),
+            Some("part") => {
+                let stale = modified
+                    .elapsed()
+                    .map(|d| d > std::time::Duration::from_secs(3600))
+                    .unwrap_or(true);
+                if stale {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+            _ => {}
+        }
+    }
+    files.sort_by(|a, b| b.2.cmp(&a.2)); // 新在前
+    let mut total = 0u64;
+    for (p, len, _) in files {
+        total = total.saturating_add(len);
+        if total > cap && p != keep {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
 /// 前端播放器的「此刻」状态快照。播放真相在前端 WebView(播放在那跑、放完只有它知道);
-/// core 起播时乐观 seed,前端在生命周期切换(playing/paused/ended/stop)时经
-/// `report_media_state` 命令回报校准。app 级瞬态(§6.4 派生可丢:丢了 = 按空闲算、不出错)。
-/// 回合装配时读成一行「此刻」背景喂模型 → 修「歌放完了模型却以为还在播着」。
+/// core 起播时乐观 seed,前端在生命周期切换(playing/paused/ended/stop)+ 音量/倍速/seek 调整
+/// + 播放中低频心跳时经 `report_media_state` 命令回报校准。app 级瞬态(§6.4 派生可丢:
+/// 丢了 = 按空闲算、不出错)。回合装配时读成一行「此刻」背景喂模型 → 修「歌放完了模型却
+/// 以为还在播着」,并让模型知道当前音量/进度(才能「调到 50」「快进 5 分钟」这类绝对/相对操作)。
 #[derive(Debug, Clone, Default)]
 struct Playback {
     /// None = 空闲(没在播任何东西);Some = 正在放/暂停的标题。
@@ -191,6 +239,42 @@ struct Playback {
     paused: bool,
     /// 当前在播的剧集进度「第 index/共 total 集」(单集内容为 None);喂模型「此刻」背景用。
     pos: Option<(usize, usize)>,
+    /// 基准音量 0–100(前端的用户意图值,不含唤醒避让折算;None = 尚无回报)。
+    /// 跨播放粘住(seed/idle 都保留)——与前端「音量粘住」语义一致。
+    volume_pct: Option<u8>,
+    /// 播放位置/总长(秒)与倍速;`at` = 回报时刻,播放中按倍速外推出「此刻」位置
+    /// (回报之间也准,不靠前端高频心跳)。
+    position_secs: Option<f64>,
+    duration_secs: Option<f64>,
+    rate: Option<f64>,
+    at: Option<std::time::Instant>,
+}
+
+/// 前端回报的播放器快照(`report_media_state` 命令载荷;新字段全可缺 —— 浏览器预览/旧路径兼容)。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct PlaybackReport {
+    /// playing | paused | idle | loading(其余按 playing)。
+    pub status: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    /// 基准音量 0–100(用户意图,不含避让折算)。
+    #[serde(default)]
+    pub volume: Option<f64>,
+    /// 播放位置 / 总长(秒)。
+    #[serde(default)]
+    pub position: Option<f64>,
+    #[serde(default)]
+    pub duration: Option<f64>,
+    /// 倍速(缺省当 1)。
+    #[serde(default)]
+    pub rate: Option<f64>,
+}
+
+/// 切集目标:相对挪一格(上/下一集)或第 N 集绝对定位(1 起数;嘴控「看第五集」)。
+#[derive(Debug, Clone, Copy)]
+enum EpisodeTarget {
+    Delta(i32),
+    Nth(usize),
 }
 
 /// 当前剧集队列(app 级瞬态,§6.4 派生可丢:丢了 = 退化成单集,绝不出错)。来源无关 ——
@@ -225,6 +309,8 @@ struct Inner {
     playback: Mutex<Playback>,
     /// 当前剧集队列(多集续播;None = 没在放剧集/单集内容)。
     playlist: Mutex<Option<Playlist>>,
+    /// 整文件 copy-remux 在飞集合(按产物路径去重:播放与连播预热撞同一文件只转一趟)。
+    remux_inflight: Mutex<std::collections::HashSet<PathBuf>>,
 }
 
 #[derive(Clone)]
@@ -250,6 +336,7 @@ impl MediaRuntime {
                 pending_play: Mutex::new(HashMap::new()),
                 playback: Mutex::new(Playback::default()),
                 playlist: Mutex::new(None),
+                remux_inflight: Mutex::new(std::collections::HashSet::new()),
             }),
         }
     }
@@ -478,26 +565,51 @@ impl MediaRuntime {
     /// 上/下一集(嘴控「下一集」、播放器按钮、`ended` 自动续播都汇到这):在**现有队列**里挪
     /// `delta`(±1),把那一集现取现播(不重建队列、流地址永不过期)。越界 = 报错喂回(到头/到顶)。
     pub async fn advance(&self, user_id: i64, delta: i32) -> Result<PlayOutcome> {
-        let (target, audio_only, pos) = {
+        self.switch_episode(user_id, EpisodeTarget::Delta(delta)).await
+    }
+
+    /// 跳到第 N 集(1 起数;嘴控「看第五集」):队列是 core 的单一真相(B 站合集/分P、本地剧集
+    /// 同一套 entries,「第N/共M集」的 N/M 就来自它)—— 模型只说集数,不需要也不可能自己拼链接。
+    /// 越界/没在放剧集 = 报错喂回;跳到当前集 = 从头重放该集(合「再放一遍这集」的口语义)。
+    pub async fn jump_to_episode(&self, user_id: i64, episode: usize) -> Result<PlayOutcome> {
+        self.switch_episode(user_id, EpisodeTarget::Nth(episode)).await
+    }
+
+    /// 切集共用体(相对挪 / 第 N 集绝对定位):算目标 index → 越界报错 → 切集即落续播进度 →
+    /// 那一集现取现播(不重建队列、流地址永不过期)。
+    async fn switch_episode(&self, user_id: i64, target: EpisodeTarget) -> Result<PlayOutcome> {
+        let (target_url, audio_only, pos) = {
             let mut guard = self.inner.playlist.lock().unwrap();
             let pl = guard
                 .as_mut()
-                .ok_or_else(|| anyhow::anyhow!("现在没有在播放剧集,没有上一集/下一集可切"))?;
-            let total = pl.entries.len() as i32;
-            let new = pl.index as i32 + delta;
-            anyhow::ensure!(new >= 0, "已经是第一集了");
-            anyhow::ensure!(new < total, "已经是最后一集了,整季都放完啦");
-            pl.index = new as usize;
+                .ok_or_else(|| anyhow::anyhow!("现在没有在播放剧集,没有可切换的集"))?;
+            let total = pl.entries.len();
+            let new = match target {
+                EpisodeTarget::Delta(d) => {
+                    let n = pl.index as i32 + d;
+                    anyhow::ensure!(n >= 0, "已经是第一集了");
+                    anyhow::ensure!((n as usize) < total, "已经是最后一集了,整季都放完啦");
+                    n as usize
+                }
+                EpisodeTarget::Nth(n) => {
+                    anyhow::ensure!(
+                        (1..=total).contains(&n),
+                        "这部一共 {total} 集,没有第 {n} 集"
+                    );
+                    n - 1
+                }
+            };
+            pl.index = new;
             let e = &pl.entries[pl.index];
             // 切集即落进度(下次续播接得上)。
             let _ = self.inner.store.media_progress.set(user_id, &pl.series_key, &e.id, 0.0);
             (
                 e.url.clone(),
                 pl.audio_only,
-                PlaylistPos { index: pl.index, total: pl.entries.len(), resumed: false },
+                PlaylistPos { index: pl.index, total, resumed: false },
             )
         };
-        self.play_entry(user_id, &target, audio_only, Some(pos)).await
+        self.play_entry(user_id, &target_url, audio_only, Some(pos)).await
     }
 
     /// 放**一集**(队列已定;不碰队列):本地直走文件端点,网络走 yt-dlp 解析 → 注册转发。
@@ -688,6 +800,238 @@ impl MediaRuntime {
         }
     }
 
+    /// C2「兼容视频省 CPU」主入口:视频轨已兼容(H.264)的本地片 → 整文件 copy-remux 进缓存,
+    /// 成功返回 /f/ 原生直传 URL(不重编码、零持续转码、原生 seek)。失败/空间不够/撞车 → None,
+    /// 调用方回落原有 HLS//m/ 路(能放,只是费 CPU 或 seek 差)—— remux 永远只是优化不是门槛。
+    async fn try_remux_direct(
+        &self,
+        relay: &relay::Relay,
+        path: &std::path::Path,
+        transcode_audio: bool,
+        duration: Option<f64>,
+    ) -> Option<String> {
+        match self.remux_to_cache(path, transcode_audio, duration).await {
+            Ok(cached) => Some(relay.register_file(cached)),
+            Err(e) => {
+                tracing::info!(path = %path.display(), "copy-remux 不可用,回落转码路: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// 整文件 copy-remux 缓存:视频 `-c copy`(不重编码)、音轨按需转 AAC 立体声+响度链,
+    /// `+faststart` 出标准 mp4 → 之后当普通兼容文件秒开。产物是**可重建缓存**(§6.2 blob 不进库),
+    /// 键 = 源路径+大小+mtime(源变了自动换键);命中秒回,总量超 `REMUX_CACHE_MAX_BYTES` 旧的先清。
+    async fn remux_to_cache(
+        &self,
+        path: &std::path::Path,
+        transcode_audio: bool,
+        duration: Option<f64>,
+    ) -> Result<PathBuf> {
+        let meta = tokio::fs::metadata(path).await?;
+        let cache_dir = self.inner.dir.join("remux");
+        tokio::fs::create_dir_all(&cache_dir).await?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let key =
+            fnv1a_hex(&format!("{}|{}|{mtime}", path.to_string_lossy(), meta.len()));
+        let out = cache_dir.join(format!("{key}.mp4"));
+        if tokio::fs::metadata(&out).await.map(|m| m.len() > 0).unwrap_or(false) {
+            return Ok(out); // 缓存命中(连播预热的成果在这兑现)
+        }
+        // 并发去重:同产物已有一趟在转(播放与预热撞车)→ 本趟让路,调用方走原路、下次命中
+        {
+            let mut inflight = self.inner.remux_inflight.lock().unwrap();
+            anyhow::ensure!(inflight.insert(out.clone()), "同文件转封装已在进行");
+        }
+        let result = self.remux_run(path, &out, transcode_audio, duration, meta.len()).await;
+        self.inner.remux_inflight.lock().unwrap().remove(&out);
+        result?;
+        // 清缓存(总量封顶,最新的留下;spawn_blocking:目录扫描别占 runtime)
+        let (dir, keep) = (cache_dir, out.clone());
+        let _ = tokio::task::spawn_blocking(move || prune_remux_cache(&dir, &keep)).await;
+        Ok(out)
+    }
+
+    /// 跑一趟 ffmpeg copy-remux(HUD 进度卡;`.part` 原子就位,失败/中断残件由 prune 清)。
+    async fn remux_run(
+        &self,
+        src: &std::path::Path,
+        out: &std::path::Path,
+        transcode_audio: bool,
+        duration: Option<f64>,
+        src_len: u64,
+    ) -> Result<()> {
+        // 磁盘预检(fs2,datadir 同款):产物 ≈ 源大小(视频 copy),不够别把盘写爆
+        let avail = fs2::available_space(out.parent().unwrap()).unwrap_or(u64::MAX);
+        anyhow::ensure!(
+            avail > src_len + REMUX_FREE_MARGIN_BYTES,
+            "磁盘剩余空间不够转封装(剩 {avail} 字节)"
+        );
+        let ffmpeg = self.ensure_component(Component::Ffmpeg).await?;
+        let name = src.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let task = self
+            .inner
+            .tasks
+            .start("remux", Text::with("task.remux", serde_json::json!({ "name": name })));
+        let part = out.with_extension("part");
+
+        let mut cmd = tokio::process::Command::new(&ffmpeg);
+        cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin").arg("-y");
+        cmd.arg("-i").arg(src);
+        // 只带首视频轨 + 首音轨(有就带):内嵌字幕/数据轨 WebView 用不上,mp4 里还会碍事
+        cmd.arg("-map").arg("0:v:0").arg("-map").arg("0:a:0?");
+        cmd.arg("-c:v").arg("copy");
+        if transcode_audio {
+            cmd.arg("-c:a")
+                .arg("aac")
+                .arg("-af")
+                .arg(relay::AUDIO_LOUDNESS_AF)
+                .arg("-b:a")
+                .arg("256k");
+        } else {
+            cmd.arg("-c:a").arg("copy");
+        }
+        cmd.arg("-sn").arg("-dn").arg("-movflags").arg("+faststart");
+        cmd.arg("-progress").arg("pipe:1").arg("-nostats");
+        cmd.arg("-f").arg("mp4").arg(&part);
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        no_console(&mut cmd);
+
+        let run = async {
+            let mut child = cmd.spawn().context("ffmpeg 起不来")?;
+            // stderr 旁路收集(失败时给出真因,不静默 §3.5)
+            let errbuf = child.stderr.take().map(|mut se| {
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = String::new();
+                    let _ = se.read_to_string(&mut buf).await;
+                    buf
+                })
+            });
+            if let Some(so) = child.stdout.take() {
+                use tokio::io::AsyncBufReadExt;
+                let mut lines = tokio::io::BufReader::new(so).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if let Some(us) = line
+                        .strip_prefix("out_time_us=")
+                        .and_then(|v| v.trim().parse::<f64>().ok())
+                    {
+                        if let Some(d) = duration.filter(|d| *d > 0.0) {
+                            task.progress((us / 1_000_000.0 / d) as f32);
+                        }
+                    }
+                }
+            }
+            let status = child.wait().await.context("等待 ffmpeg 失败")?;
+            if !status.success() {
+                let err = match errbuf {
+                    Some(h) => h.await.unwrap_or_default(),
+                    None => String::new(),
+                };
+                anyhow::bail!("ffmpeg 转封装失败: {}", err.lines().last().unwrap_or("未知错误"));
+            }
+            Ok(())
+        };
+        // 兜底超时:copy-remux 是 IO 速度(分钟级封顶),挂死的 ffmpeg 别让 HUD 永远转圈
+        let result: Result<()> =
+            match tokio::time::timeout(std::time::Duration::from_secs(30 * 60), run).await {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::anyhow!("转封装超时")),
+            };
+        match result {
+            Ok(()) => {
+                tokio::fs::rename(&part, out).await.context("转封装产物就位失败")?;
+                task.done();
+                Ok(())
+            }
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&part).await;
+                task.fail("task.err.remux", serde_json::Value::Null);
+                Err(e)
+            }
+        }
+    }
+
+    /// 剧集连播预热(C2):队列里的下一集也是「会走 remux」的本地片就先转出来 —— remux 快于
+    /// 实时,这一集没看完下一集就绪,切集零等待。只暖 mkv 类容器(剧集连播的常见形;BMFF
+    /// 音轨不兼容的少见形不预热,播到再转)。fire-and-forget,失败无声(播到时再走正路)。
+    fn prefetch_next_remux(&self) {
+        let next = {
+            let guard = self.inner.playlist.lock().unwrap();
+            guard.as_ref().and_then(|pl| {
+                if pl.audio_only {
+                    return None; // 放歌直传,无 remux 可言
+                }
+                pl.entries.get(pl.index + 1).map(|e| e.url.clone())
+            })
+        };
+        let Some(url) = next.filter(|u| is_local_path(u)) else { return };
+        let path = std::path::PathBuf::from(&url);
+        if !probe::needs_ffmpeg_container(&path) {
+            return;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            let Ok(ffmpeg) = this.ensure_component(Component::Ffmpeg).await else { return };
+            let pr = this.probe_with_ffmpeg(&ffmpeg, &path).await;
+            if pr.video_incompatible {
+                return; // 视频轨要重编码 → 不预热(HLS 按需切,预转整片太重)
+            }
+            let _ = this.remux_to_cache(&path, pr.audio_incompatible, pr.duration_seconds).await;
+        });
+    }
+
+    /// 音频字节(手机语音消息的 ogg/opus 等)→ 16k 单声道 f32 PCM(喂本地 ASR)。
+    /// ffmpeg 组件解码:落临时文件(解封装要可 seek 输入更稳)→ `-f f32le` 读 stdout;
+    /// `-t max_secs` 双保险截断(调用方已按时长挡长语音)。用完即删,失败如实报错。
+    pub async fn decode_audio_pcm16k(&self, bytes: Vec<u8>, max_secs: u32) -> Result<Vec<f32>> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let ffmpeg = self.ensure_component(Component::Ffmpeg).await?;
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let tmp = std::env::temp_dir().join(format!(
+            "lw-voicemsg-{}-{}.bin",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        tokio::fs::write(&tmp, &bytes).await.context("语音临时文件写入失败")?;
+        let mut cmd = tokio::process::Command::new(&ffmpeg);
+        cmd.arg("-hide_banner")
+            .arg("-i")
+            .arg(&tmp)
+            .arg("-t")
+            .arg(max_secs.to_string())
+            .arg("-f")
+            .arg("f32le")
+            .arg("-ar")
+            .arg("16000")
+            .arg("-ac")
+            .arg("1")
+            .arg("pipe:1");
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        no_console(&mut cmd);
+        let out = tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output()).await;
+        let _ = tokio::fs::remove_file(&tmp).await;
+        let out = out.context("ffmpeg 解码超时")?.context("ffmpeg 起不来")?;
+        anyhow::ensure!(out.status.success(), "ffmpeg 解码失败(退出码 {:?})", out.status.code());
+        anyhow::ensure!(!out.stdout.is_empty(), "解码出的音频为空");
+        Ok(out
+            .stdout
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect())
+    }
+
     /// 用已就绪的 ffmpeg 探测非 BMFF 容器(mkv/avi…):跑 `ffmpeg -i` 读 stderr 拿编码/时长。
     /// `-i` 无输出会非零退出但信息照打 stderr → 不看退出码、只解析 stderr;探不出按全兼容降级。
     async fn probe_with_ffmpeg(
@@ -760,22 +1104,56 @@ impl MediaRuntime {
             duration_seconds = pr.duration_seconds;
             if pr.audio_incompatible || pr.video_incompatible {
                 self.log_local_codec(&path, &pr);
-                let (su, mu) = self
-                    .hls_or_fallback(relay, &path, pr.video_incompatible, pr.audio_incompatible, pr.duration_seconds)
-                    .await;
-                manifest_url = mu;
-                su
+                // 视频轨兼容(只有音轨不对)→ 优先整文件 copy-remux(C2:不重编码 + 原生 seek);
+                // 不行再回落 HLS//m/(视频也不兼容 = 必须重编码,只能按需切)。
+                let remuxed = if !pr.video_incompatible {
+                    self.try_remux_direct(relay, &path, pr.audio_incompatible, pr.duration_seconds)
+                        .await
+                } else {
+                    None
+                };
+                match remuxed {
+                    Some(u) => u,
+                    None => {
+                        let (su, mu) = self
+                            .hls_or_fallback(
+                                relay,
+                                &path,
+                                pr.video_incompatible,
+                                pr.audio_incompatible,
+                                pr.duration_seconds,
+                            )
+                            .await;
+                        manifest_url = mu;
+                        su
+                    }
+                }
             } else {
                 relay.register_file(path.clone()) // 全兼容:原生直传秒开
             }
         } else if probe::needs_ffmpeg_container(&path) {
-            // mkv/avi 等容器 WebView2 放不了,必经 ffmpeg:先确保 ffmpeg、用它探编码,有时长走 HLS、否则 /m/
+            // mkv/avi 等容器 WebView2 放不了,必经 ffmpeg:先确保 ffmpeg、用它探编码。
+            // 视频轨兼容 → 整文件 copy-remux(C2,常见的 mkv+H.264 由此免重编码);
+            // 视频也不兼容 → 有时长走 HLS(按需重编码)、否则 /m/。
             match self.ensure_component(Component::Ffmpeg).await {
                 Ok(ffmpeg) => {
                     let pr = self.probe_with_ffmpeg(&ffmpeg, &path).await;
                     duration_seconds = pr.duration_seconds;
                     self.log_local_codec(&path, &pr);
-                    if let Some(dur) = pr.duration_seconds.filter(|d| *d > 0.0) {
+                    let remuxed = if !pr.video_incompatible {
+                        self.try_remux_direct(
+                            relay,
+                            &path,
+                            pr.audio_incompatible,
+                            pr.duration_seconds,
+                        )
+                        .await
+                    } else {
+                        None
+                    };
+                    if let Some(u) = remuxed {
+                        u
+                    } else if let Some(dur) = pr.duration_seconds.filter(|d| *d > 0.0) {
                         // HLS 段一律转码视频 + 立体声 AAC(relay::build_frag_cmd),不传 transcode_*
                         let url = relay.register_file_hls(path.clone(), ffmpeg, dur);
                         manifest_url = Some(url.clone());
@@ -811,6 +1189,10 @@ impl MediaRuntime {
         };
         self.seed_playing(&np.title, pos.map(|p| (p.index, p.total)));
         self.publish(MediaEvent::Play(np.clone()));
+        // 连播预热(C2):下一集若也要 remux,趁这一集在放先转好,切集零等待
+        if pos.is_some() {
+            self.prefetch_next_remux();
+        }
         Ok(np)
     }
 
@@ -819,6 +1201,10 @@ impl MediaRuntime {
     pub fn control(&self, action: &str, value: Option<f64>) -> Result<()> {
         match action {
             "pause" | "resume" | "stop" | "louder" | "softer" => {}
+            "volume" => {
+                let v = value.context("volume 需要 value(0–100)")?;
+                anyhow::ensure!((0.0..=100.0).contains(&v), "音量范围 0–100,收到 {v}");
+            }
             "speed" => {
                 let v = value.context("speed 需要 value(倍速)")?;
                 anyhow::ensure!((0.25..=3.0).contains(&v), "倍速范围 0.25–3,收到 {v}");
@@ -828,7 +1214,7 @@ impl MediaRuntime {
                 anyhow::ensure!(v >= 0.0, "定位秒数不能为负");
             }
             other => anyhow::bail!(
-                "未知动作 {other},可用: pause/resume/stop/louder/softer/speed/seek"
+                "未知动作 {other},可用: pause/resume/stop/louder/softer/volume/speed/seek"
             ),
         }
         self.publish(MediaEvent::Control { action: action.into(), value });
@@ -837,28 +1223,47 @@ impl MediaRuntime {
 
     /// 起播时乐观 seed「正在放」(前端随后经 report 校准;这步只是让模型立刻就知道在放什么)。
     /// `pos` = (index, total):在播剧集时把「第N/共M集」一并记下,喂模型「此刻」背景。
+    /// 音量跨播放粘住(前端基准如此)→ seed 保留旧值;进度/倍速是新内容的事,清零等回报。
     fn seed_playing(&self, title: &str, pos: Option<(usize, usize)>) {
-        *self.inner.playback.lock().unwrap() =
-            Playback { title: Some(title.to_string()), paused: false, pos };
+        let mut guard = self.inner.playback.lock().unwrap();
+        let volume_pct = guard.volume_pct;
+        *guard = Playback {
+            title: Some(title.to_string()),
+            paused: false,
+            pos,
+            volume_pct,
+            ..Playback::default()
+        };
     }
 
     /// 前端回报播放态(`report_media_state` 命令 → 这里):前端是播放真相源,
-    /// ended/stop/pause/resume 全经此校准 core 快照。status: playing|paused|idle(其余按 playing)。
-    /// 集数位置(pos)由 core 起播/切集时 seed,前端回报不带 → 这里**保留**已有 pos(只更标题/暂停态),
-    /// idle 才整体清空。
-    pub fn set_playback(&self, status: &str, title: Option<String>) {
+    /// ended/stop/pause/resume/音量/倍速/seek/心跳全经此校准 core 快照。
+    /// 集数位置(pos)由 core 起播/切集时 seed,前端回报不带 → 这里**保留**已有 pos;
+    /// 音量也粘住(idle 不清,与前端「跨播放粘住」一致);其余 idle 清空。
+    pub fn set_playback(&self, r: PlaybackReport) {
         let mut guard = self.inner.playback.lock().unwrap();
-        *guard = match status {
-            "idle" => Playback::default(),
-            "paused" => Playback { title, paused: true, pos: guard.pos },
-            // playing / loading / 其它 → 正在播
-            _ => Playback { title, paused: false, pos: guard.pos },
+        let volume_pct =
+            r.volume.map(|v| v.clamp(0.0, 100.0).round() as u8).or(guard.volume_pct);
+        *guard = match r.status.as_str() {
+            "idle" => Playback { volume_pct, ..Playback::default() },
+            // paused 只认显式;playing / loading / 其它 → 正在播
+            s => Playback {
+                title: r.title,
+                paused: s == "paused",
+                pos: guard.pos,
+                volume_pct,
+                position_secs: r.position,
+                duration_secs: r.duration.filter(|d| *d > 0.0),
+                rate: r.rate,
+                at: Some(std::time::Instant::now()),
+            },
         };
     }
 
     /// 「此刻」播放器状态的一行背景:回合装配追加到末条 user 喂模型,让它任何时候都拿得到
     /// 当下真相(修「歌放完了却以为还在播」)。总返回一行(含空闲),由提示词法条约束「只在
-    /// 跟播放有关时才参考、平时别主动提」。在播剧集时带上「第N/共M集」。
+    /// 跟播放有关时才参考、平时别主动提」。在播剧集时带「第N/共M集」;有回报时带**进度/音量/
+    /// 倍速** —— 模型据此才能「音量调到 50」「快进 5 分钟」(相对操作 = 自己按当前值算绝对值)。
     pub fn playback_summary(&self) -> Option<String> {
         let pb = self.inner.playback.lock().unwrap().clone();
         // 剧集补一段「(第N集/共M集)」,让模型知道进度(如被问"放到哪了""下一集")。
@@ -866,11 +1271,44 @@ impl MediaRuntime {
             .pos
             .map(|(i, n)| format!("(第{}集/共{n}集)", i + 1))
             .unwrap_or_default();
+        // 进度 = 最近回报值,播放中按倍速外推到「此刻」(回报之间也准);夹到总长。
+        let progress = pb
+            .position_secs
+            .map(|p| {
+                let mut cur = p;
+                if !pb.paused {
+                    if let Some(at) = pb.at {
+                        cur += at.elapsed().as_secs_f64() * pb.rate.unwrap_or(1.0);
+                    }
+                }
+                match pb.duration_secs {
+                    Some(d) => format!(",进度 {}/{}", fmt_clock(cur.min(d)), fmt_clock(d)),
+                    None => format!(",已播到 {}", fmt_clock(cur)),
+                }
+            })
+            .unwrap_or_default();
+        let vol = pb.volume_pct.map(|v| format!(",音量 {v}%")).unwrap_or_default();
+        let rate = pb
+            .rate
+            .filter(|r| (*r - 1.0).abs() > 0.011)
+            .map(|r| format!(",{r} 倍速"))
+            .unwrap_or_default();
         Some(match (pb.title, pb.paused) {
             (None, _) => "播放器现在空闲,没有在播放任何内容".to_string(),
-            (Some(t), false) => format!("播放器正在播放《{t}》{ep}"),
-            (Some(t), true) => format!("播放器已暂停,停在《{t}》{ep}"),
+            (Some(t), false) => format!("播放器正在播放《{t}》{ep}{progress}{vol}{rate}"),
+            (Some(t), true) => format!("播放器已暂停,停在《{t}》{ep}{progress}{vol}{rate}"),
         })
+    }
+}
+
+/// 秒 → 「M:SS」/「H:MM:SS」钟表格式(喂模型的进度表示;比裸秒数好读好算)。
+fn fmt_clock(secs: f64) -> String {
+    let s = secs.max(0.0).round() as u64;
+    let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{sec:02}")
+    } else {
+        format!("{m}:{sec:02}")
     }
 }
 
@@ -1027,6 +1465,40 @@ fn fnv1a_hex(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// remux 缓存清理:超总量从旧往新删、刚出炉的 keep 永不删、过期 .part 残件清掉。
+    #[test]
+    fn prune_remux_cache_caps_total_and_keeps_newest() {
+        let dir = std::env::temp_dir()
+            .join(format!("lw-remux-prune-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 三个"大"产物(用真实文件+人造 mtime 排序:old < mid < new)
+        for (name, age_secs) in [("old.mp4", 300), ("mid.mp4", 200), ("new.mp4", 100)] {
+            let p = dir.join(name);
+            std::fs::write(&p, vec![0u8; 1024]).unwrap();
+            let t = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+            let f = std::fs::File::options().write(true).open(&p).unwrap();
+            f.set_modified(t).unwrap();
+        }
+        // 过期 .part 残件(2 小时前)与新鲜 .part(现在)
+        for (name, age_secs) in [("stale.part", 7200u64), ("fresh.part", 0)] {
+            let p = dir.join(name);
+            std::fs::write(&p, b"x").unwrap();
+            let t = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+            let f = std::fs::File::options().write(true).open(&p).unwrap();
+            f.set_modified(t).unwrap();
+        }
+        // 封顶极小(1 字节)→ 除 keep 外全超限;keep=new.mp4 必须活下来
+        // (直接压 REMUX_CACHE_MAX_BYTES 不可行——它是编译期常量,这里用"全都超限"的极端形验逻辑:
+        //  新在前累计,new.mp4 第一个越线但它是 keep → 留;old/mid 越线且非 keep → 删)
+        prune_remux_cache_with_cap(&dir, &dir.join("new.mp4"), 1);
+        assert!(dir.join("new.mp4").is_file(), "keep 永不删");
+        assert!(!dir.join("old.mp4").exists() && !dir.join("mid.mp4").exists(), "超限旧产物清掉");
+        assert!(!dir.join("stale.part").exists(), "过期残件清掉");
+        assert!(dir.join("fresh.part").is_file(), "新鲜 .part(可能正在写)不动");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn runtime(tag: &str) -> (MediaRuntime, tokio::sync::broadcast::Receiver<AppEvent>) {
         let dir = std::env::temp_dir().join(format!("lw-media-test-{}-{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1042,10 +1514,13 @@ mod tests {
         rt.control("pause", None).unwrap();
         rt.control("speed", Some(1.5)).unwrap();
         rt.control("seek", Some(90.0)).unwrap();
+        rt.control("volume", Some(50.0)).unwrap();
         assert!(rt.control("blast_off", None).is_err(), "未知动作被拒");
         assert!(rt.control("speed", None).is_err(), "speed 缺 value 被拒");
         assert!(rt.control("speed", Some(9.0)).is_err(), "倍速超界被拒");
         assert!(rt.control("seek", Some(-3.0)).is_err(), "负秒数被拒");
+        assert!(rt.control("volume", None).is_err(), "volume 缺 value 被拒");
+        assert!(rt.control("volume", Some(120.0)).is_err(), "音量超 0–100 被拒");
         match rx.try_recv().unwrap() {
             AppEvent::Media(MediaEvent::Control { action, value }) => {
                 assert_eq!(action, "pause");
@@ -1206,9 +1681,22 @@ mod tests {
         // 点名放第3集(index>0)→ 就放那集,不被续播带走
         assert_eq!(plist(rt.play(1, &e3, false, false).await.unwrap()).index, 2);
 
-        // 没有队列时 advance 报错(没在放剧集)
+        // 第 N 集绝对定位(嘴控「看第一集」= 1 起数):跳到第1集 → index 0
+        let pos = plist(rt.jump_to_episode(1, 1).await.unwrap());
+        assert_eq!((pos.index, pos.total), (0, 3));
+        // 跳到当前集 = 从头重放该集(不报错);越界/0 集如实报错
+        assert_eq!(plist(rt.jump_to_episode(1, 1).await.unwrap()).index, 0);
+        let err = rt.jump_to_episode(1, 9).await.unwrap_err().to_string();
+        assert!(err.contains("一共 3 集"), "越界报错要说清共几集: {err}");
+        assert!(rt.jump_to_episode(1, 0).await.is_err(), "第 0 集(1 起数)被拒");
+        // 跳集也落续播进度:重放(自然起点)接到刚跳的第1集 → resumed=false(本就是首集)
+        let pos = plist(rt.play(1, &e1, false, false).await.unwrap());
+        assert_eq!((pos.index, pos.resumed), (0, false), "进度已被 jump 更新到第1集");
+
+        // 没有队列时 advance / jump 都报错(没在放剧集)
         let (rt2, _rx2) = runtime("noqueue");
         assert!(rt2.advance(1, 1).await.is_err());
+        assert!(rt2.jump_to_episode(1, 2).await.is_err());
     }
 
     #[test]
@@ -1287,6 +1775,15 @@ mod tests {
         }
     }
 
+    /// 造一份前端回报(测试便捷形;新字段默认缺 = 老形回报)。
+    fn report(status: &str, title: Option<&str>) -> PlaybackReport {
+        PlaybackReport {
+            status: status.into(),
+            title: title.map(str::to_string),
+            ..PlaybackReport::default()
+        }
+    }
+
     #[test]
     fn playback_snapshot_seed_report_and_summary() {
         let (rt, _rx) = runtime("playback");
@@ -1299,7 +1796,7 @@ mod tests {
         rt.seed_playing("天空之城", None);
         assert_eq!(rt.playback_summary().as_deref(), Some("播放器正在播放《天空之城》"));
         // 前端回报暂停(保留集数位置,这里无)
-        rt.set_playback("paused", Some("天空之城".into()));
+        rt.set_playback(report("paused", Some("天空之城")));
         assert_eq!(rt.playback_summary().as_deref(), Some("播放器已暂停,停在《天空之城》"));
 
         // 剧集:seed 带「第N/共M集」,且前端回报 playing 不丢集数位置
@@ -1308,7 +1805,7 @@ mod tests {
             rt.playback_summary().as_deref(),
             Some("播放器正在播放《海底小纵队》(第3集/共12集)")
         );
-        rt.set_playback("playing", Some("海底小纵队".into()));
+        rt.set_playback(report("playing", Some("海底小纵队")));
         assert_eq!(
             rt.playback_summary().as_deref(),
             Some("播放器正在播放《海底小纵队》(第3集/共12集)"),
@@ -1316,10 +1813,62 @@ mod tests {
         );
 
         // 前端回报 ended/stop → 空闲(修「歌放完了模型却以为还在播」),集数一并清
-        rt.set_playback("idle", None);
+        rt.set_playback(report("idle", None));
         assert_eq!(
             rt.playback_summary().as_deref(),
             Some("播放器现在空闲,没有在播放任何内容")
         );
+    }
+
+    /// 富回报(音量/进度/倍速)进「此刻」摘要;暂停不外推、播放外推;音量跨播放/空闲粘住。
+    #[test]
+    fn playback_summary_carries_volume_progress_and_rate() {
+        let (rt, _rx) = runtime("playback-rich");
+        // 暂停态:进度用回报原值(不外推),音量/倍速如实标注
+        rt.set_playback(PlaybackReport {
+            status: "paused".into(),
+            title: Some("天空之城".into()),
+            volume: Some(40.0),
+            position: Some(83.0),
+            duration: Some(7083.0),
+            rate: Some(1.5),
+        });
+        assert_eq!(
+            rt.playback_summary().as_deref(),
+            Some("播放器已暂停,停在《天空之城》,进度 1:23/1:58:03,音量 40%,1.5 倍速")
+        );
+        // 播放态:外推(elapsed≈0,仍是 1:23 量级);1 倍速不标注
+        rt.set_playback(PlaybackReport {
+            status: "playing".into(),
+            title: Some("天空之城".into()),
+            volume: Some(40.0),
+            position: Some(83.0),
+            duration: Some(7083.0),
+            rate: Some(1.0),
+        });
+        let s = rt.playback_summary().unwrap();
+        assert!(s.contains("进度 1:23/1:58:03"), "刚回报完外推≈0: {s}");
+        assert!(s.contains("音量 40%") && !s.contains("倍速"), "1 倍速不标注: {s}");
+        // 音量粘住:idle 清进度不清音量;下次 seed(新播放)也保留
+        rt.set_playback(report("idle", None));
+        assert_eq!(
+            rt.playback_summary().as_deref(),
+            Some("播放器现在空闲,没有在播放任何内容")
+        );
+        rt.seed_playing("新歌", None);
+        assert_eq!(
+            rt.playback_summary().as_deref(),
+            Some("播放器正在播放《新歌》,音量 40%"),
+            "音量跨播放粘住(前端基准语义),进度等回报"
+        );
+    }
+
+    #[test]
+    fn fmt_clock_formats() {
+        assert_eq!(fmt_clock(0.0), "0:00");
+        assert_eq!(fmt_clock(83.4), "1:23");
+        assert_eq!(fmt_clock(3600.0), "1:00:00");
+        assert_eq!(fmt_clock(7083.0), "1:58:03");
+        assert_eq!(fmt_clock(-5.0), "0:00", "负数夹到 0");
     }
 }
