@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::bus::Text;
-use crate::components::{candidates, fetch_candidates};
+use crate::components::{candidates, fetch_candidates, sha256_file};
 use crate::tasks::{TaskHandle, Tasks};
 
 /// 一个模型 = 一组文件;每个文件给多源候选(顺序即尝试顺序,github 的再按镜像展开)。
@@ -23,6 +23,9 @@ pub struct ModelSpec {
 pub struct ModelFile {
     pub name: &'static str,
     pub urls: &'static [&'static str],
+    /// 钉死的 sha256(有则下载后立即校验,不匹配 = 删残件响亮失败)。裸下载文件不受归档完整性
+    /// 保护(tar 截断解包会报错,单文件截断没人拦)→ 首推给它们钉值(vocos 实锤,2026-07-02)。
+    pub sha256: Option<&'static str>,
 }
 
 /// silero VAD(语言无关,~2MB;sherpa 官方 release 资产)。
@@ -32,6 +35,7 @@ pub const SILERO_VAD: ModelSpec = ModelSpec {
     files: &[ModelFile {
         name: "silero_vad.onnx",
         urls: &["https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"],
+        sha256: None,
     }],
 };
 
@@ -47,6 +51,7 @@ pub const ASR_SENSE_VOICE: ModelSpec = ModelSpec {
                 "https://hf-mirror.com/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/model.int8.onnx",
                 "https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/model.int8.onnx",
             ],
+            sha256: None,
         },
         ModelFile {
             name: "tokens.txt",
@@ -54,6 +59,7 @@ pub const ASR_SENSE_VOICE: ModelSpec = ModelSpec {
                 "https://hf-mirror.com/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/tokens.txt",
                 "https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/tokens.txt",
             ],
+            sha256: None,
         },
     ],
 };
@@ -74,6 +80,7 @@ pub const ASR_FIRERED_CTC: ModelSpec = ModelSpec {
                 "https://hf-mirror.com/csukuangfj/sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25/resolve/main/model.int8.onnx",
                 "https://huggingface.co/csukuangfj/sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25/resolve/main/model.int8.onnx",
             ],
+            sha256: None,
         },
         ModelFile {
             name: "tokens.txt",
@@ -81,6 +88,7 @@ pub const ASR_FIRERED_CTC: ModelSpec = ModelSpec {
                 "https://hf-mirror.com/csukuangfj/sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25/resolve/main/tokens.txt",
                 "https://huggingface.co/csukuangfj/sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25/resolve/main/tokens.txt",
             ],
+            sha256: None,
         },
     ],
 };
@@ -145,6 +153,7 @@ pub const SPEAKER_CAMPP_ZH: ModelSpec = ModelSpec {
         name: "campplus.onnx",
         // gh release 单文件(走 gh 镜像候选);仓名 typo "recongition" 是上游原样,实测可达
         urls: &["https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"],
+        sha256: None,
     }],
 };
 
@@ -176,6 +185,8 @@ pub struct TreeModelSpec {
     pub skip: &'static [&'static str],
     /// 包外单文件(不在 tar 里,如 vocos 声码器走 vocoder-models release):解包后单独拉进 dir。
     pub extra: &'static [ModelFile],
+    /// 整包 tar 的钉死 sha256(有则下载后、解包前校验;值取上游 checksum.txt 官方发布)。
+    pub tar_sha256: Option<&'static str>,
 }
 
 /// 零样本音色克隆:ZipVoice distill int8 中英双语(PLAN §11 D-clone)。跨语种零样本
@@ -203,7 +214,12 @@ pub const TTS_ZIPVOICE: TreeModelSpec = TreeModelSpec {
         urls: &[
             "https://github.com/k2-fsa/sherpa-onnx/releases/download/vocoder-models/vocos_24khz.onnx",
         ],
+        // 上游 vocoder-models/checksum.txt 恰好漏列 vocos → 钉我们实测 + 验证可加载的值(2026-07-03;
+        // 裸下载不受归档保护,正是 Windows 截断实锤的那个文件)。
+        sha256: Some("bcb3b970e384161c4d634f0bb9e999ff1c471b34c9bc0b1049a5014065ed3cc0"),
     }],
+    // 上游 tts-models/checksum.txt 官方值;与直连、ghfast 镜像、6-15 老树三方实测一致(2026-07-03 核)。
+    tar_sha256: Some("77219c8b40f4ee8d73a7f902305ff6c1128ef9b54461c41b4ca6ed890b6c2803"),
 };
 
 pub struct VoiceModels {
@@ -358,6 +374,14 @@ impl VoiceModels {
         fetch_candidates(&self.net, &candidates(spec.url, mirrors), &tarball, task)
             .await
             .with_context(|| format!("下载 {} 失败", spec.id))?;
+        // 整包 sha256 校验(上游 checksum.txt 官方值):解包前把关,坏包不解、不留。
+        if let Some(want) = spec.tar_sha256 {
+            let got = sha256_file(tarball.clone()).await?;
+            if !got.eq_ignore_ascii_case(want) {
+                tokio::fs::remove_file(&tarball).await.ok();
+                anyhow::bail!("下载校验失败:{} 整包 sha256={got},应为 {want}(下载源损坏,请重试)", spec.id);
+            }
+        }
         task.step("step.extract", serde_json::Value::Null);
         let (tar2, dir2) = (tarball.clone(), dir.to_path_buf());
         let skip: Vec<&'static str> = spec.skip.to_vec();
@@ -376,6 +400,15 @@ impl VoiceModels {
             fetch_candidates(&self.net, &urls, &part, task)
                 .await
                 .with_context(|| format!("下载 {}/{} 失败", spec.id, file.name))?;
+            // 钉死 sha256 的文件下载后立即校验:抓「镜像截断/顶包」(Content-Length 缺失时下载层
+            // 查不了完整性,2026-07-02 Windows vocos 实锤);不匹配 = 删残件响亮失败,绝不静默收下。
+            if let Some(want) = file.sha256 {
+                let got = sha256_file(part.clone()).await?;
+                if !got.eq_ignore_ascii_case(want) {
+                    tokio::fs::remove_file(&part).await.ok();
+                    anyhow::bail!("下载校验失败:{} sha256={got},应为 {want}(下载源损坏,请重试)", file.name);
+                }
+            }
             tokio::fs::rename(&part, &dest).await?;
         }
         for (f, min) in spec.ready {
@@ -410,6 +443,15 @@ impl VoiceModels {
             fetch_candidates(&self.net, &urls, &part, task)
                 .await
                 .with_context(|| format!("下载 {}/{} 失败", spec.id, file.name))?;
+            // 钉死 sha256 的文件下载后立即校验:抓「镜像截断/顶包」(Content-Length 缺失时下载层
+            // 查不了完整性,2026-07-02 Windows vocos 实锤);不匹配 = 删残件响亮失败,绝不静默收下。
+            if let Some(want) = file.sha256 {
+                let got = sha256_file(part.clone()).await?;
+                if !got.eq_ignore_ascii_case(want) {
+                    tokio::fs::remove_file(&part).await.ok();
+                    anyhow::bail!("下载校验失败:{} sha256={got},应为 {want}(下载源损坏,请重试)", file.name);
+                }
+            }
             tokio::fs::rename(&part, &dest).await?;
         }
         Ok(())

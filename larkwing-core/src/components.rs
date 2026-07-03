@@ -339,7 +339,7 @@ fn parse_sums(sums: &str, asset: &str) -> Option<String> {
     })
 }
 
-async fn sha256_file(path: PathBuf) -> Result<String> {
+pub(crate) async fn sha256_file(path: PathBuf) -> Result<String> {
     tokio::task::spawn_blocking(move || -> Result<String> {
         let mut file = std::fs::File::open(&path)?;
         let mut hasher = sha2::Sha256::new();
