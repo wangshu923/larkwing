@@ -119,6 +119,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         <div v-for="r in items" :key="r.id" class="lp-card">
           <span class="lp-dot" :class="{ warn: isDue(r) }"></span>
           <span class="lp-text">{{ r.content }}</span>
+          <!-- 家人的提醒标归属(提醒页=主人的管理面;自己的不标) -->
+          <span v-if="r.owner" class="lp-badge">{{ r.owner }}</span>
           <span v-if="repeatLabel(r)" class="lp-badge">{{ repeatLabel(r) }}</span>
           <span class="lp-date">{{ r.kind === 'cond' ? t('reminders.condition') : fmtDue(r.due_at) }}</span>
           <button class="lp-act attn" :disabled="busy === r.id" @click="cancel(r)">

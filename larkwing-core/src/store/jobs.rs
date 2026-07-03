@@ -161,6 +161,31 @@ impl JobRepo {
         self.set_status_scoped(user_id, id, "cancelled")
     }
 
+    /// 全家待触发提醒(桌面提醒页 = 主人的管理面:家人经渠道/归人设的也看得见、管得着;
+    /// 工具侧 reminder_list/cancel 仍按说话人限定)。
+    pub fn list_pending_all(&self) -> Result<Vec<Job>> {
+        self.db.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, user_id, conv_id, content, due_at, repeat, status, created_at, updated_at, kind, condition
+                 FROM jobs WHERE status = 'pending' ORDER BY due_at",
+            )?;
+            let jobs = stmt.query_map([], map_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(jobs)
+        })
+    }
+
+    /// 不限定用户的取消(桌面提醒页用,主人可撤全家的;pending 才可撤)。
+    pub fn cancel_any(&self, id: i64) -> Result<bool> {
+        self.db.with(|c| {
+            let n = c.execute(
+                "UPDATE jobs SET status = 'cancelled', updated_at = ?2
+                 WHERE id = ?1 AND status = 'pending'",
+                rusqlite::params![id, now_ms()],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
     /// 触发后的状态推进:一次性 → done/missed;重复 → 推进 due_at 留在 pending。
     pub fn finish(&self, id: i64, status: &str) -> Result<()> {
         self.db.with(|c| {

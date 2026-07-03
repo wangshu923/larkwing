@@ -150,6 +150,15 @@ pub struct AppError {
     pub message: String,
 }
 
+/// 提醒页一行(IPC 词汇):Job 全字段平铺 + `owner`(家人的提醒标谁的;自己的 = None 不显)。
+#[derive(Debug, Clone, Serialize)]
+pub struct ReminderItem {
+    #[serde(flatten)]
+    pub job: crate::store::Job,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+}
+
 /// 「想了想」轨迹的一步(PLAN §9 思考漏出·展开层):一次工具调用的技术细节。
 /// ui_key 给折叠摘要兜底;name/args/result/status 是展开后给好奇/专业用户看的真东西。
 #[derive(Debug, Clone, Serialize)]
@@ -1326,16 +1335,32 @@ impl Engine {
         Ok(())
     }
 
-    /// 提醒页:当前用户待触发的提醒(定时任务,按 due_at 升序;真相在库、回合无状态)。
-    pub fn list_reminders(&self) -> Result<Vec<crate::store::Job>, AppError> {
-        let user = self.store.users.ensure_default_user()?;
-        Ok(self.store.jobs.list_pending(user.id)?)
+    /// 提醒页 = 主人的管理面:**全家**待触发提醒(按 due_at 升序;真相在库、回合无状态)。
+    /// 家人经渠道归人设的提醒也在列,`owner` 标注是谁的(自己的 = None,前端不显标签)——
+    /// 2026-07-03 真机困惑实锤:家人对话里设的提醒在提醒页「消失」,其实是按当前用户过滤掉了。
+    /// 工具侧 reminder_list/cancel 仍按说话人限定(TA 只看/只撤自己的)。
+    pub fn list_reminders(&self) -> Result<Vec<ReminderItem>, AppError> {
+        let me = self.store.users.ensure_default_user()?;
+        let names: std::collections::HashMap<i64, String> =
+            self.store.users.list()?.into_iter().map(|u| (u.id, u.name)).collect();
+        Ok(self
+            .store
+            .jobs
+            .list_pending_all()?
+            .into_iter()
+            .map(|job| {
+                let owner = (job.user_id != me.id)
+                    .then(|| names.get(&job.user_id).cloned().unwrap_or_default())
+                    .filter(|n| !n.is_empty());
+                ReminderItem { job, owner }
+            })
+            .collect())
     }
 
-    /// 提醒页「取消」:撤掉一条提醒(按当前用户限定,防串号)。
+    /// 提醒页「取消」:撤掉一条提醒。桌面是主人的管理面 → 全家的都可撤(不按用户限定);
+    /// 说话人自助取消走工具 reminder_cancel(仍限本人)。
     pub fn cancel_reminder(&self, id: i64) -> Result<(), AppError> {
-        let user = self.store.users.ensure_default_user()?;
-        if !self.store.jobs.cancel(user.id, id)? {
+        if !self.store.jobs.cancel_any(id)? {
             return Err(AppError {
                 kind: ErrorKind::NotFound,
                 message: format!("提醒 {id} 不存在"),

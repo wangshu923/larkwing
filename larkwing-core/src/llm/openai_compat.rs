@@ -43,8 +43,16 @@ impl OpenAiCompatProvider {
                                 super::ContentPart::Text { text } => {
                                     json!({ "type": "text", "text": text })
                                 }
+                                // 非视觉模型收到 image_url 直接 400(DeepSeek 真机实锤
+                                // `unknown variant image_url`)→ 降级成占位文本:回合不炸,
+                                // 模型如实说看不了(能力表在 catalog = 数据;未知模型按不支持)。
                                 super::ContentPart::ImageUrl { url } => {
-                                    json!({ "type": "image_url", "image_url": { "url": url } })
+                                    if super::catalog::supports_vision(&self.cfg.model) {
+                                        json!({ "type": "image_url", "image_url": { "url": url } })
+                                    } else {
+                                        json!({ "type": "text", "text":
+                                            "〔用户发来一张图片,但当前模型不支持看图;如实告知看不了即可,绝不要猜图片内容〕" })
+                                    }
                                 }
                             });
                         }
@@ -478,11 +486,15 @@ mod tests {
     }
 
     // 媒体输入(PLAN §9):带图 user 出向成 content 数组(text 块 + image_url 块);
-    // 纯文本仍是字符串(前缀缓存不破)
+    // 纯文本仍是字符串(前缀缓存不破)。视觉能力按 catalog 分叉:
+    // 非视觉模型(DeepSeek)把图降级成占位文本(否则 API 400,2026-07-03 真机实锤)。
     #[test]
     fn to_wire_user_with_image_becomes_content_array() {
         use crate::llm::ContentPart;
-        let p = provider();
+        // 视觉模型(gpt-5 在目录里 vision=true):image_url 原样出
+        let mut cfg = LlmConfig::deepseek("sk-test".into());
+        cfg.model = "gpt-5".into();
+        let p = OpenAiCompatProvider::new(cfg);
         let wire = p.to_wire(&ChatRequest {
             messages: vec![ChatMessage::user_with_parts(
                 "这是什么菜",
@@ -496,6 +508,20 @@ mod tests {
         assert_eq!(content[0]["text"], "这是什么菜");
         assert_eq!(content[1]["type"], "image_url");
         assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+
+        // 非视觉模型(deepseek):图降级为占位文本,绝不出 image_url(API 会 400)
+        let p2 = provider();
+        let wire2 = p2.to_wire(&ChatRequest {
+            messages: vec![ChatMessage::user_with_parts(
+                "这是什么菜",
+                vec![ContentPart::ImageUrl { url: "data:image/png;base64,AAAA".into() }],
+            )],
+            ..Default::default()
+        });
+        let c2 = &wire2["messages"][1]["content"];
+        assert!(c2.is_array());
+        assert_eq!(c2[1]["type"], "text", "非视觉模型图片必须降级成 text 块");
+        assert!(c2[1]["text"].as_str().unwrap().contains("不支持看图"));
         // 纯文本仍是字符串(吃前缀缓存)
         let plain =
             p.to_wire(&ChatRequest { messages: vec![ChatMessage::user("嗨")], ..Default::default() });

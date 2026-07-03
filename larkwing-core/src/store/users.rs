@@ -73,12 +73,16 @@ impl UserRepo {
     }
 
     /// 添加家人(PLAN §11 D 多用户落地):新建一个用户,记忆/声纹各自独立。
+    /// ⚠️ `last_active_at` 落 0(**从未活跃**),绝不落 now —— `ensure_default_user` 按最近活跃
+    /// 恢复「当前用户」,建号若算活跃,加完家人一重启主人就被切成 TA 的空白视角
+    /// (2026-07-03 真机实锤:会话/记忆/名字/性格「全没了」,钉钉来一句 touch 主人才恢复)。
+    /// 家人的活跃只来自真实说话归人(声纹/渠道那一侧的刻意 touch,现阶段没有)。
     pub fn create(&self, name: &str) -> Result<User> {
         self.db.with(|c| {
             let now = now_ms();
             c.execute(
                 "INSERT INTO users (name, skin_id, created_at, last_active_at)
-                 VALUES (?1, 'scifi', ?2, ?2)",
+                 VALUES (?1, 'scifi', ?2, 0)",
                 rusqlite::params![name, now],
             )?;
             Ok(User {
@@ -86,7 +90,7 @@ impl UserRepo {
                 name: name.into(),
                 skin_id: "scifi".into(),
                 created_at: now,
-                last_active_at: now,
+                last_active_at: 0,
             })
         })
     }
@@ -167,4 +171,29 @@ fn row_to_user(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
         created_at: r.get(3)?,
         last_active_at: r.get(4)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::store::Store;
+
+    /// 加家人 ≠ 活跃(2026-07-03 真机实锤回归):建号若落 last_active_at=now,
+    /// 加完家人一重启,ensure_default_user 按最近活跃就把主人切成 TA 的空白视角
+    /// (会话/记忆/名字/性格「全没了」)。家人建号必须从未活跃(0)。
+    #[test]
+    fn family_creation_never_steals_boot_owner() {
+        let p = std::env::temp_dir().join(format!("lw-users-boot-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let s = Store::open(&p).unwrap();
+        let owner = s.users.ensure_default_user().unwrap();
+        s.users.touch(owner.id).unwrap();
+
+        let fam = s.users.create("爸爸").unwrap();
+        assert_eq!(fam.last_active_at, 0, "建号不算活跃");
+        assert_eq!(
+            s.users.ensure_default_user().unwrap().id,
+            owner.id,
+            "重启(ensure_default_user)仍是主人,不被新家人顶掉"
+        );
+    }
 }

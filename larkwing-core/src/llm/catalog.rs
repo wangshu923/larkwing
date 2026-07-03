@@ -98,6 +98,10 @@ pub struct ModelInfo {
     /// 家族子串(小写),按"特异在前、宽泛在后"排序参与匹配。
     pub family: &'static str,
     pub tier: Tier,
+    /// 能不能看图(vision):false 的模型收到 image_url 会直接 400(DeepSeek 真机实锤
+    /// `unknown variant image_url`)→ 兼容层把图降级成占位文本,回合不炸、模型如实说看不了。
+    /// 未知模型按 false(安全:宁可少看图,不可打挂回合);真有本地视觉模型(llava 类)再登记。
+    pub vision: bool,
     /// USD / 百万 token;None = 价格未知,记账只报 token。
     pub in_usd_per_m: Option<f64>,
     pub out_usd_per_m: Option<f64>,
@@ -109,38 +113,39 @@ pub struct ModelInfo {
 const fn m(
     family: &'static str,
     tier: Tier,
+    vision: bool,
     in_usd_per_m: Option<f64>,
     out_usd_per_m: Option<f64>,
     ctx_window_tokens: Option<u32>,
 ) -> ModelInfo {
-    ModelInfo { family, tier, in_usd_per_m, out_usd_per_m, ctx_window_tokens }
+    ModelInfo { family, tier, vision, in_usd_per_m, out_usd_per_m, ctx_window_tokens }
 }
 
 /// 顺序即匹配优先级:特异条目(-flash/-mini)必须排在其宽泛家族(deepseek-v4)之前。
 /// 第 5 列 = 上下文窗口(token,2026-06 采集快照,全部 200K–1M;发版前可校)。
 const CATALOG: &[ModelInfo] = &[
     // DeepSeek(默认供应商;V4 全系 1M 窗口。flash = 廉价档,v4 = Pro 牌价)
-    m("deepseek-v4-flash", Tier::Light, Some(0.14), Some(0.28), Some(1_000_000)),
-    m("deepseek-v4", Tier::Balanced, Some(1.74), Some(3.48), Some(1_000_000)), // V4-Pro 实价
-    m("deepseek-chat", Tier::Balanced, Some(0.28), Some(0.42), Some(1_000_000)), // 旧名,2026-07-24 弃用前仍可能遇到
-    m("deepseek-reasoner", Tier::Smart, Some(0.28), Some(0.42), Some(1_000_000)),
+    m("deepseek-v4-flash", Tier::Light, false, Some(0.14), Some(0.28), Some(1_000_000)),
+    m("deepseek-v4", Tier::Balanced, false, Some(1.74), Some(3.48), Some(1_000_000)), // V4-Pro 实价
+    m("deepseek-chat", Tier::Balanced, false, Some(0.28), Some(0.42), Some(1_000_000)), // 旧名,2026-07-24 弃用前仍可能遇到
+    m("deepseek-reasoner", Tier::Smart, false, Some(0.28), Some(0.42), Some(1_000_000)),
     // Anthropic(Opus/Sonnet 1M,Haiku 200K)
-    m("claude-opus", Tier::Smart, Some(5.0), Some(25.0), Some(1_000_000)),
-    m("claude-sonnet", Tier::Smart, Some(3.0), Some(15.0), Some(1_000_000)),
-    m("claude-haiku", Tier::Light, Some(1.0), Some(5.0), Some(200_000)),
+    m("claude-opus", Tier::Smart, true, Some(5.0), Some(25.0), Some(1_000_000)),
+    m("claude-sonnet", Tier::Smart, true, Some(3.0), Some(15.0), Some(1_000_000)),
+    m("claude-haiku", Tier::Light, true, Some(1.0), Some(5.0), Some(200_000)),
     // 其他常见(经 OpenAI 兼容端点/中转可达)
-    m("gpt-5-mini", Tier::Light, Some(0.25), Some(2.0), Some(400_000)),
-    m("gpt-5", Tier::Smart, Some(0.625), Some(5.0), Some(400_000)),
-    m("kimi-k2", Tier::Balanced, None, None, Some(256_000)),
-    m("qwen-max", Tier::Balanced, None, None, Some(256_000)), // 3.6-Max 256K(3.7-Max 已 1M,保守取低)
+    m("gpt-5-mini", Tier::Light, true, Some(0.25), Some(2.0), Some(400_000)),
+    m("gpt-5", Tier::Smart, true, Some(0.625), Some(5.0), Some(400_000)),
+    m("kimi-k2", Tier::Balanced, false, None, None, Some(256_000)),
+    m("qwen-max", Tier::Balanced, false, None, None, Some(256_000)), // 3.6-Max 256K(3.7-Max 已 1M,保守取低)
     // Google Gemini(经官方 OpenAI 兼容端点;牌价随版本浮动、存疑就不装懂 → 留 None 只报 token)。
     // 特异在前、通配在后(子串匹配按顺序)。窗口全系 1M。
-    m("gemini-2.5-flash", Tier::Light, None, None, Some(1_000_000)),
-    m("gemini-2.0-flash", Tier::Light, None, None, Some(1_000_000)),
-    m("gemini-flash", Tier::Light, None, None, Some(1_000_000)), // gemini-flash-latest 等
-    m("gemini-2.5-pro", Tier::Smart, None, None, Some(1_000_000)),
-    m("gemini-3", Tier::Smart, None, None, Some(1_000_000)), // gemini-3-pro 等
-    m("gemini", Tier::Balanced, None, None, Some(1_000_000)), // 通配兜底:未列出的 gemini 版本
+    m("gemini-2.5-flash", Tier::Light, true, None, None, Some(1_000_000)),
+    m("gemini-2.0-flash", Tier::Light, true, None, None, Some(1_000_000)),
+    m("gemini-flash", Tier::Light, true, None, None, Some(1_000_000)), // gemini-flash-latest 等
+    m("gemini-2.5-pro", Tier::Smart, true, None, None, Some(1_000_000)),
+    m("gemini-3", Tier::Smart, true, None, None, Some(1_000_000)), // gemini-3-pro 等
+    m("gemini", Tier::Balanced, true, None, None, Some(1_000_000)), // 通配兜底:未列出的 gemini 版本
     // Ollama 本地模型(llama/qwen/mistral/…):名字千变万化且本地零计费,故意不列 ——
     // 命中目录兜底规则(未知 → 均衡档 + 不报钱 + 窗口 None → 预算回落默认),正合"本地、免费"的语义。
 ];
@@ -149,6 +154,12 @@ const CATALOG: &[ModelInfo] = &[
 pub fn lookup(model_id: &str) -> Option<&'static ModelInfo> {
     let id = model_id.to_ascii_lowercase();
     CATALOG.iter().find(|info| id.contains(info.family))
+}
+
+/// 能不能看图:目录数据,未知模型按 **false**(宁可少看图、不可让 image_url 打挂回合——
+/// DeepSeek 真机 400 实锤 2026-07-03)。本地视觉模型(llava 类)真有人用再登记进目录。
+pub fn supports_vision(model_id: &str) -> bool {
+    lookup(model_id).map(|i| i.vision).unwrap_or(false)
 }
 
 /// 兜底规则:未知模型按均衡档对待。用户覆盖优先(「高级」里改过的档位)。

@@ -1189,7 +1189,12 @@ textarea.field { resize: none; font-family: inherit; line-height: 1.5; max-heigh
 }
 @keyframes flow { 0% { transform: translateY(-72px); } 100% { transform: translateY(101vh); } }
 
-.layout.cut .bubble { border-radius: 0; box-shadow: none; filter: drop-shadow(0 6px 16px rgba(0, 0, 0, 0.3)); }
-.layout.cut .bubble.wang { clip-path: polygon(0 0, 100% 0, 100% calc(100% - 9px), calc(100% - 9px) 100%, 0 100%); }
-.layout.cut .bubble.user { clip-path: polygon(0 0, 100% 0, 100% 100%, 9px 100%, 0 calc(100% - 9px)); }
+/* 切角风格:clip-path 若加在元素上,会连"贴在气泡外沿的 hover 浮层"(读数/复制/时间/耳机)
+   一起裁掉(2026-07-03 真机实锤:切角没有 hover 操作、圆角有)。改法 = 切角形状画在 ::before
+   背景层(背景/描边一并搬进去),元素本身不裁 → 浮层照常浮现。.bubble 自带 backdrop-filter
+   已成 stacking context,::before 的 z-index:-1 稳在内容之下、页面之上。 */
+.layout.cut .bubble { border-radius: 0; box-shadow: none; filter: drop-shadow(0 6px 16px rgba(0, 0, 0, 0.3)); background: transparent; border-color: transparent; }
+.layout.cut .bubble::before { content: ""; position: absolute; inset: 0; z-index: -1; background: var(--bubble-them); border: 1px solid var(--line); }
+.layout.cut .bubble.wang::before { clip-path: polygon(0 0, 100% 0, 100% calc(100% - 9px), calc(100% - 9px) 100%, 0 100%); }
+.layout.cut .bubble.user::before { background: var(--bubble-me); border-color: var(--bubble-me-line); clip-path: polygon(0 0, 100% 0, 100% 100%, 9px 100%, 0 calc(100% - 9px)); }
 </style>

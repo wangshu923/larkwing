@@ -1197,7 +1197,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         <div class="row v-speaker">
           <span class="label">{{ t('settings.voice.speaker') }}</span>
           <span class="sp-list">
-            <template v-for="sp in voiceInfo?.speakers ?? []" :key="sp.id">
+            <!-- chip 与它的删除 ✕ 包成一组:flex-wrap 换行时一起走,别把 ✕ 拆到下一行开头 -->
+            <span v-for="sp in voiceInfo?.speakers ?? []" :key="sp.id" class="sp-pair">
               <button
                 class="chip sp"
                 :class="{ on: (settings.get('voice.speaker') || voiceInfo?.defaultSpeaker) === sp.id, busy: previewing === sp.id }"
@@ -1211,7 +1212,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
                 :title="t('settings.voice.cloneDelete')"
                 @click="removeClone(sp.id)"
               >{{ cloneArm === sp.id ? t('settings.voice.cloneDeleteArm') : '✕' }}</button>
-            </template>
+            </span>
             <button class="chip sp custom" :class="{ recording: cloneRecording }" :disabled="cloneBusy" @click="recordClone">
               {{ cloneRecording ? t('settings.voice.cloneRecording') : '🎙 ' + t('settings.voice.cloneRecord') }}
             </button>
@@ -1798,6 +1799,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 /* —— 声音 tab —— */
 .v-speaker { align-items: flex-start; }
 .sp-list { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; max-width: 420px; }
+.sp-pair { display: inline-flex; align-items: center; gap: 2px; } /* chip+✕ 永远同行换行 */
 .chip.sp.custom { border-style: dashed; opacity: 0.75; }
 .chip.sp.custom:hover { opacity: 1; }
 .chip-del { border: none; background: transparent; color: var(--text-dim); cursor: pointer; font-size: 11px; padding: 0 2px; align-self: center; opacity: 0.55; }

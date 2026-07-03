@@ -800,23 +800,47 @@ impl MediaRuntime {
         }
     }
 
-    /// C2「兼容视频省 CPU」主入口:视频轨已兼容(H.264)的本地片 → 整文件 copy-remux 进缓存,
-    /// 成功返回 /f/ 原生直传 URL(不重编码、零持续转码、原生 seek)。失败/空间不够/撞车 → None,
-    /// 调用方回落原有 HLS//m/ 路(能放,只是费 CPU 或 seek 差)—— remux 永远只是优化不是门槛。
-    async fn try_remux_direct(
+    /// C2「兼容视频省 CPU」主入口(v0.2.5 改「**永不内联等待**」):缓存命中 → /f/ 原生直传秒开;
+    /// 未命中 → **后台预热**(inflight 去重)并返回 None,本次照旧走 HLS//m/ 转码路。
+    /// 曾内联 await 整片 remux —— BD 大片/NAS 一趟几分钟,直接把 media_play 工具等到超时,
+    /// kill_on_drop 连坐杀掉 ffmpeg(HUD「意外中断了」,2026-07-03 真机实锤《流浪地球2》BD)。
+    /// 现在:播放永不等 remux;首播代价 = 原路转码(与 C2 之前持平,不是回退),二刷起吃缓存;
+    /// 剧集另有连播预热。首播期间 remux(IO 型)与 HLS 转码(CPU 型)并行,资源型互补、可接受。
+    async fn remux_cached_or_warm(
         &self,
         relay: &relay::Relay,
         path: &std::path::Path,
         transcode_audio: bool,
         duration: Option<f64>,
     ) -> Option<String> {
-        match self.remux_to_cache(path, transcode_audio, duration).await {
-            Ok(cached) => Some(relay.register_file(cached)),
-            Err(e) => {
-                tracing::info!(path = %path.display(), "copy-remux 不可用,回落转码路: {e:#}");
+        match self.remux_cache_path(path).await {
+            Some(cached) if tokio::fs::metadata(&cached).await.map(|m| m.len() > 0).unwrap_or(false) => {
+                Some(relay.register_file(cached)) // 二刷/预热成果:原生直传
+            }
+            Some(_) => {
+                let (this, p) = (self.clone(), path.to_path_buf());
+                tokio::spawn(async move {
+                    if let Err(e) = this.remux_to_cache(&p, transcode_audio, duration).await {
+                        tracing::info!(path = %p.display(), "copy-remux 预热未成(下次照旧转码路): {e:#}");
+                    }
+                });
                 None
             }
+            None => None, // 元数据都读不到:交给原路自己报错
         }
+    }
+
+    /// 该文件的 remux 缓存产物路径(键 = 路径+大小+mtime;不创建、不判存在)。
+    async fn remux_cache_path(&self, path: &std::path::Path) -> Option<PathBuf> {
+        let meta = tokio::fs::metadata(path).await.ok()?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let key = fnv1a_hex(&format!("{}|{}|{mtime}", path.to_string_lossy(), meta.len()));
+        Some(self.inner.dir.join("remux").join(format!("{key}.mp4")))
     }
 
     /// 整文件 copy-remux 缓存:视频 `-c copy`(不重编码)、音轨按需转 AAC 立体声+响度链,
@@ -829,17 +853,11 @@ impl MediaRuntime {
         duration: Option<f64>,
     ) -> Result<PathBuf> {
         let meta = tokio::fs::metadata(path).await?;
-        let cache_dir = self.inner.dir.join("remux");
-        tokio::fs::create_dir_all(&cache_dir).await?;
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let key =
-            fnv1a_hex(&format!("{}|{}|{mtime}", path.to_string_lossy(), meta.len()));
-        let out = cache_dir.join(format!("{key}.mp4"));
+        let out = self
+            .remux_cache_path(path)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("源文件元数据读不到"))?;
+        tokio::fs::create_dir_all(out.parent().expect("remux 产物必有父目录")).await?;
         if tokio::fs::metadata(&out).await.map(|m| m.len() > 0).unwrap_or(false) {
             return Ok(out); // 缓存命中(连播预热的成果在这兑现)
         }
@@ -852,7 +870,8 @@ impl MediaRuntime {
         self.inner.remux_inflight.lock().unwrap().remove(&out);
         result?;
         // 清缓存(总量封顶,最新的留下;spawn_blocking:目录扫描别占 runtime)
-        let (dir, keep) = (cache_dir, out.clone());
+        let dir = out.parent().expect("remux 产物必有父目录").to_path_buf();
+        let keep = out.clone();
         let _ = tokio::task::spawn_blocking(move || prune_remux_cache(&dir, &keep)).await;
         Ok(out)
     }
@@ -1104,10 +1123,10 @@ impl MediaRuntime {
             duration_seconds = pr.duration_seconds;
             if pr.audio_incompatible || pr.video_incompatible {
                 self.log_local_codec(&path, &pr);
-                // 视频轨兼容(只有音轨不对)→ 优先整文件 copy-remux(C2:不重编码 + 原生 seek);
-                // 不行再回落 HLS//m/(视频也不兼容 = 必须重编码,只能按需切)。
+                // 视频轨兼容(只有音轨不对)→ remux 缓存命中直传;未命中后台预热、本次走原路
+                // (永不内联等待,见 remux_cached_or_warm)。视频也不兼容 = 必须重编码,只能按需切。
                 let remuxed = if !pr.video_incompatible {
-                    self.try_remux_direct(relay, &path, pr.audio_incompatible, pr.duration_seconds)
+                    self.remux_cached_or_warm(relay, &path, pr.audio_incompatible, pr.duration_seconds)
                         .await
                 } else {
                     None
@@ -1141,7 +1160,7 @@ impl MediaRuntime {
                     duration_seconds = pr.duration_seconds;
                     self.log_local_codec(&path, &pr);
                     let remuxed = if !pr.video_incompatible {
-                        self.try_remux_direct(
+                        self.remux_cached_or_warm(
                             relay,
                             &path,
                             pr.audio_incompatible,

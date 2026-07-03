@@ -274,7 +274,7 @@ pub fn delete_briefing(state: State<'_, AppState>, id: i64) -> Result<(), AppErr
 
 /// 提醒页:当前用户待触发的提醒(定时任务,按时间升序)。
 #[tauri::command]
-pub fn list_reminders(state: State<'_, AppState>) -> Result<Vec<Job>, AppError> {
+pub fn list_reminders(state: State<'_, AppState>) -> Result<Vec<larkwing_core::engine::ReminderItem>, AppError> {
     state.engine.list_reminders()
 }
 

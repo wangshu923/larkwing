@@ -117,6 +117,8 @@ export interface Reminder {
   kind: string
   created_at: number
   updated_at: number
+  /** 家人的提醒 = TA 的名字(提醒页是主人的管理面,全家可见可撤);自己的没有此字段。 */
+  owner?: string
 }
 
 export interface BootSnapshot {
