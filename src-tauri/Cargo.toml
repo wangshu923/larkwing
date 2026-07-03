@@ -43,6 +43,8 @@ time = "0.3"
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
 # 终端 CTRL+C 兜底:GUI/托盘设计下事件循环不理会 SIGINT,开发时进程停不掉。
 ctrlc = "3"
+# 原生 stderr 落盘(src/nativelog.rs):unix dup2 / Windows UCRT _dup2(libc 两端都带正确 link_name)。
+libc = "0.2"
 
 # 前台全屏检测(悬浮窗让位,见 src/fullscreen.rs):仅 Windows 需要;复用 Tauri 已拉的
 # windows 0.61,不引入新版本。Mac 原生 space 已天然不覆盖别 app 全屏,无此依赖。

@@ -5,6 +5,7 @@ mod commands;
 #[cfg(windows)]
 mod fullscreen;
 mod logkeep;
+mod nativelog;
 
 use larkwing_core::engine::Engine;
 use larkwing_core::scenes::Scenes;
@@ -116,6 +117,11 @@ pub fn run() {
         .ok();
       app.manage(LogGuard(guard));
       logkeep::spawn(data_dir.join("logs")); // 滚动之外的管护:压缩历史日志、清理 30 天前的
+      // 原生库(sherpa/ORT/espeak)的真实报错只走 stderr,GUI 子系统下会蒸发 → 落盘 native.log。
+      // dev 不启用:终端里 stderr 本来就看得见,别把 panic 从开发者眼前抢走。
+      if !cfg!(debug_assertions) {
+        nativelog::redirect_stderr(&data_dir.join("logs"), env!("CARGO_PKG_VERSION"));
+      }
       if let Some(m) = &data_missing {
         tracing::warn!(missing = %m.display(), root = %data_dir.display(),
           "数据位置失效(盘没插/被删),已回落默认根;前端将提示恢复(退出去插回磁盘 / 恢复默认)");

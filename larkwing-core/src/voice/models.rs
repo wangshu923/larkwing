@@ -198,6 +198,10 @@ pub const TTS_ZIPVOICE: TreeModelSpec = TreeModelSpec {
     url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/sherpa-onnx-zipvoice-distill-int8-zh-en-emilia.tar.bz2",
     // 实况大小(2026-07-02 直连核对):encoder 5,570,211 / decoder 124,657,100 / vocos 54,157,409 /
     // tokens 2,570 / lexicon 1,727,147;下界取 ~90%。
+    // espeak 三件 = **内容探针**(2026-07-03 补,真机「文件齐全却加载失败」追因):原先只查
+    // espeak-ng-data 目录**存在**,解包中断/被杀软拦截留下的残缺树会被判「就绪」→ sherpa 加载失败
+    // 却报「文件齐全」,自愈也不会重解(ready 恒 true)。实况:phontab 55,796 / phondata 550,424 /
+    // cmn_dict 1,566,335(中文 G2P 命根);下界取 ~60% 防上游微调误伤(同 tar 的 Mac 可加载树核对)。
     ready: &[
         ("encoder.int8.onnx", 5_000_000),
         ("decoder.int8.onnx", 110_000_000),
@@ -205,6 +209,9 @@ pub const TTS_ZIPVOICE: TreeModelSpec = TreeModelSpec {
         ("tokens.txt", 1_000),
         ("lexicon.txt", 1_500_000),
         ("espeak-ng-data", 0),
+        ("espeak-ng-data/phontab", 30_000),
+        ("espeak-ng-data/phondata", 300_000),
+        ("espeak-ng-data/cmn_dict", 900_000),
     ],
     skip: &["test_wavs"],
     // vocos 声码器不在模型 tar 里(实测:tar 仅含 encoder/decoder/tokens/lexicon/espeak-ng-data),

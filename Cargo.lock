@@ -2813,6 +2813,7 @@ dependencies = [
  "ctrlc",
  "flate2",
  "larkwing-core",
+ "libc",
  "log",
  "rustls",
  "serde",

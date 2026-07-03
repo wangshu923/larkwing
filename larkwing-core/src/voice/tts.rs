@@ -171,8 +171,12 @@ impl ZipVoiceTts {
         // 2 太保守(实测 77 字 ~19s),提到 6(留核给 ASR/LLM/UI)。配短参考音一起降延迟。
         cfg.model.num_threads = 6;
         let t0 = std::time::Instant::now();
-        let tts = sherpa_onnx::OfflineTts::create(&cfg)
-            .ok_or_else(|| anyhow!("音色克隆模型加载失败{}", zipvoice_dir_hint(model_dir)))?;
+        let tts = sherpa_onnx::OfflineTts::create(&cfg).ok_or_else(|| {
+            anyhow!(
+                "音色克隆模型加载失败{};sherpa 的真实报错在数据目录 logs/native.log 末尾(正式版)",
+                zipvoice_dir_hint(model_dir)
+            )
+        })?;
         tracing::info!(ms = t0.elapsed().as_millis() as u64, "音色克隆模型加载完成(zipvoice)");
         Ok(ZipVoiceTts { tts, resolve })
     }
