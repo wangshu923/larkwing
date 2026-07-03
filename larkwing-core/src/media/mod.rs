@@ -179,53 +179,6 @@ struct PendingPlay {
 /// 待重放有效期:超过即作废。
 const PENDING_PLAY_TTL: Duration = Duration::from_secs(600);
 
-/// copy-remux 缓存总量封顶(可重建缓存,超了从旧往新清;电影级产物一部几 GB,16G ≈ 一部剧
-/// 的连播余量 + 几部电影)。起步值,真机按盘大小体感再调(§13.7 同款「真用才能调」)。
-const REMUX_CACHE_MAX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
-/// 转封装前要求的最低磁盘余量(产物之外再留的安全垫)。
-const REMUX_FREE_MARGIN_BYTES: u64 = 500 * 1024 * 1024;
-
-/// remux 缓存清理:按 mtime 新→旧累计,超出总量封顶的旧产物删掉(`keep` = 刚出炉的永不删);
-/// 顺手清超过一小时的 `.part` 残件(中断/崩溃留下的)。
-fn prune_remux_cache(dir: &std::path::Path, keep: &std::path::Path) {
-    prune_remux_cache_with_cap(dir, keep, REMUX_CACHE_MAX_BYTES)
-}
-
-/// 拆出 cap 参数只为可单测(生产恒用 `REMUX_CACHE_MAX_BYTES`)。
-fn prune_remux_cache_with_cap(dir: &std::path::Path, keep: &std::path::Path, cap: u64) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
-    for e in rd.flatten() {
-        let Ok(meta) = e.metadata() else { continue };
-        if !meta.is_file() {
-            continue;
-        }
-        let p = e.path();
-        let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-        match p.extension().and_then(|x| x.to_str()) {
-            Some("mp4") => files.push((p, meta.len(), modified)),
-            Some("part") => {
-                let stale = modified
-                    .elapsed()
-                    .map(|d| d > std::time::Duration::from_secs(3600))
-                    .unwrap_or(true);
-                if stale {
-                    let _ = std::fs::remove_file(&p);
-                }
-            }
-            _ => {}
-        }
-    }
-    files.sort_by(|a, b| b.2.cmp(&a.2)); // 新在前
-    let mut total = 0u64;
-    for (p, len, _) in files {
-        total = total.saturating_add(len);
-        if total > cap && p != keep {
-            let _ = std::fs::remove_file(&p);
-        }
-    }
-}
-
 /// 前端播放器的「此刻」状态快照。播放真相在前端 WebView(播放在那跑、放完只有它知道);
 /// core 起播时乐观 seed,前端在生命周期切换(playing/paused/ended/stop)+ 音量/倍速/seek 调整
 /// + 播放中低频心跳时经 `report_media_state` 命令回报校准。app 级瞬态(§6.4 派生可丢:
@@ -309,8 +262,6 @@ struct Inner {
     playback: Mutex<Playback>,
     /// 当前剧集队列(多集续播;None = 没在放剧集/单集内容)。
     playlist: Mutex<Option<Playlist>>,
-    /// 整文件 copy-remux 在飞集合(按产物路径去重:播放与连播预热撞同一文件只转一趟)。
-    remux_inflight: Mutex<std::collections::HashSet<PathBuf>>,
 }
 
 #[derive(Clone)]
@@ -336,7 +287,6 @@ impl MediaRuntime {
                 pending_play: Mutex::new(HashMap::new()),
                 playback: Mutex::new(Playback::default()),
                 playlist: Mutex::new(None),
-                remux_inflight: Mutex::new(std::collections::HashSet::new()),
             }),
         }
     }
@@ -816,214 +766,6 @@ impl MediaRuntime {
         }
     }
 
-    /// C2「兼容视频省 CPU」主入口(v0.2.5 改「**永不内联等待**」):缓存命中 → /f/ 原生直传秒开;
-    /// 未命中 → **后台预热**(inflight 去重)并返回 None,本次照旧走 HLS//m/ 转码路。
-    /// 曾内联 await 整片 remux —— BD 大片/NAS 一趟几分钟,直接把 media_play 工具等到超时,
-    /// kill_on_drop 连坐杀掉 ffmpeg(HUD「意外中断了」,2026-07-03 真机实锤《流浪地球2》BD)。
-    /// 现在:播放永不等 remux;首播代价 = 原路转码(与 C2 之前持平,不是回退),二刷起吃缓存;
-    /// 剧集另有连播预热。首播期间 remux(IO 型)与 HLS 转码(CPU 型)并行,资源型互补、可接受。
-    async fn remux_cached_or_warm(
-        &self,
-        relay: &relay::Relay,
-        path: &std::path::Path,
-        transcode_audio: bool,
-        duration: Option<f64>,
-    ) -> Option<String> {
-        match self.remux_cache_path(path).await {
-            Some(cached) if tokio::fs::metadata(&cached).await.map(|m| m.len() > 0).unwrap_or(false) => {
-                Some(relay.register_file(cached)) // 二刷/预热成果:原生直传
-            }
-            Some(_) => {
-                let (this, p) = (self.clone(), path.to_path_buf());
-                tokio::spawn(async move {
-                    if let Err(e) = this.remux_to_cache(&p, transcode_audio, duration).await {
-                        tracing::info!(path = %p.display(), "copy-remux 预热未成(下次照旧转码路): {e:#}");
-                    }
-                });
-                None
-            }
-            None => None, // 元数据都读不到:交给原路自己报错
-        }
-    }
-
-    /// 该文件的 remux 缓存产物路径(键 = 路径+大小+mtime;不创建、不判存在)。
-    async fn remux_cache_path(&self, path: &std::path::Path) -> Option<PathBuf> {
-        let meta = tokio::fs::metadata(path).await.ok()?;
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let key = fnv1a_hex(&format!("{}|{}|{mtime}", path.to_string_lossy(), meta.len()));
-        Some(self.inner.dir.join("remux").join(format!("{key}.mp4")))
-    }
-
-    /// 整文件 copy-remux 缓存:视频 `-c copy`(不重编码)、音轨按需转 AAC 立体声+响度链,
-    /// `+faststart` 出标准 mp4 → 之后当普通兼容文件秒开。产物是**可重建缓存**(§6.2 blob 不进库),
-    /// 键 = 源路径+大小+mtime(源变了自动换键);命中秒回,总量超 `REMUX_CACHE_MAX_BYTES` 旧的先清。
-    async fn remux_to_cache(
-        &self,
-        path: &std::path::Path,
-        transcode_audio: bool,
-        duration: Option<f64>,
-    ) -> Result<PathBuf> {
-        let meta = tokio::fs::metadata(path).await?;
-        let out = self
-            .remux_cache_path(path)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("源文件元数据读不到"))?;
-        tokio::fs::create_dir_all(out.parent().expect("remux 产物必有父目录")).await?;
-        if tokio::fs::metadata(&out).await.map(|m| m.len() > 0).unwrap_or(false) {
-            return Ok(out); // 缓存命中(连播预热的成果在这兑现)
-        }
-        // 并发去重:同产物已有一趟在转(播放与预热撞车)→ 本趟让路,调用方走原路、下次命中
-        {
-            let mut inflight = self.inner.remux_inflight.lock().unwrap();
-            anyhow::ensure!(inflight.insert(out.clone()), "同文件转封装已在进行");
-        }
-        let result = self.remux_run(path, &out, transcode_audio, duration, meta.len()).await;
-        self.inner.remux_inflight.lock().unwrap().remove(&out);
-        result?;
-        // 清缓存(总量封顶,最新的留下;spawn_blocking:目录扫描别占 runtime)
-        let dir = out.parent().expect("remux 产物必有父目录").to_path_buf();
-        let keep = out.clone();
-        let _ = tokio::task::spawn_blocking(move || prune_remux_cache(&dir, &keep)).await;
-        Ok(out)
-    }
-
-    /// 跑一趟 ffmpeg copy-remux(HUD 进度卡;`.part` 原子就位,失败/中断残件由 prune 清)。
-    async fn remux_run(
-        &self,
-        src: &std::path::Path,
-        out: &std::path::Path,
-        transcode_audio: bool,
-        duration: Option<f64>,
-        src_len: u64,
-    ) -> Result<()> {
-        // 磁盘预检(fs2,datadir 同款):产物 ≈ 源大小(视频 copy),不够别把盘写爆
-        let avail = fs2::available_space(out.parent().unwrap()).unwrap_or(u64::MAX);
-        anyhow::ensure!(
-            avail > src_len + REMUX_FREE_MARGIN_BYTES,
-            "磁盘剩余空间不够转封装(剩 {avail} 字节)"
-        );
-        let ffmpeg = self.ensure_component(Component::Ffmpeg).await?;
-        let name = src.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        let task = self
-            .inner
-            .tasks
-            .start("remux", Text::with("task.remux", serde_json::json!({ "name": name })));
-        let part = out.with_extension("part");
-
-        let mut cmd = tokio::process::Command::new(&ffmpeg);
-        cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin").arg("-y");
-        cmd.arg("-i").arg(src);
-        // 只带首视频轨 + 首音轨(有就带):内嵌字幕/数据轨 WebView 用不上,mp4 里还会碍事
-        cmd.arg("-map").arg("0:v:0").arg("-map").arg("0:a:0?");
-        cmd.arg("-c:v").arg("copy");
-        if transcode_audio {
-            cmd.arg("-c:a")
-                .arg("aac")
-                .arg("-af")
-                .arg(relay::AUDIO_LOUDNESS_AF)
-                .arg("-b:a")
-                .arg("256k");
-        } else {
-            cmd.arg("-c:a").arg("copy");
-        }
-        cmd.arg("-sn").arg("-dn").arg("-movflags").arg("+faststart");
-        cmd.arg("-progress").arg("pipe:1").arg("-nostats");
-        cmd.arg("-f").arg("mp4").arg(&part);
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        no_console(&mut cmd);
-
-        let run = async {
-            let mut child = cmd.spawn().context("ffmpeg 起不来")?;
-            // stderr 旁路收集(失败时给出真因,不静默 §3.5)
-            let errbuf = child.stderr.take().map(|mut se| {
-                tokio::spawn(async move {
-                    use tokio::io::AsyncReadExt;
-                    let mut buf = String::new();
-                    let _ = se.read_to_string(&mut buf).await;
-                    buf
-                })
-            });
-            if let Some(so) = child.stdout.take() {
-                use tokio::io::AsyncBufReadExt;
-                let mut lines = tokio::io::BufReader::new(so).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if let Some(us) = line
-                        .strip_prefix("out_time_us=")
-                        .and_then(|v| v.trim().parse::<f64>().ok())
-                    {
-                        if let Some(d) = duration.filter(|d| *d > 0.0) {
-                            task.progress((us / 1_000_000.0 / d) as f32);
-                        }
-                    }
-                }
-            }
-            let status = child.wait().await.context("等待 ffmpeg 失败")?;
-            if !status.success() {
-                let err = match errbuf {
-                    Some(h) => h.await.unwrap_or_default(),
-                    None => String::new(),
-                };
-                anyhow::bail!("ffmpeg 转封装失败: {}", err.lines().last().unwrap_or("未知错误"));
-            }
-            Ok(())
-        };
-        // 兜底超时:copy-remux 是 IO 速度(分钟级封顶),挂死的 ffmpeg 别让 HUD 永远转圈
-        let result: Result<()> =
-            match tokio::time::timeout(std::time::Duration::from_secs(30 * 60), run).await {
-                Ok(r) => r,
-                Err(_) => Err(anyhow::anyhow!("转封装超时")),
-            };
-        match result {
-            Ok(()) => {
-                tokio::fs::rename(&part, out).await.context("转封装产物就位失败")?;
-                task.done();
-                Ok(())
-            }
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&part).await;
-                task.fail("task.err.remux", serde_json::Value::Null);
-                Err(e)
-            }
-        }
-    }
-
-    /// 剧集连播预热(C2):队列里的下一集也是「会走 remux」的本地片就先转出来 —— remux 快于
-    /// 实时,这一集没看完下一集就绪,切集零等待。只暖 mkv 类容器(剧集连播的常见形;BMFF
-    /// 音轨不兼容的少见形不预热,播到再转)。fire-and-forget,失败无声(播到时再走正路)。
-    fn prefetch_next_remux(&self) {
-        let next = {
-            let guard = self.inner.playlist.lock().unwrap();
-            guard.as_ref().and_then(|pl| {
-                if pl.audio_only {
-                    return None; // 放歌直传,无 remux 可言
-                }
-                pl.entries.get(pl.index + 1).map(|e| e.url.clone())
-            })
-        };
-        let Some(url) = next.filter(|u| is_local_path(u)) else { return };
-        let path = std::path::PathBuf::from(&url);
-        if !probe::needs_ffmpeg_container(&path) {
-            return;
-        }
-        let this = self.clone();
-        tokio::spawn(async move {
-            let Ok(ffmpeg) = this.ensure_component(Component::Ffmpeg).await else { return };
-            let pr = this.probe_with_ffmpeg(&ffmpeg, &path).await;
-            if pr.video_incompatible {
-                return; // 视频轨要重编码 → 不预热(HLS 按需切,预转整片太重)
-            }
-            let _ = this.remux_to_cache(&path, pr.audio_incompatible, pr.duration_seconds).await;
-        });
-    }
-
     /// 音频字节(手机语音消息的 ogg/opus 等)→ 16k 单声道 f32 PCM(喂本地 ASR)。
     /// ffmpeg 组件解码:落临时文件(解封装要可 seek 输入更稳)→ `-f f32le` 读 stdout;
     /// `-t max_secs` 双保险截断(调用方已按时长挡长语音)。用完即删,失败如实报错。
@@ -1139,56 +881,32 @@ impl MediaRuntime {
             duration_seconds = pr.duration_seconds;
             if pr.audio_incompatible || pr.video_incompatible {
                 self.log_local_codec(&path, &pr);
-                // 视频轨兼容(只有音轨不对)→ remux 缓存命中直传;未命中后台预热、本次走原路
-                // (永不内联等待,见 remux_cached_or_warm)。视频也不兼容 = 必须重编码,只能按需切。
-                let remuxed = if !pr.video_incompatible {
-                    self.remux_cached_or_warm(relay, &path, pr.audio_incompatible, pr.duration_seconds)
-                        .await
-                } else {
-                    None
-                };
-                match remuxed {
-                    Some(u) => u,
-                    None => {
-                        let (su, mu) = self
-                            .hls_or_fallback(
-                                relay,
-                                &path,
-                                pr.video_incompatible,
-                                pr.audio_incompatible,
-                                pr.duration_seconds,
-                            )
-                            .await;
-                        manifest_url = mu;
-                        su
-                    }
-                }
+                // 不兼容(音轨 AC3/DTS 或视频 HEVC)→ HLS 按需切片(shaka 原生 seek);无时长回落 /m/。
+                // (整文件 copy-remux/C2 已删——鸡肋:首播仍走 HLS、后台白转一份;省 CPU 的正解是
+                //  「已兼容视频 HLS copy 切片」,排 0.2.6 播放专版,见 PLAN。)
+                let (su, mu) = self
+                    .hls_or_fallback(
+                        relay,
+                        &path,
+                        pr.video_incompatible,
+                        pr.audio_incompatible,
+                        pr.duration_seconds,
+                    )
+                    .await;
+                manifest_url = mu;
+                su
             } else {
                 relay.register_file(path.clone()) // 全兼容:原生直传秒开
             }
         } else if probe::needs_ffmpeg_container(&path) {
             // mkv/avi 等容器 WebView2 放不了,必经 ffmpeg:先确保 ffmpeg、用它探编码。
-            // 视频轨兼容 → 整文件 copy-remux(C2,常见的 mkv+H.264 由此免重编码);
-            // 视频也不兼容 → 有时长走 HLS(按需重编码)、否则 /m/。
+            // 有时长走 HLS(shaka 原生 seek)、否则 /m/。(C2 整文件 remux 已删,见上。)
             match self.ensure_component(Component::Ffmpeg).await {
                 Ok(ffmpeg) => {
                     let pr = self.probe_with_ffmpeg(&ffmpeg, &path).await;
                     duration_seconds = pr.duration_seconds;
                     self.log_local_codec(&path, &pr);
-                    let remuxed = if !pr.video_incompatible {
-                        self.remux_cached_or_warm(
-                            relay,
-                            &path,
-                            pr.audio_incompatible,
-                            pr.duration_seconds,
-                        )
-                        .await
-                    } else {
-                        None
-                    };
-                    if let Some(u) = remuxed {
-                        u
-                    } else if let Some(dur) = pr.duration_seconds.filter(|d| *d > 0.0) {
+                    if let Some(dur) = pr.duration_seconds.filter(|d| *d > 0.0) {
                         // HLS 段一律转码视频 + 立体声 AAC(relay::build_frag_cmd),不传 transcode_*
                         let url = relay.register_file_hls(path.clone(), ffmpeg, dur);
                         manifest_url = Some(url.clone());
@@ -1224,10 +942,6 @@ impl MediaRuntime {
         };
         self.seed_playing(&np.title, pos.map(|p| (p.index, p.total)));
         self.publish(MediaEvent::Play(np.clone()));
-        // 连播预热(C2):下一集若也要 remux,趁这一集在放先转好,切集零等待
-        if pos.is_some() {
-            self.prefetch_next_remux();
-        }
         Ok(np)
     }
 
@@ -1499,40 +1213,6 @@ fn fnv1a_hex(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// remux 缓存清理:超总量从旧往新删、刚出炉的 keep 永不删、过期 .part 残件清掉。
-    #[test]
-    fn prune_remux_cache_caps_total_and_keeps_newest() {
-        let dir = std::env::temp_dir()
-            .join(format!("lw-remux-prune-{}-{}", std::process::id(), line!()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // 三个"大"产物(用真实文件+人造 mtime 排序:old < mid < new)
-        for (name, age_secs) in [("old.mp4", 300), ("mid.mp4", 200), ("new.mp4", 100)] {
-            let p = dir.join(name);
-            std::fs::write(&p, vec![0u8; 1024]).unwrap();
-            let t = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
-            let f = std::fs::File::options().write(true).open(&p).unwrap();
-            f.set_modified(t).unwrap();
-        }
-        // 过期 .part 残件(2 小时前)与新鲜 .part(现在)
-        for (name, age_secs) in [("stale.part", 7200u64), ("fresh.part", 0)] {
-            let p = dir.join(name);
-            std::fs::write(&p, b"x").unwrap();
-            let t = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
-            let f = std::fs::File::options().write(true).open(&p).unwrap();
-            f.set_modified(t).unwrap();
-        }
-        // 封顶极小(1 字节)→ 除 keep 外全超限;keep=new.mp4 必须活下来
-        // (直接压 REMUX_CACHE_MAX_BYTES 不可行——它是编译期常量,这里用"全都超限"的极端形验逻辑:
-        //  新在前累计,new.mp4 第一个越线但它是 keep → 留;old/mid 越线且非 keep → 删)
-        prune_remux_cache_with_cap(&dir, &dir.join("new.mp4"), 1);
-        assert!(dir.join("new.mp4").is_file(), "keep 永不删");
-        assert!(!dir.join("old.mp4").exists() && !dir.join("mid.mp4").exists(), "超限旧产物清掉");
-        assert!(!dir.join("stale.part").exists(), "过期残件清掉");
-        assert!(dir.join("fresh.part").is_file(), "新鲜 .part(可能正在写)不动");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     fn runtime(tag: &str) -> (MediaRuntime, tokio::sync::broadcast::Receiver<AppEvent>) {
         let dir = std::env::temp_dir().join(format!("lw-media-test-{}-{tag}", std::process::id()));

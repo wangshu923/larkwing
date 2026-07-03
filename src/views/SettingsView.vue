@@ -12,6 +12,7 @@ import { useToast } from '../composables/useToast'
 import { refreshAudioMode } from '../composables/useAudioGraph'
 import { useWakeCalib } from '../composables/useWakeCalib'
 import { audioFileToWavBase64 } from '../composables/useAudioDecode'
+import SkinSelect from '../components/SkinSelect.vue'
 
 const emit = defineEmits<{ (e: 'close'): void }>()
 const { t } = useI18n()
@@ -239,11 +240,21 @@ function onNightTime(key: string, ev: Event) {
 
 // 识别模型档(sense-voice 默认 / firered-ctc 更准):写库 → 开着唤醒就重启循环让新模型生效
 // (同 sensitivity;新模型首次会用时下载)→ 刷状态行(组件就绪反映的是当前选中的模型)。
-async function onAsrModel(e: Event) {
-  await settings.set('voice.asr.model', (e.target as HTMLSelectElement).value)
+async function onAsrModel(v: string) {
+  await settings.set('voice.asr.model', v)
   await restartWakeIfRunning()
   if (isTauri()) voiceInfo.value = await api.voiceStatus().catch(() => voiceInfo.value)
 }
+/** 识别模型下拉项(SkinSelect;两档,文案随 locale)。 */
+const asrOpts = computed(() => [
+  { value: 'sense-voice', label: t('settings.voice.asr_standard') },
+  { value: 'firered-ctc', label: t('settings.voice.asr_accurate') },
+])
+/** 麦克风下拉项(默认 + 设备列表)。 */
+const micOpts = computed(() => [
+  { value: '', label: t('settings.voice.micDefault') },
+  ...(voiceInfo.value?.devices ?? []).map((d) => ({ value: d, label: d })),
+])
 
 // 自定义音色:选本地音频文件 → 前端解码/重采样成 16k → 后端转写出草稿 → 起名/改稿 → 保存。
 const cloneFile = ref<HTMLInputElement | null>(null)
@@ -383,8 +394,8 @@ async function previewSpeaker(id: string) {
     finish(true, e)
   }
 }
-function setMic(ev: Event) {
-  void settings.set('voice.input_device', (ev.target as HTMLSelectElement).value)
+function setMic(v: string) {
+  void settings.set('voice.input_device', v)
   void restartWakeIfRunning() // 换麦立即生效:运行中的唤醒也重开采集用新设备
 }
 
@@ -770,12 +781,37 @@ function ovWinK(over: ModelOverride | null): number | '' {
 function tierLabel(tier: ModelTier): string {
   return t(`settings.brain.tier_${tier}`)
 }
+/** 档位下拉项(SkinSelect):首项「自动(=目录猜测)」带猜测档标签,其余三档。 */
+function tierOpts(meta: ModelMeta) {
+  return [
+    { value: '', label: t('settings.brain.tierAuto', { tier: tierLabel(meta.guess.tier) }) },
+    { value: 'light', label: t('settings.brain.tier_light') },
+    { value: 'balanced', label: t('settings.brain.tier_balanced') },
+    { value: 'smart', label: t('settings.brain.tier_smart') },
+  ]
+}
+/** 计价方式下拉项(SkinSelect)。 */
+const billingOpts = computed(() => [
+  { value: '', label: t('settings.brain.billingAuto') },
+  { value: 'cached', label: t('settings.brain.billing_cached') },
+  { value: 'uncached', label: t('settings.brain.billing_uncached') },
+  { value: 'percall', label: t('settings.brain.billing_percall') },
+])
+/** 渠道对话「指认给谁」下拉项:还没指认 + 家人们。 */
+const famOpts = computed(() => [
+  { value: '', label: t('settings.family.unassigned') },
+  ...family.value.map((m) => ({ value: String(m.id), label: m.name })),
+])
 // 改一格 → 合并进该模型的覆盖,空值删该格;后端空壳自动删整条
+// 数字输入(上下文/价格)走 Event;两个下拉(档位/计价)走 SkinSelect 直接给值 → 共用核心。
 async function saveOv(p: ProviderView, field: keyof ModelOverride, ev: Event) {
+  await saveOvRaw(p, field, (ev.target as HTMLInputElement).value)
+}
+async function saveOvRaw(p: ProviderView, field: keyof ModelOverride, rawIn: string) {
   const meta = modelMeta[p.model]
   if (!meta) return
   const cur: ModelOverride = { model: p.model, ...(meta.over ?? {}) }
-  const raw = (ev.target as HTMLInputElement | HTMLSelectElement).value.trim()
+  const raw = rawIn.trim()
   if (field === 'tier' || field === 'billing') {
     if (raw) (cur as unknown as Record<string, unknown>)[field] = raw
     else delete cur[field]
@@ -895,8 +931,7 @@ async function removeFam(m: FamilyMember) {
     useToast().error(t('toast.deleteFailed'))
   }
 }
-async function bindChat(c: ChannelChat, ev: Event) {
-  const v = (ev.target as HTMLSelectElement).value
+async function bindChat(c: ChannelChat, v: string) {
   const uid = v ? Number(v) : null
   try {
     await api.bindChannelChat(c.id, uid)
@@ -1071,12 +1106,12 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           </button>
           <div v-if="advOpen[p.id] && modelMeta[p.model]" class="p-grid adv-grid">
             <label>{{ t('settings.brain.tier') }}</label>
-            <select class="s-input" :value="modelMeta[p.model].over?.tier ?? ''" @change="saveOv(p, 'tier', $event)">
-              <option value="">{{ t('settings.brain.tierAuto', { tier: tierLabel(modelMeta[p.model].guess.tier) }) }}</option>
-              <option value="light">{{ t('settings.brain.tier_light') }}</option>
-              <option value="balanced">{{ t('settings.brain.tier_balanced') }}</option>
-              <option value="smart">{{ t('settings.brain.tier_smart') }}</option>
-            </select>
+            <SkinSelect
+              :model-value="modelMeta[p.model].over?.tier ?? ''"
+              :options="tierOpts(modelMeta[p.model])"
+              :aria-label="t('settings.brain.tier')"
+              @update:model-value="(v: string) => saveOvRaw(p, 'tier', v)"
+            />
             <label>{{ t('settings.brain.ctxWindow') }}</label>
             <input class="s-input s-mono-input" type="number" min="1"
               :value="ovWinK(modelMeta[p.model].over)"
@@ -1093,12 +1128,12 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               :placeholder="autoHint(modelMeta[p.model].guess.outUsdPerM)"
               @change="saveOv(p, 'outUsdPerM', $event)" />
             <label>{{ t('settings.brain.billing') }}</label>
-            <select class="s-input" :value="modelMeta[p.model].over?.billing ?? ''" @change="saveOv(p, 'billing', $event)">
-              <option value="">{{ t('settings.brain.billingAuto') }}</option>
-              <option value="cached">{{ t('settings.brain.billing_cached') }}</option>
-              <option value="uncached">{{ t('settings.brain.billing_uncached') }}</option>
-              <option value="percall">{{ t('settings.brain.billing_percall') }}</option>
-            </select>
+            <SkinSelect
+              :model-value="modelMeta[p.model].over?.billing ?? ''"
+              :options="billingOpts"
+              :aria-label="t('settings.brain.billing')"
+              @update:model-value="(v: string) => saveOvRaw(p, 'billing', v)"
+            />
             <p class="adv-hint">{{ t('settings.brain.advHint') }}</p>
           </div>
         </div>
@@ -1183,10 +1218,13 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           <div v-for="c in chats" :key="c.id" class="row fam-row">
             <span class="chip">{{ channelName(c.channel) }}</span>
             <span class="fam-chat-label" :title="c.ext_id">{{ c.label || c.ext_id }}</span>
-            <select class="s-input fam-select" :value="c.user_id ?? ''" @change="bindChat(c, $event)">
-              <option value="">{{ t('settings.family.unassigned') }}</option>
-              <option v-for="m in family" :key="m.id" :value="m.id">{{ m.name }}</option>
-            </select>
+            <SkinSelect
+              class="fam-select"
+              :model-value="String(c.user_id ?? '')"
+              :options="famOpts"
+              :aria-label="t('settings.family.unassigned')"
+              @update:model-value="(v: string) => bindChat(c, v)"
+            />
           </div>
           <p v-if="chats.length" class="hint">{{ t('settings.family.chatsHint') }}</p>
         </template>
@@ -1343,10 +1381,13 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         </div>
         <div class="row">
           <span class="label">{{ t('settings.voice.micDevice') }}</span>
-          <select class="s-input v-mic" :value="settings.get('voice.input_device')" @change="setMic">
-            <option value="">{{ t('settings.voice.micDefault') }}</option>
-            <option v-for="d in voiceInfo?.devices ?? []" :key="d" :value="d">{{ d }}</option>
-          </select>
+          <SkinSelect
+            class="v-mic"
+            :model-value="settings.get('voice.input_device')"
+            :options="micOpts"
+            :aria-label="t('settings.voice.micDevice')"
+            @update:model-value="setMic"
+          />
         </div>
         <!-- 在线/离线合成档(D 期):离线断网也能说,但要下个大模型、音色单一 -->
         <div class="row">
@@ -1364,14 +1405,13 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
              FireRed 中文最准。模型用时下载;换档后开着唤醒会重启循环让新模型生效(同 sensitivity) -->
         <div class="row">
           <span class="label">{{ t('settings.voice.asrModel') }}</span>
-          <select
-            class="s-input v-mic"
-            :value="settings.get('voice.asr.model') || 'sense-voice'"
-            @change="onAsrModel"
-          >
-            <option value="sense-voice">{{ t('settings.voice.asr_standard') }}</option>
-            <option value="firered-ctc">{{ t('settings.voice.asr_accurate') }}</option>
-          </select>
+          <SkinSelect
+            class="v-mic"
+            :model-value="settings.get('voice.asr.model') || 'sense-voice'"
+            :options="asrOpts"
+            :aria-label="t('settings.voice.asrModel')"
+            @update:model-value="onAsrModel"
+          />
         </div>
         <p class="hint">{{ t('settings.voice.asrModelHint') }}</p>
         <div class="row">
@@ -1787,6 +1827,9 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .p-grid { display: grid; grid-template-columns: 52px minmax(0, 1fr); gap: 8px 12px; align-items: center; margin-top: 11px; font-size: 12.5px; }
 .p-grid label { color: var(--text-dim); }
 .p-grid .s-input { width: 100%; min-width: 0; }
+/* 高级格里的 SkinSelect(档位/计价)填满单元格(root 默认 inline-block 不自动撑) */
+.adv-grid .skinsel { width: 100%; }
+.adv-grid .skinsel .s-input { min-width: 0; }
 /* 高级折叠:档位/价/窗口纠错。标签更长 → 加宽标签列;提示占满两列 */
 .adv-toggle { margin-top: 10px; font-size: 12px; color: var(--text-dim); }
 .adv-grid { grid-template-columns: 96px minmax(0, 1fr); margin-top: 8px; padding-top: 10px; border-top: 1px dashed var(--line); }
@@ -1815,7 +1858,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .fam-row .chip-del { margin-left: auto; }
 .fam-you { color: var(--text-dim); font-size: 11px; }
 .fam-chat-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); font-size: 12.5px; }
-.fam-select { flex: 0 0 auto; max-width: 160px; margin-left: auto; }
+.fam-select { flex: 0 0 auto; width: 180px; margin-left: auto; }
+.fam-select .s-input, .v-mic .s-input { min-width: 0; } /* SkinSelect 按钮不吃 .s-input 的 220 min-width,随容器 */
 .hidden-file { display: none; }
 .clone-edit { align-items: flex-start; }
 .clone-form { display: flex; flex-direction: column; gap: 6px; max-width: 420px; width: 100%; }
@@ -1837,7 +1881,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .sens { display: inline-flex; align-items: center; gap: 10px; }
 .sens small { color: var(--text-dim); font-size: 12px; white-space: nowrap; }
 .sens .v-vol { width: 150px; }
-.v-mic { max-width: 280px; }
+.v-mic { width: 280px; max-width: 280px; }
 .comp { letter-spacing: 1px; color: var(--text-dim); }
 .comp.ok { color: var(--ok); }
 
