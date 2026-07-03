@@ -1126,15 +1126,40 @@ impl Engine {
         Ok(())
     }
 
-    /// 删除家人:守住"至少留一人"+ 编排跨域清理(记忆/声纹随人走,隐私)。
-    /// 会话不删(历史可能混着别人,归属悬空无害;boot 取最近活跃用户兜底)。
+    /// 删除家人:守住"至少留一人"+ 编排跨域清理(记忆/声纹随人走,隐私;渠道指认清掉
+    /// 回落会话归属者)。会话不删(历史可能混着别人,归属悬空无害;boot 取最近活跃用户兜底)。
     pub fn delete_user(&self, id: i64) -> Result<(), AppError> {
         if self.store.users.count()? <= 1 {
             return Err(AppError { kind: ErrorKind::Internal, message: "至少得留一个人".into() });
         }
         self.store.memory.delete_for_user(id)?;
         self.store.voiceprints.remove(id)?;
+        self.store.channels.unbind_user(id)?;
         self.store.users.delete(id)?;
+        Ok(())
+    }
+
+    /// 渠道对话列表(家人页「远程对话」区:这条 TG/钉钉对话是谁在用)。
+    pub fn list_channel_chats(&self) -> Result<Vec<crate::store::ChannelThread>, AppError> {
+        Ok(self.store.channels.list()?)
+    }
+
+    /// 指认某条渠道对话归哪位家人(None = 取消指认,回落会话归属者)。
+    /// 校验家人真实存在,防绑到悬空 id(送进 speaker_user 前的同款防线)。
+    pub fn bind_channel_chat(
+        &self,
+        thread_id: i64,
+        user_id: Option<i64>,
+    ) -> Result<(), AppError> {
+        if let Some(uid) = user_id {
+            if self.store.users.get(uid)?.is_none() {
+                return Err(AppError {
+                    kind: ErrorKind::NotFound,
+                    message: format!("家人 {uid} 不存在"),
+                });
+            }
+        }
+        self.store.channels.bind_user(thread_id, user_id)?;
         Ok(())
     }
 
@@ -1640,7 +1665,10 @@ impl Engine {
                 Some(sid) if sid != conv_user && store.users.get(sid)?.is_some() => sid,
                 _ => conv_user,
             };
-            store.users.touch(mem_user)?;
+            // touch **会话归属者**而非说话人:last_active_at 是「这台电脑前用 app 的人」的信号,
+            // boot 的 ensure_default_user 按它恢复当前用户 —— 若 touch 说话人,家人在手机渠道
+            // 说一句就会「最近活跃」,主人重启 app 竟被切成 TA 的视角(渠道归人启用后才暴露)。
+            store.users.touch(conv_user)?;
             // 记忆只取常驻·画像层进前缀(§13.3 ②;按需层靠 recall 工具取),写时已执法预算
             // → 前缀有界、字节稳定,记得再多也不胀前缀(修掉「全量进前缀」雷,§13.1)
             let memories = store.memory.list_resident(mem_user)?;
@@ -1678,6 +1706,22 @@ impl Engine {
                 page_base as i64,
                 (total - page_base) as i64,
             )?;
+            // 说话人标记原料(渠道归人/声纹,§6 记忆归人的可见面):历史里出现过 speaker
+            // 才查家人表(id→名,排除会话归属者:主人自己不标);常态会话 = 空 map 零查询。
+            let speakers: std::collections::HashMap<i64, String> = if history
+                .iter()
+                .any(|m| m.payload.as_deref().is_some_and(|p| p.contains("speaker_user")))
+            {
+                store
+                    .users
+                    .list()?
+                    .into_iter()
+                    .filter(|u| u.id != conv_user)
+                    .map(|u| (u.id, u.name))
+                    .collect()
+            } else {
+                Default::default()
+            };
             let mut request = context::build_context(
                 &scene,
                 pet_name.as_deref(),
@@ -1688,6 +1732,7 @@ impl Engine {
                 page_base,
                 budget,
                 &tool_defs,
+                &speakers,
             );
             // 当轮注入图片 parts:挂到最后一条 user 消息上,持久前缀(few-shot/历史)字节不动 →
             // 缓存不破,也不为历史里的旧图反复付 vision 费(图当轮;文档文字已并进落库内容)。
@@ -1931,6 +1976,7 @@ impl Engine {
                     0,
                     budget,
                     &tool_defs,
+                    &std::collections::HashMap::new(), // 历史为空 → 无说话人标记
                 );
                 request
                     .messages

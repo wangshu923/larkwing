@@ -68,7 +68,7 @@ async fn serve(ctx: &ChannelCtx, net: &net::Client, ct: &CancellationToken) -> R
             if let Some(id) = upd.get("update_id").and_then(Value::as_i64) {
                 offset = offset.max(id + 1);
             }
-            let Some((chat_id, text)) = parse_message(&upd) else { continue };
+            let Some((chat_id, text, sender)) = parse_message(&upd) else { continue };
             let chat = chat_id.to_string();
 
             // 访问控制(非风控 §9):配了白名单就只放行名单内;空白名单 = 谁来都先发 onboarding
@@ -82,7 +82,7 @@ async fn serve(ctx: &ChannelCtx, net: &net::Client, ct: &CancellationToken) -> R
             }
 
             // 复用 turn loop:攒回复 → 按 4096 分片发回
-            match drive_turn(&ctx.engine, CHANNEL, &chat, text).await {
+            match drive_turn(&ctx.engine, CHANNEL, &chat, text, sender.as_deref()).await {
                 Ok(Some(reply)) => {
                     for piece in split_message(&reply, TG_MAX) {
                         if let Err(e) = send_message(net, &token, chat_id, &piece).await {
@@ -138,15 +138,21 @@ async fn send_message(net: &net::Client, token: &str, chat_id: i64, text: &str) 
     Ok(())
 }
 
-/// 从 update 取 (chat_id, text);非文本消息 → None。
-fn parse_message(upd: &Value) -> Option<(i64, String)> {
+/// 从 update 取 (chat_id, text, 发送者昵称);非文本消息 → None。
+/// 昵称 = from.first_name(+ last_name),只给家人页认脸,取不到无妨。
+fn parse_message(upd: &Value) -> Option<(i64, String, Option<String>)> {
     let msg = upd.get("message")?;
     let text = msg.get("text").and_then(Value::as_str)?.trim().to_string();
     if text.is_empty() {
         return None;
     }
     let chat_id = msg.get("chat")?.get("id").and_then(Value::as_i64)?;
-    Some((chat_id, text))
+    let sender = msg.get("from").map(|f| {
+        let first = f.get("first_name").and_then(Value::as_str).unwrap_or("");
+        let last = f.get("last_name").and_then(Value::as_str).unwrap_or("");
+        format!("{first} {last}").trim().to_string()
+    });
+    Some((chat_id, text, sender.filter(|s| !s.is_empty())))
 }
 
 /// 白名单(逗号/空格/分号/换行分隔的 chat id);空 = 未配置。
@@ -166,12 +172,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_message_extracts_text_and_chat() {
+    fn parse_message_extracts_text_chat_and_sender() {
         let upd = serde_json::json!({
             "update_id": 10,
-            "message": { "text": "  在吗  ", "chat": { "id": 12345 } }
+            "message": {
+                "text": "  在吗  ",
+                "chat": { "id": 12345 },
+                "from": { "first_name": "豆豆", "last_name": "" }
+            }
         });
-        assert_eq!(parse_message(&upd), Some((12345, "在吗".to_string())));
+        assert_eq!(parse_message(&upd), Some((12345, "在吗".to_string(), Some("豆豆".into()))));
+        // 无 from(频道帖等):昵称 None,消息照收
+        let bare = serde_json::json!({ "message": { "text": "hi", "chat": { "id": 1 } } });
+        assert_eq!(parse_message(&bare), Some((1, "hi".to_string(), None)));
     }
 
     #[test]

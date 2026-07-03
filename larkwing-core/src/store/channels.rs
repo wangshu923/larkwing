@@ -1,15 +1,19 @@
 //! 远程渠道会话映射(PLAN 远程渠道):平台 chat ↔ Larkwing 会话的持久绑定。
 //! 一个 (channel, ext_id) → 一个 conv_id;回访同一 chat 续接同一会话(复用 send_message 的历史回放)。
 //! 与「渠道 = 数据」一致:channel 是开放 TEXT,加渠道不改本域。
+//! 渠道归人(多用户第一步):每个 chat 可指认给一位家人(`user_id`,NULL = 会话归属者),
+//! 入站回合据此带 `speaker_user`(记忆/提醒归 TA);`label` 存平台昵称,只为家人页认得出这是谁的对话。
 
 use anyhow::Result;
 use rusqlite::OptionalExtension;
+use serde::Serialize;
 
 use super::db::{m, now_ms, Db, Migration};
 
-pub const MIGRATIONS: &[Migration] = &[m(
-    "0013_channels_init",
-    "CREATE TABLE channel_threads (
+pub const MIGRATIONS: &[Migration] = &[
+    m(
+        "0013_channels_init",
+        "CREATE TABLE channel_threads (
         id         INTEGER PRIMARY KEY,
         channel    TEXT NOT NULL,
         ext_id     TEXT NOT NULL,
@@ -17,7 +21,26 @@ pub const MIGRATIONS: &[Migration] = &[m(
         created_at INTEGER NOT NULL,
         UNIQUE (channel, ext_id)
     );",
-)];
+    ),
+    m(
+        "0017_channel_threads_user",
+        "ALTER TABLE channel_threads ADD COLUMN user_id INTEGER;
+         ALTER TABLE channel_threads ADD COLUMN label TEXT;",
+    ),
+];
+
+/// 一条渠道会话映射(家人页「谁的对话」列表行;serde 直过 IPC)。
+#[derive(Debug, Clone, Serialize)]
+pub struct ChannelThread {
+    pub id: i64,
+    pub channel: String,
+    pub ext_id: String,
+    pub conv_id: i64,
+    /// 指认给的家人(NULL = 未指认 → 按会话归属者,零行为变化)。
+    pub user_id: Option<i64>,
+    /// 平台昵称(TG first_name / 钉钉 senderNick),入站时顺手记下,给绑定 UI 认脸。
+    pub label: Option<String>,
+}
 
 #[derive(Clone)]
 pub struct ChannelRepo {
@@ -31,15 +54,21 @@ impl ChannelRepo {
 
     /// 该平台 chat 已绑定的会话 id(无则 None → 调用方建会话再 bind)。
     pub fn conv_for(&self, channel: &str, ext_id: &str) -> Result<Option<i64>> {
+        Ok(self.thread_for(channel, ext_id)?.map(|t| t.conv_id))
+    }
+
+    /// 整行映射(渠道入站用:conv_id + 指认的家人一次拿到)。
+    pub fn thread_for(&self, channel: &str, ext_id: &str) -> Result<Option<ChannelThread>> {
         self.db.with(|c| {
-            let id = c
+            let t = c
                 .query_row(
-                    "SELECT conv_id FROM channel_threads WHERE channel = ?1 AND ext_id = ?2",
+                    "SELECT id, channel, ext_id, conv_id, user_id, label
+                     FROM channel_threads WHERE channel = ?1 AND ext_id = ?2",
                     rusqlite::params![channel, ext_id],
-                    |r| r.get::<_, i64>(0),
+                    row_to_thread,
                 )
                 .optional()?;
-            Ok(id)
+            Ok(t)
         })
     }
 
@@ -55,6 +84,68 @@ impl ChannelRepo {
             Ok(())
         })
     }
+
+    /// 全部映射(家人页「远程对话」区;最近建的在前)。
+    pub fn list(&self) -> Result<Vec<ChannelThread>> {
+        self.db.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, channel, ext_id, conv_id, user_id, label
+                 FROM channel_threads ORDER BY created_at DESC",
+            )?;
+            let rows =
+                stmt.query_map([], row_to_thread)?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// 指认这条对话是谁在用(None = 取消指认,回到会话归属者)。
+    pub fn bind_user(&self, thread_id: i64, user_id: Option<i64>) -> Result<()> {
+        self.db.with(|c| {
+            c.execute(
+                "UPDATE channel_threads SET user_id = ?2 WHERE id = ?1",
+                rusqlite::params![thread_id, user_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// 记下平台昵称(入站顺手写,空白不写;给家人页认脸,不参与任何逻辑)。
+    pub fn set_label(&self, channel: &str, ext_id: &str, label: &str) -> Result<()> {
+        let label = label.trim();
+        if label.is_empty() {
+            return Ok(());
+        }
+        self.db.with(|c| {
+            c.execute(
+                "UPDATE channel_threads SET label = ?3
+                 WHERE channel = ?1 AND ext_id = ?2 AND (label IS NULL OR label <> ?3)",
+                rusqlite::params![channel, ext_id, label],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// 某家人被删:清掉所有指认(回落会话归属者,不删映射本身)。
+    pub fn unbind_user(&self, user_id: i64) -> Result<()> {
+        self.db.with(|c| {
+            c.execute(
+                "UPDATE channel_threads SET user_id = NULL WHERE user_id = ?1",
+                rusqlite::params![user_id],
+            )?;
+            Ok(())
+        })
+    }
+}
+
+fn row_to_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChannelThread> {
+    Ok(ChannelThread {
+        id: r.get(0)?,
+        channel: r.get(1)?,
+        ext_id: r.get(2)?,
+        conv_id: r.get(3)?,
+        user_id: r.get(4)?,
+        label: r.get(5)?,
+    })
 }
 
 #[cfg(test)]
@@ -85,5 +176,48 @@ mod tests {
         s.channels.bind("dingtalk", "100", 9).unwrap();
         assert_eq!(s.channels.conv_for("telegram", "100").unwrap(), Some(2));
         assert_eq!(s.channels.conv_for("dingtalk", "100").unwrap(), Some(9));
+    }
+
+    #[test]
+    fn bind_user_and_label_roundtrip() {
+        let s = store("binduser");
+        s.channels.bind("telegram", "555", 3).unwrap();
+        let t = s.channels.thread_for("telegram", "555").unwrap().unwrap();
+        assert_eq!((t.user_id, t.label), (None, None), "新映射无指认无昵称");
+
+        // 指认给家人 + 记昵称
+        s.channels.bind_user(t.id, Some(42)).unwrap();
+        s.channels.set_label("telegram", "555", " 豆豆 ").unwrap();
+        let t = s.channels.thread_for("telegram", "555").unwrap().unwrap();
+        assert_eq!(t.user_id, Some(42));
+        assert_eq!(t.label.as_deref(), Some("豆豆"), "昵称去空白落库");
+
+        // 空白昵称不覆盖;取消指认回 NULL
+        s.channels.set_label("telegram", "555", "   ").unwrap();
+        s.channels.bind_user(t.id, None).unwrap();
+        let t = s.channels.thread_for("telegram", "555").unwrap().unwrap();
+        assert_eq!(t.label.as_deref(), Some("豆豆"));
+        assert_eq!(t.user_id, None);
+
+        // rebind(会话重建)保留指认与昵称(UPDATE 不动新列)
+        s.channels.bind_user(t.id, Some(42)).unwrap();
+        s.channels.bind("telegram", "555", 8).unwrap();
+        let t = s.channels.thread_for("telegram", "555").unwrap().unwrap();
+        assert_eq!((t.conv_id, t.user_id), (8, Some(42)));
+    }
+
+    #[test]
+    fn unbind_user_clears_all_assignments() {
+        let s = store("unbind");
+        s.channels.bind("telegram", "a", 1).unwrap();
+        s.channels.bind("dingtalk", "b", 2).unwrap();
+        let ta = s.channels.thread_for("telegram", "a").unwrap().unwrap();
+        let tb = s.channels.thread_for("dingtalk", "b").unwrap().unwrap();
+        s.channels.bind_user(ta.id, Some(5)).unwrap();
+        s.channels.bind_user(tb.id, Some(5)).unwrap();
+        s.channels.unbind_user(5).unwrap();
+        let list = s.channels.list().unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().all(|t| t.user_id.is_none()), "该家人的指认全清");
     }
 }

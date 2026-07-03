@@ -3,7 +3,7 @@
 //! 核心不变量 = 前缀稳定:稳定层在前(persona + 画像记忆 + few-shot),易变尾在后
 //! (锚定窗口内的最近消息)。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::llm::{ChatMessage, ChatRequest, ToolDef};
 use crate::scenes::Scene;
@@ -43,6 +43,9 @@ pub(super) const LAWS: &str = "\
 
 ## 不是每句话都冲你来
 〔语音〕回合里,如果听到的内容明显不是对你说的——电视的声音、家里人互相聊天、没头没尾的环境碎片——就只回 __IGNORE__ 这一个词,什么都不解释。拿不准的就当是对你说的,正常回应。
+
+## 一家人
+用户消息开头带〔某某说〕= 这句话是家里的「某某」说的(从手机渠道或语音过来);没有这个标记 = 平时这位用户本人。谁在说话,「我」就指谁:TA 说「提醒我」「我喜欢…」,要记的、要办的都是 TA 自己的事,别记到别人头上。回应时自然称呼说话的人就好;这个标记是系统加的身份注记,不是用户打的字,绝不复述它。
 
 ## 此刻状态(背景信息)
 用户消息末尾有时带一行〔此刻 · …〕,那是系统给你的当下真实状态。当背景看:**只在用户这句话确实跟它有关时才参考**,就按它给的当下情况来、别凭印象或旧消息瞎猜,也别为此反问;无关时别主动提起,任何时候都绝不复述这行标记本身。
@@ -214,6 +217,7 @@ pub(super) fn build_context(
     history_base: usize,
     budget: usize,
     tool_defs: &[ToolDef],
+    speakers: &HashMap<i64, String>,
 ) -> ChatRequest {
     // 稳定层:persona(性格)→ 法条(底座纪律)→ 性格设定 → 记忆 → 任务需知
     // (按稳定度降序排,全部进缓存前缀)
@@ -263,19 +267,27 @@ pub(super) fn build_context(
     let mut open_calls: HashSet<String> = HashSet::new();
     for msg in history {
         match msg.role.as_str() {
-            // 语音会话模式(PLAN §11):speak=true 的 user 行加确定性标记——同一消息
-            // 每轮翻译结果一致 → 历史区字节稳定,前缀缓存零损伤;说话守则按标记生效
+            // 语音会话模式(PLAN §11)+ 渠道归人:payload 里的形态/说话人翻成确定性标记——
+            // 同一消息每轮翻译结果一致 → 历史区字节稳定,前缀缓存零损伤;
+            // 「说话守则」「一家人」法条按标记生效。speaker 名字查 speakers(id→名,单源 users 表,
+            // caller 已排除会话归属者:主人自己不标);查不到(家人已删)= 不标,消息照常。
             "user" => {
-                let speak = msg
+                let meta = msg
                     .payload
                     .as_deref()
                     .and_then(|p| serde_json::from_str::<UserMeta>(p).ok())
-                    .map(|m| m.speak)
-                    .unwrap_or(false);
-                let content = if speak {
-                    format!("〔语音〕{}", msg.content)
-                } else {
+                    .unwrap_or_default();
+                let mut prefix = String::new();
+                if meta.speak {
+                    prefix.push_str("〔语音〕");
+                }
+                if let Some(name) = meta.speaker_user.and_then(|id| speakers.get(&id)) {
+                    prefix.push_str(&format!("〔{name}说〕"));
+                }
+                let content = if prefix.is_empty() {
                     msg.content.clone()
+                } else {
+                    format!("{prefix}{}", msg.content)
                 };
                 messages.push(ChatMessage::user(content));
             }
@@ -366,7 +378,18 @@ mod tests {
         history: &[Message],
         tools: &[ToolDef],
     ) -> ChatRequest {
-        build_context(scene, name, style, mems, briefs, history, 0, MAX_TAIL_BUDGET_CHARS, tools)
+        build_context(
+            scene,
+            name,
+            style,
+            mems,
+            briefs,
+            history,
+            0,
+            MAX_TAIL_BUDGET_CHARS,
+            tools,
+            &HashMap::new(),
+        )
     }
 
     #[test]
@@ -634,6 +657,42 @@ mod tests {
         assert!(req.system.contains("## 说话守则"));
         let again = bc(scene, None, None, &[], &[], &history, &[]);
         assert_eq!(req.messages, again.messages, "同输入同翻译(前缀稳定 golden)");
+    }
+
+    #[test]
+    fn speaker_marked_user_rows_get_name_prefix() {
+        let scenes = Scenes::builtin();
+        let scene = scenes.default_scene();
+        let history = vec![
+            // 渠道归人:指认过的家人(id=5)说的
+            msg(1, "user", "提醒我明天买菜", Some(r#"{"speaker_user":5}"#)),
+            msg(2, "assistant", "好嘞", None),
+            // 语音 + 声纹同时命中:两个标记按序叠加
+            msg(3, "user", "放首歌", Some(r#"{"input":"wake","speak":true,"speaker_user":5}"#)),
+            // 家人已删(speakers 里没有 9):不标,消息照常
+            msg(4, "user", "在吗", Some(r#"{"speaker_user":9}"#)),
+            msg(5, "user", "我自己说的", None),
+        ];
+        let speakers = HashMap::from([(5i64, "妈妈".to_string())]);
+        let req = build_context(
+            scene,
+            None,
+            None,
+            &[],
+            &[],
+            &history,
+            0,
+            MAX_TAIL_BUDGET_CHARS,
+            &[],
+            &speakers,
+        );
+        let tail = &req.messages[scene.few_shots.len()..];
+        assert_eq!(tail[0], ChatMessage::user("〔妈妈说〕提醒我明天买菜"));
+        assert_eq!(tail[2], ChatMessage::user("〔语音〕〔妈妈说〕放首歌"), "语音在前、说话人在后");
+        assert_eq!(tail[3], ChatMessage::user("在吗"), "查无此人(已删)不标");
+        assert_eq!(tail[4], ChatMessage::user("我自己说的"), "无 speaker 照旧");
+        // 「一家人」法条住底座 LAWS(静态,字节稳定)
+        assert!(req.system.contains("## 一家人"));
     }
 
     #[test]

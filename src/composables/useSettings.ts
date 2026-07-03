@@ -71,6 +71,7 @@ const FAKE_PROVIDERS: ProviderView[] = [
 
 const state = reactive({
   ready: false,
+  userId: 0, // 当前用户 id(boot 过桥;家人页据此标「你」、防删自己)
   userName: '我',
   skin: 'scifi', // 用户级皮肤(users.skin_id);默认/兜底 = 科幻。boot 过桥应用,设置页可切
   values: { ...DEFAULTS } as Record<string, string>,
@@ -182,7 +183,8 @@ async function rename(name: string) {
 }
 
 /** boot 数据过桥(useChat 单向调用,避免循环依赖)。 */
-export function hydrateUserName(name: string) {
+export function hydrateUser(id: number, name: string) {
+  state.userId = id
   state.userName = name
 }
 

@@ -19,7 +19,7 @@ import {
   type UsageTotals,
 } from '../lib/backend'
 import { applyLocale, i18n } from '../i18n'
-import { hydrateUserName, onProvidersUsable, useSettings } from './useSettings'
+import { hydrateUser, onProvidersUsable, useSettings } from './useSettings'
 import { useSpeech } from './useSpeech'
 import { useMedia } from './useMedia'
 import { useToast } from './useToast'
@@ -417,7 +417,7 @@ async function boot() {
   try {
     const snap = await api.boot()
     applyLocale(snap.locale) // 用户级语言(与皮肤同款),core 只过桥不产文案
-    hydrateUserName(snap.user.name) // 设置页"现在陪着"用,单向过桥
+    hydrateUser(snap.user.id, snap.user.name) // 设置页家人页用(标「你」/防删自己),单向过桥
     // 皮肤改由 useSettings.load() 经 api.skin() 拉取并应用(主窗 & 悬浮窗同一路径,不再走 boot 过桥)
     state.hasApiKey = snap.hasApiKey
     state.convId = snap.conversation.id

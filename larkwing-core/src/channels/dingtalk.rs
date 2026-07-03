@@ -92,9 +92,9 @@ async fn serve(ctx: &Arc<ChannelCtx>, net: &Arc<net::Client>, ct: &CancellationT
             // bot 消息:先 ACK(钉钉要求及时回执),再异步处理(回复走 sessionWebhook,不占 WS)
             BOT_TOPIC => {
                 let _ = ws.send(Message::Text(ack_frame(&message_id, "{}").into())).await;
-                if let Some((ext_id, content, webhook)) = parse_bot_message(&frame) {
+                if let Some(m) = parse_bot_message(&frame) {
                     let (c, n) = (ctx.clone(), net.clone());
-                    tokio::spawn(async move { handle_message(&c, &n, ext_id, content, webhook).await });
+                    tokio::spawn(async move { handle_message(&c, &n, m).await });
                 }
             }
             _ => {}
@@ -102,18 +102,26 @@ async fn serve(ctx: &Arc<ChannelCtx>, net: &Arc<net::Client>, ct: &CancellationT
     }
 }
 
+/// 一条已解析的 bot 消息(ext_id 规则见 `parse_bot_message`;sender = 发言人昵称,给家人页认脸)。
+struct BotMessage {
+    ext_id: String,
+    text: String,
+    webhook: String,
+    sender: Option<String>,
+}
+
 /// 异步处理一条 bot 消息:复用 turn loop 攒回复 → POST sessionWebhook。spawn 出来跑,不阻塞 WS 收循环。
-async fn handle_message(ctx: &ChannelCtx, net: &net::Client, ext_id: String, text: String, webhook: String) {
-    match drive_turn(&ctx.engine, CHANNEL, &ext_id, text).await {
+async fn handle_message(ctx: &ChannelCtx, net: &net::Client, m: BotMessage) {
+    match drive_turn(&ctx.engine, CHANNEL, &m.ext_id, m.text, m.sender.as_deref()).await {
         Ok(Some(reply)) => {
-            if let Err(e) = reply_webhook(net, &webhook, &reply).await {
+            if let Err(e) = reply_webhook(net, &m.webhook, &reply).await {
                 tracing::warn!(err = %format!("{e:#}"), "钉钉回复失败");
             }
         }
         Ok(None) => {} // 折进在飞回合
         Err(e) => {
             tracing::warn!(err = %format!("{e:#}"), "钉钉回合失败");
-            let _ = reply_webhook(net, &webhook, ERR_HINT).await;
+            let _ = reply_webhook(net, &m.webhook, ERR_HINT).await;
         }
     }
 }
@@ -159,9 +167,10 @@ fn ack_frame(message_id: &str, data: &str) -> String {
     .to_string()
 }
 
-/// 从 bot 帧取 (ext_id, 文本, sessionWebhook)。data 是 JSON 字符串(二次解析)。
-/// 单聊按 conversationId 续接;群聊按 (conversationId, 发言人) 隔离 + strip 开头 @mention。
-fn parse_bot_message(frame: &Value) -> Option<(String, String, String)> {
+/// 从 bot 帧解析一条消息。data 是 JSON 字符串(二次解析)。
+/// 单聊按 conversationId 续接;群聊按 (conversationId, 发言人) 隔离 + strip 开头 @mention;
+/// senderNick = 发言人昵称(给家人页认脸,取不到无妨)。
+fn parse_bot_message(frame: &Value) -> Option<BotMessage> {
     let data_str = frame.get("data").and_then(Value::as_str)?;
     let data: Value = serde_json::from_str(data_str).ok()?;
     let raw = data.pointer("/text/content").and_then(Value::as_str)?;
@@ -178,7 +187,12 @@ fn parse_bot_message(frame: &Value) -> Option<(String, String, String)> {
     } else {
         conv_id.to_string()
     };
-    Some((ext_id, text, webhook))
+    let sender = data
+        .get("senderNick")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    Some(BotMessage { ext_id, text, webhook, sender })
 }
 
 /// 群聊里开头的 @机器人 前缀去掉(robot 坑#7),只去开头一个。
@@ -202,15 +216,17 @@ mod tests {
         let data = serde_json::json!({
             "conversationType": "1",
             "conversationId": "cidAAA",
+            "senderNick": " 妈妈 ",
             "sessionWebhook": "https://oapi.dingtalk.com/robot/x",
             "text": { "content": "  在吗  " }
         })
         .to_string();
         let frame = serde_json::json!({ "headers": { "topic": BOT_TOPIC, "messageId": "m1" }, "data": data });
-        let (ext, text, webhook) = parse_bot_message(&frame).unwrap();
-        assert_eq!(ext, "cidAAA");
-        assert_eq!(text, "在吗");
-        assert!(webhook.contains("oapi.dingtalk.com"));
+        let m = parse_bot_message(&frame).unwrap();
+        assert_eq!(m.ext_id, "cidAAA");
+        assert_eq!(m.text, "在吗");
+        assert!(m.webhook.contains("oapi.dingtalk.com"));
+        assert_eq!(m.sender.as_deref(), Some("妈妈"), "昵称去空白");
     }
 
     #[test]
@@ -224,9 +240,10 @@ mod tests {
         })
         .to_string();
         let frame = serde_json::json!({ "data": data });
-        let (ext, text, _) = parse_bot_message(&frame).unwrap();
-        assert_eq!(ext, "grpBBB:staff9", "群聊按发言人隔离");
-        assert_eq!(text, "今天天气", "开头 @机器人 被去掉");
+        let m = parse_bot_message(&frame).unwrap();
+        assert_eq!(m.ext_id, "grpBBB:staff9", "群聊按发言人隔离");
+        assert_eq!(m.text, "今天天气", "开头 @机器人 被去掉");
+        assert_eq!(m.sender, None, "无 senderNick → None");
     }
 
     #[test]

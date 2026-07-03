@@ -445,6 +445,16 @@ export interface FamilyMember {
   enrolled: boolean
 }
 
+/** 一条渠道对话映射(家人页「远程对话」区):这条 TG/钉钉对话被指认给谁。 */
+export interface ChannelChat {
+  id: number
+  channel: string // 'telegram' | 'dingtalk'
+  ext_id: string
+  conv_id: number
+  user_id: number | null // 指认的家人;null = 未指认(按会话归属者)
+  label: string | null // 平台昵称(认脸用);null = 还没抓到
+}
+
 /** 远程渠道一行(设置页,PLAN 远程渠道);**凭证本身永不过桥**,只报 configured(bool)。 */
 export interface RemoteChannelView {
   id: string // 'telegram' | 'dingtalk'
@@ -817,6 +827,13 @@ export const api = {
   listFamily: () => invoke<FamilyMember[]>('list_family'),
   addFamily: (name: string) => invoke<{ id: number; name: string }>('add_family', { name }),
   removeFamily: (id: number) => invoke<void>('remove_family', { id }),
+  /** 给某家人改名(renameUser 改的是默认用户,这条按 id)。 */
+  renameFamily: (id: number, name: string) => invoke<void>('rename_family', { id, name }),
+  /** 渠道对话列表(家人页「远程对话」区)。 */
+  listChannelChats: () => invoke<ChannelChat[]>('list_channel_chats'),
+  /** 指认某条渠道对话归哪位家人(null = 取消指认)。 */
+  bindChannelChat: (id: number, userId: number | null) =>
+    invoke<void>('bind_channel_chat', { id, userId }),
   /** 给某家人录声纹:立即返回,进展走 voice 事件(Listening→Idle),完成后重拉 list_family。 */
   voiceEnroll: (userId: number) => invoke<void>('voice_enroll', { userId }),
   /** 句级 TTS:合成进缓存(命中秒回),返回可挂 <audio> 的 localhost URL。 */

@@ -448,3 +448,51 @@ async fn provider_cards_prefill_mask_and_upsert() {
     let views = engine.remove_provider("relay").unwrap();
     assert!(!views.iter().any(|v| v.id == "relay"));
 }
+
+// 渠道归人 / 声纹(多用户第一步)的端到端链:speaker_user 物化进 payload 落库 →
+// 装配时加〔名字说〕确定性标记(FakeLlm 回声最后一条 user 的 content,标记从外部可见)→
+// touch 只动会话归属者 —— 家人在手机渠道说话不改「最近活跃」,否则主人重启会被切成 TA 的视角。
+#[tokio::test(flavor = "multi_thread")]
+async fn speaker_user_marks_context_and_keeps_boot_owner() {
+    let (store, engine, conv_id) = setup("speaker", 1);
+    let owner = store.users.ensure_default_user().unwrap();
+    let kid = store.users.create("豆豆").unwrap();
+    // 让 send 里的 touch 时间戳严格晚于 kid 的创建时间(同毫秒会让"最近活跃"排序不定)
+    tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+
+    let meta = larkwing_core::engine::UserMeta {
+        speaker_user: Some(kid.id),
+        ..Default::default()
+    };
+    let mut rx = engine
+        .send_message(conv_id, "提醒我明天带作业".into(), Some(meta), vec![])
+        .await
+        .unwrap();
+    let mut streamed = String::new();
+    while let Some(ev) = rx.recv().await {
+        if let TurnEvent::Delta(t) = ev {
+            streamed.push_str(&t)
+        }
+    }
+    // ① 装配标记端到端可见:回声内容 = 带说话人标记的形态
+    assert!(
+        streamed.contains("〔豆豆说〕提醒我明天带作业"),
+        "回声应带说话人标记: {streamed}"
+    );
+    // ② payload 物化(真相在库,历史回放同一字节形)
+    let msgs = store.chat.recent_messages(conv_id, 10).unwrap();
+    assert!(
+        msgs[0]
+            .payload
+            .as_deref()
+            .unwrap_or("")
+            .contains(&format!("\"speaker_user\":{}", kid.id)),
+        "user 行 payload 应物化 speaker_user: {:?}",
+        msgs[0].payload
+    );
+    // ③ touch 会话归属者而非说话人:豆豆说完话,「最近活跃」(boot 恢复依据)仍是主人
+    let kid_after = store.users.get(kid.id).unwrap().unwrap();
+    assert_eq!(kid_after.last_active_at, kid.last_active_at, "说话人不该被 touch");
+    let current = store.users.ensure_default_user().unwrap();
+    assert_eq!(current.id, owner.id, "重启后当前用户仍是主人");
+}

@@ -442,12 +442,19 @@ export default {
       auto: '自动:{v}', // {v} 由代码填(目录猜测值,— = 不知道)
     },
     family: {
-      current: '现在陪着',
+      you: '(你)',
       rename: '改名字',
-      namePlaceholder: '怎么称呼你?',
+      namePlaceholder: '怎么称呼?',
       save: '好啦',
-      addSoon: '＋ 添加家人 · 装载中',
-      addSoonHint: '多成员舱位建造中,很快每个人都有自己的专属记忆。',
+      add: '添加',
+      addPlaceholder: '家人的称呼(比如:豆豆)',
+      deleteArm: '确认删除?',
+      membersHint: '每个人都有自己的小本本:喜好、提醒各记各的,不会串。删除会把 TA 的记忆一起清掉。',
+      chats: '手机上的对话',
+      chatsEmpty: '还没有远程对话。到「远程」里接上 Telegram 或钉钉,家人在手机上发一句话,这里就会出现。',
+      chatsHint: '指认之后,TA 在手机上说「提醒我」「我喜欢什么」,旺财就知道是 TA 自己的事,记在 TA 的本子上。',
+      unassigned: '还没指认',
+      dingtalk: '钉钉',
     },
     audio: {
       leveling: '音量均衡',

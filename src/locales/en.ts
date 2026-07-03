@@ -443,12 +443,19 @@ export default {
       auto: 'Auto: {v}', // {v} filled by code (catalog guess; — = unknown)
     },
     family: {
-      current: 'Currently with',
+      you: '(you)',
       rename: 'Rename',
-      namePlaceholder: 'What should I call you?',
+      namePlaceholder: 'What should I call them?',
       save: 'Done',
-      addSoon: '＋ Add family · coming soon',
-      addSoonHint: 'Multi-member bays are under construction — soon everyone gets their own memories.',
+      add: 'Add',
+      addPlaceholder: 'Their name (e.g. Emma)',
+      deleteArm: 'Delete for real?',
+      membersHint: 'Everyone gets their own notebook: likes and reminders stay separate. Deleting someone clears their memories too.',
+      chats: 'Chats on their phones',
+      chatsEmpty: 'No remote chats yet. Connect Telegram or DingTalk under "Remote", have a family member send one message, and it shows up here.',
+      chatsHint: 'Once assigned, when they say "remind me" or "I like…" on their phone, it goes into their own notebook — not anyone else\'s.',
+      unassigned: 'Not assigned',
+      dingtalk: 'DingTalk',
     },
     audio: {
       leveling: 'Volume leveling',

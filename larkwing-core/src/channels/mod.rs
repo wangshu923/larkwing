@@ -88,6 +88,9 @@ pub async fn run(engine: Arc<Engine>, status: ChannelStatus, ct: CancellationTok
 }
 
 /// 把一条入站文本喂进引擎、攒出回复(**渠道无关**,复用 turn loop —— 这是"渠道复用回合循环"的兑现)。
+/// `sender_label` = 平台昵称(有就顺手记进映射,给家人页认脸,不参与逻辑)。
+/// 渠道归人:该 chat 若被指认给某家人(家人页设置),回合带 `speaker_user` —— 记忆/需知/提醒
+/// 归 TA(与桌面声纹同一条 `UserMeta` 缝);未指认 = None,零行为变化。
 /// 返回 `None` = 已折进在飞回合(inject,沿用桌面前端语义,本条不单独回);
 /// `Some(text)` = 完整回复,调用方按平台限长 `split_message` 后发出。
 pub(crate) async fn drive_turn(
@@ -95,23 +98,32 @@ pub(crate) async fn drive_turn(
     channel: &str,
     ext_id: &str,
     text: String,
+    sender_label: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
     let store = engine.store().clone();
     // 会话映射:回访续接同一会话(send_message 自带历史回放),首次建专属会话并绑定
-    let conv_id = match store.channels.conv_for(channel, ext_id)? {
-        Some(id) => id,
+    let (conv_id, speaker) = match store.channels.thread_for(channel, ext_id)? {
+        Some(t) => (t.conv_id, t.user_id),
         None => {
             let conv = engine.new_conversation(channel)?;
             store.channels.bind(channel, ext_id, conv.id)?;
-            conv.id
+            (conv.id, None)
         }
     };
+    if let Some(label) = sender_label {
+        let _ = store.channels.set_label(channel, ext_id, label); // 尽力件,失败不挡回合
+    }
+    // 指认过的家人才带 speaker(悬空 id 由 send_message 的存在性校验兜底 → 回落会话用户)
+    let meta = speaker.map(|uid| crate::engine::UserMeta {
+        speaker_user: Some(uid),
+        ..Default::default()
+    });
 
     // 在飞 → 插队(折进当前回合);否则起新回合。与桌面前端 inject-or-send 同语义。
-    if engine.inject(conv_id, text.clone(), None, Vec::new()).await {
+    if engine.inject(conv_id, text.clone(), meta.clone(), Vec::new()).await {
         return Ok(None);
     }
-    let mut rx = engine.send_message(conv_id, text, None, Vec::new()).await?;
+    let mut rx = engine.send_message(conv_id, text, meta, Vec::new()).await?;
     let mut buf = String::new();
     while let Some(ev) = rx.recv().await {
         match ev {

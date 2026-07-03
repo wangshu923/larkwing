@@ -87,7 +87,7 @@
 - **已否决的名字**(别再提):`Tideripper`(太凶)、`Sunwing`(撞加航)、`Waterwing`(像泳圈)、`Emberwing`(撞游戏)。
 
 ### 4.2 产品定位 🔒
-- 消费级、面向普通人 / 家庭,**不是开发者**;架构支持多用户(每人各自记忆),但**当前 MVP 不投入多用户 UI**(2026-06-12 用户拍板先搁置,声纹 / 家人 core 已备未启用,见 §9);首个场景 = 闲聊陪伴。
+- 消费级、面向普通人 / 家庭,**不是开发者**;架构支持多用户(每人各自记忆)。**多用户第一步「渠道归人」已启用(2026-07-03 用户拍板,进 v0.2.4)**:家人页(加/删/改名)+ 手机渠道对话指认给家人 → TA 说的「提醒我 / 我喜欢」归 TA 自己(§7.7);**没有「切换用户」概念**(§3 零新概念:谁说话就是谁,桌面打字恒 = 会话归属者)。声纹识别(桌面语音归人)是第二步,core 已备仍休眠(§9);首个场景 = 闲聊陪伴。
 
 ### 4.3 技术栈 🔒
 - **Tauri v2**(Rust + WebView)。**不用 Electron、不用 Python。**
@@ -327,6 +327,7 @@
 - **钉钉 = 官方 Stream 模式**(WebSocket,免公网,robot 同款):WS 只收 + 回 ACK/pong;回复走 sessionWebhook(HTTP)→ 回合可异步 spawn、不阻塞收循环、不丢 ping。单聊按 conversationId 续接、群聊按 (conv, 发言人) 隔离 + strip @mention(robot 坑 #2/#7)。
 - **访问控制(非风控 §9)**:Telegram `allowed_chats` 白名单,空 = 不放行 + 回 onboarding 报 chat id(不静默吞,§3.5);钉钉靠应用可见范围。
 - **凭证不过桥**:token/app_secret 走 `set_setting` 的 `remote.*` 写入臂(**不进 `APP_SETTING_KEYS`** → 写得进读不回);设置页状态读 `remote_status`(只报 `configured` bool + 连接态);**凭证已与 LLM key 一并走 keyring**(§6.3,`SECRET_KEYS` 含 `remote.*` 三把)。
+- **渠道归人 = 多用户第一步(2026-07-03,v0.2.4;确定性归人先行,概率性的声纹后置)**:每条渠道对话(`channel_threads` 映射行)可在设置·家人**指认**给一位家人(`user_id` 列,NULL = 会话归属者、零行为变化);入站 `drive_turn` 据此带 `UserMeta.speaker_user` → **记忆 / 需知 / 工具(`ToolCtx.user_id` = mem_user,提醒随之)归说话人**,人格 / pet_name / 会话归属仍走会话归属者(前缀字节稳定,一家人轮流说不破缓存)。装配时该消息加确定性标记 `〔某某说〕`(与 `〔语音〕` 同款「payload 物化 + 装配标记 + LAWS『一家人』法条」;名字单源 users 表、每回合 id→name 现查,家人已删 = 不标不崩)。平台昵称(TG `from.first_name` / 钉钉 `senderNick`)只作家人页认脸 `label`,不参与逻辑。⚠️ **`users.touch` 只 touch 会话归属者、绝不 touch 说话人**——`ensure_default_user` 按 `last_active_at` 恢复「当前用户」,若 touch 说话人,家人在手机上说一句就成「最近活跃」,主人重启 app 会被切成 TA 的视角(2026-07-03 实改于 send_message,回归测试 `speaker_user_marks_context_and_keeps_boot_owner` 守着)。删家人时 `delete_user` 编排里连带 `channels.unbind_user`(指认回落,映射本身保留)。
 - **微信暂不做**(2026-06-17):个人微信无官方 API、企业微信需公网回调,都不合「出站连接、免公网」的家用形态——承载方式想清再说。
 - **✅ 2026-06-30 真机/真网验过**:真 bot token / 真钉钉应用、手机收发、续历史、断网重连、钉钉 WS 在 Windows 连通——见 PLAN 远程渠道 watch-items。
 
@@ -374,7 +375,7 @@
   - **计价感知(2026-06-30,推翻原「计价方式 defer」)**:`tail_budget_chars(window, billing)` 再吃一个 `catalog::BillingMode`(`Cached` 默认/`Uncached`/`PerCall`):**无缓存 → 预算封到 `DEFAULT`(每轮全价重发尾巴贵 → 少留勤压)**;有缓存/按次 → 按窗口放大(常态)。**只影响压缩(留多少),不改记账数字**(`est_cost_usd` 仍按 token 估、缓存折扣不建模/高估)。目录无 billing 列(当前 provider 都有前缀缓存)→ 默认 Cached、纯 override 驱动。
   - **模型「高级设置」override(2026-06-30,方案A)**:大脑设置每张 provider 卡折叠「高级设置」= 按 model id 纠正**档位/上下文(K)/输入价/输出价/计价方式**(空=用目录猜测,纠错非配置 §3)。机制 = catalog **进程级 overlay**(`static OVERRIDES`,engine `reload_providers` 顶 `set_overrides`,boot+保存刷新)→ `tier_of`/`ctx_window_of`/`est_cost_usd`/`billing_of` 内部先查覆盖再回落目录 → **消费点零改动**(catalog 仍不依赖 store,§6.1)。明文 settings `llm.model_overrides`(非秘密,不进 keyring/白名单);命令对 `model_meta`/`set_model_override`(空壳删条 → reload 刷 overlay + 档位变了重排候选)。
 - **「已备未启用」的休眠能力——看到没接 UI 的 core 代码,不要当「未完成的活」去补完**:
-  - **声纹 + 多用户 core**(2026-06-12 用户拍板**先放弃多用户**):voiceprints 域 / CAM++ 识别 / 家人 CRUD / 记忆归人 / enroll / 壳层命令全套**已写完测试绿,故意不接 UI**(家人 tab 维持占位 teaser)。`speaker_user=None` 走会话用户是**向前兼容的正确行为,不是 bug**。真做多用户时作**独立里程碑**,补家人 tab UI + 当前用户切换。
+  - **声纹识别(多用户第二步)仍休眠**(2026-07-03 更新:多用户**第一步「渠道归人」已启用**,见 §4.2/§7.7——家人 CRUD / 家人页 UI / 记忆归人 / `speaker_user` 缝全部接通投用):还休眠的是**声纹链路**——voiceprints 域 / CAM++ 识别 / enroll(`voice_enroll` 命令已注册但 UI 无入口)。桌面语音回合 `speaker_user=None` 走会话用户仍是**向前兼容的正确行为,不是 bug**。做第二步时补:家人卡「让旺财认识 TA 的声音」入口 + 识别置信策略(宁可不认、绝不错认——错认代价是记忆写歪,与唤醒「宁松勿严」方向相反)。**不做「当前用户切换」**(§4.2:没有切换概念)。
   - `Tool::risk()` 闸门、审批分区 = 同类预留,引擎不消费,别擅自接。
 
 ---
@@ -403,4 +404,4 @@
 
 ---
 
-*最后整编:2026-06-30(模型「高级设置」override 落地=按模型纠正档位/上下文/价/计价方式,catalog 进程级 overlay;计价感知压缩补上=无缓存少留;窗口 UI 以 K 计。前次 2026-06-29:§9 收窄媒体规则=文档文字进 history、图仍当轮;上下文处理合并成单一 model-aware 字数预算 + 整块锚定、删条数窗口 WINDOW_MAX;catalog 加 ctx_window_tokens。2026-06-20 新增 §4.11 用户准则)。原合并自 CLAUDE.md(宪法)、PLAN.md(§0–§12 设计与执行状态)及历次会话的踩坑沉淀。*
+*最后整编:2026-07-03(多用户第一步「渠道归人」启用 = 家人页激活 + 渠道对话指认给家人 + speaker_user 归人全链,§4.2/§7.7/§9 三处更新;声纹仍休眠为第二步。前次 2026-06-30:模型「高级设置」override 落地=按模型纠正档位/上下文/价/计价方式,catalog 进程级 overlay;计价感知压缩补上=无缓存少留;窗口 UI 以 K 计。前次 2026-06-29:§9 收窄媒体规则=文档文字进 history、图仍当轮;上下文处理合并成单一 model-aware 字数预算 + 整块锚定、删条数窗口 WINDOW_MAX;catalog 加 ctx_window_tokens。2026-06-20 新增 §4.11 用户准则)。原合并自 CLAUDE.md(宪法)、PLAN.md(§0–§12 设计与执行状态)及历次会话的踩坑沉淀。*

@@ -476,10 +476,34 @@ pub fn add_family(state: State<'_, AppState>, name: String) -> Result<User, AppE
     state.engine.create_user(&name)
 }
 
-/// 删除家人(守住至少留一人;记忆/声纹随人走)。
+/// 删除家人(守住至少留一人;记忆/声纹/渠道指认随人走)。
 #[tauri::command]
 pub fn remove_family(state: State<'_, AppState>, id: i64) -> Result<(), AppError> {
     state.engine.delete_user(id)
+}
+
+/// 给某家人改名(家人卡片行内改;rename_user 改的是默认用户,这条按 id)。
+#[tauri::command]
+pub fn rename_family(state: State<'_, AppState>, id: i64, name: String) -> Result<(), AppError> {
+    state.engine.rename_family(id, &name)
+}
+
+/// 渠道对话列表(家人页「远程对话」区:哪条 TG/钉钉对话是谁在用)。
+#[tauri::command]
+pub fn list_channel_chats(
+    state: State<'_, AppState>,
+) -> Result<Vec<larkwing_core::store::ChannelThread>, AppError> {
+    state.engine.list_channel_chats()
+}
+
+/// 指认某条渠道对话归哪位家人(user_id 空 = 取消指认,回落会话归属者)。
+#[tauri::command]
+pub fn bind_channel_chat(
+    state: State<'_, AppState>,
+    id: i64,
+    user_id: Option<i64>,
+) -> Result<(), AppError> {
+    state.engine.bind_channel_chat(id, user_id)
 }
 
 /// 给某家人录声纹:立即返回,录音/识别进展走 app_event 的 voice 车道

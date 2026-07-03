@@ -3,10 +3,10 @@
 // 暗 tab 可点、进 teaser 页 —— 能点的必有反应(铁律3),绝不放灰掉的死控件。
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { api, appVersion, emitWakeChanged, isTauri, openExternal, setFloatVisible, type ModelMeta, type ModelOverride, type ModelTier, type ProviderView, type RemoteChannelView, type VoiceStatus } from '../lib/backend'
+import { api, appVersion, emitWakeChanged, isTauri, openExternal, setFloatVisible, type ChannelChat, type FamilyMember, type ModelMeta, type ModelOverride, type ModelTier, type ProviderView, type RemoteChannelView, type VoiceStatus } from '../lib/backend'
 import { applyLocale } from '../i18n'
 import { useChat } from '../composables/useChat'
-import { useSettings } from '../composables/useSettings'
+import { hydrateUser, useSettings } from '../composables/useSettings'
 import { useUpdater } from '../composables/useUpdater'
 import { useToast } from '../composables/useToast'
 import { refreshAudioMode } from '../composables/useAudioGraph'
@@ -624,9 +624,10 @@ function remoteStatusText(c: RemoteChannelView): string {
   if (!c.configured) return t('settings.remote.statusUnconfigured')
   return t('settings.remote.statusStarting')
 }
-// 切到远程 tab 时拉一次状态(切走不轮询)
+// 切到远程/家人 tab 时拉一次(切走不轮询)
 watch(tab, (v) => {
   if (v === 'remote') void loadRemote()
+  if (v === 'family') void loadFamily()
 })
 
 // 段选控件的数据驱动写法:一行配置 = 一个设置项
@@ -820,16 +821,93 @@ async function addCustom() {
   }
 }
 
-// 改名:行内编辑
-const nameEditing = ref(false)
-const nameDraft = ref('')
-function startRename() {
-  nameDraft.value = settings.state.userName
-  nameEditing.value = true
+// 家人页(渠道归人 = 多用户第一步,声纹后置):家人列表 CRUD + 手机对话指认给家人。
+// 指认后 TA 在手机上说的「提醒我 / 我喜欢…」归 TA 自己(speaker_user 缝,记忆归人 §6)。
+const family = ref<FamilyMember[]>([])
+const chats = ref<ChannelChat[]>([])
+const famError = ref(false)
+const famEditing = ref(0) // 行内改名中的家人 id;0 = 没有
+const famDraft = ref('')
+const famNew = ref('')
+const famArm = ref(0) // 删除二次确认中的家人 id(clone 删除同款手势)
+async function loadFamily() {
+  if (!isTauri()) {
+    // 浏览器预览假数据(UI 摸手感;与后端 FamilyMember/ChannelChat 同构)。
+    // 预览没有 boot 过桥 → 补上当前用户 id,让「(你)/防删自己」渲染与真机一致
+    if (!settings.state.userId) hydrateUser(1, settings.state.userName)
+    family.value = [
+      { id: 1, name: settings.state.userName, skin_id: 'scifi', created_at: 0, last_active_at: 0, enrolled: false },
+      { id: 2, name: '豆豆', skin_id: 'scifi', created_at: 0, last_active_at: 0, enrolled: false },
+    ]
+    chats.value = [
+      { id: 1, channel: 'telegram', ext_id: '12345678', conv_id: 9, user_id: 2, label: 'Doudou' },
+      { id: 2, channel: 'dingtalk', ext_id: 'cidXXXX', conv_id: 10, user_id: null, label: '妈妈' },
+    ]
+    return
+  }
+  famError.value = false
+  try {
+    const [f, c] = await Promise.all([api.listFamily(), api.listChannelChats()])
+    family.value = f
+    chats.value = c
+  } catch {
+    famError.value = true // 初载失败别装空(§6.6):错误态 + 重试
+  }
 }
-function submitRename() {
-  settings.rename(nameDraft.value)
-  nameEditing.value = false
+function startFamRename(m: FamilyMember) {
+  famDraft.value = m.name
+  famEditing.value = m.id
+}
+async function saveFamRename(m: FamilyMember) {
+  const name = famDraft.value.trim()
+  famEditing.value = 0
+  if (!name || name === m.name) return
+  try {
+    // 自己走既有 rename 链(同步顶栏「现在陪着」名);家人按 id 改
+    if (m.id === settings.state.userId) await settings.rename(name)
+    else await api.renameFamily(m.id, name)
+    await loadFamily()
+  } catch {
+    useToast().error(t('toast.actionFailed'))
+  }
+}
+async function addFam() {
+  const name = famNew.value.trim()
+  if (!name) return
+  try {
+    await api.addFamily(name)
+    famNew.value = ''
+    await loadFamily()
+  } catch {
+    useToast().error(t('toast.actionFailed'))
+  }
+}
+async function removeFam(m: FamilyMember) {
+  if (famArm.value !== m.id) {
+    famArm.value = m.id
+    return
+  }
+  famArm.value = 0
+  try {
+    await api.removeFamily(m.id)
+    await loadFamily()
+  } catch {
+    useToast().error(t('toast.deleteFailed'))
+  }
+}
+async function bindChat(c: ChannelChat, ev: Event) {
+  const v = (ev.target as HTMLSelectElement).value
+  const uid = v ? Number(v) : null
+  try {
+    await api.bindChannelChat(c.id, uid)
+    c.user_id = uid
+  } catch {
+    useToast().error(t('toast.actionFailed'))
+    await loadFamily() // 失败把 select 拉回真值
+  }
+}
+function channelName(id: string): string {
+  return id === 'telegram' ? 'Telegram' : id === 'dingtalk' ? t('settings.family.dingtalk') : id
 }
 
 function onKeydown(e: KeyboardEvent) {
@@ -1052,30 +1130,66 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         </div>
       </div>
 
-      <!-- 家人 -->
+      <!-- 家人:渠道归人第一步(声纹后置)——没有「切换用户」概念,谁说话就是谁 -->
       <div v-else-if="tab === 'family'">
-        <div class="row">
-          <span class="label">{{ t('settings.family.current') }}</span>
-          <span v-if="!nameEditing" class="key-state">
-            <span class="chip on">{{ settings.state.userName }}</span>
-            <button class="link" @click="startRename">{{ t('settings.family.rename') }}</button>
-          </span>
-          <span v-else class="key-edit">
-            <input
-              v-model="nameDraft"
-              class="s-input"
-              :placeholder="t('settings.family.namePlaceholder')"
-              @keyup.enter="submitRename"
-            />
-            <button class="link" :disabled="!nameDraft.trim()" @click="submitRename">
-              {{ t('settings.family.save') }}
-            </button>
-          </span>
+        <div v-if="famError" class="lp-error">
+          {{ t('common.loadError') }}
+          <button class="lp-retry" @click="loadFamily">{{ t('common.retry') }}</button>
         </div>
-        <p class="hint">
-          <span class="chip future">{{ t('settings.family.addSoon') }}</span>
-          {{ t('settings.family.addSoonHint') }}
-        </p>
+        <template v-else>
+          <div v-for="m in family" :key="m.id" class="row fam-row">
+            <template v-if="famEditing === m.id">
+              <span class="key-edit">
+                <input
+                  v-model="famDraft"
+                  class="s-input"
+                  :placeholder="t('settings.family.namePlaceholder')"
+                  @keyup.enter="saveFamRename(m)"
+                />
+                <button class="link" :disabled="!famDraft.trim()" @click="saveFamRename(m)">
+                  {{ t('settings.family.save') }}
+                </button>
+              </span>
+            </template>
+            <template v-else>
+              <span class="chip" :class="{ on: m.id === settings.state.userId }">{{ m.name }}</span>
+              <small v-if="m.id === settings.state.userId" class="fam-you">{{ t('settings.family.you') }}</small>
+              <button class="link" @click="startFamRename(m)">{{ t('settings.family.rename') }}</button>
+              <button
+                v-if="m.id !== settings.state.userId"
+                class="chip-del"
+                :class="{ armed: famArm === m.id }"
+                @click="removeFam(m)"
+              >{{ famArm === m.id ? t('settings.family.deleteArm') : '✕' }}</button>
+            </template>
+          </div>
+          <div class="row">
+            <span class="key-edit">
+              <input
+                v-model="famNew"
+                class="s-input"
+                :placeholder="t('settings.family.addPlaceholder')"
+                @keyup.enter="addFam"
+              />
+              <button class="link" :disabled="!famNew.trim()" @click="addFam">
+                {{ t('settings.family.add') }}
+              </button>
+            </span>
+          </div>
+          <p class="hint">{{ t('settings.family.membersHint') }}</p>
+
+          <p class="section">{{ t('settings.family.chats') }}</p>
+          <p v-if="!chats.length" class="hint">{{ t('settings.family.chatsEmpty') }}</p>
+          <div v-for="c in chats" :key="c.id" class="row fam-row">
+            <span class="chip">{{ channelName(c.channel) }}</span>
+            <span class="fam-chat-label" :title="c.ext_id">{{ c.label || c.ext_id }}</span>
+            <select class="s-input fam-select" :value="c.user_id ?? ''" @change="bindChat(c, $event)">
+              <option value="">{{ t('settings.family.unassigned') }}</option>
+              <option v-for="m in family" :key="m.id" :value="m.id">{{ m.name }}</option>
+            </select>
+          </div>
+          <p v-if="chats.length" class="hint">{{ t('settings.family.chatsHint') }}</p>
+        </template>
       </div>
 
       <!-- 声音(PLAN §11):第一层只放高频两项;高级分组线下(强默认收口) -->
@@ -1689,6 +1803,13 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .chip-del { border: none; background: transparent; color: var(--text-dim); cursor: pointer; font-size: 11px; padding: 0 2px; align-self: center; opacity: 0.55; }
 .chip-del:hover { color: var(--danger); opacity: 1; }
 .chip-del.armed { color: var(--danger); opacity: 1; font-weight: 600; }
+/* 家人页:行内成员卡 + 渠道对话指认(全语义 token,换肤跟随)。
+   .row 默认 space-between 会把中间按钮拉开 → 改左对齐,删除钮 margin-left:auto 靠右 */
+.fam-row { justify-content: flex-start; gap: 10px; }
+.fam-row .chip-del { margin-left: auto; }
+.fam-you { color: var(--text-dim); font-size: 11px; }
+.fam-chat-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); font-size: 12.5px; }
+.fam-select { flex: 0 0 auto; max-width: 160px; margin-left: auto; }
 .hidden-file { display: none; }
 .clone-edit { align-items: flex-start; }
 .clone-form { display: flex; flex-direction: column; gap: 6px; max-width: 420px; width: 100%; }

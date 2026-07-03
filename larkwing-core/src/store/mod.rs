@@ -17,7 +17,7 @@ pub mod users;
 pub mod voiceprints;
 
 pub use briefings::{Briefing, BriefingRepo};
-pub use channels::ChannelRepo;
+pub use channels::{ChannelRepo, ChannelThread};
 pub use chat::{ChatRepo, Conversation, Message, SearchHit};
 pub use cloned_voices::{ClonedVoice, ClonedVoiceRepo};
 pub use db::Db;
