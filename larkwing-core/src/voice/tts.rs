@@ -152,6 +152,10 @@ fn zipvoice_dir_hint(dir: &Path) -> String {
 /// feat_scale/t_shift/target_rms/guidance_scale 取自 sherpa-onnx 官方 `zipvoice_tts` 例子
 /// (Default 全 0 会跑不出声),锁死不暴露(同管线参数纪律)。
 fn zipvoice_config(model_dir: &Path) -> Result<sherpa_onnx::OfflineTtsConfig> {
+    // 兜底去 Windows 长路径前缀(根因修在 datadir,这里防其它来源):verbatim 形关闭 `/`→`\`
+    // 归一化,sherpa 内部拼 `espeak-ng-data/phontab` 会「文件不存在」(2026-07-03 真机破案)。
+    let model_dir = crate::datadir::simplify(model_dir);
+    let model_dir = model_dir.as_path();
     let p = |n: &str| Some(model_dir.join(n).to_string_lossy().into_owned());
     let mut cfg = sherpa_onnx::OfflineTtsConfig::default();
     cfg.model.zipvoice.tokens = p("tokens.txt");

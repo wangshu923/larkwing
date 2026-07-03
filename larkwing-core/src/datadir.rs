@@ -81,18 +81,20 @@ pub fn write_pointer(anchor: &Path, p: &Pointer) -> Result<()> {
 /// 启动解析:`anchor` = OS 默认 app_data_dir。
 pub fn resolve(anchor: &Path) -> Resolution {
     let p = read_pointer(anchor);
+    // 指针路径先去 verbatim 前缀:老版本搬家写进过 `\\?\E:\…`(norm 未 simplify 时期),
+    // 这里统一洗一遍 = 存量用户下次启动即自愈,不用改指针文件。
     let recorded = p
         .data_root
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
+        .map(|s| simplify(Path::new(s)));
     let old_root = p
         .old_root
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
+        .map(|s| simplify(Path::new(s)));
     match recorded {
         None => Resolution { root: anchor.to_path_buf(), old_root, missing: None },
         // 搬过家:目录在 = 用它;目录不在(盘没插 / 被删)= missing,回落锚点交壳层处理。
@@ -144,12 +146,34 @@ pub struct MovePlan {
     pub free_bytes: u64,
 }
 
+/// 去掉 Windows 长路径前缀(`\\?\C:\…` → `C:\…`;`\\?\UNC\srv\share` → `\\srv\share`)。
+/// Rust `canonicalize` 在 Windows 恒返回 verbatim 形;Rust 自己的 fs 无所谓,但 **verbatim
+/// 会关闭 Win32 的路径归一化(`/` 不再当 `\`)** —— sherpa/espeak 这类 C 库内部用 `/` 拼
+/// 子路径(`espeak-ng-data/phontab`),在带前缀的数据根下全部「文件不存在」
+/// (2026-07-03 克隆音色真机破案:搬家到 E 盘后指针带上了 `\\?\`)。
+/// 数据根从这里出去 → 一律去前缀;只认盘符形与 UNC 形(canonicalize 的全部产出),
+/// 其它 `\\?\` 设备路径原样保留防误伤。
+pub fn simplify(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        let b = rest.as_bytes();
+        if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+            return PathBuf::from(rest);
+        }
+    }
+    p.to_path_buf()
+}
+
 /// 规范化路径(canonicalize 失败 —— 如目标尚不存在 —— 就用原值,尽力而为)。
 /// ⚠️ macOS 的 `/var → /private/var` 等符号链接:**只能** canonicalize 存在的路径,
 /// 故嵌套判断要先把存在的 `picked`/`current` 规范化,再从规范化的前缀拼出尚不存在的 `new_root`,
 /// 否则一头带 `/private` 一头不带,`starts_with` 永远不命中。
+/// Windows 侧顺手去 verbatim 前缀(见 `simplify`)—— 由此拼出的 new_root 写进指针即是干净形。
 fn norm(p: &Path) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    simplify(&std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()))
 }
 
 /// 预检:`current_root` = 当前数据根;`picked` = 用户选的目录。
@@ -401,6 +425,24 @@ mod tests {
     use super::*;
     use crate::bus::Bus;
     use crate::tasks::Tasks;
+
+    /// verbatim 前缀剥离(克隆音色真机破案的修法;字符串级,Mac 也可测)。
+    #[test]
+    fn simplify_strips_windows_verbatim_prefixes() {
+        assert_eq!(simplify(Path::new(r"\\?\E:\a\b")), PathBuf::from(r"E:\a\b"));
+        assert_eq!(
+            simplify(Path::new(r"\\?\UNC\nas\share\x")),
+            PathBuf::from(r"\\nas\share\x"),
+            "UNC verbatim 还原成 \\\\server\\share 形"
+        );
+        assert_eq!(simplify(Path::new(r"C:\plain")), PathBuf::from(r"C:\plain"), "普通盘符不动");
+        assert_eq!(simplify(Path::new("/unix/path")), PathBuf::from("/unix/path"), "unix 路径不动");
+        // 非盘符的 \\?\ 设备路径(canonicalize 不会产)原样保留,防误伤
+        assert_eq!(
+            simplify(Path::new(r"\\?\Volume{abc}\y")),
+            PathBuf::from(r"\\?\Volume{abc}\y")
+        );
+    }
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("lw-datadir-{}-{tag}", std::process::id()));
