@@ -110,6 +110,10 @@ pub struct AttachmentRef {
     pub name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mime: String,
+    /// 图片落盘的相对文件名(`attachments/` 下):重开会话仍能显缩略图(§9:图不喂 LLM 省钱,
+    /// 但 UI 该看得见——bytes 走文件不进库 §6.2,前端按需经 relay /f/ 取)。doc / 旧数据 = None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 /// 入站附件(IPC 词汇):前端把图/文档读成 base64 随消息送来。当轮处理——图走 image_url,
@@ -407,9 +411,43 @@ pub(crate) struct InjectReady {
     pub payload: Option<String>,
 }
 
+/// 图片按 mime 定落盘扩展名(仅为文件名好看 / relay 猜 content-type;识别失败给 bin)。
+fn image_ext(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        m if m.starts_with("image/") => "jpg", // jpeg / 其它都当 jpg
+        _ => "bin",
+    }
+}
+
+/// 把图片 bytes 落到 `atts_dir`(内容寻址命名,天然去重),返回相对文件名;失败 → None
+/// (没缩略图但不炸,退回旧行为)。§6.2 blob 走文件不进库、§9 图不喂 LLM 只为 UI 回看。
+fn save_image_blob(atts_dir: &std::path::Path, bytes: &[u8], mime: &str) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    let name = format!("{:016x}.{}", h.finish(), image_ext(mime));
+    if std::fs::create_dir_all(atts_dir).is_err() {
+        return None;
+    }
+    let path = atts_dir.join(&name);
+    // 内容寻址:已存在(同图重发)就不重写
+    if path.exists() || std::fs::write(&path, bytes).is_ok() {
+        Some(name)
+    } else {
+        None
+    }
+}
+
 /// 入站附件 → (图 image_url parts, 文档抽出的文字, 落库小票)。send_message 与插队共用。
+/// `atts_dir` = 图片缩略图落盘目录(`<media>/attachments`);图 bytes 写盘、小票记相对名,
+/// 供重开会话回看(不进 DB、不喂 LLM)。
 fn process_attachments(
     attachments: &[InAttachment],
+    atts_dir: &std::path::Path,
 ) -> (Vec<crate::llm::ContentPart>, String, Vec<AttachmentRef>) {
     use base64::Engine as _;
     let mut image_parts = Vec::new();
@@ -420,7 +458,18 @@ fn process_attachments(
             image_parts.push(crate::llm::ContentPart::ImageUrl {
                 url: format!("data:{};base64,{}", a.mime, a.data),
             });
-            refs.push(AttachmentRef { kind: "image".into(), name: a.name.clone(), mime: a.mime.clone() });
+            // 落盘缩略图(§1 用户反馈:图转一圈回来只剩名字太糙)——解一次 base64 写文件;
+            // 失败只是没缩略图,回合照走。
+            let file = base64::engine::general_purpose::STANDARD
+                .decode(a.data.as_bytes())
+                .ok()
+                .and_then(|bytes| save_image_blob(atts_dir, &bytes, &a.mime));
+            refs.push(AttachmentRef {
+                kind: "image".into(),
+                name: a.name.clone(),
+                mime: a.mime.clone(),
+                file,
+            });
             continue;
         }
         let extracted = base64::engine::general_purpose::STANDARD
@@ -431,7 +480,12 @@ fn process_attachments(
             Some(t) => doc_text.push_str(&format!("\n\n〔附件:{}〕\n{t}", a.name)),
             None => doc_text.push_str(&format!("\n\n〔附件:{}(暂时读不出内容)〕", a.name)),
         }
-        refs.push(AttachmentRef { kind: "doc".into(), name: a.name.clone(), mime: a.mime.clone() });
+        refs.push(AttachmentRef {
+            kind: "doc".into(),
+            name: a.name.clone(),
+            mime: a.mime.clone(),
+            file: None,
+        });
     }
     (image_parts, doc_text, refs)
 }
@@ -441,8 +495,9 @@ fn build_inject_ready(
     text: String,
     meta: Option<UserMeta>,
     attachments: Vec<InAttachment>,
+    atts_dir: &std::path::Path,
 ) -> InjectReady {
-    let (parts, doc_text, refs) = process_attachments(&attachments);
+    let (parts, doc_text, refs) = process_attachments(&attachments, atts_dir);
     let mut eff_meta = meta.unwrap_or_default();
     eff_meta.attachments = refs.clone();
     let payload = (!eff_meta.is_default()).then(|| serde_json::to_string(&eff_meta).ok()).flatten();
@@ -1657,14 +1712,16 @@ impl Engine {
         // 落用户消息 + 取上下文原料 + 单一装配权出 ChatRequest(阻塞 IO 下沉线程池)
         let store = self.store.clone();
         let conv_user = conversation.user_id;
+        let atts_dir = self.media.attachments_dir(); // 图缩略图落盘目录(闭包内写图)
         // 标题还空 = 本次 append 会写下截断占位 → 回头后台给它起个正经名(engine/title.rs)
         let needs_title = conversation.title.is_empty();
         let (mut request, user_msg_id, mem_user, title_seed) = tokio::task::spawn_blocking(
             move || -> anyhow::Result<(crate::llm::ChatRequest, i64, i64, Option<String>)> {
             // 入站附件(媒体输入 PLAN §9):图 → image_url 当轮注入(不落库,vision 重复计费);
             // 文档**文字**并进落库的 user 消息内容 → 进 history,多轮追问还在、且落可缓存前缀
-            // (§9 收窄:仅图当轮,文档持久化)。只把小票(AttachmentRef)落 payload。与插队共用
-            let (image_parts, doc_text, att_refs) = process_attachments(&attachments);
+            // (§9 收窄:仅图当轮,文档持久化)。图 bytes 另落文件、小票记相对名(重开会话回看图);
+            // 只把小票(AttachmentRef)落 payload。与插队共用
+            let (image_parts, doc_text, att_refs) = process_attachments(&attachments, &atts_dir);
 
             // 语音会话模式(PLAN §11)+ 附件小票:非默认形态物化进 payload(真相在库)
             let mut eff_meta = meta.unwrap_or_default();
@@ -1827,9 +1884,10 @@ impl Engine {
         if inject.lock().expect("inject lock poisoned").finishing {
             return false;
         }
-        // 处理附件(阻塞下沉线程池)→ 就绪形
+        // 处理附件(阻塞下沉线程池)→ 就绪形。附件目录先取(cheap PathBuf),move 进闭包写图。
+        let atts_dir = self.media.attachments_dir();
         let ready = match tokio::task::spawn_blocking(move || {
-            build_inject_ready(text, meta, attachments)
+            build_inject_ready(text, meta, attachments, &atts_dir)
         })
         .await
         {

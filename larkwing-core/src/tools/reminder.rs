@@ -13,8 +13,13 @@ const CONTENT_MAX_CHARS: usize = 2000;
 const TASK_TITLE_MAX_CHARS: usize = 16;
 
 fn parse_local(s: &str) -> anyhow::Result<i64> {
-    let naive = chrono::NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M")
-        .context("时间格式应为 YYYY-MM-DD HH:MM")?;
+    let s = s.trim();
+    // 先试带秒(短提醒「一分钟后」要秒级才准:now 现在也给秒,模型能算准点),回落到分。
+    // 否则「00:52:59 + 1 分钟」被截成「00:53」→ 只差 1 秒就触发,像「立刻」而非「一分钟后」
+    // (2026-07-04 用户点出的边界)。
+    let naive = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M"))
+        .context("时间格式应为 YYYY-MM-DD HH:MM(可带 :SS)")?;
     chrono::Local
         .from_local_datetime(&naive)
         .single()
@@ -52,8 +57,10 @@ impl ReminderSet {
         ReminderSet {
             spec: ToolSpec {
                 name: "reminder_set",
-                description: "定提醒或定时任务。先用 now 看当前时间,把「明早八点/十分钟后」\
-                              换算成 first_at。content 必须自包含:到点执行时**看不到现在的\
+                description: "定提醒或定时任务。**先用 now 看当前时间**(now 精确到秒)再把\
+                              「明早八点/十分钟后」换算成 first_at;短提醒(如「一分钟后」)务必\
+                              基于 now 的秒数算准、first_at 带上秒,别只写到分钟(否则可能差出小半\
+                              分钟、显得像立刻就响)。content 必须自包含:到点执行时**看不到现在的\
                               对话**,所以把要做的事、相关细节、对话里的指代全部展开写清\
                               (写「提醒吃降压药(饭后、配水)」,不写「提醒吃那个药」)。\
                               mode 选择:remind=捎话提醒,到点的话出现在当前对话(默认);\
@@ -68,7 +75,7 @@ impl ReminderSet {
                         },
                         "first_at": {
                             "type": "string",
-                            "description": "首次触发时间,本地时区,格式 YYYY-MM-DD HH:MM"
+                            "description": "首次触发时间,本地时区,格式 YYYY-MM-DD HH:MM(短提醒可带秒 HH:MM:SS 更准)"
                         },
                         "repeat": {
                             "type": "string",
@@ -358,6 +365,16 @@ mod tests {
             )
             .await;
         assert!(bad.is_err());
+    }
+
+    #[test]
+    fn parse_local_accepts_minute_and_second_precision() {
+        let a = parse_local("2030-01-02 08:30").unwrap();
+        let b = parse_local("2030-01-02 08:30:00").unwrap();
+        assert_eq!(a, b, "带秒 :00 与不带秒同刻");
+        let c = parse_local("2030-01-02 08:30:45").unwrap();
+        assert_eq!(c - a, 45_000, "秒被真正解析进 first_at(短提醒精度)");
+        assert!(parse_local("2030-01-02 08:30:99").is_err(), "非法秒被拒");
     }
 
     #[tokio::test]

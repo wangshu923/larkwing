@@ -42,13 +42,17 @@ impl UserRepo {
         Self { db }
     }
 
-    /// 首启零配置:一个用户都没有时自动建默认用户;否则返回最近活跃的那个。
+    /// 首启零配置:一个用户都没有时自动建默认用户;否则返回**主人**(= 最早建的那个 = 最小 id)。
+    /// ⚠️ 身份绝不按活跃度推断(2026-07-04 真机实锤):曾 `ORDER BY last_active_at DESC`,
+    /// 结果加家人 / 家人发条渠道消息都会改选「当前用户」,主人视角乱漂(会话/记忆/名字/性格
+    /// 忽有忽无、「(你)」标记乱跳)。主人是**固定身份**——第一次开机建的那个用户(id 最小,
+    /// 家人永远晚于它建),锚死在 id,与 last_active_at 彻底解耦。删自己 UI 已拦(§渠道归人)。
     pub fn ensure_default_user(&self) -> Result<User> {
         self.db.with(|c| {
             let existing = c
                 .query_row(
                     "SELECT id, name, skin_id, created_at, last_active_at
-                     FROM users ORDER BY last_active_at DESC LIMIT 1",
+                     FROM users ORDER BY id ASC LIMIT 1",
                     [],
                     row_to_user,
                 )
@@ -121,9 +125,10 @@ impl UserRepo {
 
     pub fn list(&self) -> Result<Vec<User>> {
         self.db.with(|c| {
+            // 主人在前(id 最小),家人按加入顺序 —— 稳定,不随活跃度跳(§家人页「(你)」定位)。
             let mut stmt = c.prepare(
                 "SELECT id, name, skin_id, created_at, last_active_at
-                 FROM users ORDER BY last_active_at DESC",
+                 FROM users ORDER BY id ASC",
             )?;
             let users = stmt
                 .query_map([], row_to_user)?
@@ -190,10 +195,14 @@ mod tests {
 
         let fam = s.users.create("爸爸").unwrap();
         assert_eq!(fam.last_active_at, 0, "建号不算活跃");
+        // 家人后来「活跃」了(渠道发消息 touch 等)——身份也绝不能漂到 TA 身上
+        s.users.touch(fam.id).unwrap();
         assert_eq!(
             s.users.ensure_default_user().unwrap().id,
             owner.id,
-            "重启(ensure_default_user)仍是主人,不被新家人顶掉"
+            "身份锚死主人(最小 id),与 last_active_at 无关:家人再活跃也顶不掉主人"
         );
+        // 家人列表:主人恒在最前(id 升序),不随活跃度跳
+        assert_eq!(s.users.list().unwrap().first().unwrap().id, owner.id, "主人恒在列表首");
     }
 }

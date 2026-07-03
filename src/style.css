@@ -27,10 +27,13 @@
   --warn: #ffc85f;     --warn-rgb: 255, 200, 95;
   --attn: #ffb86b;     --attn-rgb: 255, 184, 107;
   --danger: #f09595;   --danger-rgb: 240, 149, 149;
-  /* 气泡(科幻:深蓝玻璃 / 浅蓝) */
+  /* 气泡(科幻:深蓝玻璃 / 我方偏亮蓝玻璃)。
+     ⚠️ 我方用「中蓝 + 低 alpha」而非「亮天蓝」:亮色叠 backdrop-blur 会读成磨砂不透明块
+     (2026-07-04 真机反馈「用户消息不透明」),中蓝在暗背景上和对方一样透出星空,只是更蓝更亮
+     一档以区分「我」。仍保证白字对比够(text=#eaf4ff)。 */
   --bubble-them: rgba(20, 46, 78, 0.45);
-  --bubble-me: rgba(95, 175, 235, 0.22);
-  --bubble-me-line: rgba(120, 200, 255, 0.3);
+  --bubble-me: rgba(46, 108, 178, 0.4);
+  --bubble-me-line: rgba(120, 200, 255, 0.28);
   --bubble-me-text: #eaf4ff;
   --veil-top: rgba(6, 16, 34, 0.18);     /* 对话区氛围罩(顶→底渐深),科幻=暗蓝;换皮换它 */
   --veil-bottom: rgba(6, 16, 34, 0.44);

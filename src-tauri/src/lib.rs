@@ -379,6 +379,7 @@ pub fn run() {
       commands::retry_voice_model,
       commands::media_advance,
       commands::report_media_state,
+      commands::attachment_url,
       commands::remote_status,
       commands::reload_channels,
       commands::voice_listen_start,

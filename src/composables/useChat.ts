@@ -45,6 +45,8 @@ export interface UiAttachment {
   dataUrl?: string
   /** 出站 base64(发送用,不进持久展示态)。 */
   base64?: string
+  /** 历史图片落盘相对名:重开会话经 attachmentUrl 拉回缩略图(填进 dataUrl)。 */
+  file?: string
 }
 
 export interface UiMessage {
@@ -106,7 +108,8 @@ onProvidersUsable(() => {
 
 function toUi(m: Message): UiMessage {
   const ui: UiMessage = { id: m.id, role: m.role === 'user' ? 'user' : 'wang', text: m.content, at: m.created_at }
-  // 历史里的附件小票:从 user 行 payload(UserMeta)解出,显「📷/📄 名字」(无 dataUrl)
+  // 历史里的附件小票:从 user 行 payload(UserMeta)解出。图带 file → 稍后 resolveThumbs
+  // 拉回缩略图(填 dataUrl);拉到前 / doc / 旧数据显「📷/📄 名字」兜底。
   if (m.role === 'user' && m.payload) {
     try {
       const refs = (JSON.parse(m.payload) as { attachments?: AttachmentRef[] }).attachments
@@ -115,6 +118,7 @@ function toUi(m: Message): UiMessage {
           kind: a.kind === 'image' ? 'image' : 'doc',
           name: a.name,
           mime: a.mime,
+          file: a.file,
         }))
       }
     } catch {
@@ -122,6 +126,23 @@ function toUi(m: Message): UiMessage {
     }
   }
   return ui
+}
+
+/** 历史图片缩略图按需回填:遍历 reactive state.messages,给带 file 的图拉 localhost URL
+ *  填进 dataUrl(经 reactive 代理改 → 触发重渲染)。取不到就留名字兜底,不炸。 */
+async function resolveThumbs() {
+  if (!state.inTauri) return
+  for (const m of state.messages) {
+    for (const a of m.attachments ?? []) {
+      if (a.kind === 'image' && a.file && !a.dataUrl) {
+        try {
+          a.dataUrl = await api.attachmentUrl(a.file)
+        } catch {
+          /* 取不到(文件被清 / relay 没起)→ 留「📷 名字」,不影响其它 */
+        }
+      }
+    }
+  }
 }
 
 /** 内部行不进聊天流:'tool' 行、'event' 行(定时触发,7274 的转述才是给人看的)、
@@ -398,6 +419,7 @@ async function boot() {
           state.messages = msgs.filter(visible).map(toUi)
           void hydrateStats(state.convId) // 提醒/自启回合的气泡也带上 hover 读数
           void hydrateTrace(state.convId) // …和「想了想」轨迹
+          void resolveThumbs() // 历史图缩略图回填
           // 提醒到点自动开口(PLAN §11 B 期):设备主动叫人,off 档才闭嘴;
           // 回合没标〔语音〕(屏幕排版),念之前净化兜底。跨会话提醒念话 C 期随唤醒流程
           const last = msgs.filter(visible).at(-1)
@@ -422,6 +444,7 @@ async function boot() {
     state.hasApiKey = snap.hasApiKey
     state.convId = snap.conversation.id
     state.messages = snap.messages.filter(visible).map(toUi)
+    void resolveThumbs() // 历史图缩略图回填
     if (snap.openingLine) {
       state.openingLine = snap.openingLine
       pushOpening() // 空会话给开场白(只展示,不落库)
@@ -760,6 +783,7 @@ async function selectConversation(convId: number) {
   try {
     const msgs = await api.loadConversation(convId)
     state.messages = msgs.filter(visible).map(toUi)
+    void resolveThumbs() // 历史图缩略图回填
     void hydrateStats(convId) // 切回的历史会话:气泡 hover 读数从库回填
     void hydrateTrace(convId) // …和「想了想」轨迹
     if (!msgs.length) pushOpening()

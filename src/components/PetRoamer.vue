@@ -66,8 +66,15 @@ function roamFrame() {
     }
     roamerFlipped.value = facing < 0
   }
-  // 图片自身 -50% 居中,这里直接写中心点(蹲/跑画布不同大也不会跳位)
-  if (roamer.value) roamer.value.style.transform = `translate(${dogX}px, ${dogY}px)`
+  // 图片自身 -50% 居中,这里直接写中心点(蹲/跑画布不同大也不会跳位)。
+  // ⚠️ 叠加 scrollTop:.roamer 绝对定位在 .stream(滚动容器)里,top:0 = 内容顶而非视口顶;
+  // dogX/dogY 是「视口坐标」(newTarget 用 clientHeight 挑落点)→ 写入时加当前 scrollTop,
+  // 桌宠才始终在**可见区**遛弯。否则会话一长它被钉在内容最上方、滚到最新 turn 就看不见了
+  // (2026-07-04 真机实锤)。
+  if (roamer.value) {
+    const off = props.bounds ? props.bounds.scrollTop : 0
+    roamer.value.style.transform = `translate(${dogX}px, ${dogY + off}px)`
+  }
 }
 
 // 换形象:重置步态 + **立即换成新角色静止帧**(不等下一帧;rAF 万一没在跑也立刻反映切换,

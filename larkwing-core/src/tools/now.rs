@@ -37,9 +37,11 @@ impl Tool for Now {
         let now = chrono::Local::now();
         let weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
             [chrono::Datelike::weekday(&now).num_days_from_monday() as usize];
-        // 结果是喂给模型的观察(不是 UI 文案),用模型当前人格的语言最顺
+        // 结果是喂给模型的观察(不是 UI 文案),用模型当前人格的语言最顺。
+        // 带秒:短提醒(「一分钟后」)要秒级现刻才算得准,截到分会差出小一分钟
+        // (2026-07-04 边界);reminder_set 的 first_at 也接受带秒。
         Ok(serde_json::json!({
-            "now": now.format("%Y-%m-%d %H:%M").to_string(),
+            "now": now.format("%Y-%m-%d %H:%M:%S").to_string(),
             "weekday": weekday,
         })
         .to_string())

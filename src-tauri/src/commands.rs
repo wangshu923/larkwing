@@ -21,8 +21,7 @@ use larkwing_core::llm::catalog::ModelOverride;
 use larkwing_core::llm::AccountBalance;
 use larkwing_core::media::{CookieRec, MediaRuntime};
 use larkwing_core::store::{
-    Briefing, ClonedVoice, Conversation, FsOpRow, Job, Memory, Message, SearchHit, UsageTotals,
-    User,
+    Briefing, ClonedVoice, Conversation, FsOpRow, Memory, Message, SearchHit, UsageTotals, User,
 };
 use larkwing_core::voice::{FamilyMember, VoiceRuntime, VoiceStatus};
 
@@ -753,6 +752,13 @@ pub fn report_media_state(
     report: larkwing_core::media::PlaybackReport,
 ) {
     state.media.set_playback(report);
+}
+
+/// 历史图片小票 → 可显缩略图的 localhost URL(重开会话回看发过的图,§1/§9)。
+/// 前端 hydrate 历史时按需取;图 bytes 走文件不进库、不再喂 LLM。
+#[tauri::command]
+pub async fn attachment_url(state: State<'_, AppState>, file: String) -> Result<String, AppError> {
+    state.media.attachment_url(&file).await.map_err(AppError::internal)
 }
 
 // ---- 远程渠道(PLAN 远程渠道:Telegram / 钉钉 bot) ----

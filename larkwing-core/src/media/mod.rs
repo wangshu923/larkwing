@@ -378,6 +378,22 @@ impl MediaRuntime {
         Ok(relay.register_file(path))
     }
 
+    /// 聊天图片缩略图落盘目录(`<media>/attachments`;随数据根搬家)。engine 写、命令读回。
+    pub fn attachments_dir(&self) -> PathBuf {
+        self.inner.dir.join("attachments")
+    }
+
+    /// 历史图片小票(相对文件名)→ 可显缩略图的 localhost URL(重开会话回看图,§1/§9)。
+    /// 文件名兜底防目录穿越:只取末段 file_name,拒绝 `..` / 路径分隔。
+    pub async fn attachment_url(&self, file: &str) -> Result<String> {
+        let name = std::path::Path::new(file)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .context("非法附件名")?;
+        self.file_url(self.attachments_dir().join(name)).await
+    }
+
     fn default_source(&self) -> &Arc<dyn MediaSource> {
         &self.inner.sources[0]
     }

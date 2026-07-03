@@ -445,11 +445,14 @@ export interface OutAttachment {
   data: string
 }
 
-/** 持久小票(历史里标这条带过图/文档);附件本体当轮注入 LLM 后不留存。 */
+/** 持久小票(历史里标这条带过图/文档);文档本体不留存,**图片 bytes 落文件**(file 相对名),
+ *  重开会话经 attachmentUrl 取回缩略图(不再喂 LLM,§1/§9)。 */
 export interface AttachmentRef {
   kind: 'image' | 'doc' | string
   name: string
   mime?: string
+  /** 图片落盘相对名;有 = 可经 attachmentUrl 显缩略图。doc / 旧数据无。 */
+  file?: string
 }
 
 /** 家人(设置·家人 tab,D 期):用户字段 + 是否已录声纹。 */
@@ -818,6 +821,8 @@ export const api = {
    *  倍速。core 据此在下个回合喂模型「此刻」背景 —— 修「歌放完了却以为还在播」,并让模型知道
    *  当前音量/进度(才能「调到 50」「快进 5 分钟」)。fire-and-forget。 */
   reportMediaState: (report: PlaybackReport) => invoke<void>('report_media_state', { report }),
+  /** 历史图片小票(相对名)→ 可显缩略图的 localhost URL(重开会话回看发过的图)。 */
+  attachmentUrl: (file: string) => invoke<string>('attachment_url', { file }),
   /** 远程渠道状态(设置页):开关/已配凭证/白名单/连接态(凭证不过桥)。 */
   remoteStatus: () => invoke<RemoteChannelView[]>('remote_status'),
   /** 保存远程渠道配置后调:停旧起新(类比 provider 保存即重建)。 */
