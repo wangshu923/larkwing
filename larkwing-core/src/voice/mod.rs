@@ -12,7 +12,7 @@ mod tts;
 mod wake;
 
 pub use models::VoiceModels;
-pub use tts::{Speaker, DEFAULT_SPEAKER, SPEAKERS_ZH};
+pub use tts::{probe_zipvoice, Speaker, DEFAULT_SPEAKER, SPEAKERS_ZH};
 
 /// 家人列表项(设置·家人 tab):用户 + 是否已录声纹。壳层 list_family 用。
 #[derive(Debug, Clone, serde::Serialize)]
@@ -97,6 +97,8 @@ struct Inner {
     tts_clone: tokio::sync::OnceCell<Arc<tts::ZipVoiceTts>>,
     /// 克隆模型加载失败时「清树重下」自愈,本会话只做一次(避免非下载原因坏时反复重下几百 MB)。
     clone_reheal: std::sync::atomic::AtomicBool,
+    /// 克隆加载失败后的子进程探针(抓 sherpa 的 /MT stderr),本会话只跑一次(模型加载很重)。
+    clone_probe_done: std::sync::atomic::AtomicBool,
     /// 克隆参考音目录(`数据目录/voice/clones/<wav_file>`)。
     clones_dir: PathBuf,
     /// 声纹提取器(CAM++ 26MB):有家人注册声纹时才加载(PLAN §11 D)。
@@ -162,6 +164,7 @@ impl VoiceRuntime {
                 tts_offline: tokio::sync::OnceCell::new(),
                 tts_clone: tokio::sync::OnceCell::new(),
                 clone_reheal: std::sync::atomic::AtomicBool::new(false),
+                clone_probe_done: std::sync::atomic::AtomicBool::new(false),
                 clones_dir: dir.join("clones"),
                 speaker: tokio::sync::OnceCell::new(),
                 wake: std::sync::Mutex::new(None),
@@ -251,13 +254,62 @@ impl VoiceRuntime {
                 // 重下一次再试,**免让用户去数据目录手删**。本会话只做一次(swap):重下后仍失败(可能非
                 // 下载问题,如格式/运行时)就不再反复重下几百 MB,直接把带文件线索的错误报上去。
                 if self.inner.clone_reheal.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    self.spawn_zipvoice_probe();
                     return Err(e);
                 }
                 tracing::warn!(err = %format!("{e:#}"), "音色克隆加载失败,清模型树重下一次再试(自愈,本会话仅一次)");
                 self.inner.models.reset_tree(&models::TTS_ZIPVOICE).ok();
-                self.try_load_clone_tts().await
+                let r = self.try_load_clone_tts().await;
+                if r.is_err() {
+                    // 全新校验文件仍失败 = 非下载问题 → 拉探针抓 sherpa 真话(见下)
+                    self.spawn_zipvoice_probe();
+                }
+                r
             }
         }
+    }
+
+    /// 抓 sherpa 真实报错的子进程探针(每会话至多一次,fire-and-forget,结果进 larkwing.log)。
+    /// 为什么要子进程:Windows 的 sherpa 预编译库是**静态 CRT(/MT)**,它的 stderr 与主进程
+    /// Rust 侧不是同一张 fd 表 —— 进程内 dup2(nativelog)接不到它;而子进程出生时**所有** CRT
+    /// 都从父进程给的管道初始化 fd 2 → sherpa 的 LOGE 全收(2026-07-03 真机追因的产物)。
+    fn spawn_zipvoice_probe(&self) {
+        if self.inner.clone_probe_done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let dir = self.inner.models.tree_dir(&models::TTS_ZIPVOICE);
+        tokio::spawn(async move {
+            let exe = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(err = %e, "zipvoice 探针:拿不到自身 exe 路径");
+                    return;
+                }
+            };
+            let run = tokio::process::Command::new(&exe)
+                .arg("--probe-zipvoice")
+                .arg(&dir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .output();
+            match tokio::time::timeout(std::time::Duration::from_secs(180), run).await {
+                Ok(Ok(out)) => {
+                    let mut text = String::from_utf8_lossy(&out.stderr).into_owned();
+                    if text.len() > 16_000 {
+                        // 只留尾巴(真因在最后);按字符切防撕 UTF-8
+                        text = text.chars().rev().take(16_000).collect::<Vec<_>>().into_iter().rev().collect();
+                    }
+                    tracing::warn!(
+                        exit = ?out.status.code(),
+                        "zipvoice 探针(sherpa 真实输出如下)\n{text}"
+                    );
+                }
+                Ok(Err(e)) => tracing::warn!(err = %e, "zipvoice 探针进程起不来"),
+                Err(_) => tracing::warn!("zipvoice 探针超时(180s)"),
+            }
+        });
     }
 
     /// 确保 ZipVoice 模型在位 + 加载进 OnceCell 缓存。加载失败不缓存(get_or_try_init 语义),

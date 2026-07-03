@@ -148,32 +148,57 @@ fn zipvoice_dir_hint(dir: &Path) -> String {
     }
 }
 
+/// 组一份 ZipVoice 加载配置(`load` 与子进程探针共用同一份——探针要复现的就是这份)。
+/// feat_scale/t_shift/target_rms/guidance_scale 取自 sherpa-onnx 官方 `zipvoice_tts` 例子
+/// (Default 全 0 会跑不出声),锁死不暴露(同管线参数纪律)。
+fn zipvoice_config(model_dir: &Path) -> Result<sherpa_onnx::OfflineTtsConfig> {
+    let p = |n: &str| Some(model_dir.join(n).to_string_lossy().into_owned());
+    let mut cfg = sherpa_onnx::OfflineTtsConfig::default();
+    cfg.model.zipvoice.tokens = p("tokens.txt");
+    cfg.model.zipvoice.encoder = p("encoder.int8.onnx");
+    cfg.model.zipvoice.decoder = p("decoder.int8.onnx");
+    cfg.model.zipvoice.vocoder = p("vocos_24khz.onnx");
+    cfg.model.zipvoice.data_dir = p("espeak-ng-data");
+    // 多音字补丁:把内置补丁词表合并进下载的 lexicon,纠正「好战」类贪婪误读。
+    cfg.model.zipvoice.lexicon =
+        Some(merge_polyphone_lexicon(model_dir)?.to_string_lossy().into_owned());
+    cfg.model.zipvoice.feat_scale = 0.1;
+    cfg.model.zipvoice.t_shift = 0.5;
+    cfg.model.zipvoice.target_rms = 0.1;
+    cfg.model.zipvoice.guidance_scale = 1.0;
+    // CPU 合成线程:克隆音色是本地 ZipVoice,合成耗时随线程数近线性下降;
+    // 2 太保守(实测 77 字 ~19s),提到 6(留核给 ASR/LLM/UI)。配短参考音一起降延迟。
+    cfg.model.num_threads = 6;
+    Ok(cfg)
+}
+
+/// 子进程探针本体(壳层 `--probe-zipvoice <dir>` 入口调):用与 `load` 完全相同的配置
+/// 重跑一次 create。**存在意义 = 抓 sherpa 的 stderr**:Windows 的 sherpa 预编译库是
+/// 静态 CRT(/MT),它的 stderr 与主进程 Rust 侧不是同一张 fd 表,进程内怎么 dup2 都
+/// 接不到(native.log 只见 boot 标记的真因,2026-07-03);而**子进程**出生时所有 CRT 都
+/// 从父进程给的句柄初始化 fd 2 → 管道全收。返回 create 是否成功。
+pub fn probe_zipvoice(model_dir: &Path) -> bool {
+    eprintln!("[probe] zipvoice create: {}", model_dir.display());
+    let cfg = match zipvoice_config(model_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[probe] 配置构建失败(lexicon 合并):{e:#}");
+            return false;
+        }
+    };
+    let ok = sherpa_onnx::OfflineTts::create(&cfg).is_some();
+    eprintln!("[probe] create => {}", if ok { "ok" } else { "null(真因见上方 sherpa 输出)" });
+    ok
+}
+
 impl ZipVoiceTts {
     /// 加载 ZipVoice 模型(encoder/decoder/vocoder/tokens + espeak-ng-data 目录 + lexicon)。
-    /// feat_scale/t_shift/target_rms/guidance_scale 取自 sherpa-onnx 官方 `zipvoice_tts` 例子
-    /// (Default 全 0 会跑不出声),锁死不暴露(同管线参数纪律)。
     pub fn load(model_dir: &Path, resolve: CloneResolver) -> Result<ZipVoiceTts> {
-        let p = |n: &str| Some(model_dir.join(n).to_string_lossy().into_owned());
-        let mut cfg = sherpa_onnx::OfflineTtsConfig::default();
-        cfg.model.zipvoice.tokens = p("tokens.txt");
-        cfg.model.zipvoice.encoder = p("encoder.int8.onnx");
-        cfg.model.zipvoice.decoder = p("decoder.int8.onnx");
-        cfg.model.zipvoice.vocoder = p("vocos_24khz.onnx");
-        cfg.model.zipvoice.data_dir = p("espeak-ng-data");
-        // 多音字补丁:把内置补丁词表合并进下载的 lexicon,纠正「好战」类贪婪误读。
-        cfg.model.zipvoice.lexicon =
-            Some(merge_polyphone_lexicon(model_dir)?.to_string_lossy().into_owned());
-        cfg.model.zipvoice.feat_scale = 0.1;
-        cfg.model.zipvoice.t_shift = 0.5;
-        cfg.model.zipvoice.target_rms = 0.1;
-        cfg.model.zipvoice.guidance_scale = 1.0;
-        // CPU 合成线程:克隆音色是本地 ZipVoice,合成耗时随线程数近线性下降;
-        // 2 太保守(实测 77 字 ~19s),提到 6(留核给 ASR/LLM/UI)。配短参考音一起降延迟。
-        cfg.model.num_threads = 6;
+        let cfg = zipvoice_config(model_dir)?;
         let t0 = std::time::Instant::now();
         let tts = sherpa_onnx::OfflineTts::create(&cfg).ok_or_else(|| {
             anyhow!(
-                "音色克隆模型加载失败{};sherpa 的真实报错在数据目录 logs/native.log 末尾(正式版)",
+                "音色克隆模型加载失败{};sherpa 真实报错由自动探针抓取,见 logs/larkwing.log 的「zipvoice 探针」行",
                 zipvoice_dir_hint(model_dir)
             )
         })?;

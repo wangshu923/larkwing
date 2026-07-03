@@ -1,6 +1,7 @@
 [package]
 name = "larkwing-core"
 version.workspace = true
+license.workspace = true
 edition = "2021"
 rust-version = "1.77.2"
 

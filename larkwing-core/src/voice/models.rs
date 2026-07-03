@@ -336,6 +336,11 @@ impl VoiceModels {
         Ok(())
     }
 
+    /// 整包模型的落盘目录(诊断探针等外部只读用;不触发下载)。
+    pub fn tree_dir(&self, spec: &TreeModelSpec) -> PathBuf {
+        self.dir.join(spec.id)
+    }
+
     pub fn is_tree_ready(&self, spec: &TreeModelSpec) -> bool {
         let dir = self.dir.join(spec.id);
         spec.ready.iter().all(|(f, min)| tree_item_ok(&dir, f, *min))

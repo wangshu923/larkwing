@@ -6,3 +6,5 @@ members = ["larkwing-core", "src-tauri"]
 # 改版本走 `scripts/bump-version.sh X.Y.Z`(它一并改 package.json / tauri.conf.json + 同步 Cargo.lock)。
 [workspace.package]
 version = "0.2.4"
+# 许可证单一真源(根 LICENSE 文件 = MIT):成员 crate 用 `license.workspace = true` 继承。
+license = "MIT"
