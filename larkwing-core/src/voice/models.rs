@@ -167,8 +167,11 @@ pub struct TreeModelSpec {
     pub id: &'static str,
     pub label_key: &'static str,
     pub url: &'static str,
-    /// 解包后用于就绪判定的相对路径(文件或目录均可)。
-    pub ready: &'static [&'static str],
+    /// 解包后用于就绪判定的 (相对路径, 最小字节数);0 = 只要求存在(目录用)。
+    /// 最小值取实况大小的保守下界:抓「镜像截断 / HTML 错误页顶包」这类坏下载(实锤 2026-07-02:
+    /// Windows 自愈重下的 zipvoice 树「文件都在」却加载失败 —— 旧检查只看存在性,截断文件被放行,
+    /// sherpa 又只回 None;上游 re-export 的合法微调不会低于这些下界,不误伤)。
+    pub ready: &'static [(&'static str, u64)],
     /// 解包时跳过的(strip 后)顶层子目录名(省空间)。
     pub skip: &'static [&'static str],
     /// 包外单文件(不在 tar 里,如 vocos 声码器走 vocoder-models release):解包后单独拉进 dir。
@@ -182,13 +185,15 @@ pub const TTS_ZIPVOICE: TreeModelSpec = TreeModelSpec {
     id: "zipvoice-distill-int8-zh-en",
     label_key: "task.download.voice_tts_clone",
     url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/sherpa-onnx-zipvoice-distill-int8-zh-en-emilia.tar.bz2",
+    // 实况大小(2026-07-02 直连核对):encoder 5,570,211 / decoder 124,657,100 / vocos 54,157,409 /
+    // tokens 2,570 / lexicon 1,727,147;下界取 ~90%。
     ready: &[
-        "encoder.int8.onnx",
-        "decoder.int8.onnx",
-        "vocos_24khz.onnx",
-        "tokens.txt",
-        "lexicon.txt",
-        "espeak-ng-data",
+        ("encoder.int8.onnx", 5_000_000),
+        ("decoder.int8.onnx", 110_000_000),
+        ("vocos_24khz.onnx", 48_000_000),
+        ("tokens.txt", 1_000),
+        ("lexicon.txt", 1_500_000),
+        ("espeak-ng-data", 0),
     ],
     skip: &["test_wavs"],
     // vocos 声码器不在模型 tar 里(实测:tar 仅含 encoder/decoder/tokens/lexicon/espeak-ng-data),
@@ -300,14 +305,7 @@ impl VoiceModels {
 
     pub fn is_tree_ready(&self, spec: &TreeModelSpec) -> bool {
         let dir = self.dir.join(spec.id);
-        spec.ready.iter().all(|f| {
-            // 目录只需存在;文件必须非空 —— 0 字节 = 上次下载/写入坏了,判未就绪 → 重下,不放行坏模型
-            // (sherpa 加载坏文件只回 None 不报错,放行了就成「点了不出声」;检测自愈的第一道)。
-            match std::fs::metadata(dir.join(f)) {
-                Ok(m) => m.is_dir() || m.len() > 0,
-                Err(_) => false,
-            }
-        })
+        spec.ready.iter().all(|(f, min)| tree_item_ok(&dir, f, *min))
     }
 
     /// 清掉一棵模型树(自愈用:加载失败 = 文件坏 / 没下全 → 删掉整树,下次 ensure_tar_tree 重下)。
@@ -380,8 +378,12 @@ impl VoiceModels {
                 .with_context(|| format!("下载 {}/{} 失败", spec.id, file.name))?;
             tokio::fs::rename(&part, &dest).await?;
         }
-        for f in spec.ready {
-            anyhow::ensure!(dir.join(f).exists(), "包里没找到 {f}");
+        for (f, min) in spec.ready {
+            anyhow::ensure!(
+                tree_item_ok(dir, f, *min),
+                "下载不完整:{f} 缺失或过小(实际 {} 字节,应 ≥ {min})",
+                std::fs::metadata(dir.join(f)).map(|m| m.len()).unwrap_or(0)
+            );
         }
         Ok(())
     }
@@ -411,6 +413,16 @@ impl VoiceModels {
             tokio::fs::rename(&part, &dest).await?;
         }
         Ok(())
+    }
+}
+
+/// 树模型就绪单项:min=0 只要求存在(目录);否则要求是文件且 ≥ min 字节(抓镜像截断/坏下载,
+/// 实锤 2026-07-02 Windows 重下截断被旧存在性检查放行 → sherpa 加载只回 None「不出声」)。
+pub(crate) fn tree_item_ok(dir: &Path, name: &str, min: u64) -> bool {
+    match std::fs::metadata(dir.join(name)) {
+        Ok(m) if min == 0 => m.is_dir() || m.len() > 0,
+        Ok(m) => m.is_file() && m.len() >= min,
+        Err(_) => false,
     }
 }
 
@@ -484,6 +496,24 @@ fn rel_is_safe(rel: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 截断/坏下载必须判「未就绪」→ 触发重下(2026-07-02 Windows 实锤:镜像截断的 decoder
+    /// 被旧存在性检查放行,sherpa 加载只回 None,克隆音色「点了不出声」)。
+    #[test]
+    fn tree_item_rejects_truncated_files() {
+        let d = &std::env::temp_dir().join(format!("lw-tree-item-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(d);
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::write(d.join("model.onnx"), vec![0u8; 500]).unwrap(); // 截断:500B < 下界
+        assert!(!tree_item_ok(d, "model.onnx", 1_000_000), "截断文件不得算就绪");
+        std::fs::write(d.join("ok.onnx"), vec![0u8; 1_200_000]).unwrap();
+        assert!(tree_item_ok(d, "ok.onnx", 1_000_000));
+        assert!(!tree_item_ok(d, "missing.onnx", 1), "缺失不得算就绪");
+        std::fs::create_dir(d.join("espeak-ng-data")).unwrap();
+        assert!(tree_item_ok(d, "espeak-ng-data", 0), "min=0 目录存在即可");
+        std::fs::write(d.join("empty.txt"), b"").unwrap();
+        assert!(!tree_item_ok(d, "empty.txt", 0), "min=0 文件也不得为空");
+    }
 
     #[test]
     fn specs_have_files_and_sources() {

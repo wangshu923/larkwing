@@ -127,24 +127,19 @@ pub struct ZipVoiceTts {
 }
 
 /// sherpa `OfflineTts::create` 只回 None、不给缘由 → 自己核一遍必需文件,把线索塞进加载错误(§3.5)。
-/// 头号疑点 = 单独下载的 vocos_24khz.onnx(~54MB,非主 tar)。返回「(…)」附在错误信息后,便于日志区分
-/// 「缺文件/没下全(→ 自愈重下能救)」还是「文件都在却加载失败(→ 格式/运行时问题,重下没用)」。
+/// 判定与 `models::TTS_ZIPVOICE.ready` **同一份清单/下界**(单源;旧版 1MB 松门槛把截断的 124MB
+/// decoder 也报成「文件齐全」,2026-07-02 Windows 实锤)。区分「缺/过小(→ 自愈重下能救)」和
+/// 「真齐全却加载失败(→ 格式/运行时问题,重下没用)」。
 fn zipvoice_dir_hint(dir: &Path) -> String {
     let mut bad = Vec::new();
-    for (name, min) in [
-        ("encoder.int8.onnx", 1u64 << 20),
-        ("decoder.int8.onnx", 1u64 << 20),
-        ("vocos_24khz.onnx", 1u64 << 20),
-        ("tokens.txt", 1u64),
-    ] {
+    for (name, min) in super::models::TTS_ZIPVOICE.ready {
+        if super::models::tree_item_ok(dir, name, *min) {
+            continue;
+        }
         match std::fs::metadata(dir.join(name)) {
-            Ok(m) if m.len() >= min => {}
-            Ok(m) => bad.push(format!("{name}={}B(过小)", m.len())),
+            Ok(m) => bad.push(format!("{name}={}B(应≥{min})", m.len())),
             Err(_) => bad.push(format!("{name} 缺失")),
         }
-    }
-    if !dir.join("espeak-ng-data").is_dir() {
-        bad.push("espeak-ng-data 目录缺失".into());
     }
     if bad.is_empty() {
         "(文件齐全,疑似格式/运行时问题,非缺文件)".into()

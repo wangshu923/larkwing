@@ -58,7 +58,8 @@ function applyVolume() {
 }
 
 // 避让恢复用渐变(逐渐爬回基准),不一下子轰回来 —— 压低仍即时(让 7274 的话马上被听见)。
-const DUCK_RESTORE_FADE_MS = 700
+// 700ms 用户反馈「还是有点快」(2026-07-02)→ 放慢到 2.5s,电影声音缓缓浮回来。
+const DUCK_RESTORE_FADE_MS = 2500
 let fadeTimer: ReturnType<typeof setInterval> | undefined
 function cancelFade() {
   if (fadeTimer) {
