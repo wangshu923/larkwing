@@ -72,7 +72,7 @@ onBeforeUnmount(() => document.removeEventListener('pointerdown', onDocDown, tru
   <div ref="root" class="skinsel" :class="{ open, disabled }" @keydown="onKey">
     <button
       type="button"
-      class="skinsel-btn s-input"
+      class="skinsel-btn"
       role="combobox"
       :aria-expanded="open"
       :aria-label="ariaLabel"
@@ -100,10 +100,17 @@ onBeforeUnmount(() => document.removeEventListener('pointerdown', onDocDown, tru
 
 <style scoped>
 .skinsel { position: relative; display: inline-block; }
+/* 按钮自带皮肤 token 外观(与 .s-input 同款)——**不能**复用 SettingsView 的 .s-input:
+   那是别的组件的 scoped 样式,选不中本组件内部元素,否则关闭态回落浏览器白底
+   (2026-07-04 真机;§6.7 scoped 隔离陷阱)。 */
 .skinsel-btn {
   display: inline-flex; align-items: center; justify-content: space-between; gap: 8px;
   width: 100%; cursor: pointer; text-align: left;
+  background: var(--surface-deep); border: 1px solid var(--line); border-radius: 10px;
+  padding: 7px 11px; color: var(--text); font-size: 13px; outline: none;
 }
+.skinsel-btn:focus-visible { border-color: var(--accent); }
+.skinsel.open .skinsel-btn { border-color: var(--accent); }
 .skinsel-btn:disabled { opacity: 0.5; cursor: default; }
 .skinsel-cur { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .skinsel-arrow { color: var(--text-dim); font-size: 11px; flex: 0 0 auto; }

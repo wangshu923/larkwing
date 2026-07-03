@@ -1829,7 +1829,6 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .p-grid .s-input { width: 100%; min-width: 0; }
 /* 高级格里的 SkinSelect(档位/计价)填满单元格(root 默认 inline-block 不自动撑) */
 .adv-grid .skinsel { width: 100%; }
-.adv-grid .skinsel .s-input { min-width: 0; }
 /* 高级折叠:档位/价/窗口纠错。标签更长 → 加宽标签列;提示占满两列 */
 .adv-toggle { margin-top: 10px; font-size: 12px; color: var(--text-dim); }
 .adv-grid { grid-template-columns: 96px minmax(0, 1fr); margin-top: 8px; padding-top: 10px; border-top: 1px dashed var(--line); }
@@ -1859,7 +1858,6 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .fam-you { color: var(--text-dim); font-size: 11px; }
 .fam-chat-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); font-size: 12.5px; }
 .fam-select { flex: 0 0 auto; width: 180px; margin-left: auto; }
-.fam-select .s-input, .v-mic .s-input { min-width: 0; } /* SkinSelect 按钮不吃 .s-input 的 220 min-width,随容器 */
 .hidden-file { display: none; }
 .clone-edit { align-items: flex-start; }
 .clone-form { display: flex; flex-direction: column; gap: 6px; max-width: 420px; width: 100%; }
