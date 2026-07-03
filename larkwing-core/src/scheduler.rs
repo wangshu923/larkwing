@@ -72,8 +72,10 @@ pub async fn tick(engine: &Engine, now: i64) -> anyhow::Result<()> {
                 .await??;
             }
             Ok(false) => {
-                // 目标会话正在飞:不打断,状态不动,下个 tick 再试
-                tracing::debug!(job = job.id, "会话忙,本轮跳过");
+                // 目标会话正在飞:不打断,状态不动,下个 tick 再试。
+                // info 级:这条若连续刷 = 会话被误判「一直在忙」,是要人看见的异常信号
+                // (2026-07-04 之前是 debug,提醒被无声跳过好几天没人知道)。
+                tracing::info!(job = job.id, conv = job.conv_id, "会话忙,提醒本轮跳过(下个 tick 再试)");
             }
             Err(e) => {
                 // 没钥匙/建连失败:留 pending 自然重试,最终被宽限规则收掉,不死循环轰炸

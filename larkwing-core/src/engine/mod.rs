@@ -1955,10 +1955,18 @@ impl Engine {
         .map_err(AppError::internal)??;
         let conv_id = conversation.id;
 
-        // 忙检:绝不打断用户正在进行的对话;调度器会重试
+        // 忙检:绝不打断用户正在进行的对话;调度器会重试。
+        // ⚠️ 必须看 `join.is_finished()`,不能只看 `inflight.is_some()` —— 正常收尾的回合
+        // **不清 inflight**(只有 cancel/新 send 才 take),句柄常驻 Some;只查 is_some 的话,
+        // 会话只要聊过一次,之后的提醒就被「会话忙」永远无声跳过(2026-07-04 真机实锤:
+        // 提醒到点零动静零日志;重启曾侥幸——sessions 是内存态,重启即清)。
         {
             let sessions = self.sessions.lock().expect("sessions lock poisoned");
-            if sessions.get(&conv_id).is_some_and(|s| s.inflight.is_some()) {
+            let busy = sessions
+                .get(&conv_id)
+                .and_then(|s| s.inflight.as_ref())
+                .is_some_and(|h| !h.join.is_finished());
+            if busy {
                 return Ok(false);
             }
         }

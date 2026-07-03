@@ -496,3 +496,23 @@ async fn speaker_user_marks_context_and_keeps_boot_owner() {
     let current = store.users.ensure_default_user().unwrap();
     assert_eq!(current.id, owner.id, "重启后当前用户仍是主人");
 }
+
+/// 提醒必须能在「聊过天的会话」里触发(2026-07-04 真机实锤回归):正常收尾的回合**不清**
+/// inflight 句柄(只有 cancel/新 send 才 take),忙检若只看 `is_some`,该会话此后所有
+/// wake_turn 都被「会话忙」无声跳过——提醒到点零动静零日志;重启曾侥幸(sessions 是内存态)。
+/// 修 = 忙检看 `join.is_finished()`。
+#[tokio::test(flavor = "multi_thread")]
+async fn wake_turn_fires_after_completed_turn_in_same_conv() {
+    let (store, engine, conv_id) = setup("wake-after-turn", 1);
+
+    // 先在该会话正常聊一轮到收尾(inflight 句柄从此常驻 Some)
+    let mut rx = engine.send_message(conv_id, "先聊一句".into(), None, vec![]).await.unwrap();
+    while rx.recv().await.is_some() {}
+    // 事件流干净收尾后,回合任务本体还要几拍才真正退场 → 给点余量再验忙检
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+    let user = store.users.ensure_default_user().unwrap();
+    let job = store.jobs.add(user.id, conv_id, "提醒用户喝水", 0, "once").unwrap();
+    let fired = engine.wake_turn(&job).await.unwrap();
+    assert!(fired, "聊过的会话到点必须能触发:忙检要看 join 是否真在跑,不是句柄在不在");
+}

@@ -274,7 +274,7 @@
 - 提示词总原则:**提示词只立法条,教学归 few-shot,绑定归工具描述,内容归数据节**。
 
 ### 7.4 提醒 / jobs / web(PLAN §10)
-- **jobs 底座**:`jobs` 域 + `scheduler`(30s 轮询,无 cron 框架;错过宽限 2h——once→missed、**重复任务推进到未来不补发**(防开机轰炸);触发即推进 = at-most-once)+ `engine.wake_turn` 自启回合(event 行落库 UI 不渲染,模型转述才给人看;目标会话在飞则跳过本 tick 绝不打断;经全局事件车道发动静)。
+- **jobs 底座**:`jobs` 域 + `scheduler`(30s 轮询,无 cron 框架;错过宽限 2h——once→missed、**重复任务推进到未来不补发**(防开机轰炸);触发即推进 = at-most-once)+ `engine.wake_turn` 自启回合(event 行落库 UI 不渲染,模型转述才给人看;目标会话在飞则跳过本 tick 绝不打断;经全局事件车道发动静)。**忙检必须看 `join.is_finished()` 而非 `inflight.is_some()`(2026-07-04 真机 P0)**:正常收尾的回合不清 inflight 句柄(只有 cancel/新 send 才 take),只查 is_some → 会话聊过一次后所有提醒被「会话忙」永远跳过且零日志(skip 原是 debug 级,已升 info);重启侥幸 = sessions 是内存态。回归测试 `wake_turn_fires_after_completed_turn_in_same_conv` 守着。
 - **job 执行一律新鲜上下文**:稳定前缀与聊天回合字节级相同(共享缓存),不回放历史;任务语境靠创建时**物化进 content**(自包含、指代全展开,2000 字上限)。
 - **mode 只活在创建时刻**:remind → 落当前会话;task → 建专属会话(连载帖,闲聊会话零污染)。
 - **提醒三件套** reminder_set/list/cancel:用户说人话,模型用 `now` 推 first_at;**cron/job 概念永不暴露**。**桌面提醒页 = 主人的管理面(2026-07-04)**:显示**全家**待触发提醒(家人经渠道归人设的带名字标签)、都可撤(`jobs.list_pending_all`/`cancel_any`);工具侧 reminder_list/cancel 仍按说话人限定——此前按当前用户过滤,家人设的提醒在页面上「消失」,真机困惑实锤。

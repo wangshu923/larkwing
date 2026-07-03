@@ -954,6 +954,9 @@ watch(messages, () => nextTick(() => {
   white-space: nowrap; pointer-events: none; user-select: none;
   opacity: 0; transform: translateY(-2px); transition: opacity .18s ease, transform .18s ease;
   z-index: 7;
+  /* 窄气泡:读数比气泡宽会压到右下角的 复制/耳机 按钮(真机实锤)→ 给按钮区让位,
+     超出省略号截断(72px ≈ 两个按钮 + 间距;% 相对气泡宽,宽气泡不受影响) */
+  max-width: calc(100% - 72px); overflow: hidden; text-overflow: ellipsis;
 }
 .bubble:hover .turn-meta { opacity: 0.9; transform: translateY(0); }
 /* 在飞读数:常驻可见,轻微呼吸 —— 跳秒本身就是"我在干活"的信号 */
