@@ -780,6 +780,13 @@ pub async fn attachment_url(state: State<'_, AppState>, file: String) -> Result<
     state.media.attachment_url(&file).await.map_err(AppError::internal)
 }
 
+/// 前端播放层诊断 → 写进 `larkwing.log`(正式版 WebView 无 JS console,MSE 只在 Windows 真机能验;
+/// 靠这条把「自适应为何卡/回落」的现场喂到日志,便于下一版真机定位)。仅记日志,不改状态。
+#[tauri::command]
+pub fn media_log(msg: String) {
+    tracing::info!("[前端播放] {msg}");
+}
+
 /// 兜底重放:本地「音视频分离自适应」在前端手写 MSE 上播放失败时,前端调此命令,
 /// 后端对同一文件强制回落 muxed HLS(能放的老路)。异步 spawn,不阻塞;失败只记日志。
 #[tauri::command]

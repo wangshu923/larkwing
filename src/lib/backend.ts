@@ -841,6 +841,8 @@ export const api = {
   /** 兜底重放:本地自适应(手写 MSE)播放失败 → 后端对同一文件强制走 muxed HLS(能放的老路)。 */
   mediaReplayCompat: (pageUrl: string, audioOnly: boolean) =>
     invoke<void>('media_replay_compat', { pageUrl, audioOnly }),
+  /** 前端播放层诊断 → 写进 larkwing.log(正式版无 JS console,真机定位自适应问题靠它)。 */
+  mediaLog: (msg: string) => invoke<void>('media_log', { msg }).catch(() => {}),
   /** 历史图片小票(相对名)→ 可显缩略图的 localhost URL(重开会话回看发过的图)。 */
   attachmentUrl: (file: string) => invoke<string>('attachment_url', { file }),
   /** 远程渠道状态(设置页):开关/已配凭证/白名单/连接态(凭证不过桥)。 */

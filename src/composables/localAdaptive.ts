@@ -33,6 +33,9 @@ export interface AdaptiveController {
 
 const AHEAD = 24 // 视频缓冲领先秒数(够顺 + 不撑爆配额)
 const BEHIND = 12 // 落后多少秒开始驱逐旧段
+const AUDIO_AHEAD = 30 // 音频缓冲领先秒数(背压上限:读够就暂停读,ffmpeg 随 HTTP body 回压暂停)
+const AUDIO_BEHIND = 12 // 音频落后多少秒开始驱逐(控 MSE 配额)
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 
 /** 起播:把 `el` 接管为手写 MSE 播放 descUrl 的自适应流。异步返回控制器;失败 reject(调用方回落)。 */
 export async function playAdaptive(
@@ -56,11 +59,26 @@ export async function playAdaptive(
   let asb: SourceBuffer | null = null
   let audioAbort: AbortController | null = null
   let dead = false
+  const ranges = (sb: SourceBuffer | null): string => {
+    try {
+      if (!sb) return '-'
+      const b = sb.buffered
+      const o: string[] = []
+      for (let i = 0; i < b.length; i++) o.push(`${b.start(i).toFixed(1)}-${b.end(i).toFixed(1)}`)
+      return o.join(',') || '空'
+    } catch {
+      return '?'
+    }
+  }
   const fail = (why: string) => {
     if (dead) return
     dead = true
-    console.error('[lw][adaptive]', why, '| video.error=', el.error?.message)
-    onError(why)
+    // 富化失败现场(t/readyState/两轨缓冲/video.error)→ onError → 写进 larkwing.log,真机可定位。
+    const detail =
+      `${why} | t=${el.currentTime.toFixed(1)} rs=${el.readyState}` +
+      ` verr=${el.error?.code ?? '-'} vbuf=[${ranges(vsb)}] abuf=[${ranges(asb)}]`
+    console.error('[lw][adaptive]', detail)
+    onError(detail)
   }
 
   // 每条 SB 一条串行队列:MSE 不允许并发 append/remove(updating 时再操作会抛)。
@@ -71,17 +89,24 @@ export async function playAdaptive(
         () =>
           new Promise<void>((res) => {
             if (stopped || ms.readyState !== 'open') return res()
-            const done = () => {
-              sb.removeEventListener('updateend', done)
-              sb.removeEventListener('error', done)
+            const cleanup = () => {
+              sb.removeEventListener('updateend', onEnd)
+              sb.removeEventListener('error', onErr)
               res()
             }
-            sb.addEventListener('updateend', done, { once: true })
-            sb.addEventListener('error', done, { once: true })
+            const onEnd = () => cleanup()
+            // SB 'error' 事件 = 真失败(坏数据/解码不了)→ 触发 fail(回落),不再静默吞掉。
+            const onErr = () => {
+              fail('sb error event')
+              cleanup()
+            }
+            sb.addEventListener('updateend', onEnd, { once: true })
+            sb.addEventListener('error', onErr, { once: true })
             try {
               op()
             } catch (e) {
-              done()
+              cleanup()
+              // 配额已由有界缓冲防住;真抛异常(含意外 Quota)→ 回落。
               fail('sb op: ' + e)
             }
           }),
@@ -153,9 +178,25 @@ export async function playAdaptive(
         if (!resp.ok || !resp.body) throw new Error('audio ' + resp.status)
         const reader = resp.body.getReader()
         for (;;) {
+          // 背压:音频缓冲领先够了就先不读 —— relay/ffmpeg 随 HTTP body 回压暂停编码,音频缓冲**有界**。
+          // 这是关键修复:原来把整片音频一股脑灌进一个 MSE 缓冲 → 爆配额(实测 ~11MB)→ Chromium
+          // 驱逐掉开头 [0,~3s] → t=0 无音频 → 严格的 WebView2 卡在起点(真机实锤,预览宽容故未现)。
+          while (
+            !stopped &&
+            !signal.aborted &&
+            ms.readyState === 'open' &&
+            bufEnd(asb!, el.currentTime) - el.currentTime > AUDIO_AHEAD
+          ) {
+            await sleep(200)
+          }
+          if (stopped || signal.aborted) break
           const { done, value } = await reader.read()
           if (done || stopped || signal.aborted || ms.readyState !== 'open') break
           if (value && value.byteLength) await aq(() => asb!.appendBuffer(value))
+          // 驱逐落后 AUDIO_BEHIND 秒的旧音频(控配额,和视频段一样)。
+          if (asb!.buffered.length && asb!.buffered.start(0) < el.currentTime - AUDIO_BEHIND) {
+            await aq(() => asb!.remove(0, el.currentTime - AUDIO_BEHIND))
+          }
         }
       } catch (e) {
         if (!stopped && !signal.aborted) fail('audio: ' + e)

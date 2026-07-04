@@ -148,20 +148,23 @@ async function loadVideoInto(el: HTMLVideoElement) {
     await destroyShaka()
     if (state.current !== cur) return
     // 兜底:自适应(setup 或播放期)失败 → 让后端对同一文件强制走 muxed HLS(能放的老路,§3.5)。
-    // 每个文件只兜底一次(避免 muxed 也失败时来回重放)。
-    const fallbackCompat = () => {
-      if (!isTauri() || adaptiveFellBackFor === cur.page_url) return
+    // 每个文件只兜底一次(避免 muxed 也失败时来回重放);why 富含现场,写进 larkwing.log 供真机定位。
+    const fallbackCompat = (why?: string) => {
+      if (adaptiveFellBackFor === cur.page_url) return
       adaptiveFellBackFor = cur.page_url
-      console.warn('[lw][adaptive] failed → 回落 muxed HLS')
-      void api.mediaReplayCompat(cur.page_url, cur.kind === 'audio').catch(() => {})
+      console.warn('[lw][adaptive] failed → 回落 muxed HLS:', why)
+      void api.mediaLog(`[adaptive] 播放失败(${why ?? '?'})→ 回落 muxed HLS`)
+      if (isTauri()) void api.mediaReplayCompat(cur.page_url, cur.kind === 'audio').catch(() => {})
     }
     try {
       const ctl = await playAdaptive(el, cur.manifest_url, fallbackCompat)
       if (state.current !== cur) ctl.stop() // 加载期间已切走
-      else adaptiveCtl = ctl
+      else {
+        adaptiveCtl = ctl
+        void api.mediaLog('[adaptive] 起播 ok') // 日志留痕:setup 成功(卡在其后就知道不是 setup 问题)
+      }
     } catch (e) {
-      console.error('[lw][adaptive] setup failed', e)
-      fallbackCompat()
+      fallbackCompat('setup: ' + e)
     }
     return
   }
