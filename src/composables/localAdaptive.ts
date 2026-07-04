@@ -18,6 +18,8 @@ interface AdaptiveDesc {
   audioMime: string
   duration: number
   copyVideo: boolean
+  audioSeg: number // 音频段时长(固定网格,秒)
+  audioPreroll: number // 音频段左预卷(秒),前端 appendWindow 裁掉它连同 priming
   segments: { start: number; dur: number }[]
 }
 
@@ -33,9 +35,8 @@ export interface AdaptiveController {
 
 const AHEAD = 24 // 视频缓冲领先秒数(够顺 + 不撑爆配额)
 const BEHIND = 12 // 落后多少秒开始驱逐旧段
-const AUDIO_AHEAD = 30 // 音频缓冲领先秒数(背压上限:读够就暂停读,ffmpeg 随 HTTP body 回压暂停)
+const AUDIO_AHEAD = 30 // 音频段缓冲领先秒数(领先够了就先不喂下一段)
 const AUDIO_BEHIND = 12 // 音频落后多少秒开始驱逐(控 MSE 配额)
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 
 /** 起播:把 `el` 接管为手写 MSE 播放 descUrl 的自适应流。异步返回控制器;失败 reject(调用方回落)。 */
 export async function playAdaptive(
@@ -57,7 +58,6 @@ export async function playAdaptive(
   let stopped = false
   let vsb: SourceBuffer | null = null
   let asb: SourceBuffer | null = null
-  let audioAbort: AbortController | null = null
   let dead = false
   const ranges = (sb: SourceBuffer | null): string => {
     try {
@@ -115,32 +115,37 @@ export async function playAdaptive(
     }
   }
   let vq: (op: () => void) => Promise<void>
+  let aq: (op: () => void) => Promise<void>
   const bufEnd = (sb: SourceBuffer, t: number): number => {
     // 覆盖 t 的已缓冲区间的末端(没覆盖到 → t 本身,表示这里之后没数据)。
     const b = sb.buffered
     for (let i = 0; i < b.length; i++) if (b.start(i) <= t + 0.1 && b.end(i) > t) return b.end(i)
     return t
   }
-  const fetchBuf = (u: string, signal?: AbortSignal) =>
-    fetch(u, signal ? { signal } : undefined).then((r) => {
+  const fetchBuf = (u: string) =>
+    fetch(u).then((r) => {
       if (!r.ok) throw new Error(u + ' ' + r.status)
       return r.arrayBuffer()
     })
 
-  // 视频按需泵:保证 [now-BEHIND, now+AHEAD] 有段;落后的驱逐。串行、无并发 append。
-  let nextSeg = 0 // 下一个待 append 的段号(顺序推进;seek 会重设)
-  let pumping = false
-  const pump = async () => {
-    if (pumping || stopped || dead || !vsb || ms.readyState !== 'open') return
-    pumping = true
+  // seek 代次:seek 时 +1,让 seek 前发出的在途请求(resolve 时)自弃,不把过期段 append 到错位。
+  let gen = 0
+  let nextSeg = 0 // 下一个待喂的**视频**段号(顺序推进;seek 重设)
+  let nextAudioSeg = 0 // 下一个待喂的**音频**段号(固定 6s 网格)
+  const audioSegCount = Math.max(1, Math.ceil(desc.duration / desc.audioSeg))
+  let pumpingV = false
+  let pumpingA = false
+
+  // 视频按需泵:保证 [now−BEHIND, now+AHEAD] 有段;落后的驱逐。串行、无并发 append。
+  const pumpVideo = async () => {
+    if (pumpingV || stopped || dead || !vsb || ms.readyState !== 'open') return
+    pumpingV = true
     try {
       const now = el.currentTime
-      // 驱逐:落后 BEHIND 秒以上的已缓冲头部(降配额压力,避免 QuotaExceeded)。
       const b = vsb.buffered
       if (b.length && b.start(0) < now - BEHIND && !vsb.updating) {
         await vq(() => vsb!.remove(0, now - BEHIND))
       }
-      // 领先不足 AHEAD 且还有段没喂 → 喂下一个(每次一个,timeupdate 再来接着喂)。
       while (
         !stopped &&
         !dead &&
@@ -149,84 +154,81 @@ export async function playAdaptive(
       ) {
         const i = nextSeg
         nextSeg++
+        const myGen = gen
         const buf = await fetchBuf(base + '/v' + i)
-        if (stopped || dead || ms.readyState !== 'open') break
+        if (stopped || dead || ms.readyState !== 'open' || gen !== myGen) break
         await vq(() => vsb!.appendBuffer(new Uint8Array(buf)))
       }
     } catch (e) {
       if (!stopped) fail('video pump: ' + e)
     } finally {
-      pumping = false
+      pumpingV = false
     }
   }
 
-  // 音频:一条渐进流边下边喂(可从 fromSec 起,配 timestampOffset 落到正确时间轴)。
-  const startAudio = (fromSec: number) => {
-    if (!asb || stopped) return
-    audioAbort?.abort()
-    audioAbort = new AbortController()
-    const signal = audioAbort.signal
-    const aq = mkQueue(asb)
-    aq(() => {
-      if (asb!.timestampOffset !== fromSec) asb!.timestampOffset = fromSec
-    })
-    ;(async () => {
-      try {
-        const resp = await fetch(base + '/audio' + (fromSec > 0 ? '?t=' + fromSec.toFixed(3) : ''), {
-          signal,
-        })
-        if (!resp.ok || !resp.body) throw new Error('audio ' + resp.status)
-        const reader = resp.body.getReader()
-        for (;;) {
-          // 背压:音频缓冲领先够了就先不读 —— relay/ffmpeg 随 HTTP body 回压暂停编码,音频缓冲**有界**。
-          // 这是关键修复:原来把整片音频一股脑灌进一个 MSE 缓冲 → 爆配额(实测 ~11MB)→ Chromium
-          // 驱逐掉开头 [0,~3s] → t=0 无音频 → 严格的 WebView2 卡在起点(真机实锤,预览宽容故未现)。
-          while (
-            !stopped &&
-            !signal.aborted &&
-            ms.readyState === 'open' &&
-            bufEnd(asb!, el.currentTime) - el.currentTime > AUDIO_AHEAD
-          ) {
-            await sleep(200)
-          }
-          if (stopped || signal.aborted) break
-          const { done, value } = await reader.read()
-          if (done || stopped || signal.aborted || ms.readyState !== 'open') break
-          if (value && value.byteLength) await aq(() => asb!.appendBuffer(value))
-          // 驱逐落后 AUDIO_BEHIND 秒的旧音频(控配额,和视频段一样)。
-          if (asb!.buffered.length && asb!.buffered.start(0) < el.currentTime - AUDIO_BEHIND) {
-            await aq(() => asb!.remove(0, el.currentTime - AUDIO_BEHIND))
-          }
-        }
-      } catch (e) {
-        if (!stopped && !signal.aborted) fail('audio: ' + e)
+  // 音频按需泵:**离散段**(不流式,WebView2 收不下流式 body),固定 6s 网格。每段带左预卷,靠
+  // `appendWindow` 裁到 [grid, grid+seg] —— 连同 AAC 逐段 priming 一起裁掉 → gapless、无累计漂移。
+  // `timestampOffset` 把段内(tfdt=0)内容放到真时间轴。领先 AUDIO_AHEAD 停喂、落后 AUDIO_BEHIND 驱逐。
+  const pumpAudio = async () => {
+    if (pumpingA || stopped || dead || !asb || ms.readyState !== 'open') return
+    pumpingA = true
+    try {
+      const now = el.currentTime
+      const b = asb.buffered
+      if (b.length && b.start(0) < now - AUDIO_BEHIND && !asb.updating) {
+        await aq(() => asb!.remove(0, now - AUDIO_BEHIND))
       }
-    })()
+      while (
+        !stopped &&
+        !dead &&
+        nextAudioSeg < audioSegCount &&
+        nextAudioSeg * desc.audioSeg < now + AUDIO_AHEAD
+      ) {
+        const n = nextAudioSeg
+        nextAudioSeg++
+        const myGen = gen
+        const grid = n * desc.audioSeg
+        const buf = await fetchBuf(base + '/a' + n)
+        if (stopped || dead || ms.readyState !== 'open' || gen !== myGen) break
+        await aq(() => {
+          // 顺序要紧:先设 End(更大),再设 Start(< End),否则 appendWindowStart>End 会抛。
+          asb!.appendWindowEnd = Math.min(desc.duration, grid + desc.audioSeg)
+          asb!.appendWindowStart = grid
+          asb!.timestampOffset = n > 0 ? grid - desc.audioPreroll : 0
+          asb!.appendBuffer(new Uint8Array(buf))
+        })
+      }
+    } catch (e) {
+      if (!stopped) fail('audio pump: ' + e)
+    } finally {
+      pumpingA = false
+    }
   }
 
-  // seek:目标已缓冲(视频段 + 音频)→ 原生跳,啥都不做;否则重设视频段指针 + 重起音频。
+  const pump = () => {
+    void pumpVideo()
+    void pumpAudio()
+  }
+
+  // seek:两轨目标都已缓冲 → 原生跳;否则 seek 代次 +1(弃在途)、重设两轨段指针、清缓冲、重泵。
   const onSeeking = () => {
     if (stopped || dead || !vsb || !asb) return
     const t = el.currentTime
-    const vOk = bufEnd(vsb, t) > t + 0.3
-    const aOk = bufEnd(asb, t) > t + 0.3
-    if (vOk && aOk) return // 命中缓冲,原生 seek 即可
-    // 视频:清空重来,指针定位到覆盖 t 的段(线性找,段数不多)。
-    let seg = desc.segments.findIndex((s) => s.start <= t && s.start + s.dur > t)
-    if (seg < 0) seg = Math.max(0, desc.segments.length - 1)
-    nextSeg = seg
-    const clearAndPump = async () => {
+    if (bufEnd(vsb, t) > t + 0.3 && bufEnd(asb, t) > t + 0.3) return // 命中缓冲,原生 seek 即可
+    gen++
+    let vseg = desc.segments.findIndex((s) => s.start <= t && s.start + s.dur > t)
+    if (vseg < 0) vseg = Math.max(0, desc.segments.length - 1)
+    nextSeg = vseg
+    nextAudioSeg = Math.max(0, Math.floor(t / desc.audioSeg))
+    void (async () => {
       try {
-        if (vsb && vsb.buffered.length && ms.readyState === 'open') {
-          await vq(() => vsb!.remove(0, Infinity))
-        }
+        if (vsb!.buffered.length && ms.readyState === 'open') await vq(() => vsb!.remove(0, Infinity))
+        if (asb!.buffered.length && ms.readyState === 'open') await aq(() => asb!.remove(0, Infinity))
       } catch {
         /* ignore */
       }
-      void pump()
-    }
-    void clearAndPump()
-    if (!aOk) startAudio(desc.segments[seg]?.start ?? t) // 音频从段首连续起(与视频对齐)
+      pump()
+    })()
   }
 
   return await new Promise<AdaptiveController>((resolve, reject) => {
@@ -241,18 +243,22 @@ export async function playAdaptive(
         return
       }
       vq = mkQueue(vsb)
-      // 先喂视频 init,再泵段 + 起音频。
+      aq = mkQueue(asb)
+      // 先喂两轨 init,再泵段(视频 + 音频离散段)。
       try {
-        const vinit = await fetchBuf(base + '/vinit')
+        const [vinit, ainit] = await Promise.all([
+          fetchBuf(base + '/vinit'),
+          fetchBuf(base + '/ainit'),
+        ])
         await vq(() => vsb!.appendBuffer(new Uint8Array(vinit)))
+        await aq(() => asb!.appendBuffer(new Uint8Array(ainit)))
       } catch (e) {
-        reject(new Error('vinit: ' + e))
+        reject(new Error('init: ' + e))
         return
       }
       el.addEventListener('timeupdate', pump)
       el.addEventListener('seeking', onSeeking)
-      startAudio(0)
-      await pump()
+      pump() // 首泵:视频段 + 音频段都喂上(覆盖 t=0)
       void el.play().catch(() => {})
       // 停滞看门狗:MSE 有时既不报错也不出画(静默黑屏)。12s 后若仍卡在起点(且非用户暂停)→
       // 判失败,触发 onError → useMedia 兜底回落 muxed HLS(能放的老路)。宽松阈值防弱机首段慢误杀。
@@ -265,7 +271,6 @@ export async function playAdaptive(
           clearTimeout(watchdog)
           el.removeEventListener('timeupdate', pump)
           el.removeEventListener('seeking', onSeeking)
-          audioAbort?.abort()
           try {
             if (ms.readyState === 'open') ms.endOfStream()
           } catch {

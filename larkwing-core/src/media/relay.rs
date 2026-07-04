@@ -48,11 +48,11 @@ enum Entry {
     /// 段一律转码视频 + 下混立体声 AAC(见 build_frag_cmd 三处实证),故无 transcode_* 旋钮。
     FileHls { path: PathBuf, ffmpeg: PathBuf, duration: f64 },
     /// 本地不兼容文件的**音视频分离**自适应播放(0.2.6 治本):前端手写 MSE 两条 SourceBuffer —
-    /// 视频按需分段(`copy_video` 决定 `-c:v copy` 省 CPU 还是转 H.264)、音频**一整条连续编码**
-    /// 边转边吐。治「逐段音频 priming 累积漂移」(连续编码结构性无漂移),兼省 CPU。端点(`/la/{token}/…`):
-    /// `desc`(JSON:两轨 mime + 视频段清单 start/dur + 时长)/`vinit`(缓存的视频 init)/
-    /// `v{N}`(视频段 N:copy/转码 + tfdt 累积)/`audio`(连续音频渐进流)。`video_init` 在注册时
-    /// 生成一次并缓存(顺带解出 `video_mime` 的精确 codec 串);段无状态、现切现回。
+    /// 视频按需分段(`copy_video` 决定 `-c:v copy` 省 CPU 还是转 H.264)、音频**离散段 + 左预卷**
+    /// (前端 appendWindow 裁掉 priming → gapless 无漂移)。端点(`/la/{token}/…`):
+    /// `desc`(JSON:两轨 mime + 视频段清单 + 音频网格/预卷 + 时长)/`vinit`+`v{N}`(视频 init/段)/
+    /// `ainit`+`a{N}`(音频 init/段,离散完整响应——WebView2 收不下流式 body,故不流式)。`video_init`
+    /// 在注册时生成一次并缓存(顺带解出 `video_mime` 的精确 codec 串);段无状态、现切现回。
     FileAdaptive {
         path: PathBuf,
         ffmpeg: PathBuf,
@@ -69,6 +69,11 @@ enum Entry {
 
 /// HLS 切片时长(秒):段越短 seek 越细但请求越多;6s 是常见折中。自适应路(mod.rs)也用它当段目标。
 pub(crate) const HLS_SEG: f64 = 6.0;
+/// 自适应音频段时长(秒,固定网格 —— 音频无关键帧约束,任意帧可切)。
+const AUDIO_SEG: f64 = 6.0;
+/// 音频段左侧预卷(秒):切段时多切这么一段在前面,前端用 `appendWindowStart` 把它连同 AAC
+/// 编码器 priming(~43ms 静音)一起裁掉 → 逐段独立编码也**无累计漂移**(gapless)。0.5s 足够盖住 priming。
+const AUDIO_PREROLL: f64 = 0.5;
 
 struct Inner {
     port: u16,
@@ -523,11 +528,10 @@ async fn hls(State(state): State<Arc<Inner>>, AxPath((token, seg)): AxPath<(Stri
 
 /// 本地自适应(音视频分离,手写 MSE):`desc`(JSON:两轨 mime + 视频段清单 + 时长)/
 /// `vinit`(缓存视频 init)/`v{N}`(视频段 N:copy/转码 + tfdt 累积,video-only)/
-/// `audio`(连续音频渐进流,`?t=` 从某秒起——seek 时前端重起并配 timestampOffset)。
+/// `ainit`(音频 init)/`a{N}`(音频段 N:固定 6s 网格 + 左预卷,离散完整响应,前端 appendWindow 裁 priming)。
 async fn local_adaptive(
     State(state): State<Arc<Inner>>,
     AxPath((token, seg)): AxPath<(String, String)>,
-    Query(q): Query<RemuxQuery>,
 ) -> Response {
     let Some(entry) = lookup(&state, &token) else { return bad(StatusCode::NOT_FOUND) };
     let Entry::FileAdaptive { path, ffmpeg, copy_video, video_mime, video_init, segments, duration } =
@@ -545,29 +549,51 @@ async fn local_adaptive(
             })
             .collect();
         let json = format!(
-            "{{\"videoMime\":{vm},\"audioMime\":\"audio/mp4; codecs=\\\"mp4a.40.2\\\"\",\"duration\":{dur:.6},\"copyVideo\":{cv},\"segments\":[{segs}]}}",
+            "{{\"videoMime\":{vm},\"audioMime\":\"audio/mp4; codecs=\\\"mp4a.40.2\\\"\",\"duration\":{dur:.6},\"copyVideo\":{cv},\"audioSeg\":{aseg},\"audioPreroll\":{apre},\"segments\":[{segs}]}}",
             vm = json_string(video_mime),
             dur = duration,
             cv = copy_video,
+            aseg = AUDIO_SEG,
+            apre = AUDIO_PREROLL,
         );
         return json_response(json);
     }
     if seg == "vinit" {
         return bytes_response(video_init.clone(), "video/mp4");
     }
-    if seg == "audio" {
-        // 一整条连续编码(可选 `-ss t` 从 seek 点起);渐进吐流。整条连续 → 无逐段 priming 漂移。
-        let mut cmd = tokio::process::Command::new(ffmpeg);
-        cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin");
-        if q.t > 0.0 {
-            cmd.arg("-ss").arg(format!("{:.3}", q.t));
+    // 音频改**离散段**(不再流式 —— WebView2 的 fetch 不吐流式 body,实锤 abuf=[空] 卡死;离散完整
+    // 响应 WebView2 收得下,同视频段)。ainit=音频 init;a{N}=第 N 段(固定 6s 网格,带左预卷供前端
+    // appendWindow 裁掉 priming → gapless 无漂移)。段内 tfdt=0,前端靠 timestampOffset+appendWindow 定位。
+    if seg == "ainit" {
+        let cmd = build_audio_frag_cmd(ffmpeg, path, 0.0, 0.1);
+        let Some(full) = run_ffmpeg_collect(cmd, 4 * 1024 * 1024).await else {
+            return bad(StatusCode::BAD_GATEWAY);
+        };
+        let Some(moof) = super::probe::first_moof_offset(&full) else {
+            return bad(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+        return bytes_response(full[..moof].to_vec(), "audio/mp4");
+    }
+    if let Some(n) = seg.strip_prefix('a').and_then(|s| s.parse::<usize>().ok()) {
+        let grid = n as f64 * AUDIO_SEG;
+        if grid >= *duration {
+            return bad(StatusCode::NOT_FOUND);
         }
-        cmd.arg("-i").arg(path).arg("-vn")
-            .arg("-c:a").arg("aac").arg("-af").arg(AUDIO_LOUDNESS_AF).arg("-b:a").arg("256k")
-            .arg("-movflags").arg("frag_keyframe+empty_moov+default_base_moof")
-            .arg("-frag_duration").arg("2000000")
-            .arg("-f").arg("mp4").arg("pipe:1");
-        return stream_ffmpeg(cmd, "audio/mp4", true);
+        let seg_dur = (duration - grid).min(AUDIO_SEG);
+        // N>0 左移 preroll 多切一段(前端 appendWindow 裁掉);N=0 从头切(起点无 priming 可裁,留着即可)。
+        let (ss, cut) =
+            if n > 0 { (grid - AUDIO_PREROLL, seg_dur + AUDIO_PREROLL) } else { (0.0, seg_dur) };
+        tracing::info!(seg = n, grid, "自适应:现切音频段");
+        let cmd = build_audio_frag_cmd(ffmpeg, path, ss, cut);
+        let Some(full) = run_ffmpeg_collect(cmd, 16 * 1024 * 1024).await else {
+            return bad(StatusCode::BAD_GATEWAY);
+        };
+        let Some(moof) = super::probe::first_moof_offset(&full) else {
+            return bad(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+        let end = super::probe::moof_segment_end(&full, moof);
+        // tfdt 不改(=0):前端用 timestampOffset=grid-preroll 放到真时间轴,appendWindow 裁到 [grid, grid+dur]。
+        return bytes_response(full[moof..end].to_vec(), "audio/mp4");
     }
     // v{N} → 视频段 N(video-only 分片,tfdt 改累计起点;与 HLS 段同款处理,只是无音轨)。
     let Some(n) = seg.strip_prefix('v').and_then(|s| s.parse::<usize>().ok()) else {
@@ -683,6 +709,23 @@ fn build_frag_cmd(
 
 /// copy 段 `-ss` 的微正 margin(秒):够跨过浮点舍入、又远小于任何关键帧间距(≥ 一帧 ~16ms)。
 const COPY_SS_EPS: f64 = 0.001;
+
+/// 构建音频段命令(`-vn` 纯音频 → AAC 立体声 + 响度,单 moof 分片吐 stdout)。`ss>0` 从该秒输入 seek
+/// (段带左预卷时用),`dur` = 要切的时长(含预卷)。init 段取 `ss=0,dur=0.1`。tfdt 由 ffmpeg 归零,
+/// 前端 timestampOffset + appendWindow 定位/裁剪。
+fn build_audio_frag_cmd(ffmpeg: &Path, path: &Path, ss: f64, dur: f64) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(ffmpeg);
+    cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin");
+    if ss > 0.0 {
+        cmd.arg("-ss").arg(format!("{ss:.6}"));
+    }
+    cmd.arg("-i").arg(path).arg("-t").arg(format!("{dur:.6}")).arg("-vn")
+        .arg("-c:a").arg("aac").arg("-af").arg(AUDIO_LOUDNESS_AF).arg("-b:a").arg("256k")
+        .arg("-movflags").arg("empty_moov+default_base_moof")
+        .arg("-frag_duration").arg("600000000")
+        .arg("-f").arg("mp4").arg("pipe:1");
+    cmd
+}
 
 /// 跑 ffmpeg、把 stdout 整段收进内存(封顶 cap;分片就几 MB~几十 MB,稳)。失败/空 → None(并记 stderr)。
 async fn run_ffmpeg_collect(mut cmd: tokio::process::Command, cap: usize) -> Option<Vec<u8>> {
@@ -1168,22 +1211,16 @@ mod tests {
         let v0b = v0.bytes().await.unwrap();
         assert!(has(&v0b, b"moof") && has(&v0b, b"mdat"), "v0 应是 moof+mdat 段");
 
-        // audio:连续流,读头部一截,应是 fMP4(ftyp+moov)。
-        let audio = http.get(format!("{base}/audio")).send().await.unwrap();
-        assert_eq!(audio.status().as_u16(), 200);
-        let head = {
-            use futures_util::StreamExt;
-            let mut s = audio.bytes_stream();
-            let mut buf = Vec::new();
-            while let Some(Ok(chunk)) = s.next().await {
-                buf.extend_from_slice(&chunk);
-                if buf.len() > 4096 {
-                    break;
-                }
-            }
-            buf
-        };
-        assert!(!head.is_empty() && has(&head, b"moov"), "audio 流应有 fMP4 头");
+        // ainit:音频 init(ftyp+moov)。
+        let ainit = http.get(format!("{base}/ainit")).send().await.unwrap();
+        assert_eq!(ainit.status().as_u16(), 200);
+        let ab = ainit.bytes().await.unwrap();
+        assert!(has(&ab, b"moov"), "ainit 应含 moov");
+        // a0:音频段 0(moof+mdat)。
+        let a0 = http.get(format!("{base}/a0")).send().await.unwrap();
+        assert_eq!(a0.status().as_u16(), 200);
+        let a0b = a0.bytes().await.unwrap();
+        assert!(has(&a0b, b"moof") && has(&a0b, b"mdat"), "a0 应是 moof+mdat 段");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
