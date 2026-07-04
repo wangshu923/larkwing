@@ -4,11 +4,12 @@
 // 纯浏览器预览:假数据看视觉。
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { api, isTauri, type Briefing, type Memory } from '../lib/backend'
+import { api, isTauri, type Briefing, type FamilyMember, type Memory } from '../lib/backend'
 import { useContextMenu } from '../composables/useContextMenu'
-import { useSettings } from '../composables/useSettings'
+import { hydrateUser, useSettings } from '../composables/useSettings'
 import { useToast } from '../composables/useToast'
 import { copyText } from '../lib/clipboard'
+import SkinSelect from '../components/SkinSelect.vue'
 
 const emit = defineEmits<{ (e: 'close'): void }>()
 const { t } = useI18n()
@@ -33,22 +34,34 @@ const arming = ref<string | null>(null)
 
 const total = computed(() => memories.value.length + briefings.value.length)
 
-async function load() {
+// 看谁的记忆(§渠道归人第二步「主人查看家人记忆」):主人换视角看家人的小本本 —— **不是切换用户**,
+// 只是过滤视图。共享的「家里的事」(home-scope 需知)对谁都在,只有归人的小本本随人切。
+const family = ref<FamilyMember[]>([])
+/** 0 = 当前主人(默认);>0 = 指认查看某家人。 */
+const viewUser = ref(0)
+const showPicker = computed(() => family.value.length > 1)
+const viewingSelf = computed(() => !viewUser.value || viewUser.value === settings.state.userId)
+/** 传给后端的目标 user_id:主人视角传 undefined(走 ensure_default_user),家人传其 id。 */
+const targetId = computed(() => (viewingSelf.value ? undefined : viewUser.value))
+const viewingName = computed(() => family.value.find((m) => m.id === viewUser.value)?.name ?? '')
+const famOptions = computed(() =>
+  family.value.map((m) => ({
+    // settings.family.you 本身已含括号「(你)」,直接拼、别再套一层
+    value: String(m.id),
+    label: m.id === settings.state.userId ? `${m.name}${t('settings.family.you')}` : m.name,
+  })),
+)
+
+/** 只重拉记忆/备忘(切人时调;家人列表不用重拉)。 */
+async function loadEntries() {
   if (!isTauri()) {
-    memories.value = [
-      { id: 1, user_id: 1, kind: 'fact', content: '不吃香菜', resident: true, salience: 3, source: 'explicit', last_used_at: Date.now() - 12 * 60_000, created_at: Date.now() - 5 * 86400_000, updated_at: 0 },
-      { id: 2, user_id: 1, kind: 'fact', content: '对花生过敏', resident: true, salience: 1, source: 'explicit', last_used_at: null, created_at: Date.now() - 2 * 86400_000, updated_at: 0 },
-    ]
-    briefings.value = [
-      { id: 1, domain: 'media', content: '电影在 \\\\nas\\film;动画片在 \\\\nas\\kids', scope: 'home', resident: true, created_at: Date.now() - 86400_000, updated_at: 0 },
-      { id: 2, domain: 'appliance', content: '路由器在客厅电视柜后面', scope: 'home', resident: true, created_at: Date.now() - 3600_000, updated_at: 0 },
-    ]
+    loadFakeEntries()
     loaded.value = true
     return
   }
   error.value = false
   try {
-    const [m, b] = await Promise.all([api.listMemories(), api.listBriefings()])
+    const [m, b] = await Promise.all([api.listMemories(targetId.value), api.listBriefings(targetId.value)])
     memories.value = m
     briefings.value = b
   } catch (e) {
@@ -58,13 +71,51 @@ async function load() {
   loaded.value = true
 }
 
+function onPickUser(v: string) {
+  viewUser.value = Number(v) || 0
+  void loadEntries()
+}
+
+async function load() {
+  if (isTauri()) {
+    family.value = await api.listFamily().catch(() => [])
+    viewUser.value = settings.state.userId
+  } else {
+    if (!settings.state.userId) hydrateUser(1, settings.state.userName)
+    family.value = [
+      { id: 1, name: settings.state.userName, skin_id: 'scifi', created_at: 0, last_active_at: 0, enrolled: true },
+      { id: 2, name: '豆豆', skin_id: 'scifi', created_at: 0, last_active_at: 0, enrolled: true },
+    ]
+    viewUser.value = 1
+  }
+  await loadEntries()
+}
+
+// 浏览器预览:小本本随「看谁」变(演示归人切换),家里的事共享不变(演示共同记忆)
+function loadFakeEntries() {
+  memories.value =
+    viewUser.value === 2
+      ? [
+          { id: 10, user_id: 2, kind: 'fact', content: '喜欢恐龙,怕打雷', resident: true, salience: 2, source: 'distilled', last_used_at: Date.now() - 3600_000, created_at: Date.now() - 3 * 86400_000, updated_at: 0 },
+          { id: 11, user_id: 2, kind: 'fact', content: '睡前要听一个故事', resident: true, salience: 1, source: 'explicit', last_used_at: null, created_at: Date.now() - 86400_000, updated_at: 0 },
+        ]
+      : [
+          { id: 1, user_id: 1, kind: 'fact', content: '不吃香菜', resident: true, salience: 3, source: 'explicit', last_used_at: Date.now() - 12 * 60_000, created_at: Date.now() - 5 * 86400_000, updated_at: 0 },
+          { id: 2, user_id: 1, kind: 'fact', content: '对花生过敏', resident: true, salience: 1, source: 'explicit', last_used_at: null, created_at: Date.now() - 2 * 86400_000, updated_at: 0 },
+        ]
+  briefings.value = [
+    { id: 1, domain: 'media', content: '电影在 \\\\nas\\film;动画片在 \\\\nas\\kids', scope: 'home', resident: true, created_at: Date.now() - 86400_000, updated_at: 0 },
+    { id: 2, domain: 'appliance', content: '路由器在客厅电视柜后面', scope: 'home', resident: true, created_at: Date.now() - 3600_000, updated_at: 0 },
+  ]
+}
+
 /** 真删记忆(乐观更新,失败补回)。hover ✕ 走两步确认后调它;右键菜单直接调(右键本身已是明确动作)。 */
 async function doRemoveMemory(m: Memory) {
   const idx = memories.value.findIndex((x) => x.id === m.id)
   if (idx >= 0) memories.value.splice(idx, 1)
   if (!isTauri()) return
   try {
-    await api.deleteMemory(m.id)
+    await api.deleteMemory(m.id, targetId.value) // 看家人时删的是 TA 的记忆(主人管理面)
   } catch (e) {
     console.error('删除记忆失败', e)
     if (idx >= 0) memories.value.splice(idx, 0, m)
@@ -165,8 +216,21 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
     </header>
 
     <div class="view-scroll">
-      <!-- 自动记住开关(§13 Phase 3):回忆页是记忆唯一触点,开关放它产出的记忆上方 -->
-      <div class="mem-auto">
+      <!-- 看谁的记忆(§渠道归人第二步):主人换视角看家人小本本;不是切换用户,只是过滤视图。
+           家里的事(home 共享)对谁都在,只有归人的小本本随人切。 -->
+      <div v-if="showPicker" class="mem-who">
+        <b class="mem-who-title">{{ t('memory.whoTitle') }}</b>
+        <SkinSelect
+          class="mem-who-sel"
+          :model-value="String(viewUser)"
+          :options="famOptions"
+          :aria-label="t('memory.whoTitle')"
+          @update:model-value="onPickUser"
+        />
+      </div>
+
+      <!-- 自动记住开关(§13 Phase 3):只在看自己时显(是主人自己的设置);看家人时改显一句说明 -->
+      <div v-if="viewingSelf" class="mem-auto">
         <b class="mem-auto-title">{{ t('memory.autoTitle') }}</b>
         <span class="key-state">
           <span class="chip" :class="{ on: autoRemember }">{{ autoRemember ? t('memory.autoOn') : t('memory.autoOff') }}</span>
@@ -175,6 +239,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           </button>
         </span>
       </div>
+      <p v-else class="hint mem-viewing">{{ t('memory.viewingFamily', { name: viewingName }) }}</p>
 
       <p v-if="loaded && total" class="lp-count">{{ t('memory.count', { n: total }) }}</p>
 
@@ -228,6 +293,26 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 
 <!-- 自动记住开关:回忆页专属、自包含;只用语义 token(§6.7 绝不写死颜色),换肤自动跟随 -->
 <style scoped>
+/* 看谁的记忆:主人切视角(§渠道归人第二步)。SkinSelect 皮肤化下拉,全语义 token */
+.mem-who {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.mem-who-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+  flex: 0 0 auto;
+}
+.mem-who-sel {
+  min-width: 160px;
+}
+.mem-viewing {
+  margin-top: 0;
+  margin-bottom: 14px;
+}
 .mem-auto {
   display: flex;
   align-items: center;

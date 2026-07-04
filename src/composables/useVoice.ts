@@ -21,7 +21,16 @@ const state = reactive({
   wakeArmed: false,
   /** 当前唤醒词(显示用;默认「小七」)。 */
   wakeKeywords: [] as string[],
+  /** 声纹注册进展(家人页录声纹,D 期第二步):驱动对应家人卡的「准备中/第N遍/成功/失败」。
+   *  userId=0 → 没有进行中;stage='' | preparing | recording | saved | failed。 */
+  enroll: { userId: 0, stage: '' as string, done: 0, total: 0 },
 })
+
+/** 声纹注册终态(saved/failed)回调:SettingsView 注入 → toast + 重拉家人 + 重启唤醒。 */
+let onEnrollDoneCb: ((userId: number, ok: boolean) => void) | null = null
+export function onEnrollDone(cb: (userId: number, ok: boolean) => void) {
+  onEnrollDoneCb = cb
+}
 
 /** Transcribed → send 链的接线口(MainLayout 注入,避免组合式互相 import)。
  *  speaker = 声纹认出的家人 user_id(D 期),记忆归 TA;undefined = 走会话用户。 */
@@ -119,8 +128,50 @@ function wire() {
       case 'listen_ended':
         flashEndReason(v.data.reason)
         break
+      case 'enroll': {
+        const e = v.data
+        state.enroll = { userId: e.user_id, stage: e.stage, done: e.done ?? 0, total: e.total ?? 0 }
+        if (e.stage === 'saved' || e.stage === 'failed') onEnrollDoneCb?.(e.user_id, e.stage === 'saved')
+        break
+      }
     }
   })
+}
+
+/** 给某家人录声纹(录 3 段取平均);点了立刻置 preparing 给反馈,之后由 enroll 事件推进。 */
+function startEnroll(userId: number) {
+  if (!isTauri()) {
+    fakeEnroll(userId)
+    return
+  }
+  state.enroll = { userId, stage: 'preparing', done: 0, total: 0 }
+  api.voiceEnroll(userId).catch(() => {
+    state.enroll = { userId, stage: 'failed', done: 0, total: 0 }
+    onEnrollDoneCb?.(userId, false)
+  })
+}
+
+/** 忘掉某家人的声纹(只删声纹,人/记忆不动)。 */
+function unenroll(userId: number) {
+  if (!isTauri()) return Promise.resolve()
+  return api.voiceUnenroll(userId)
+}
+
+// 浏览器预览假注册:走一遍 preparing→录3遍→saved,让家人卡进度动起来(UI 优先)
+function fakeEnroll(userId: number) {
+  state.enroll = { userId, stage: 'preparing', done: 0, total: 3 }
+  let done = 0
+  const step = () => {
+    if (done < 3) {
+      state.enroll = { userId, stage: 'recording', done, total: 3 }
+      done++
+      setTimeout(step, 900)
+    } else {
+      state.enroll = { userId, stage: 'saved', done: 3, total: 3 }
+      onEnrollDoneCb?.(userId, true)
+    }
+  }
+  setTimeout(step, 700)
 }
 
 function start() {
@@ -178,5 +229,5 @@ function fakeStop(accept: boolean) {
 
 export function useVoice() {
   wire()
-  return { state, start, stop, toggle }
+  return { state, start, stop, toggle, startEnroll, unenroll }
 }

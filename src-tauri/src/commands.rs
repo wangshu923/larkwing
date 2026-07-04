@@ -240,15 +240,23 @@ pub fn rename_user(state: State<'_, AppState>, name: String) -> Result<User, App
     state.engine.rename_user(&name)
 }
 
-/// 回忆页:小本本全量(当前用户)。
+/// 回忆页:小本本全量。user_id 省略 = 当前主人;传家人 id = 主人查看 TA 的记忆(§渠道归人第二步)。
 #[tauri::command]
-pub fn list_memories(state: State<'_, AppState>) -> Result<Vec<Memory>, AppError> {
-    state.engine.list_memories()
+pub fn list_memories(
+    state: State<'_, AppState>,
+    user_id: Option<i64>,
+) -> Result<Vec<Memory>, AppError> {
+    state.engine.list_memories(user_id)
 }
 
+/// 删记忆。user_id 省略 = 当前主人;传家人 id = 主人删 TA 的记忆(主人管理面)。
 #[tauri::command]
-pub fn delete_memory(state: State<'_, AppState>, id: i64) -> Result<(), AppError> {
-    state.engine.delete_memory(id)
+pub fn delete_memory(
+    state: State<'_, AppState>,
+    user_id: Option<i64>,
+    id: i64,
+) -> Result<(), AppError> {
+    state.engine.delete_memory(user_id, id)
 }
 
 /// 记忆维护流水(§13.7 调阈值用:回看每轮衰减/下沉/升层/合并/硬清了多少)。limit 缺省 50。
@@ -260,10 +268,14 @@ pub fn memory_maintenance_log(
     state.engine.list_memory_maintenance(limit.unwrap_or(50).clamp(1, 500))
 }
 
-/// 回忆页「家里的事」分组:家庭备忘(任务需知)。
+/// 回忆页「家里的事」分组:家庭备忘(任务需知)。user_id 省略 = 当前主人;传家人 id =
+/// TA 视角(home 共享那份对谁都在,个人 scope 跟着切)。
 #[tauri::command]
-pub fn list_briefings(state: State<'_, AppState>) -> Result<Vec<Briefing>, AppError> {
-    state.engine.list_briefings()
+pub fn list_briefings(
+    state: State<'_, AppState>,
+    user_id: Option<i64>,
+) -> Result<Vec<Briefing>, AppError> {
+    state.engine.list_briefings(user_id)
 }
 
 #[tauri::command]
@@ -520,11 +532,18 @@ pub fn bind_channel_chat(
 pub fn voice_enroll(state: State<'_, AppState>, user_id: i64) -> Result<(), AppError> {
     let voice = state.voice.clone();
     tauri::async_runtime::spawn(async move {
+        // 终态(saved/failed)由 enroll 内部经 Enroll 事件推前端;这里只兜底日志(§3.5)。
         if let Err(e) = voice.enroll(user_id).await {
             tracing::error!(err = %format!("{e:#}"), "声纹注册失败");
         }
     });
     Ok(())
+}
+
+/// 忘掉某家人的声纹(家人页「忘掉声音」):只删声纹,人 / 记忆不动。同步返回。
+#[tauri::command]
+pub fn voice_unenroll(state: State<'_, AppState>, user_id: i64) -> Result<(), AppError> {
+    state.engine.forget_voiceprint(user_id)
 }
 
 /// 句级 TTS(PLAN §11 B 期):合成进缓存(命中秒回)→ relay 注册 → 返回可挂
@@ -759,6 +778,18 @@ pub fn report_media_state(
 #[tauri::command]
 pub async fn attachment_url(state: State<'_, AppState>, file: String) -> Result<String, AppError> {
     state.media.attachment_url(&file).await.map_err(AppError::internal)
+}
+
+/// 兜底重放:本地「音视频分离自适应」在前端手写 MSE 上播放失败时,前端调此命令,
+/// 后端对同一文件强制回落 muxed HLS(能放的老路)。异步 spawn,不阻塞;失败只记日志。
+#[tauri::command]
+pub fn media_replay_compat(state: State<'_, AppState>, page_url: String, audio_only: bool) {
+    let media = state.media.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = media.replay_local_compat(&page_url, audio_only).await {
+            tracing::warn!("兜底重放(muxed HLS)失败: {e:#}");
+        }
+    });
 }
 
 // ---- 远程渠道(PLAN 远程渠道:Telegram / 钉钉 bot) ----

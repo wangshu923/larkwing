@@ -157,6 +157,18 @@ pub enum VoiceEvent {
         adopted_spelling: bool,
         verdict: String,
     },
+    /// 声纹注册进展(家人页「让它认识 TA 的声音」,PLAN §11 D 第二步)。core 只发数据,
+    /// 文案走前端字典(§6.6)。stage: preparing(下载/加载声纹模型)| recording(录第
+    /// done+1/total 段,请说话)| saved(成功落库)| failed(出错,前端 toast 请重试,§3.5)。
+    /// user_id = 给谁录(多张家人卡时前端据此只在对应卡显进度)。
+    Enroll {
+        user_id: i64,
+        stage: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        done: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        total: Option<u32>,
+    },
 }
 
 /// 对话回合此刻"在干嘛"(PLAN §12 修订:原 v1 头像不镜像思考/说话,现上总线 ——

@@ -11,6 +11,7 @@ import { useUpdater } from '../composables/useUpdater'
 import { useToast } from '../composables/useToast'
 import { refreshAudioMode } from '../composables/useAudioGraph'
 import { useWakeCalib } from '../composables/useWakeCalib'
+import { useVoice, onEnrollDone } from '../composables/useVoice'
 import { audioFileToWavBase64 } from '../composables/useAudioDecode'
 import SkinSelect from '../components/SkinSelect.vue'
 
@@ -945,6 +946,53 @@ function channelName(id: string): string {
   return id === 'telegram' ? 'Telegram' : id === 'dingtalk' ? t('settings.family.dingtalk') : id
 }
 
+// 声纹注册(多用户第二步):让旺财凭声音认出家人 → TA 说的话记忆/提醒归 TA(§渠道归人第二步)。
+// 录 3 段取平均(core);进度/终态走 voice 的 enroll 事件。owner 也可录(便于与家人区分,§4.2)。
+const voice = useVoice()
+/** 某家人此刻是否正在录(preparing/recording)——决定卡片显进度还是显按钮。 */
+function enrollBusy(id: number): boolean {
+  const e = voice.state.enroll
+  return e.userId === id && (e.stage === 'preparing' || e.stage === 'recording')
+}
+function enrollLabel(id: number): string {
+  const e = voice.state.enroll
+  if (e.userId !== id) return ''
+  return e.stage === 'preparing'
+    ? t('settings.family.enrollPreparing')
+    : t('settings.family.enrollRecording', { n: e.done + 1, total: e.total })
+}
+function startEnrollFam(m: FamilyMember) {
+  voice.startEnroll(m.id)
+}
+async function forgetVoice(m: FamilyMember) {
+  try {
+    await voice.unenroll(m.id)
+    if (!isTauri()) m.enrolled = false
+    else {
+      await loadFamily()
+      await restartWakeIfRunning() // 唤醒循环要重载声纹库(少一个候选)才生效
+    }
+    useToast().ok(t('settings.family.forgetDone'))
+  } catch {
+    useToast().error(t('toast.actionFailed'))
+  }
+}
+// 注册终态:成功 = toast + 刷新「已录」+ 唤醒在跑就重启让新声纹生效;失败 = toast 请重试(§3.5)
+onEnrollDone(async (userId, ok) => {
+  if (!ok) {
+    useToast().error(t('settings.family.enrollFailed'))
+    return
+  }
+  useToast().ok(t('settings.family.enrollDone'))
+  if (!isTauri()) {
+    const m = family.value.find((x) => x.id === userId)
+    if (m) m.enrolled = true // 预览:本地标已录看视觉
+  } else {
+    await loadFamily()
+    await restartWakeIfRunning() // 首次注册后唤醒循环要重载声纹库才认得出
+  }
+})
+
 function onKeydown(e: KeyboardEvent) {
   if (e.key === 'Escape') emit('close')
 }
@@ -1190,6 +1238,17 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               <span class="chip" :class="{ on: m.id === settings.state.userId }">{{ m.name }}</span>
               <small v-if="m.id === settings.state.userId" class="fam-you">{{ t('settings.family.you') }}</small>
               <button class="link" @click="startFamRename(m)">{{ t('settings.family.rename') }}</button>
+              <!-- 声纹:让旺财凭声音认出 TA(录 3 段);认出后 TA 的话记忆归 TA。owner 也可录以便区分 -->
+              <span v-if="enrollBusy(m.id)" class="fam-enroll-hint">{{ enrollLabel(m.id) }}</span>
+              <template v-else>
+                <small v-if="m.enrolled" class="fam-enrolled">{{ t('settings.family.enrolled') }}</small>
+                <button class="link" @click="startEnrollFam(m)">
+                  {{ m.enrolled ? t('settings.family.reEnroll') : t('settings.family.enroll') }}
+                </button>
+                <button v-if="m.enrolled" class="link fam-forget" @click="forgetVoice(m)">
+                  {{ t('settings.family.forgetVoice') }}
+                </button>
+              </template>
               <button
                 v-if="m.id !== settings.state.userId"
                 class="chip-del"
@@ -1212,6 +1271,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             </span>
           </div>
           <p class="hint">{{ t('settings.family.membersHint') }}</p>
+          <p class="hint">{{ t('settings.family.enrollHint') }}</p>
 
           <p class="section">{{ t('settings.family.chats') }}</p>
           <p v-if="!chats.length" class="hint">{{ t('settings.family.chatsEmpty') }}</p>
@@ -1858,6 +1918,12 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .fam-you { color: var(--text-dim); font-size: 11px; }
 .fam-chat-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); font-size: 12.5px; }
 .fam-select { flex: 0 0 auto; width: 180px; margin-left: auto; }
+/* 声纹注册:进度提示(录音中辉光跟随 accent)/ 已录徽标(ok token)/ 忘掉声音(dim→danger) */
+.fam-enroll-hint { color: var(--accent); font-size: 11.5px; white-space: nowrap; }
+.fam-enrolled { color: var(--ok); font-size: 11px; white-space: nowrap; }
+.fam-enrolled::before { content: '✓ '; }
+.fam-forget { color: var(--text-dim); }
+.fam-forget:hover { color: var(--danger); }
 .hidden-file { display: none; }
 .clone-edit { align-items: flex-start; }
 .clone-form { display: flex; flex-direction: column; gap: 6px; max-width: 420px; width: 100%; }

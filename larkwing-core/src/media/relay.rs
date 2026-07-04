@@ -47,10 +47,28 @@ enum Entry {
     /// 已验通的同路、MSE 直吃。无临时目录/无会话(每段无状态),seek = shaka 请求目标段 → 现切现回。
     /// 段一律转码视频 + 下混立体声 AAC(见 build_frag_cmd 三处实证),故无 transcode_* 旋钮。
     FileHls { path: PathBuf, ffmpeg: PathBuf, duration: f64 },
+    /// 本地不兼容文件的**音视频分离**自适应播放(0.2.6 治本):前端手写 MSE 两条 SourceBuffer —
+    /// 视频按需分段(`copy_video` 决定 `-c:v copy` 省 CPU 还是转 H.264)、音频**一整条连续编码**
+    /// 边转边吐。治「逐段音频 priming 累积漂移」(连续编码结构性无漂移),兼省 CPU。端点(`/la/{token}/…`):
+    /// `desc`(JSON:两轨 mime + 视频段清单 start/dur + 时长)/`vinit`(缓存的视频 init)/
+    /// `v{N}`(视频段 N:copy/转码 + tfdt 累积)/`audio`(连续音频渐进流)。`video_init` 在注册时
+    /// 生成一次并缓存(顺带解出 `video_mime` 的精确 codec 串);段无状态、现切现回。
+    FileAdaptive {
+        path: PathBuf,
+        ffmpeg: PathBuf,
+        copy_video: bool,
+        /// 完整 MSE type:`video/mp4; codecs="avc1.xxxxxx"`(从视频 init 的 avcC 解出)。
+        video_mime: String,
+        /// 缓存的视频 init(ftyp+moov),vinit 端点直接回它(跨段 codec 配置一致)。
+        video_init: Vec<u8>,
+        /// 视频段计划 `(start, dur)`:copy=关键帧对齐变长,转码=固定 6s。
+        segments: Vec<(f64, f64)>,
+        duration: f64,
+    },
 }
 
-/// HLS 切片时长(秒):段越短 seek 越细但请求越多;6s 是常见折中。
-const HLS_SEG: f64 = 6.0;
+/// HLS 切片时长(秒):段越短 seek 越细但请求越多;6s 是常见折中。自适应路(mod.rs)也用它当段目标。
+pub(crate) const HLS_SEG: f64 = 6.0;
 
 struct Inner {
     port: u16,
@@ -87,6 +105,8 @@ impl Relay {
             .route("/dash/{token}/{seg}", get(dash).options(dash_preflight))
             // 本地 HLS:m3u8 + 按需切片(同样 shaka fetch 跨源 → CORS)。
             .route("/hls/{token}/{seg}", get(hls).options(dash_preflight))
+            // 本地自适应(音视频分离,手写 MSE):desc/vinit/v{N}/audio(前端 fetch 跨源 → CORS)。
+            .route("/la/{token}/{seg}", get(local_adaptive).options(dash_preflight))
             .with_state(inner.clone());
         tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app).await {
@@ -181,6 +201,44 @@ impl Relay {
         );
         format!("http://127.0.0.1:{}/hls/{token}/index.m3u8", self.inner.port)
     }
+
+    /// 注册音视频分离自适应播放,返回 `…/la/{token}/desc`(前端手写 MSE 据此起播)。
+    /// `video_init` 由 `gen_video_init` 预生成(顺带解出 codec 串填 `video_mime`)。
+    pub fn register_file_adaptive(
+        &self,
+        path: PathBuf,
+        ffmpeg: PathBuf,
+        copy_video: bool,
+        video_mime: String,
+        video_init: Vec<u8>,
+        segments: Vec<(f64, f64)>,
+        duration: f64,
+    ) -> String {
+        let token = self.token();
+        self.inner.streams.lock().expect("relay streams lock poisoned").insert(
+            token.clone(),
+            Arc::new(Entry::FileAdaptive {
+                path,
+                ffmpeg,
+                copy_video,
+                video_mime,
+                video_init,
+                segments,
+                duration,
+            }),
+        );
+        format!("http://127.0.0.1:{}/la/{token}/desc", self.inner.port)
+    }
+}
+
+/// 生成视频 init(ftyp+moov):切 0.1s 分片、取首个 moof 之前的部分。注册自适应播放时调一次,
+/// 既拿到 init 字节缓存(vinit 端点直接回),又能从中解出精确 codec 串(avcC)。失败 → None
+/// (调用方回落 muxed HLS,不硬走分离路)。`copy_video` 与后续各段一致 → init 与段的 avcC 匹配。
+pub async fn gen_video_init(ffmpeg: &Path, path: &Path, copy_video: bool) -> Option<Vec<u8>> {
+    let cmd = build_frag_cmd(ffmpeg, path, 0.0, 0.1, copy_video, true);
+    let full = run_ffmpeg_collect(cmd, 8 * 1024 * 1024).await?;
+    let moof = super::probe::first_moof_offset(&full)?;
+    Some(full[..moof].to_vec())
 }
 
 /// 取一条上游流的前段(≤cap 字节)用于探 sidx:带防盗链头 + Range;上游若忽略 Range 回 200 全量,
@@ -423,7 +481,7 @@ async fn hls(State(state): State<Arc<Inner>>, AxPath((token, seg)): AxPath<(Stri
         // 共享 init(ftyp+moov):切一小段、取首个 moof 之前的部分。codec 配置与各 moof 段一致
         //(同输入 + 同 copy/转码 flag → ffmpeg 产出确定、跨调用兼容,Mac 已验 init+moof 可拼)。
         tracing::info!("HLS:发 init");
-        let cmd = build_frag_cmd(ffmpeg, path, 0.0, 0.1);
+        let cmd = build_frag_cmd(ffmpeg, path, 0.0, 0.1, false, false);
         let Some(full) = run_ffmpeg_collect(cmd, 8 * 1024 * 1024).await else {
             return bad(StatusCode::BAD_GATEWAY);
         };
@@ -446,7 +504,7 @@ async fn hls(State(state): State<Arc<Inner>>, AxPath((token, seg)): AxPath<(Stri
         return bad(StatusCode::NOT_FOUND);
     }
     tracing::info!(seg = n, start, "HLS:现切一段");
-    let cmd = build_frag_cmd(ffmpeg, path, start, HLS_SEG);
+    let cmd = build_frag_cmd(ffmpeg, path, start, HLS_SEG, false, false);
     let Some(full) = run_ffmpeg_collect(cmd, 256 * 1024 * 1024).await else {
         return bad(StatusCode::BAD_GATEWAY);
     };
@@ -463,15 +521,103 @@ async fn hls(State(state): State<Arc<Inner>>, AxPath((token, seg)): AxPath<(Stri
     bytes_response(body, "video/mp4")
 }
 
+/// 本地自适应(音视频分离,手写 MSE):`desc`(JSON:两轨 mime + 视频段清单 + 时长)/
+/// `vinit`(缓存视频 init)/`v{N}`(视频段 N:copy/转码 + tfdt 累积,video-only)/
+/// `audio`(连续音频渐进流,`?t=` 从某秒起——seek 时前端重起并配 timestampOffset)。
+async fn local_adaptive(
+    State(state): State<Arc<Inner>>,
+    AxPath((token, seg)): AxPath<(String, String)>,
+    Query(q): Query<RemuxQuery>,
+) -> Response {
+    let Some(entry) = lookup(&state, &token) else { return bad(StatusCode::NOT_FOUND) };
+    let Entry::FileAdaptive { path, ffmpeg, copy_video, video_mime, video_init, segments, duration } =
+        entry.as_ref()
+    else {
+        return bad(StatusCode::NOT_FOUND);
+    };
+
+    if seg == "desc" {
+        let segs: String = segments
+            .iter()
+            .enumerate()
+            .map(|(i, (s, d))| {
+                format!("{}{{\"start\":{s:.6},\"dur\":{d:.6}}}", if i == 0 { "" } else { "," })
+            })
+            .collect();
+        let json = format!(
+            "{{\"videoMime\":{vm},\"audioMime\":\"audio/mp4; codecs=\\\"mp4a.40.2\\\"\",\"duration\":{dur:.6},\"copyVideo\":{cv},\"segments\":[{segs}]}}",
+            vm = json_string(video_mime),
+            dur = duration,
+            cv = copy_video,
+        );
+        return json_response(json);
+    }
+    if seg == "vinit" {
+        return bytes_response(video_init.clone(), "video/mp4");
+    }
+    if seg == "audio" {
+        // 一整条连续编码(可选 `-ss t` 从 seek 点起);渐进吐流。整条连续 → 无逐段 priming 漂移。
+        let mut cmd = tokio::process::Command::new(ffmpeg);
+        cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin");
+        if q.t > 0.0 {
+            cmd.arg("-ss").arg(format!("{:.3}", q.t));
+        }
+        cmd.arg("-i").arg(path).arg("-vn")
+            .arg("-c:a").arg("aac").arg("-af").arg(AUDIO_LOUDNESS_AF).arg("-b:a").arg("256k")
+            .arg("-movflags").arg("frag_keyframe+empty_moov+default_base_moof")
+            .arg("-frag_duration").arg("2000000")
+            .arg("-f").arg("mp4").arg("pipe:1");
+        return stream_ffmpeg(cmd, "audio/mp4", true);
+    }
+    // v{N} → 视频段 N(video-only 分片,tfdt 改累计起点;与 HLS 段同款处理,只是无音轨)。
+    let Some(n) = seg.strip_prefix('v').and_then(|s| s.parse::<usize>().ok()) else {
+        return bad(StatusCode::NOT_FOUND);
+    };
+    let Some(&(start, dur)) = segments.get(n) else { return bad(StatusCode::NOT_FOUND) };
+    tracing::info!(seg = n, start, dur, copy = copy_video, "自适应:现切视频段");
+    let cmd = build_frag_cmd(ffmpeg, path, start, dur, *copy_video, true);
+    let Some(full) = run_ffmpeg_collect(cmd, 256 * 1024 * 1024).await else {
+        return bad(StatusCode::BAD_GATEWAY);
+    };
+    let Some(moof) = super::probe::first_moof_offset(&full) else {
+        tracing::warn!(seg = n, "自适应视频段:没找到 moof");
+        return bad(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    let end = super::probe::moof_segment_end(&full, moof);
+    let mut body = full[moof..end].to_vec();
+    // 用缓存的 video_init 解 timescale(段本身无 moov)→ tfdt 改成累计起点 start×ts。
+    let ts = super::probe::init_timescales(video_init);
+    super::probe::patch_segment_tfdt(&mut body, &ts, start);
+    bytes_response(body, "video/mp4")
+}
+
+/// 转义成 JSON 字符串字面量(video_mime 含 `codecs="…"` 的双引号,必须转义)。
+fn json_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// 带 CORS 的 JSON 响应(desc 被前端跨源 fetch)。
+fn json_response(body: String) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .header("access-control-allow-origin", "*")
+        .body(Body::from(body))
+        .unwrap_or_else(|_| bad(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
 /// 音频统一响度:先下混到立体声、整段统一提量、再限幅防削顶 —— 修「转码后整段偏小(人声+音效一起小)」。
 /// 做的是「整段一起抬」,**不挑人声**(与用户讨论:不是对白被埋,是整体衰减 —— 5.1→立体声下混归一化
 /// 约 −8dB + AC3/DTS 的 DRC 被 ffmpeg 套上)。`volume` 必须在下混**之后**提量才有效(故都塞进 `-af`,
 /// 别用 `-ac 2`——那是输出选项、在滤镜之后跑,会把提过的量又除回去);`alimiter` 只削最尖的峰值
 /// (防「系统音量开太大被吓到」),音效整体力度保留。**值是真机可调项**:实际增益/限幅只能
-/// Windows 真机 + 真 5.1 片验(§8.1),这里给保守起点。改这一处即改全部转码音频
-/// (HLS 段 / /m/ 流式混流 / mod.rs 的整文件 copy-remux 共用)。
+/// Windows 真机 + 真 5.1 片验(§8.1)。改这一处即改全部转码音频(build_frag_cmd 的 HLS 段 /
+/// FileRemux 的 `/m/` 流式混流共用)。
+/// **增益 2026-07-04 由 +8dB 降到 +5dB**:真机反馈响的时候「偶尔轻微破音」—— +8dB 把响段推进
+/// alimiter 太狠,重限幅出失真。−3dB 后仍明显提量(从下混/DRC 的偏小里拉回来),破音余量更足。
+/// 还破就继续调小这一个数;想更响调回去。
 pub(crate) const AUDIO_LOUDNESS_AF: &str =
-    "aformat=channel_layouts=stereo,volume=8dB,alimiter=limit=0.95";
+    "aformat=channel_layouts=stereo,volume=5dB,alimiter=limit=0.95";
 
 /// 构建「区间 [start, start+dur) 的自包含分片 mp4」命令(ftyp+moov+moof+mdat 吐 stdout)。
 /// HLS 的 init(取 0.1s)与各段(取 HLS_SEG)都用它。
@@ -486,19 +632,46 @@ pub(crate) const AUDIO_LOUDNESS_AF: &str =
 ///    整个 init(报在 video 轨上,正是用户「video:2 code=3014 黑屏」)→ aformat 下混立体声永远能 append;
 ///    顺带整段提量 + 限幅,修「转码后整段偏小」(替掉原来的 `-ac 2`,见 AUDIO_LOUDNESS_AF 说明)。
 /// 代价 = 已是 H.264 的片子(仅因容器 mkv / 音轨 AC3 才进 HLS)也被重编视频,弱机吃 CPU;
-/// 但这些片子当前本就黑屏(mpegts 链路),不是回退。「视频已兼容」者现已优先走 mod.rs 的
-/// **整文件 copy-remux 缓存**(v0.2.4,不重编码 + 原生 seek),HLS 只兜「视频轨也不兼容」的重活。
-fn build_frag_cmd(ffmpeg: &Path, path: &Path, start: f64, dur: f64) -> tokio::process::Command {
+/// 但这些片子当前本就黑屏(mpegts 链路),不是回退。**0.2.6 起「视频已兼容」的片走音视频分离
+/// 的 `FileAdaptive` 路(视频 `-c:v copy`、音频一整条连续编码),省 CPU + 治漂移**(见下);
+/// 本函数的「muxed HLS(视频转码 + 逐段音频)」只兜「视频轨也不兼容(HEVC/AV1)且不走分离路」的老链路。
+///
+/// `copy_video`:true = `-c:v copy`(视频已兼容,零重编码,须段界落关键帧);false = 转 H.264。
+/// `video_only`:true = `-an`(分离路的视频段,音频另走连续流);false = 带音轨(老 muxed HLS)。
+fn build_frag_cmd(
+    ffmpeg: &Path,
+    path: &Path,
+    start: f64,
+    dur: f64,
+    copy_video: bool,
+    video_only: bool,
+) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(ffmpeg);
     cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin");
     if start > 0.0 {
-        cmd.arg("-ss").arg(format!("{start:.3}")); // 输入 seek 到段首(转码从此处起新 IDR)
+        // copy 必须精确落在关键帧上:高精度 + 微正 margin(COPY_SS_EPS),防浮点舍入落到**前一个**
+        // 关键帧(关键帧间距 ≫ margin,不会误跳到下一个)。转码不挑关键帧(从新 IDR 重编),用 .3 即可。
+        let ss = if copy_video {
+            format!("{:.6}", start + COPY_SS_EPS)
+        } else {
+            format!("{start:.3}")
+        };
+        cmd.arg("-ss").arg(ss);
     }
-    cmd.arg("-i").arg(path).arg("-t").arg(format!("{dur:.3}"));
-    cmd.arg("-map").arg("0:v:0?").arg("-map").arg("0:a:0?");
-    cmd.arg("-c:v").arg("libx264").arg("-preset").arg("veryfast").arg("-crf").arg("23")
-        .arg("-pix_fmt").arg("yuv420p");
-    cmd.arg("-c:a").arg("aac").arg("-af").arg(AUDIO_LOUDNESS_AF).arg("-b:a").arg("256k");
+    cmd.arg("-i").arg(path).arg("-t").arg(format!("{dur:.6}"));
+    cmd.arg("-map").arg("0:v:0?");
+    if !video_only {
+        cmd.arg("-map").arg("0:a:0?");
+    }
+    if copy_video {
+        cmd.arg("-c:v").arg("copy"); // 视频已兼容:原样搬,不掉画质、CPU 近零
+    } else {
+        cmd.arg("-c:v").arg("libx264").arg("-preset").arg("veryfast").arg("-crf").arg("23")
+            .arg("-pix_fmt").arg("yuv420p");
+    }
+    if !video_only {
+        cmd.arg("-c:a").arg("aac").arg("-af").arg(AUDIO_LOUDNESS_AF).arg("-b:a").arg("256k");
+    }
     // 单 moof/段:`-frag_duration` 给个远超段长(600s)的值 → ffmpeg 不在段内再分片,整段就一个
     // moof+mdat,便于把 tfdt 改成累计值(见 probe::patch_segment_tfdt)。default_base_moof 让 trun
     // 数据偏移相对 moof → 切掉 init 后偏移仍对。
@@ -507,6 +680,9 @@ fn build_frag_cmd(ffmpeg: &Path, path: &Path, start: f64, dur: f64) -> tokio::pr
         .arg("-f").arg("mp4").arg("pipe:1");
     cmd
 }
+
+/// copy 段 `-ss` 的微正 margin(秒):够跨过浮点舍入、又远小于任何关键帧间距(≥ 一帧 ~16ms)。
+const COPY_SS_EPS: f64 = 0.001;
 
 /// 跑 ffmpeg、把 stdout 整段收进内存(封顶 cap;分片就几 MB~几十 MB,稳)。失败/空 → None(并记 stderr)。
 async fn run_ffmpeg_collect(mut cmd: tokio::process::Command, cap: usize) -> Option<Vec<u8>> {
@@ -922,5 +1098,93 @@ mod tests {
         let over = http.get(&url).header("Range", "bytes=99-").send().await.unwrap();
         assert_eq!(over.status().as_u16(), 416);
         assert_eq!(over.headers()["content-range"], "bytes */10");
+    }
+
+    /// 端到端(需 PATH 有 ffmpeg,平时 #[ignore]):生成真片 → 注册 FileAdaptive(copy)→ 用 reqwest
+    /// 打全部端点,断言字节形态对(desc JSON / vinit 含 moov / v0 含 moof+mdat / audio 连续流有料)。
+    /// `cargo test -p larkwing-core --lib media::relay -- --ignored adaptive` 手跑。
+    #[tokio::test]
+    #[ignore]
+    async fn real_ffmpeg_adaptive_endpoints() {
+        use std::process::Command;
+        let has = |h: &[u8], n: &[u8]| h.windows(n.len()).any(|w| w == n);
+        let dir = std::env::temp_dir().join(format!("lw-adaptive-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.mp4");
+        // 20s,25fps,关键帧每 2s,H.264 + AAC(视频兼容 → 走 copy)。
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                "testsrc=size=320x240:rate=25:duration=20", "-f", "lavfi", "-i",
+                "sine=frequency=440:sample_rate=48000:duration=20", "-c:v", "libx264", "-preset",
+                "ultrafast", "-pix_fmt", "yuv420p", "-g", "50", "-keyint_min", "50",
+                "-sc_threshold", "0", "-c:a", "aac",
+            ])
+            .arg(&src)
+            .status()
+            .expect("run ffmpeg")
+            .success();
+        assert!(ok, "生成测试源失败");
+
+        let ffmpeg = PathBuf::from("ffmpeg");
+        let pr = super::super::probe::probe_local(&src);
+        let dur = pr.duration_seconds.expect("时长");
+        let codec = pr.video_codec.clone().expect("H.264 codec");
+        assert!(!pr.video_keyframes.is_empty(), "应有关键帧");
+        let init = gen_video_init(&ffmpeg, &src, true).await.expect("生成 init");
+        assert!(has(&init, b"moov") && has(&init, b"ftyp"), "vinit 应含 ftyp+moov");
+        let segments = super::super::probe::plan_copy_segments(&pr.video_keyframes, dur, HLS_SEG);
+        assert!(!segments.is_empty());
+
+        let relay = Relay::start().await.unwrap();
+        let desc_url = relay.register_file_adaptive(
+            src.clone(),
+            ffmpeg,
+            true,
+            format!("video/mp4; codecs=\"{codec}\""),
+            init,
+            segments,
+            dur,
+        );
+        let base = desc_url.strip_suffix("/desc").unwrap().to_string();
+        let http = reqwest::Client::new();
+
+        // desc:JSON 有两轨 mime + 段清单。
+        let desc = http.get(&desc_url).send().await.unwrap();
+        assert_eq!(desc.status().as_u16(), 200);
+        let body = desc.text().await.unwrap();
+        assert!(body.contains("videoMime") && body.contains("avc1."), "desc 带视频 codec: {body}");
+        assert!(body.contains("mp4a.40.2") && body.contains("\"segments\""), "desc 带音频+段: {body}");
+
+        // vinit:ftyp+moov。
+        let vinit = http.get(format!("{base}/vinit")).send().await.unwrap();
+        assert_eq!(vinit.status().as_u16(), 200);
+        let vb = vinit.bytes().await.unwrap();
+        assert!(has(&vb, b"moov"), "vinit 应含 moov");
+
+        // v0:moof+mdat(段体)。
+        let v0 = http.get(format!("{base}/v0")).send().await.unwrap();
+        assert_eq!(v0.status().as_u16(), 200);
+        let v0b = v0.bytes().await.unwrap();
+        assert!(has(&v0b, b"moof") && has(&v0b, b"mdat"), "v0 应是 moof+mdat 段");
+
+        // audio:连续流,读头部一截,应是 fMP4(ftyp+moov)。
+        let audio = http.get(format!("{base}/audio")).send().await.unwrap();
+        assert_eq!(audio.status().as_u16(), 200);
+        let head = {
+            use futures_util::StreamExt;
+            let mut s = audio.bytes_stream();
+            let mut buf = Vec::new();
+            while let Some(Ok(chunk)) = s.next().await {
+                buf.extend_from_slice(&chunk);
+                if buf.len() > 4096 {
+                    break;
+                }
+            }
+            buf
+        };
+        assert!(!head.is_empty() && has(&head, b"moov"), "audio 流应有 fMP4 头");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

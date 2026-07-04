@@ -58,6 +58,10 @@ pub struct LocalProbe {
     pub video_incompatible: bool,
     /// 从 mvhd 读出的总时长(秒):/m/ 混流流 `<video>.duration` 不可靠,靠它喂进度条。
     pub duration_seconds: Option<f64>,
+    /// 视频轨关键帧时刻(秒,升序);空 = 无 stss/非视频/解析不出 → 不能 copy 切片(§0.2.6)。
+    pub video_keyframes: Vec<f64>,
+    /// 视频轨 H.264 codec 串(`avc1.xxxxxx`);None = 非 H.264 或解不出 → copy 路走不了,回落转码。
+    pub video_codec: Option<String>,
 }
 
 fn ext_lower(path: &Path) -> Option<String> {
@@ -205,6 +209,8 @@ pub fn probe_local(path: &Path) -> LocalProbe {
         audio_incompatible: INCOMPATIBLE_AUDIO.iter().any(|tag| contains(&moov, tag)),
         video_incompatible: INCOMPATIBLE_VIDEO.iter().any(|tag| contains(&moov, tag)),
         duration_seconds: duration_from_moov(&moov),
+        video_keyframes: video_keyframes(&moov).unwrap_or_default(),
+        video_codec: video_h264_codec(&moov),
     }
 }
 
@@ -274,6 +280,143 @@ fn duration_from_moov(moov: &[u8]) -> Option<f64> {
     };
     let secs = duration / timescale as f64;
     (secs.is_finite() && secs > 0.0).then_some(secs)
+}
+
+/// 从 moov 里取**视频轨**的关键帧时间戳(秒,升序),供 HLS `-c:v copy` 切片按关键帧对齐切段
+/// —— copy 不能任意切,段界只能落在真实 IDR 上(变长段),见 PLAN ★0.2.6。路径:
+/// trak →(hdlr 认出 `vide` + mdhd 取 timescale)→ minf → stbl →(stss 同步样本号 + stts 样本时长)
+/// → 累积 DTS ÷ timescale。无 stss(全帧同步/异常)、解析越界(moov 被 32MB 截断等)、无视频轨
+/// → **None**,调用方回落逐段重编码(安全,能放只是费 CPU)。首个同步样本恒是第 1 帧(时间 ≈0)。
+pub fn video_keyframes(moov: &[u8]) -> Option<Vec<f64>> {
+    let (mo_s, mo_e) = find_box(moov, b"moov", 0, moov.len())
+        // probe_local 传进来的通常已是 moov **payload**(不含盒头):没套 moov 盒时直接在整块上找 trak。
+        .unwrap_or((0, moov.len()));
+    let mut found: Option<Vec<f64>> = None;
+    for_each_box(moov, mo_s, mo_e, |t, hdr, bs, be| {
+        if t == b"trak" && found.is_none() {
+            found = keyframes_of_trak(moov, bs + hdr, be);
+        }
+    });
+    found.filter(|k| !k.is_empty())
+}
+
+/// 单条 trak:是视频轨则返回其关键帧秒数;非视频轨 / 缺表 / 越界 → None(调用方跳过换下一条)。
+fn keyframes_of_trak(moov: &[u8], tr_s: usize, tr_e: usize) -> Option<Vec<f64>> {
+    let (md_s, md_e) = find_box(moov, b"mdia", tr_s, tr_e)?;
+    // hdlr payload:version/flags(4) + pre_defined(4) + handler_type(4) → 只认 'vide'。
+    let (hd_s, _) = find_box(moov, b"hdlr", md_s, md_e)?;
+    if moov.get(hd_s + 8..hd_s + 12)? != b"vide" {
+        return None;
+    }
+    // mdhd:version/flags(4) + creation/mod(v1:8+8 / v0:4+4) + timescale(4)。
+    let (mh_s, _) = find_box(moov, b"mdhd", md_s, md_e)?;
+    let mhv = *moov.get(mh_s)?;
+    let ts_off = mh_s + 4 + if mhv == 1 { 16 } else { 8 };
+    let timescale = u32::from_be_bytes(moov.get(ts_off..ts_off + 4)?.try_into().ok()?);
+    if timescale == 0 {
+        return None;
+    }
+    let (mn_s, mn_e) = find_box(moov, b"minf", md_s, md_e)?;
+    let (st_s, st_e) = find_box(moov, b"stbl", mn_s, mn_e)?;
+    let (ss_s, ss_e) = find_box(moov, b"stss", st_s, st_e)?; // 缺 stss = 无关键帧表 → None
+    let (tt_s, tt_e) = find_box(moov, b"stts", st_s, st_e)?;
+    let sync = parse_stss(moov.get(ss_s..ss_e)?)?;
+    let deltas = parse_stts(moov.get(tt_s..tt_e)?)?;
+    Some(keyframe_secs(&sync, &deltas, timescale))
+}
+
+/// stss payload → 同步样本号列表(1 起)。version/flags(4) + entry_count(4) + entry_count×u32。
+fn parse_stss(p: &[u8]) -> Option<Vec<u32>> {
+    let n = u32::from_be_bytes(p.get(4..8)?.try_into().ok()?) as usize;
+    let mut out = Vec::with_capacity(n.min(1 << 20));
+    for i in 0..n {
+        let o = 8 + i * 4;
+        out.push(u32::from_be_bytes(p.get(o..o + 4)?.try_into().ok()?));
+    }
+    Some(out)
+}
+
+/// stts payload →(样本数, 每样本时长)列表。version/flags(4) + entry_count(4) + entry_count×(u32,u32)。
+fn parse_stts(p: &[u8]) -> Option<Vec<(u32, u32)>> {
+    let n = u32::from_be_bytes(p.get(4..8)?.try_into().ok()?) as usize;
+    let mut out = Vec::with_capacity(n.min(1 << 20));
+    for i in 0..n {
+        let o = 8 + i * 8;
+        let count = u32::from_be_bytes(p.get(o..o + 4)?.try_into().ok()?);
+        let delta = u32::from_be_bytes(p.get(o + 4..o + 8)?.try_into().ok()?);
+        out.push((count, delta));
+    }
+    Some(out)
+}
+
+/// 合并遍历 stss(同步样本号)与 stts(样本时长游程),算每个关键帧的解码时刻(秒)。
+/// stts 是「count 个样本各 delta 时长」的游程压缩;样本 s(1 起)的 DTS = 它前面所有样本的 delta 之和。
+/// sync 升序、stts 顺序 → 单趟归并,O(sync + stts)。
+fn keyframe_secs(sync: &[u32], deltas: &[(u32, u32)], timescale: u32) -> Vec<f64> {
+    let mut out = Vec::with_capacity(sync.len());
+    let mut di = 0usize; // 当前游程下标
+    let mut run_first: u64 = 1; // 当前游程首样本号(1 起)
+    let mut run_dts: u64 = 0; // run_first 处的累积 DTS
+    for &s in sync {
+        let s = s as u64;
+        if s == 0 {
+            continue; // 样本号 1 起,0 非法
+        }
+        while di < deltas.len() {
+            let (count, delta) = (deltas[di].0 as u64, deltas[di].1 as u64);
+            if s < run_first + count {
+                let dts = run_dts + (s - run_first) * delta;
+                out.push(dts as f64 / timescale as f64);
+                break;
+            }
+            run_dts += count * delta;
+            run_first += count;
+            di += 1;
+        }
+    }
+    out
+}
+
+/// 从 moov 解视频轨的 H.264 codec 串(`avc1.PPCCLL`,MSE 建 SourceBuffer 必需精确编码串)。
+/// 只认 H.264(avc1/avc3 → 读 avcC 的 profile/compat/level 三字节);其它编码(HEVC/VP9/…)→ None,
+/// 调用方据此**不走 copy**(copy 只对能确证 H.264 的做,否则回落转码,安全)。子串定位 `avcC` 盒够用
+/// (moov 结构化,样本表里恰好排出 "avcC" 4 字节的概率可忽略),避免全量下钻 stsd。
+pub fn video_h264_codec(moov: &[u8]) -> Option<String> {
+    let tag = find_subslice(moov, b"avcC")?;
+    // avcC payload 紧随类型标签:configurationVersion(1) + profile(1) + compat(1) + level(1)…
+    let p = moov.get(tag + 4..tag + 8)?;
+    Some(format!("avc1.{:02X}{:02X}{:02X}", p[1], p[2], p[3]))
+}
+
+/// 按关键帧把整片切成**变长段**的计划:每段从一个关键帧起,尽量凑够 `target` 秒后落到**下一个
+/// 关键帧**收尾(copy 只能在关键帧断开)。返回 `(start_secs, dur_secs)` 列表:start 恒是真实关键帧
+/// 时刻,末段补到 `duration`。纯函数、可测。keyframes 为空 → 空列表(调用方回落固定 6s 重编码)。
+/// 关键帧稀疏时段会长于 target(正确,只是段大);过密则 ≈target。
+pub fn plan_copy_segments(keyframes: &[f64], duration: f64, target: f64) -> Vec<(f64, f64)> {
+    if keyframes.is_empty() || !(duration > 0.0) || !(target > 0.0) {
+        return Vec::new();
+    }
+    let mut segs = Vec::new();
+    let mut start = keyframes[0].max(0.0); // 首关键帧通常 ≈0
+    let mut ki = 0usize;
+    loop {
+        let want = start + target;
+        // 找第一个时刻 ≥ want 的关键帧当段尾(必须严格 > start,避免零长段)。
+        while ki < keyframes.len() && (keyframes[ki] <= start || keyframes[ki] < want) {
+            ki += 1;
+        }
+        if ki >= keyframes.len() {
+            // 没有更靠后的关键帧了 → 末段补到片尾。
+            if duration > start {
+                segs.push((start, duration - start));
+            }
+            break;
+        }
+        let end = keyframes[ki];
+        segs.push((start, end - start));
+        start = end;
+    }
+    segs
 }
 
 /// fMP4 里第一个 `moof` 盒的偏移(= `ftyp`+`moov` 之后)。把 ffmpeg 出的「自包含分片 mp4」
@@ -800,5 +943,156 @@ Input #0, matroska,webm, from 'movie.mkv':
         let p = parse_ffmpeg_stderr(stderr);
         assert!(!p.video_incompatible && !p.audio_incompatible, "theora/vorbis 当兼容");
         assert_eq!(p.duration_seconds, None);
+    }
+
+    // ── 关键帧提取 + copy 切片计划(PLAN ★0.2.6) ──────────────────────────
+
+    fn hdlr(kind: &[u8; 4]) -> Vec<u8> {
+        let mut p = fullbox(0);
+        p.extend_from_slice(&0u32.to_be_bytes()); // pre_defined
+        p.extend_from_slice(kind); // handler_type('vide'/'soun')
+        p.extend_from_slice(&[0u8; 12]); // reserved
+        p.extend_from_slice(b"x\0"); // name(任意)
+        p
+    }
+    fn stss_box(samples: &[u32]) -> Vec<u8> {
+        let mut p = fullbox(0);
+        p.extend_from_slice(&(samples.len() as u32).to_be_bytes());
+        for &s in samples {
+            p.extend_from_slice(&s.to_be_bytes());
+        }
+        mp4_box(b"stss", &p)
+    }
+    fn stts_box(entries: &[(u32, u32)]) -> Vec<u8> {
+        let mut p = fullbox(0);
+        p.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        for &(c, d) in entries {
+            p.extend_from_slice(&c.to_be_bytes());
+            p.extend_from_slice(&d.to_be_bytes());
+        }
+        mp4_box(b"stts", &p)
+    }
+    /// 造一条带 hdlr/mdhd/stbl(stss+stts)的 trak。handler='vide' 才会被 video_keyframes 采用。
+    fn media_trak(handler: &[u8; 4], timescale: u32, sync: &[u32], stts: &[(u32, u32)]) -> Vec<u8> {
+        let mut stbl = stss_box(sync);
+        stbl.extend_from_slice(&stts_box(stts));
+        let minf = mp4_box(b"minf", &mp4_box(b"stbl", &stbl));
+        let mut mdia = mp4_box(b"hdlr", &hdlr(handler));
+        mdia.extend_from_slice(&mp4_box(b"mdhd", &mdhd_v0(timescale)));
+        mdia.extend_from_slice(&minf);
+        let mut payload = mp4_box(b"tkhd", &tkhd_v0(1));
+        payload.extend_from_slice(&mp4_box(b"mdia", &mdia));
+        mp4_box(b"trak", &payload)
+    }
+
+    #[test]
+    fn video_keyframes_from_stss_stts() {
+        // ts=1000,250 帧各 40 单位(=40ms,25fps,10s);关键帧每 50 帧一个 → 时刻 0,2,4,6,8。
+        let mut moov = mp4_box(b"mvhd", &mvhd_v0(1000, 10_000));
+        // 先放一条音频轨(handler='soun')确认被跳过,再放视频轨。
+        moov.extend_from_slice(&media_trak(b"soun", 48_000, &[1], &[(1, 1024)]));
+        moov.extend_from_slice(&media_trak(b"vide", 1000, &[1, 51, 101, 151, 201], &[(250, 40)]));
+        let kf = video_keyframes(&moov).expect("应从视频轨解析出关键帧");
+        assert_eq!(kf, vec![0.0, 2.0, 4.0, 6.0, 8.0]);
+    }
+
+    #[test]
+    fn video_keyframes_handles_stts_runs() {
+        // 变帧率:前 100 帧 delta=40(0..4s),后 100 帧 delta=20(4s 起,50fps)。
+        // 关键帧样本 1(0s)、101(前 100 帧 = 100×40=4000 → 4.0s)、151(4.0 + 50×20/1000=5.0s)。
+        let mut moov = mp4_box(b"mvhd", &mvhd_v0(1000, 6000));
+        moov.extend_from_slice(&media_trak(b"vide", 1000, &[1, 101, 151], &[(100, 40), (100, 20)]));
+        let kf = video_keyframes(&moov).expect("应解析");
+        assert_eq!(kf, vec![0.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn video_keyframes_none_without_stss() {
+        // 无 stss(全帧同步 / 异常)→ None,调用方回落重编码。
+        let minf = mp4_box(b"minf", &mp4_box(b"stbl", &stts_box(&[(100, 40)])));
+        let mut mdia = mp4_box(b"hdlr", &hdlr(b"vide"));
+        mdia.extend_from_slice(&mp4_box(b"mdhd", &mdhd_v0(1000)));
+        mdia.extend_from_slice(&minf);
+        let mut payload = mp4_box(b"tkhd", &tkhd_v0(1));
+        payload.extend_from_slice(&mp4_box(b"mdia", &mdia));
+        let mut moov = mp4_box(b"mvhd", &mvhd_v0(1000, 4000));
+        moov.extend_from_slice(&mp4_box(b"trak", &payload));
+        assert_eq!(video_keyframes(&moov), None);
+        // 完全没有视频轨(只有音频)→ None
+        let mut audio_only = mp4_box(b"mvhd", &mvhd_v0(1000, 4000));
+        audio_only.extend_from_slice(&media_trak(b"soun", 48_000, &[1], &[(200, 1024)]));
+        assert_eq!(video_keyframes(&audio_only), None);
+    }
+
+    #[test]
+    fn plan_copy_segments_dense_keyframes() {
+        // 关键帧每 2s,target 6s → 每段凑到 ≥6s 的下一个关键帧(6),末段补到片尾。
+        let kf: Vec<f64> = (0..=6).map(|i| i as f64 * 2.0).collect(); // 0,2,4,6,8,10,12
+        let segs = plan_copy_segments(&kf, 13.0, 6.0);
+        assert_eq!(segs, vec![(0.0, 6.0), (6.0, 6.0), (12.0, 1.0)]);
+        // 段界恒落关键帧、首尾相接、总长=片长
+        assert!(segs.iter().all(|&(s, _)| kf.contains(&s)), "每段起点都是关键帧");
+        let total: f64 = segs.iter().map(|&(_, d)| d).sum();
+        assert!((total - 13.0).abs() < 1e-9, "覆盖到片尾");
+    }
+
+    #[test]
+    fn plan_copy_segments_sparse_keyframes_make_long_segments() {
+        // 关键帧稀疏(10s 一个)→ 段会长于 target(正确,copy 只能在关键帧断)。
+        let segs = plan_copy_segments(&[0.0, 10.0, 20.0], 25.0, 6.0);
+        assert_eq!(segs, vec![(0.0, 10.0), (10.0, 10.0), (20.0, 5.0)]);
+    }
+
+    #[test]
+    fn plan_copy_segments_edges() {
+        assert_eq!(plan_copy_segments(&[0.0], 5.0, 6.0), vec![(0.0, 5.0)], "短于一段 → 单段到片尾");
+        assert!(plan_copy_segments(&[], 10.0, 6.0).is_empty(), "无关键帧 → 空(回落重编码)");
+        assert!(plan_copy_segments(&[0.0], 0.0, 6.0).is_empty(), "无时长 → 空");
+        // 相接性 + 无零长段
+        let kf: Vec<f64> = (0..30).map(|i| i as f64 * 1.001).collect();
+        let segs = plan_copy_segments(&kf, 30.03, 6.0);
+        for w in segs.windows(2) {
+            assert!((w[0].0 + w[0].1 - w[1].0).abs() < 1e-9, "段首尾相接");
+        }
+        assert!(segs.iter().all(|&(_, d)| d > 0.0), "无零长段");
+    }
+
+    /// 端到端(需 PATH 有 ffmpeg,平时 #[ignore]):生成关键帧每 2s 的真片,读 moov 解关键帧,
+    /// 断言与 ffmpeg 实际排布吻合;再验 copy 切段首尾相接。`cargo test -- --ignored keyframe` 手跑。
+    #[test]
+    #[ignore]
+    fn real_ffmpeg_keyframes_match_and_copy_segments_align() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("lw-kf-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.mp4");
+        // 20s,25fps,关键帧每 50 帧(=2s):-g 50 -keyint_min 50 -sc_threshold 0(禁场景切额外关键帧)。
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                "testsrc=size=320x240:rate=25:duration=20", "-c:v", "libx264", "-preset",
+                "ultrafast", "-pix_fmt", "yuv420p", "-g", "50", "-keyint_min", "50",
+                "-sc_threshold", "0",
+            ])
+            .arg(&src)
+            .status()
+            .expect("run ffmpeg")
+            .success();
+        assert!(ok, "生成测试源失败");
+
+        let moov = read_moov(&src).expect("读 moov");
+        let kf = video_keyframes(&moov).expect("解关键帧");
+        // 期望 0,2,4,…,18(10 个);允许 ±1 帧(0.04s)误差。
+        let want: Vec<f64> = (0..10).map(|i| i as f64 * 2.0).collect();
+        assert_eq!(kf.len(), want.len(), "关键帧个数应为 10,实得 {kf:?}");
+        for (g, w) in kf.iter().zip(&want) {
+            assert!((g - w).abs() < 0.05, "关键帧 {g} 应≈{w}(全部:{kf:?})");
+        }
+        // 切片计划:段界落关键帧、首尾相接、覆盖到 20s。
+        let segs = plan_copy_segments(&kf, 20.0, 6.0);
+        assert!(segs.iter().all(|&(s, _)| kf.iter().any(|k| (k - s).abs() < 1e-6)));
+        let total: f64 = segs.iter().map(|&(_, d)| d).sum();
+        assert!((total - 20.0).abs() < 0.05, "覆盖到片尾,段:{segs:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

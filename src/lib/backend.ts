@@ -336,6 +336,9 @@ export interface PlaylistPos {
   resumed: boolean
 }
 
+/** 本次播放走的链路(core 发 key,前端出短标签)。见 Rust `media::PlaybackRoute`。 */
+export type PlaybackRoute = 'direct' | 'dash' | 'hls_copy' | 'hls_transcode' | 'remux'
+
 export interface NowPlaying {
   kind: 'audio' | 'video'
   title: string
@@ -345,6 +348,9 @@ export interface NowPlaying {
   /** 有值 = 自适应流(DASH/HLS):前端用 shaka(MSE)播,播放器管时间轴 → 原生 seek/同步(B 站走这里)。
    *  否则用 stream_url 挂原生 <video>/<audio>(直传文件/单流)。 */
   manifest_url?: string
+  /** 「怎么放的」:直传 / 转码 / copy 切片 / 混流 / 自适应 —— 播放条上出一枚小徽章。
+   *  可选:浏览器预览的假数据可能不带(徽章据此不显)。 */
+  route?: PlaybackRoute
   page_url: string
   source: string
   /** 有值 = 多集剧集:UI 显「第N/共M集」+ 上/下一集按钮;ended 时若非末集自动续播。 */
@@ -409,6 +415,17 @@ export type VoiceEvent =
         recall: number
         adopted_spelling: boolean
         verdict: string
+      }
+    }
+  // 声纹注册进展(家人页「让它认识 TA 的声音」):stage=preparing(备模型)|recording(录第
+  // done+1/total 段,请说话)|saved(成功)|failed(失败,前端 toast 请重试)。user_id=给谁录。
+  | {
+      type: 'enroll'
+      data: {
+        user_id: number
+        stage: 'preparing' | 'recording' | 'saved' | 'failed' | string
+        done?: number
+        total?: number
       }
     }
 
@@ -821,6 +838,9 @@ export const api = {
    *  倍速。core 据此在下个回合喂模型「此刻」背景 —— 修「歌放完了却以为还在播」,并让模型知道
    *  当前音量/进度(才能「调到 50」「快进 5 分钟」)。fire-and-forget。 */
   reportMediaState: (report: PlaybackReport) => invoke<void>('report_media_state', { report }),
+  /** 兜底重放:本地自适应(手写 MSE)播放失败 → 后端对同一文件强制走 muxed HLS(能放的老路)。 */
+  mediaReplayCompat: (pageUrl: string, audioOnly: boolean) =>
+    invoke<void>('media_replay_compat', { pageUrl, audioOnly }),
   /** 历史图片小票(相对名)→ 可显缩略图的 localhost URL(重开会话回看发过的图)。 */
   attachmentUrl: (file: string) => invoke<string>('attachment_url', { file }),
   /** 远程渠道状态(设置页):开关/已配凭证/白名单/连接态(凭证不过桥)。 */
@@ -857,8 +877,11 @@ export const api = {
   /** 指认某条渠道对话归哪位家人(null = 取消指认)。 */
   bindChannelChat: (id: number, userId: number | null) =>
     invoke<void>('bind_channel_chat', { id, userId }),
-  /** 给某家人录声纹:立即返回,进展走 voice 事件(Listening→Idle),完成后重拉 list_family。 */
+  /** 给某家人录声纹(录 3 段取平均):立即返回,进展/终态走 voice 的 enroll 事件
+   *  (preparing→recording×3→saved/failed);saved 后重拉 list_family 刷新「已录」。 */
   voiceEnroll: (userId: number) => invoke<void>('voice_enroll', { userId }),
+  /** 忘掉某家人的声纹(只删声纹,人/记忆不动):同步返回。 */
+  voiceUnenroll: (userId: number) => invoke<void>('voice_unenroll', { userId }),
   /** 句级 TTS:合成进缓存(命中秒回),返回可挂 <audio> 的 localhost URL。 */
   ttsSynthesize: (text: string) => invoke<string>('tts_synthesize', { text }),
   /** 设置页音色试听(试听句出自字典——core 不产文案)。 */
@@ -883,12 +906,15 @@ export const api = {
     invoke<void>('rename_voice_clone', { cloneId, name }),
   /** 删除克隆音色(内置不可删)。 */
   deleteVoiceClone: (cloneId: string) => invoke<void>('delete_voice_clone', { cloneId }),
-  listMemories: () => invoke<Memory[]>('list_memories'),
-  deleteMemory: (id: number) => invoke<void>('delete_memory', { id }),
+  /** 小本本。userId 省略 = 当前主人;传家人 id = 主人查看 TA 的记忆(§渠道归人第二步)。 */
+  listMemories: (userId?: number) => invoke<Memory[]>('list_memories', { userId }),
+  /** 删记忆。userId 省略 = 当前主人;传家人 id = 主人删 TA 的记忆。 */
+  deleteMemory: (id: number, userId?: number) => invoke<void>('delete_memory', { id, userId }),
   // 记忆维护流水(§13.7 调阈值用:回看每轮衰减/下沉/升层/合并/硬清了多少)。
   memoryMaintenanceLog: (limit?: number) =>
     invoke<MaintenanceLog[]>('memory_maintenance_log', { limit }),
-  listBriefings: () => invoke<Briefing[]>('list_briefings'),
+  /** 家里的事(家庭备忘)。userId 省略 = 当前主人;传家人 id = TA 视角(home 共享那份都在)。 */
+  listBriefings: (userId?: number) => invoke<Briefing[]>('list_briefings', { userId }),
   deleteBriefing: (id: number) => invoke<void>('delete_briefing', { id }),
   /** 提醒页:当前用户待触发的提醒 + 取消(jobs 域,按时间升序)。 */
   listReminders: () => invoke<Reminder[]>('list_reminders'),

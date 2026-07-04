@@ -14,6 +14,22 @@ const { state, toggle, stop, seek, setVolume, setRate, next, prev } = useMedia()
 /** 多集剧集才出集数指示 + 上/下一集按钮(单集/电影为 null,不出现)。 */
 const playlist = computed(() => state.current?.playlist ?? null)
 
+/** 「怎么放的」徽章:直连/自适应/免转码=省(ok 绿),转码中=吃 CPU(attn 琥珀),混流=中性(accent)。
+ *  route 缺省(浏览器预览假数据 / 老数据)→ 不显。key 由 core PlaybackRoute snake → camel 对齐字典。 */
+const ROUTE_TONE: Record<string, 'ok' | 'attn' | 'accent'> = {
+  direct: 'ok',
+  hls_copy: 'ok',
+  dash: 'accent',
+  remux: 'accent',
+  hls_transcode: 'attn',
+}
+const routeInfo = computed(() => {
+  const r = state.current?.route
+  if (!r) return null
+  const camel = r.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase()) // hls_copy → hlsCopy
+  return { label: t(`media.route.${camel}`), hint: t(`media.route.${camel}Hint`), tone: ROUTE_TONE[r] ?? 'accent' }
+})
+
 /** 倍速循环挡位(点一下进一档,家庭场景不需要精调)。 */
 const RATES = [1, 1.25, 1.5, 2, 0.75]
 function cycleRate() {
@@ -168,6 +184,13 @@ onUnmounted(() => {
     >
       <header class="bar top">
         <span class="title">{{ state.current!.title }}</span>
+        <span
+          v-if="routeInfo"
+          class="route"
+          :class="'tone-' + routeInfo.tone"
+          :title="routeInfo.hint"
+          >{{ routeInfo.label }}</span
+        >
         <span v-if="playlist" class="ep">{{
           t('media.episodeOf', { cur: playlist.index + 1, total: playlist.total })
         }}</span>
@@ -292,6 +315,14 @@ onUnmounted(() => {
   padding: 2px 8px; border-radius: 999px;
   background: rgba(var(--accent-rgb), 0.12); border: 1px solid rgba(var(--accent-rgb), 0.28);
 }
+/* 「怎么放的」徽章:自设 color 覆盖全屏态强制的浅字(否则读不出 tone);语义 token,随皮肤。 */
+.route {
+  flex: none; font-size: 11px; letter-spacing: .3px; white-space: nowrap;
+  padding: 2px 8px; border-radius: 999px; cursor: default;
+}
+.route.tone-ok { color: var(--ok); background: rgba(var(--ok-rgb), 0.12); border: 1px solid rgba(var(--ok-rgb), 0.30); }
+.route.tone-attn { color: var(--attn); background: rgba(var(--attn-rgb), 0.14); border: 1px solid rgba(var(--attn-rgb), 0.34); }
+.route.tone-accent { color: var(--accent); background: rgba(var(--accent-rgb), 0.10); border: 1px solid rgba(var(--accent-rgb), 0.26); }
 .clock { color: var(--text-dim); font: 11px/1 ui-monospace, "SF Mono", monospace; letter-spacing: .5px; flex: none; }
 
 .vbtn {

@@ -1228,10 +1228,36 @@ impl Engine {
         Ok(())
     }
 
-    /// 小本本(回忆页):看 7274 记住了什么。
-    pub fn list_memories(&self) -> Result<Vec<Memory>, AppError> {
-        let user = self.store.users.ensure_default_user()?;
-        Ok(self.store.memory.list(user.id)?)
+    /// 目标用户解析:None = 当前主人(ensure_default_user);Some = 校验真实存在的家人
+    /// (回忆页「主人查看家人记忆」/删家人记忆前的同款防线,防绑悬空 id;§渠道归人第二步)。
+    fn resolve_user(&self, user_id: Option<i64>) -> Result<i64, AppError> {
+        match user_id {
+            Some(uid) => {
+                if self.store.users.get(uid)?.is_none() {
+                    return Err(AppError {
+                        kind: ErrorKind::NotFound,
+                        message: format!("家人 {uid} 不存在"),
+                    });
+                }
+                Ok(uid)
+            }
+            None => Ok(self.store.users.ensure_default_user()?.id),
+        }
+    }
+
+    /// 忘掉某家人的声纹(家人页「忘掉声音」):只删声纹,不删人 / 记忆。之后 TA 说话回落
+    /// 会话用户(identify 少一个候选)。校家人存在(防悬空 id)。
+    pub fn forget_voiceprint(&self, id: i64) -> Result<(), AppError> {
+        let uid = self.resolve_user(Some(id))?;
+        self.store.voiceprints.remove(uid)?;
+        Ok(())
+    }
+
+    /// 小本本(回忆页):看记住了什么。user_id=None → 当前主人;Some → 主人查看某家人
+    /// (§渠道归人第二步「主人查看家人记忆」;共享的「家里的事」由 briefings 承载,不在此)。
+    pub fn list_memories(&self, user_id: Option<i64>) -> Result<Vec<Memory>, AppError> {
+        let uid = self.resolve_user(user_id)?;
+        Ok(self.store.memory.list(uid)?)
     }
 
     /// 最近的记忆维护流水(§13.7 调阈值用:回看「淡出/合并是否过激」)。归当前用户。
@@ -1362,10 +1388,11 @@ impl Engine {
         });
     }
 
-    /// 记错了点掉(记忆卫生 = 信任感);按当前用户限定。
-    pub fn delete_memory(&self, id: i64) -> Result<(), AppError> {
-        let user = self.store.users.ensure_default_user()?;
-        if !self.store.memory.delete(user.id, id)? {
+    /// 记错了点掉(记忆卫生 = 信任感)。user_id=None → 当前主人;Some → 主人删某家人的记忆
+    /// (主人管理面,同提醒页;delete 按 (user,id) 限定,删不到别人的行)。
+    pub fn delete_memory(&self, user_id: Option<i64>, id: i64) -> Result<(), AppError> {
+        let uid = self.resolve_user(user_id)?;
+        if !self.store.memory.delete(uid, id)? {
             return Err(AppError {
                 kind: ErrorKind::NotFound,
                 message: format!("记忆 {id} 不存在"),
@@ -1374,10 +1401,11 @@ impl Engine {
         Ok(())
     }
 
-    /// 回忆页「家里的事」分组:当前用户视角的家庭备忘(home + 个人 scope)。
-    pub fn list_briefings(&self) -> Result<Vec<Briefing>, AppError> {
-        let user = self.store.users.ensure_default_user()?;
-        Ok(self.store.briefings.list_for(user.id)?)
+    /// 回忆页「家里的事」分组:某用户视角的家庭备忘 = home(全家共享)+ TA 的个人 scope。
+    /// user_id=None → 当前主人;Some → 主人查看某家人视角(共享那份对谁都在,归人的跟着切)。
+    pub fn list_briefings(&self, user_id: Option<i64>) -> Result<Vec<Briefing>, AppError> {
+        let uid = self.resolve_user(user_id)?;
+        Ok(self.store.briefings.list_for(uid)?)
     }
 
     pub fn delete_briefing(&self, id: i64) -> Result<(), AppError> {

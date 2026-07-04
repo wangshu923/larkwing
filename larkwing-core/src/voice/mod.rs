@@ -45,6 +45,7 @@ const MIN_SPEECH_S: f32 = 0.5; // 反幻觉第一道闸:更短的段不算话
 const MAX_SPEECH_S: f32 = 12.0;
 const START_TIMEOUT: Duration = Duration::from_secs(6); // 开听后多久没人开口就放弃
 const LEVEL_EVERY_WINDOWS: u32 = 3; // 电平事件节流:每 3 窗 ≈ 96ms ≈ 10Hz
+const ENROLL_SAMPLES: u32 = 3; // 声纹注册录几段取平均(2026-07-04 用户拍板,§4.2「绝不错认」)
 const CALIB_TAKES: u8 = 5; // 唤醒标定:录几遍正样本(+1 段底噪/负样本)
 const CALIB_AMBIENT_SECS: f32 = 4.0; // 标定底噪/负样本采集时长
 const CALIB_COMPUTE_SECS: u64 = 60; // 扫描计算超时兜底(正常 1~3s;超时=组件异常,报错不无限转)
@@ -562,44 +563,81 @@ impl VoiceRuntime {
             .cloned()
     }
 
-    /// 录一句话给某家人注册声纹(家人 tab「让它认识你的声音」)。
-    /// 复用听写采集(VAD 切一句)→ 提取 embedding → 落库;期间挂起唤醒防自激。
+    /// 录 N 段话给某家人注册声纹(家人页「让它认识 TA 的声音」)。多段取平均更稳
+    /// (§4.2「绝不错认」的可靠度杠杆,2026-07-04 用户拍板 3 段)。复用听写采集(VAD 切一句),
+    /// 每段进度 + 终态经 `Enroll` 事件推前端(§3.5 不静默失败);终态一律有动静。
     pub async fn enroll(&self, user_id: i64) -> Result<()> {
+        let r = self.enroll_inner(user_id).await;
+        let stage = if r.is_ok() { "saved" } else { "failed" };
+        self.publish(VoiceEvent::Enroll { user_id, stage: stage.into(), done: None, total: None });
+        if let Err(e) = &r {
+            tracing::error!(user = user_id, err = %format!("{e:#}"), "声纹注册失败");
+        }
+        r
+    }
+
+    async fn enroll_inner(&self, user_id: i64) -> Result<()> {
         anyhow::ensure!(
             self.inner.store.users.get(user_id)?.is_some(),
             "用户不存在,先添加家人再录声纹"
         );
+        // 组件/模型首次用时下载(VAD + CAM++,秒级);进度另有 Task 车道,这里只发「准备中」。
+        self.publish(VoiceEvent::Enroll {
+            user_id,
+            stage: "preparing".into(),
+            done: None,
+            total: None,
+        });
         let (vad_model, _asr) = self.ensure_engines().await?;
         let spk = self.ensure_speaker().await?;
+        // 挂起唤醒防自激;无论成败都恢复(capture 出错也要放回,否则唤醒卡在挂起态)。
         self.wake_suspend(true);
+        let outcome = self.enroll_capture(user_id, vad_model, spk).await;
+        self.wake_suspend(false);
+        let emb = outcome?;
+        self.inner.store.voiceprints.upsert(user_id, &emb)?;
+        tracing::info!(user = user_id, samples = ENROLL_SAMPLES, "声纹注册完成");
+        Ok(())
+    }
+
+    /// 连录 ENROLL_SAMPLES 段(每段一句)→ 逐段提 embedding → 取平均。每段前发 recording 进度,
+    /// 前端提示「第 done+1/total 遍,请说话」。任一段没录到/太短 → 整次失败(由 `enroll` 兜终态)。
+    async fn enroll_capture(
+        &self,
+        user_id: i64,
+        vad_model: PathBuf,
+        spk: Arc<speaker::SpeakerId>,
+    ) -> Result<Vec<f32>> {
         let rt = self.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<Vec<f32>> {
+        tokio::task::spawn_blocking(move || -> Result<Vec<f32>> {
             let hangover = hangover_secs(&rt.patience());
             let vad = new_vad(&vad_model, hangover)?;
             let pipe = open_capture(rt.input_device())?;
-            rt.publish(VoiceEvent::State { phase: VoicePhase::Listening });
-            let out =
-                collect_utterance(&pipe, &vad, &rt, None, START_TIMEOUT, hangover)?;
+            let mut embeds = Vec::with_capacity(ENROLL_SAMPLES as usize);
+            for done in 0..ENROLL_SAMPLES {
+                rt.publish(VoiceEvent::Enroll {
+                    user_id,
+                    stage: "recording".into(),
+                    done: Some(done),
+                    total: Some(ENROLL_SAMPLES),
+                });
+                let out = collect_utterance(&pipe, &vad, &rt, None, START_TIMEOUT, hangover)?;
+                let mut pcm = match out {
+                    CaptureOut::Utterance(p) => p,
+                    _ => anyhow::bail!("没录到声音,再说一句试试"),
+                };
+                anyhow::ensure!(
+                    (pcm.len() as f32) >= 1.0 * TARGET_RATE as f32,
+                    "说得太短啦,多说一两句(报名字、念句话都行)"
+                );
+                peak_normalize(&mut pcm);
+                embeds.push(spk.embed(&pcm)?);
+            }
             drop(pipe);
-            let mut pcm = match out {
-                CaptureOut::Utterance(p) => p,
-                _ => anyhow::bail!("没录到声音,再说一句试试"),
-            };
-            anyhow::ensure!(
-                (pcm.len() as f32) >= 1.0 * TARGET_RATE as f32,
-                "说得太短啦,多说一两句(报名字、念句话都行)"
-            );
-            peak_normalize(&mut pcm);
-            spk.embed(&pcm)
+            speaker::mean_embedding(&embeds).ok_or_else(|| anyhow!("声纹平均失败"))
         })
         .await
-        .context("声纹注册任务挂了")?;
-        self.publish(VoiceEvent::State { phase: VoicePhase::Idle });
-        self.wake_suspend(false);
-        let emb = result?;
-        self.inner.store.voiceprints.upsert(user_id, &emb)?;
-        tracing::info!(user = user_id, "声纹注册完成");
-        Ok(())
+        .context("声纹注册任务挂了")?
     }
 
     // ---- 唤醒录音标定(PLAN §11 后续):录几遍 → 一次扫描定拼写(B)+ 阈值(A)→ 写回 ----

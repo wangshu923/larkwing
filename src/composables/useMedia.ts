@@ -18,6 +18,7 @@ import {
 } from '../lib/backend'
 import { i18n } from '../i18n'
 import { attachMedia, detachAudio } from './useAudioGraph'
+import { isAdaptiveUrl, playAdaptive, type AdaptiveController } from './localAdaptive'
 
 export type PlayStatus = 'idle' | 'loading' | 'playing' | 'paused'
 
@@ -121,6 +122,14 @@ function destroyShaka(): Promise<void> {
   }
   return shakaTeardown
 }
+// 本地自适应(手写 MSE,音视频分离,0.2.6 治漂移):与 shaka 二选一,各自的 <video> 接管要拆干净。
+let adaptiveCtl: AdaptiveController | null = null
+/** 已为哪个 page_url 兜底回落过 muxed(每文件只兜一次,防来回重放);新 play() 复位。 */
+let adaptiveFellBackFor: string | null = null
+function destroyAdaptive() {
+  adaptiveCtl?.stop()
+  adaptiveCtl = null
+}
 /** 把当前视频装进 <video>:自适应流(manifest_url)走 shaka(MSE);否则原生 src(直传/本地混流)。
  *  play() 与 registerVideoEl(后挂场景)都走它。异步加载期间若已切走/停了,据 state.current 比对退出。 */
 async function loadVideoInto(el: HTMLVideoElement) {
@@ -131,6 +140,29 @@ async function loadVideoInto(el: HTMLVideoElement) {
   if (!cur.manifest_url) {
     el.src = cur.stream_url
     void el.play().catch(() => (state.status = 'paused'))
+    return
+  }
+  // 本地自适应(/la/):手写 MSE(音视频分离,连续音频治漂移 + 视频 copy 省 CPU)。绕开 shaka。
+  if (isAdaptiveUrl(cur.manifest_url)) {
+    destroyAdaptive()
+    await destroyShaka()
+    if (state.current !== cur) return
+    // 兜底:自适应(setup 或播放期)失败 → 让后端对同一文件强制走 muxed HLS(能放的老路,§3.5)。
+    // 每个文件只兜底一次(避免 muxed 也失败时来回重放)。
+    const fallbackCompat = () => {
+      if (!isTauri() || adaptiveFellBackFor === cur.page_url) return
+      adaptiveFellBackFor = cur.page_url
+      console.warn('[lw][adaptive] failed → 回落 muxed HLS')
+      void api.mediaReplayCompat(cur.page_url, cur.kind === 'audio').catch(() => {})
+    }
+    try {
+      const ctl = await playAdaptive(el, cur.manifest_url, fallbackCompat)
+      if (state.current !== cur) ctl.stop() // 加载期间已切走
+      else adaptiveCtl = ctl
+    } catch (e) {
+      console.error('[lw][adaptive] setup failed', e)
+      fallbackCompat()
+    }
     return
   }
   try {
@@ -193,6 +225,7 @@ export function registerVideoEl(el: HTMLVideoElement | null) {
   if (videoEl && videoEl !== el) detachAudio(videoEl) // 换/卸载旧 <video>:释放它的响度均衡链,防泄漏/多源争抢
   videoEl = el
   if (!el) {
+    destroyAdaptive() // 浮层卸载:拆掉手写 MSE(它接管了那个 <video>)
     void destroyShaka() // 浮层卸载:拆掉 shaka(它接管了那个 <video>)
     return
   }
@@ -246,6 +279,7 @@ function play(np: NowPlaying) {
   //  强行 bringToFront+全屏,每个集边界都拽一次,是 bug。)只有「从无到有」起播视频才叫窗到前 + 全屏。
   const continuation = state.current?.kind === 'video' && np.kind === 'video'
   stopElements()
+  adaptiveFellBackFor = null // 新播放:清兜底记忆(muxed 回落走 /hls/ 不再进自适应,不会循环)
   state.current = np
   state.status = 'loading'
   state.position = 0
@@ -360,6 +394,7 @@ function stopElements() {
     audio.pause()
     audio.removeAttribute('src')
   }
+  destroyAdaptive() // 手写 MSE(本地自适应)先拆:停泵/停音频流/收 MediaSource
   void destroyShaka() // 自适应流:先拆 shaka(它经 MSE 接管了 <video>),再清原生 src
   if (videoEl) {
     videoEl.pause()
@@ -515,6 +550,7 @@ function wire() {
       title: '小猪佩奇 第3集 踩泥坑',
       duration_seconds: 320,
       stream_url: '',
+      route: 'hls_transcode', // 预览:本地不兼容片今天走转码(0.2.6 copy 切片落地后会是 'hls_copy')
       page_url: '#',
       source: 'local',
       playlist: { index: 2, total: 12, resumed: false },

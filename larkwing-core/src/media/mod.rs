@@ -101,6 +101,45 @@ pub enum MediaKind {
     Video,
 }
 
+/// 「怎么放的」——本次播放走了哪条链路(core 只发 key,前端按 locale 出短标签,§6.6)。
+/// 给用户/开发者一个可见的「省 CPU 还是在转码」信号,也是 0.2.6 copy 切片真机验收的眼睛:
+/// 同是本地不兼容片,看到 `HlsCopy`(视频没重编)还是 `HlsTranscode`(在转)一目了然。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackRoute {
+    /// 原生直传:本地 `/f/` 全兼容文件 或 网络单流 `/s/` —— 零转码、原生 seek,最省。
+    Direct,
+    /// 自适应流(DASH,shaka/MSE):B 站音视频分离直供,播放器管时间轴 → 原生 seek + 同步。
+    Dash,
+    /// HLS 视频 `-c:v copy` 切片(视频已兼容 → 不重编码,仅音轨转 AAC):首播即省 CPU(0.2.6)。
+    HlsCopy,
+    /// HLS 重编码切片(视频 HEVC/AV1 等 WebView2 解不了 → 转 H.264):吃 CPU。
+    HlsTranscode,
+    /// ffmpeg 渐进混流(`/m/`):网络 DASH 回落 或 本地转封装,`?t=` 重启式 seek(无原生 seek)。
+    Remux,
+}
+
+/// 从注册好的 relay URL 反推链路(relay 路径是稳定契约,前端也已按 `/m/` 判混流)。
+/// 本地 `/hls/` 当前恒是重编码;0.2.6 copy 切片落地后由调用点显式传 `HlsCopy` 覆盖,不走这里。
+fn derive_route(stream_url: &str, manifest_url: Option<&str>) -> PlaybackRoute {
+    match manifest_url {
+        Some(m) if m.contains("/dash/") => PlaybackRoute::Dash,
+        Some(_) => PlaybackRoute::HlsTranscode, // `/hls/`(本地按需切片)
+        None if stream_url.contains("/m/") => PlaybackRoute::Remux,
+        None => PlaybackRoute::Direct,
+    }
+}
+
+/// 固定 `target` 秒的段计划(转码用,不必关键帧对齐——转码每段从新 IDR 重编):
+/// `(0,t),(t,t),…,(末段,余量)`。末段补到 `duration`。纯函数。
+fn fixed_segments(duration: f64, target: f64) -> Vec<(f64, f64)> {
+    if !(duration > 0.0) || !(target > 0.0) {
+        return Vec::new();
+    }
+    let n = (duration / target).ceil().max(1.0) as usize;
+    (0..n).map(|i| (i as f64 * target, (duration - i as f64 * target).min(target))).collect()
+}
+
 /// 「正在播放」:前端拿 stream_url 挂播放元素;page_url 留诊断/以后“浏览器打开”。
 #[derive(Debug, Clone, Serialize)]
 pub struct NowPlaying {
@@ -115,6 +154,8 @@ pub struct NowPlaying {
     /// 否则前端用 `stream_url` 挂原生 `<video>/<audio>`(直传文件/单流,原生 seek)。(B 站 DASH 走这里。)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_url: Option<String>,
+    /// 本次播放走的链路(见 `PlaybackRoute`):前端在播放条上出一枚「怎么放的」小徽章。
+    pub route: PlaybackRoute,
     pub page_url: String,
     pub source: String,
     /// 多集续播位置:有值 = 这是一个 ≥2 集的剧集(B 站合集/分P、本地剧集文件夹)。
@@ -588,7 +629,10 @@ impl MediaRuntime {
         pos: Option<PlaylistPos>,
     ) -> Result<PlayOutcome> {
         if is_local_path(page_url) {
-            return self.play_local(page_url, audio_only, pos).await.map(PlayOutcome::Playing);
+            return self
+                .play_local(page_url, audio_only, pos, true)
+                .await
+                .map(PlayOutcome::Playing);
         }
         let ytdlp = self.ensure_component(Component::YtDlp).await?;
 
@@ -688,6 +732,7 @@ impl MediaRuntime {
             title: resolved.title,
             author: resolved.uploader,
             duration_seconds: resolved.duration_seconds,
+            route: derive_route(&stream_url, manifest_url.as_deref()),
             stream_url,
             manifest_url,
             page_url: page_url.into(),
@@ -745,6 +790,63 @@ impl MediaRuntime {
                 (relay.register_file(path.to_path_buf()), None)
             }
         }
+    }
+
+    /// 本地 BMFF 不兼容文件的**音视频分离自适应**(0.2.6 治本):视频按需分段(兼容→`copy` 省 CPU、
+    /// 否则转 H.264)、音频**一整条连续编码** → 前端手写 MSE 播,治「逐段音频 priming 漂移」+ 省 CPU。
+    /// 返回 `(stream_url, manifest_url, route)`。任一前提不满足(无时长 / ffmpeg 取不到 / init 生成失败 /
+    /// 解不出 H.264 codec)→ **回落现有 muxed HLS**(能放、只是老样子),绝不阻断播放(§兜底)。
+    async fn adaptive_or_fallback(
+        &self,
+        relay: &relay::Relay,
+        path: &std::path::Path,
+        pr: &probe::LocalProbe,
+    ) -> (String, Option<String>, PlaybackRoute) {
+        let (vi, ai) = (pr.video_incompatible, pr.audio_incompatible);
+        let Some(dur) = pr.duration_seconds.filter(|d| *d > 0.0) else {
+            tracing::warn!(path = %path.display(), "无时长,自适应建不了段清单,回落 muxed HLS");
+            let (su, mu) = self.hls_or_fallback(relay, path, vi, ai, pr.duration_seconds).await;
+            return (su, mu, PlaybackRoute::HlsTranscode);
+        };
+        let ffmpeg = match self.ensure_component(Component::Ffmpeg).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), "ffmpeg 取不到,自适应走不了,退直传: {e:#}");
+                return (relay.register_file(path.to_path_buf()), None, PlaybackRoute::Direct);
+            }
+        };
+        // 视频兼容 + 有关键帧 + 能定 H.264 codec → copy 切片(省 CPU);否则转码(仍分离音频治漂移)。
+        let copy_video =
+            !pr.video_incompatible && !pr.video_keyframes.is_empty() && pr.video_codec.is_some();
+        let segments = if copy_video {
+            probe::plan_copy_segments(&pr.video_keyframes, dur, relay::HLS_SEG)
+        } else {
+            fixed_segments(dur, relay::HLS_SEG)
+        };
+        if segments.is_empty() {
+            tracing::warn!(path = %path.display(), "自适应段计划为空,回落 muxed HLS");
+            let (su, mu) = self.hls_or_fallback(relay, path, vi, ai, Some(dur)).await;
+            return (su, mu, PlaybackRoute::HlsTranscode);
+        }
+        // 生成视频 init(顺带据其 avcC 定精确 codec 串);任一失败 → 回落 muxed HLS。
+        let Some(init) = relay::gen_video_init(&ffmpeg, path, copy_video).await else {
+            tracing::warn!(path = %path.display(), "自适应 init 生成失败,回落 muxed HLS");
+            let (su, mu) = self.hls_or_fallback(relay, path, vi, ai, Some(dur)).await;
+            return (su, mu, PlaybackRoute::HlsTranscode);
+        };
+        let Some(codec) = probe::video_h264_codec(&init) else {
+            tracing::warn!(path = %path.display(), "自适应 init 解不出 H.264 codec,回落 muxed HLS");
+            let (su, mu) = self.hls_or_fallback(relay, path, vi, ai, Some(dur)).await;
+            return (su, mu, PlaybackRoute::HlsTranscode);
+        };
+        let video_mime = format!("video/mp4; codecs=\"{codec}\"");
+        let route = if copy_video { PlaybackRoute::HlsCopy } else { PlaybackRoute::HlsTranscode };
+        tracing::info!(path = %path.display(), copy = copy_video, segs = segments.len(),
+            "自适应播放(音视频分离,连续音频治漂移)");
+        let url = relay.register_file_adaptive(
+            path.to_path_buf(), ffmpeg, copy_video, video_mime, init, segments, dur,
+        );
+        (url.clone(), Some(url), route)
     }
 
     /// 取 ffmpeg 注册转封装/转码 URL(走 /m/);ffmpeg 取不到则退回原生直传。HLS 无时长时的回落用。
@@ -832,6 +934,14 @@ impl MediaRuntime {
         }
     }
 
+    /// 兜底重放(前端手写 MSE〔本地自适应〕播放失败时调):对同一本地文件**强制走 muxed HLS**
+    /// (能放的老路,会漂但不黑屏,§3.5 不静默失败)。`play_local` 内部已发 Play 事件替换当前播放。
+    /// pos=None:兜底不重建剧集队列(先保能放;切集另说)。仅本地文件有意义(网络路本就 shaka)。
+    pub async fn replay_local_compat(&self, page_url: &str, audio_only: bool) -> Result<()> {
+        self.play_local(page_url, audio_only, None, false).await?;
+        Ok(())
+    }
+
     /// 本地文件(含 NAS 挂载/UNC):跳过 yt-dlp,注册文件端点即播 —— 单文件免混流,
     /// Range 原生 seek 白送,秒级无任务进度可言,不上 HUD。
     ///
@@ -844,11 +954,14 @@ impl MediaRuntime {
     ///   · webm / 未知 / 放歌(audio_only):直传,交给浏览器。
     ///
     /// `pos` = 这一集在本地剧集队列里的位置(None = 单文件);写进 `NowPlaying.playlist` 驱动续播 UI。
+    /// `prefer_adaptive`:true(常态)= 不兼容 BMFF 走音视频分离自适应(治漂移 + copy 省 CPU);
+    /// false = 前端手写 MSE 播放失败后的**兜底重放**,强制回落 muxed HLS(能放的老路)。
     async fn play_local(
         &self,
         path_str: &str,
         audio_only: bool,
         pos: Option<PlaylistPos>,
+        prefer_adaptive: bool,
     ) -> Result<NowPlaying> {
         let path = std::path::PathBuf::from(path_str);
         let meta = tokio::fs::metadata(&path)
@@ -870,6 +983,7 @@ impl MediaRuntime {
         //(manifest_url 有值 → 前端 shaka 播 → 原生 seek + 音画同步);兼容文件原生 /f/ 直传。
         let mut duration_seconds = None;
         let mut manifest_url: Option<String> = None;
+        let mut route: Option<PlaybackRoute> = None; // Some = 显式(自适应路 URL 反推不出 copy/转码)
         let stream_url = if audio_only {
             relay.register_file(path.clone()) // 放歌:本地音频常见格式浏览器都吃,直传
         } else if probe::is_isobmff_ext(&path) {
@@ -881,20 +995,21 @@ impl MediaRuntime {
             duration_seconds = pr.duration_seconds;
             if pr.audio_incompatible || pr.video_incompatible {
                 self.log_local_codec(&path, &pr);
-                // 不兼容(音轨 AC3/DTS 或视频 HEVC)→ HLS 按需切片(shaka 原生 seek);无时长回落 /m/。
-                // (整文件 copy-remux/C2 已删——鸡肋:首播仍走 HLS、后台白转一份;省 CPU 的正解是
-                //  「已兼容视频 HLS copy 切片」,排 0.2.6 播放专版,见 PLAN。)
-                let (su, mu) = self
-                    .hls_or_fallback(
-                        relay,
-                        &path,
-                        pr.video_incompatible,
-                        pr.audio_incompatible,
-                        pr.duration_seconds,
-                    )
-                    .await;
-                manifest_url = mu;
-                su
+                if prefer_adaptive {
+                    // 0.2.6 治本:音视频分离自适应 —— 视频兼容→`copy` 省 CPU、否则转码;音频一整条连续
+                    // 编码(治「逐段音频 priming 累积漂移」)。前提不满足自动回落 muxed HLS(绝不阻断)。
+                    let (su, mu, r) = self.adaptive_or_fallback(relay, &path, &pr).await;
+                    manifest_url = mu;
+                    route = Some(r);
+                    su
+                } else {
+                    // 兜底重放:前端手写 MSE 播放失败 → 强制走 muxed HLS(能放的老路,会漂但不黑屏)。
+                    let (su, mu) = self
+                        .hls_or_fallback(relay, &path, pr.video_incompatible, pr.audio_incompatible, pr.duration_seconds)
+                        .await;
+                    manifest_url = mu;
+                    su
+                }
             } else {
                 relay.register_file(path.clone()) // 全兼容:原生直传秒开
             }
@@ -934,6 +1049,8 @@ impl MediaRuntime {
             title,
             author: None,
             duration_seconds,
+            // 自适应路显式给 route(URL 是 /la/,反推不出 copy/转码);其余路由由 URL 反推。
+            route: route.unwrap_or_else(|| derive_route(&stream_url, manifest_url.as_deref())),
             stream_url,
             manifest_url,
             page_url: path_str.into(),
