@@ -50,7 +50,7 @@ pub(crate) fn clean(raw: &str) -> Option<String> {
                 matches!(c, '"' | '\'' | '“' | '”' | '‘' | '’' | '「' | '」' | '『' | '』' | '《' | '》' | '`')
             })
             .trim_end_matches(|c: char| {
-                matches!(c, '。' | '.' | '!' | '！' | '?' | '？' | '…' | ',' | ',' | ';' | ';')
+                matches!(c, '。' | '.' | '!' | '！' | '?' | '？' | '…' | ',' | '，' | ';' | '；')
             })
             .trim();
         if stripped == line {
