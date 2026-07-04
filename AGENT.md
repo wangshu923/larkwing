@@ -27,7 +27,7 @@
 - **一句话**:面向普通人 / 家庭(含老人小孩)的**暖萌 / 科幻陪伴型 AI 助手**,**Rust 全新重写**(不是现有 Python `robot`)。= 旺财的桌面版。
 - **给谁**:消费级产品,目标用户**不是开发者**。核心洞察 = robot 太自由可配置普通人不会用;Larkwing 反过来**强默认、开箱即用、收口**。
 - **技术栈一句话**:Tauri v2 壳 + 单 `larkwing-core`(Rust/tokio)+ Vue 3 + TS(MVVM)+ SQLite + DeepSeek 优先(多供应商 trait 化)。
-- **现状(2026-06)**:MVP 后端 + agent/工具运行时 + 影音 + 任务需知 + 文件能力 + 提醒/web + 语音(A+B+C 全量、D 部分)+ 常驻临场(开机自启/托盘/悬浮窗)**均已落地**,核心测试全绿。**权威执行状态以 PLAN.md 各 § 为准。**
+- **现状(最新 v0.2.6,2026-07-04 发布)**:MVP 后端 + agent/工具运行时 + 影音 + 任务需知 + 文件能力 + 提醒/web + 语音(A+B+C 全量、D 部分)+ 常驻临场(开机自启/托盘/悬浮窗)+ 远程渠道(TG/钉钉)+ 多用户(渠道归人 + 声纹归人)**均已落地**,核心测试全绿。**最近 v0.2.6 = 播放治本**(本地不兼容片走音视频分离自适应:视频 copy 省 CPU + 音频离散段 appendWindow 治音画漂移;§7.1)+ 声纹归人 + 响度调整,已 Windows 真机验过并发布。**权威执行状态以 PLAN.md 各 § 为准。**
 
 ---
 
@@ -87,7 +87,7 @@
 - **已否决的名字**(别再提):`Tideripper`(太凶)、`Sunwing`(撞加航)、`Waterwing`(像泳圈)、`Emberwing`(撞游戏)。
 
 ### 4.2 产品定位 🔒
-- 消费级、面向普通人 / 家庭,**不是开发者**;架构支持多用户(每人各自记忆)。**多用户第一步「渠道归人」已启用(2026-07-03 用户拍板,进 v0.2.4)**:家人页(加/删/改名)+ 手机渠道对话指认给家人 → TA 说的「提醒我 / 我喜欢」归 TA 自己(§7.7);**没有「切换用户」概念**(§3 零新概念:谁说话就是谁,桌面打字恒 = 会话归属者)。**声纹识别(桌面语音归人)= 第二步,2026-07-04 已落地(§9,0.2.5 批;真机待验)**:enroll 录 3 段 + 置信「宁可不认绝不错认」(≥0.5 且比第二名高 ≥0.10)+ 主人可在回忆页看/管家人记忆(切视图非切身份);首个场景 = 闲聊陪伴。
+- 消费级、面向普通人 / 家庭,**不是开发者**;架构支持多用户(每人各自记忆)。**多用户第一步「渠道归人」已启用(2026-07-03 用户拍板,进 v0.2.4)**:家人页(加/删/改名)+ 手机渠道对话指认给家人 → TA 说的「提醒我 / 我喜欢」归 TA 自己(§7.7);**没有「切换用户」概念**(§3 零新概念:谁说话就是谁,桌面打字恒 = 会话归属者)。**声纹识别(桌面语音归人)= 第二步,2026-07-04 已落地并随 v0.2.6 发布(§9;声纹 enroll 的真机验以其所属会话记录为准)**:enroll 录 3 段 + 置信「宁可不认绝不错认」(≥0.5 且比第二名高 ≥0.10)+ 主人可在回忆页看/管家人记忆(切视图非切身份);首个场景 = 闲聊陪伴。
 
 ### 4.3 技术栈 🔒
 - **Tauri v2**(Rust + WebView)。**不用 Electron、不用 Python。**
@@ -258,8 +258,13 @@
 - 本地播放链:需知(目录)→ 文件原语找文件 → `media_play` 放行本地绝对路径 → relay `/f/` 本地文件端点(手写 Range)。NAS 挂载盘符 / UNC 是普通路径。
   - **本地视频"探测→只转处理不了的那部分"(2026-06-19,§8.1 编解码坑的本地补课;用户拍板「按需」)**:`play_local` 三分路(均**只转 WebView2 解不了的轨**,兼容轨一律 `-c copy`):① **BMFF(mp4/mov/m4v)** 走 `probe::probe_local` 读 `moov`(零子进程、不下 ffmpeg、不拖慢普通文件)→ 全兼容原生 `/f/` 直传秒开,音轨 AC3/DTS/EAC3/TrueHD/ALAC 或视频 HEVC/AV1/杜比视界不兼容才取 ffmpeg;② **mkv/avi/ts/wmv… 容器**(`needs_ffmpeg_container`,WebView2 本就放不了)必经 ffmpeg 转封装 → 先 `ensure_component(Ffmpeg)`、再 `ffmpeg -i` 解析 stderr(`probe::parse_ffmpeg_stderr` 纯函数可测)拿编码+时长、按需 copy/转;③ webm/未知/`audio_only`(放歌)→ 直传。转码走 relay `Entry::FileRemux`(`-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p` / `-c:a aac`,与 B 站 DASH 混流共用 `stream_ffmpeg` + 走 `/m/` + 前端 `?t=` 重启 seek,**前端零改**);ffmpeg 取不到一律退回直传不阻断。配套:`play()` 一进来**后台预取 ffmpeg**(首次播放**任何**媒体含放歌就 fire-and-forget 下好——预取的是工具不是转码,下了不一定用但真用到时零等待;不卡播放,§4.6 同款 net 下载;锁去重+已在磁盘秒返回 → 与用时下载只下一份)。视频转码吃 CPU、弱机可能跟不上,preset/硬解是真机调优项。
     - **整文件 copy-remux(C2)—— 已删(2026-07-04,v0.2.5;用户判鸡肋)**:曾对「视频兼容、只容器/音轨不对」的片一次性 `-c:v copy` 转封装进 `media/remux/` 缓存,想让「下次」秒开。删因:首播仍走 HLS 重编码(CPU 没省)+ 后台又搬一份整片,只有极少的二刷/连播切集回本;`+faststart` 二次 pass 让 4.5G 本地片"整理"要好几分钟(真机《流浪地球2》)。`play_local` 已退回纯 HLS(C2 之前的已验证行为,非回归)。`remux_or_direct`(HLS 无时长回落 /m/)是 pre-C2 件,保留。
-    - **★0.2.6「播放治本」= 音视频分离自适应(2026-07-04 落地,Mac 全绿真机待验)**:本地不兼容 BMFF 片改走 `Entry::FileAdaptive`(`/la/` 端点)——**视频按需分段**(兼容→`-c:v copy` 省 CPU、关键帧对齐变长段〔`probe::video_keyframes`/`plan_copy_segments`,从 moov 的 stss/stts〕;否则转 H.264)+ **音频一整条连续编码**(渐进流),前端 `localAdaptive.ts` 手写 MSE 两条 SourceBuffer 播。**根治两件事**:① 逐段独立转 AAC 的编码器 priming 被钉到固定网格 → MSE 丢重叠 → **音频越放越快(实测每 6s 快 ~80ms)**;连续编码结构性无此漂移。② 视频兼容也重编 = 白吃 CPU;copy 省掉。**双层兜底**(§3.5,拼错绝不黑屏回归):前提不满足(无时长/ffmpeg 缺/无关键帧/解不出 codec)后端回落 muxed HLS;前端 MSE 运行时失败(含停滞看门狗)→ `media_replay_compat` 强制回落 muxed。判据:`route=HlsCopy`(徽章「免转码」)= 走了 copy 省 CPU。mkv/容器暂留 muxed(需 EBML 解析,BMFF-first)。设计+验收见 PLAN ★0.2.6。
-    - **响度 −3dB(2026-07-04)**:`AUDIO_LOUDNESS_AF` 的 `volume` 8dB→5dB,修真机「响段偶尔轻微破音」(+8dB 把峰值推进 alimiter 太狠出失真)。一个常量、转码链共用,真机可继续调。
+    - **★0.2.6「播放治本」= 音视频分离自适应 ✅ 2026-07-04 落地 + Windows 真机验过 + v0.2.6 发布**:本地不兼容 BMFF 片改走 `Entry::FileAdaptive`(`/la/` 端点),前端 `localAdaptive.ts` **手写 MSE 两条 SourceBuffer**(绕开 shaka)——
+      - **视频**:按需分段。兼容(H.264)→ `-c:v copy` **省 CPU**、关键帧对齐**变长段**(`probe::video_keyframes`/`plan_copy_segments`,从 moov 的 stss/stts;copy 段 `-ss` 加 `COPY_SS_EPS` 精确落关键帧);不兼容(HEVC/AV1)→ 转 H.264。tfdt 改累计起点(`patch_segment_tfdt`)。
+      - **音频**:**离散段**(`/la/{ainit,a{N}}`,**不是流式** —— WebView2 的 fetch 收不下流式 body,§8.1 坑);固定 6s 网格,每段左带 `AUDIO_PREROLL`=0.5s 预卷,前端 **`appendWindow`**(先设 End 再设 Start)裁到 `[grid,grid+seg]` —— 连同逐段 AAC 编码器 priming 一起裁掉 → **gapless、无累计漂移**;`timestampOffset` 定位;有界(领先 30s 停喂 / 落后 12s 驱逐,不爆 MSE 配额);seek 用代次 `gen` 弃在途段。
+      - **根治两件事**:① 原 muxed HLS 逐段独立转 AAC、priming 被钉固定网格 → MSE 丢重叠 → **音频越放越快(实测每 6s 快 ~80ms、10min 漂 ~8s)**;离散段 + appendWindow 裁 priming 后无漂移。② 视频兼容也重编 = 白吃 CPU;copy 省掉。
+      - **双层兜底**(§3.5,拼错绝不黑屏回归):前提不满足(无时长/ffmpeg 缺/无关键帧/解不出 codec)后端回落 muxed HLS;前端 MSE 运行时失败(含 12s 停滞看门狗)→ `media_replay_compat` 强制回落 muxed。判据:`route=HlsCopy`(徽章「免转码」)= 走了 copy 省 CPU。mkv/容器暂留 muxed(关键帧需 EBML 解析,BMFF-first,留后续)。
+      - **真机两轮迭代教训(见 §8.1 + 记忆 webview2-mac-dev-divergence)**:①「音频整片流式灌一个 MSE 缓冲爆配额→Chromium 驱逐开头→t=0 无声」②「WebView2 fetch 不吐流式 body→abuf 空」—— **两坑都是「Mac 预览(Chromium)能放、真机 WebView2 不行」**,靠**诊断日志桥 `media_log`**(前端播放态写进 larkwing.log,正式版无 JS console)定位。设计 + 验收全程见 PLAN ★0.2.6。
+    - **响度 −3dB(2026-07-04,随 0.2.6 验过)**:`AUDIO_LOUDNESS_AF` 的 `volume` 8dB→5dB,修真机「响段偶尔轻微破音」(+8dB 把峰值推进 alimiter 太狠出失真)。一个常量、转码链共用,真机可继续调。
 - **工具入参的布尔值走 `tools::arg_bool` 宽容解析(2026-06-19)**:模型(尤其流式 JSON)常把 schema 声明为 boolean 的参数发成**字符串** `"true"`/`"false"`,裸 `Value::as_bool` 认不出就静默回落默认(实锤:`audio_only:"true"` → 当 false → 放本地歌弹出全屏视频框)。新加 boolean 入参一律用 `arg_bool`(真 bool / "true"/"false"/1/0/yes/no 都认),别再裸 `as_bool`。属 §4.4「Quirks 数据修正」一类。
 
 ### 7.2 文件能力(PLAN §9「文件能力」)
@@ -425,4 +430,4 @@
 
 ---
 
-*最后整编:2026-07-03·晚(v0.2.4 批次二:§7.7 手机端补全=提醒推回手机/TG 语音照片能收/看不了必回话、原「MVP 纯文本」入站半边解除,channels 组合 voice+media;§7.1 加「视频已兼容」整文件 copy-remux 缓存;§7.6 重试载体补语音模型三型。同日早:多用户第一步「渠道归人」启用 = 家人页激活 + 渠道对话指认给家人 + speaker_user 归人全链,§4.2/§7.7/§9 三处更新;声纹仍休眠为第二步。前次 2026-06-30:模型「高级设置」override 落地=按模型纠正档位/上下文/价/计价方式,catalog 进程级 overlay;计价感知压缩补上=无缓存少留;窗口 UI 以 K 计。前次 2026-06-29:§9 收窄媒体规则=文档文字进 history、图仍当轮;上下文处理合并成单一 model-aware 字数预算 + 整块锚定、删条数窗口 WINDOW_MAX;catalog 加 ctx_window_tokens。2026-06-20 新增 §4.11 用户准则)。原合并自 CLAUDE.md(宪法)、PLAN.md(§0–§12 设计与执行状态)及历次会话的踩坑沉淀。*
+*最后整编:2026-07-04·晚(v0.2.6 发布:**播放治本** = 本地不兼容 BMFF 片走「音视频分离自适应」——视频 `-c:v copy` 省 CPU(关键帧对齐变长段)+ 音频**离散段 + appendWindow 裁 priming** 治「音画越放越快」漂移,手写 MSE 绕开 shaka,双层兜底回落 muxed;§7.1 大改。两轮真机迭代踩到「Mac 预览 Chromium 能放、WebView2 不行」两坑〔整片音频流式爆配额→驱逐开头 t=0 无声;WebView2 fetch 不吐流式 body→abuf 空〕,靠诊断日志桥 `media_log` 定位,§8.1 记。同版:声纹归人〔另一会话,§4.2/§9〕+ 响度 −3dB。前次 2026-07-03·晚(v0.2.4 批次二:§7.7 手机端补全=提醒推回手机/TG 语音照片能收/看不了必回话、原「MVP 纯文本」入站半边解除,channels 组合 voice+media;§7.1 加「视频已兼容」整文件 copy-remux 缓存;§7.6 重试载体补语音模型三型。同日早:多用户第一步「渠道归人」启用 = 家人页激活 + 渠道对话指认给家人 + speaker_user 归人全链,§4.2/§7.7/§9 三处更新;声纹仍休眠为第二步。前次 2026-06-30:模型「高级设置」override 落地=按模型纠正档位/上下文/价/计价方式,catalog 进程级 overlay;计价感知压缩补上=无缓存少留;窗口 UI 以 K 计。前次 2026-06-29:§9 收窄媒体规则=文档文字进 history、图仍当轮;上下文处理合并成单一 model-aware 字数预算 + 整块锚定、删条数窗口 WINDOW_MAX;catalog 加 ctx_window_tokens。2026-06-20 新增 §4.11 用户准则)。原合并自 CLAUDE.md(宪法)、PLAN.md(§0–§12 设计与执行状态)及历次会话的踩坑沉淀。*
