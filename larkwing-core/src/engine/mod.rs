@@ -598,6 +598,20 @@ impl Engine {
         &self.store
     }
 
+    /// 助手显示名:主人的 `ui.pet_name`(空 = 出厂默认名 `context::DEFAULT_NAME`)。
+    /// core 侧需要具名的用户可见文案时用(如渠道引导语);默认名回落单一真相源,
+    /// 绝不再硬编「旺财 / 7274」(§4.1 名字 = 用户数据、§4.11 单源、§6.6 名字准则)。
+    pub(crate) fn pet_name(&self) -> String {
+        self.store
+            .users
+            .ensure_default_user()
+            .ok()
+            .and_then(|u| self.store.settings.get(Some(u.id), "ui.pet_name").ok().flatten())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| context::DEFAULT_NAME.to_string())
+    }
+
     /// 直接注入单 provider(测试 / FakeLlm);None = 清空回首跑态。
     pub fn set_provider(&self, p: Option<Arc<dyn LlmProvider>>) {
         *self.llm.write().expect("llm lock poisoned") = match p {

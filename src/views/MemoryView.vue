@@ -16,6 +16,8 @@ const { t } = useI18n()
 const { openMenu } = useContextMenu()
 const settings = useSettings()
 const toast = useToast()
+// 名字跟随用户设置(ui.pet_name 空 = 默认名 pet.name);徽章绝不硬编 7274/旺财(§6.6 名字准则)。
+const petName = computed(() => settings.get('ui.pet_name') || t('pet.name'))
 
 /** 自动记住开关(memory.auto_consolidate,默认开):回忆页是记忆的唯一用户触点(§7.3),
  *  开关安在它产出的记忆上方,因果一目了然。关掉只停后台自动提炼,手动/对话里记不受影响。 */
@@ -209,7 +211,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
     <header class="view-head sep" data-tauri-drag-region>
       <div class="view-title">
         <b>{{ t('memory.title') }}</b>
-        <span class="view-mono">7274 · MEMORY</span>
+        <span class="view-mono">{{ petName }} · MEMORY</span>
         <small>{{ t('memory.tagline') }}</small>
       </div>
       <button class="view-back" @click="emit('close')">{{ t('memory.back') }}</button>

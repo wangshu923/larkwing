@@ -22,6 +22,112 @@ use tokio::io::AsyncReadExt;
 
 use super::resolver::UpStream;
 
+/// 视频转码用哪个 H.264 编码器。**探测出来的、每 entry 固定**(init 与各段必须同编码器,否则
+/// avcC 配置不一致、MSE 拼不上)。有硬件编码器就用 GPU(省 CPU,§硬件加速),没有则回落软件
+/// libx264 —— 回落时**逐字节等同旧行为、零回归**。选择由 `detect_video_encoder` 试编码探出、
+/// `Relay` 进程级缓存(`Inner.hw_encoder`);"播放失败兜底重放"强制走 `Software`(最兼容)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoEncoder {
+    /// libx264(软件,永远可用的回落)。
+    Software,
+    /// NVIDIA NVENC(`h264_nvenc`)。
+    Nvenc,
+    /// Intel Quick Sync(`h264_qsv`)。
+    Qsv,
+    /// AMD AMF(`h264_amf`)。
+    Amf,
+    /// Apple VideoToolbox(`h264_videotoolbox`,Mac 开发机)。
+    VideoToolbox,
+}
+
+/// 追加视频编码参数到 ffmpeg 命令。**所有转码点共用这一处**(§4.8 单源):build_frag_cmd(HLS 段 /
+/// 自适应视频段)、FileRemux(/m/)。质量目标 crf/cq≈23;硬件路加 `-profile:v high` 保 WebView2
+/// 能解;`-pix_fmt yuv420p` 强制 8bit(10bit HEVC 一并压回,浏览器只认 8bit)。
+/// **Software 分支保持与旧代码逐字节一致**(veryfast+crf23+yuv420p),不碰已验证的软件路。
+fn apply_video_encode(cmd: &mut tokio::process::Command, enc: VideoEncoder) {
+    match enc {
+        VideoEncoder::Software => {
+            cmd.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]);
+        }
+        // p5 = 速度/画质折中(p1 最快~p7 最慢);vbr+cq 恒定质量(-b:v 0 让 cq 纯控质量不设码率)。
+        VideoEncoder::Nvenc => {
+            cmd.args([
+                "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", "23",
+                "-b:v", "0", "-profile:v", "high",
+            ]);
+        }
+        VideoEncoder::Qsv => {
+            cmd.args([
+                "-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "23",
+                "-profile:v", "high",
+            ]);
+        }
+        VideoEncoder::Amf => {
+            cmd.args([
+                "-c:v", "h264_amf", "-rc", "cqp", "-qp_i", "23", "-qp_p", "23", "-profile:v", "high",
+            ]);
+        }
+        VideoEncoder::VideoToolbox => {
+            cmd.args(["-c:v", "h264_videotoolbox", "-q:v", "60", "-profile:v", "high"]);
+        }
+    }
+    cmd.args(["-pix_fmt", "yuv420p"]);
+}
+
+/// 试编码一帧探这台机器能不能真用某编码器:编译进 ≠ 能用(如 h264_nvenc 编进了但没 N 卡 →
+/// 运行时失败)。`color` 源出一帧喂给编码器 `-f null` 丢弃,退出码成功即可用。带 10s 超时防卡。
+async fn probe_encoder(ffmpeg: &Path, name: &str) -> bool {
+    let mut cmd = tokio::process::Command::new(ffmpeg);
+    cmd.arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-nostdin")
+        .arg("-f")
+        .arg("lavfi")
+        .arg("-i")
+        .arg("color=c=black:s=256x256:r=5:d=0.4")
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-c:v")
+        .arg(name)
+        .arg("-f")
+        .arg("null")
+        .arg("-");
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    super::no_console(&mut cmd);
+    matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), cmd.status()).await,
+        Ok(Ok(s)) if s.success()
+    )
+}
+
+/// 按平台优先级逐个试编码,取第一个真能用的硬件编码器;都不行回落 `Software`。
+/// **探测不假设**(§4.11):从不硬认"有 GPU",全靠实测。整进程探一次(Relay 缓存)。
+async fn detect_video_encoder(ffmpeg: &Path) -> VideoEncoder {
+    let candidates: &[(&str, VideoEncoder)] = if cfg!(target_os = "windows") {
+        &[
+            ("h264_nvenc", VideoEncoder::Nvenc),
+            ("h264_qsv", VideoEncoder::Qsv),
+            ("h264_amf", VideoEncoder::Amf),
+        ]
+    } else if cfg!(target_os = "macos") {
+        &[("h264_videotoolbox", VideoEncoder::VideoToolbox)]
+    } else {
+        &[]
+    };
+    for (name, enc) in candidates {
+        if probe_encoder(ffmpeg, name).await {
+            tracing::info!(encoder = name, "硬件视频编码器可用,转码走 GPU");
+            return *enc;
+        }
+    }
+    tracing::info!("无可用硬件视频编码器,转码回落 libx264(软件)");
+    VideoEncoder::Software
+}
+
 enum Entry {
     Direct(UpStream),
     Remux { video: UpStream, audio: UpStream, ffmpeg: PathBuf },
@@ -32,7 +138,13 @@ enum Entry {
     /// 音轨转 AAC 否则 `-c:a copy`;`transcode_video` 真则视频转 H.264(吃 CPU)否则 `-c:v copy`
     /// (不掉画质/CPU 近零)。两者皆假时也仍跑(给 mkv 这类只需"转封装成 mp4"的容器用)。走 /m/
     /// 通道(渐进流、无原生 seek,前端按 ?t= 换 src 重启),与 B 站 DASH 混流同播放路径,前端零改。
-    FileRemux { path: PathBuf, ffmpeg: PathBuf, transcode_video: bool, transcode_audio: bool },
+    FileRemux {
+        path: PathBuf,
+        ffmpeg: PathBuf,
+        transcode_video: bool,
+        transcode_audio: bool,
+        enc: VideoEncoder,
+    },
     /// B 站 DASH:两条独立自适应流(video.m4s + audio.m4s)。**不混流** —— 合成一份 DASH MPD,
     /// 前端 shaka 经 MSE 把两条喂给播放器、播放器自己管时间轴 → 原生 seek、天生同步(像 b 站网页)。
     /// `/dash/{token}/manifest.mpd` 返回 `mpd`;`/dash/{token}/v|a` 把 shaka 的 Range 请求带防盗链
@@ -46,7 +158,8 @@ enum Entry {
     /// 实锤 mpegts 段经 shaka 的 mux.js transmux 视频会失败(code 3015/3016)→ 黑屏;fMP4 = B 站 DASH
     /// 已验通的同路、MSE 直吃。无临时目录/无会话(每段无状态),seek = shaka 请求目标段 → 现切现回。
     /// 段一律转码视频 + 下混立体声 AAC(见 build_frag_cmd 三处实证),故无 transcode_* 旋钮。
-    FileHls { path: PathBuf, ffmpeg: PathBuf, duration: f64 },
+    /// `enc` = 视频编码器(硬件/软件,注册时定死 → init 与各段同编码器,avcC 一致可拼)。
+    FileHls { path: PathBuf, ffmpeg: PathBuf, duration: f64, enc: VideoEncoder },
     /// 本地不兼容文件的**音视频分离**自适应播放(0.2.6 治本):前端手写 MSE 两条 SourceBuffer —
     /// 视频按需分段(`copy_video` 决定 `-c:v copy` 省 CPU 还是转 H.264)、音频**离散段 + 左预卷**
     /// (前端 appendWindow 裁掉 priming → gapless 无漂移)。端点(`/la/{token}/…`):
@@ -57,6 +170,8 @@ enum Entry {
         path: PathBuf,
         ffmpeg: PathBuf,
         copy_video: bool,
+        /// 视频编码器(转码段用;copy 段不理会)。与 `video_init` 同编码器,故段的 avcC 与 init 一致。
+        enc: VideoEncoder,
         /// 完整 MSE type:`video/mp4; codecs="avc1.xxxxxx"`(从视频 init 的 avcC 解出)。
         video_mime: String,
         /// 缓存的视频 init(ftyp+moov),vinit 端点直接回它(跨段 codec 配置一致)。
@@ -80,6 +195,8 @@ struct Inner {
     streams: Mutex<HashMap<String, Arc<Entry>>>,
     net: crate::net::Client,
     counter: AtomicU64,
+    /// 探出来的视频编码器(硬件优先),整进程探一次缓存;转码点复用,免每次试编码。
+    hw_encoder: tokio::sync::OnceCell<VideoEncoder>,
 }
 
 #[derive(Clone)]
@@ -101,6 +218,7 @@ impl Relay {
             // 走统一 net::Client(CLAUDE.md §5):墙内 CDN 直连优先永不代理,未来墙外源(YouTube 等)直连失败自动落代理。
             net: crate::net::Client::new(|b| b.connect_timeout(std::time::Duration::from_secs(10))),
             counter: AtomicU64::new(1),
+            hw_encoder: tokio::sync::OnceCell::new(),
         });
         let app = Router::new()
             .route("/s/{token}", get(direct))
@@ -158,16 +276,27 @@ impl Relay {
         self.register(Entry::File(path), "f")
     }
 
+    /// 探/取该机器可用的视频编码器(硬件优先,整进程探一次缓存)。转码前调,拿来定 entry 的 `enc`。
+    pub async fn video_encoder(&self, ffmpeg: &Path) -> VideoEncoder {
+        *self.inner.hw_encoder.get_or_init(|| detect_video_encoder(ffmpeg)).await
+    }
+
     /// 本地文件、ffmpeg 转封装/转码后的混流 URL(走 /m/ 通道,与 register_remux 同播放路径)。
     /// `transcode_video`/`transcode_audio` 各自决定该轨 copy 还是转码(按 probe 结论,只转不兼容的)。
-    pub fn register_file_remux(
+    pub async fn register_file_remux(
         &self,
         path: PathBuf,
         ffmpeg: PathBuf,
         transcode_video: bool,
         transcode_audio: bool,
+        force_software: bool,
     ) -> String {
-        self.register(Entry::FileRemux { path, ffmpeg, transcode_video, transcode_audio }, "m")
+        let enc = if force_software {
+            VideoEncoder::Software
+        } else {
+            self.video_encoder(&ffmpeg).await
+        };
+        self.register(Entry::FileRemux { path, ffmpeg, transcode_video, transcode_audio, enc }, "m")
     }
 
     /// B 站 DASH:**不混流**。探两条流的 sidx → 合成 MPD → 注册,返回 `…/dash/{token}/manifest.mpd`。
@@ -198,17 +327,29 @@ impl Relay {
 
     /// 本地不兼容文件走 HLS 按需切片(Stage 2)。注册返回 `…/hls/{token}/index.m3u8`(前端 shaka
     /// 经 manifest_url 播,自动认 HLS)。duration 来自 probe(mvhd / ffmpeg -i);切片按需现切(见 hls)。
-    pub fn register_file_hls(&self, path: PathBuf, ffmpeg: PathBuf, duration: f64) -> String {
+    pub async fn register_file_hls(
+        &self,
+        path: PathBuf,
+        ffmpeg: PathBuf,
+        duration: f64,
+        force_software: bool,
+    ) -> String {
+        let enc = if force_software {
+            VideoEncoder::Software
+        } else {
+            self.video_encoder(&ffmpeg).await
+        };
         let token = self.token();
         self.inner.streams.lock().expect("relay streams lock poisoned").insert(
             token.clone(),
-            Arc::new(Entry::FileHls { path, ffmpeg, duration }),
+            Arc::new(Entry::FileHls { path, ffmpeg, duration, enc }),
         );
         format!("http://127.0.0.1:{}/hls/{token}/index.m3u8", self.inner.port)
     }
 
     /// 注册音视频分离自适应播放,返回 `…/la/{token}/desc`(前端手写 MSE 据此起播)。
     /// `video_init` 由 `gen_video_init` 预生成(顺带解出 codec 串填 `video_mime`)。
+    #[allow(clippy::too_many_arguments)]
     pub fn register_file_adaptive(
         &self,
         path: PathBuf,
@@ -218,6 +359,7 @@ impl Relay {
         video_init: Vec<u8>,
         segments: Vec<(f64, f64)>,
         duration: f64,
+        enc: VideoEncoder,
     ) -> String {
         let token = self.token();
         self.inner.streams.lock().expect("relay streams lock poisoned").insert(
@@ -226,6 +368,7 @@ impl Relay {
                 path,
                 ffmpeg,
                 copy_video,
+                enc,
                 video_mime,
                 video_init,
                 segments,
@@ -239,8 +382,13 @@ impl Relay {
 /// 生成视频 init(ftyp+moov):切 0.1s 分片、取首个 moof 之前的部分。注册自适应播放时调一次,
 /// 既拿到 init 字节缓存(vinit 端点直接回),又能从中解出精确 codec 串(avcC)。失败 → None
 /// (调用方回落 muxed HLS,不硬走分离路)。`copy_video` 与后续各段一致 → init 与段的 avcC 匹配。
-pub async fn gen_video_init(ffmpeg: &Path, path: &Path, copy_video: bool) -> Option<Vec<u8>> {
-    let cmd = build_frag_cmd(ffmpeg, path, 0.0, 0.1, copy_video, true);
+pub async fn gen_video_init(
+    ffmpeg: &Path,
+    path: &Path,
+    copy_video: bool,
+    enc: VideoEncoder,
+) -> Option<Vec<u8>> {
+    let cmd = build_frag_cmd(ffmpeg, path, 0.0, 0.1, copy_video, true, enc);
     let full = run_ffmpeg_collect(cmd, 8 * 1024 * 1024).await?;
     let moof = super::probe::first_moof_offset(&full)?;
     Some(full[..moof].to_vec())
@@ -469,7 +617,7 @@ async fn dash_preflight() -> Response {
 /// (fMP4 单 moof,一律转码视频 + 立体声 AAC,见 build_frag_cmd)。无临时目录/无会话:每段现切现回。
 async fn hls(State(state): State<Arc<Inner>>, AxPath((token, seg)): AxPath<(String, String)>) -> Response {
     let Some(entry) = lookup(&state, &token) else { return bad(StatusCode::NOT_FOUND) };
-    let Entry::FileHls { path, ffmpeg, duration } = entry.as_ref() else {
+    let Entry::FileHls { path, ffmpeg, duration, enc } = entry.as_ref() else {
         return bad(StatusCode::NOT_FOUND);
     };
     // 三种请求:清单 / 共享 init / moof 段。段走 **fMP4(非 mpegts)** —— MSE 直接吃,绕开 shaka 的
@@ -486,7 +634,7 @@ async fn hls(State(state): State<Arc<Inner>>, AxPath((token, seg)): AxPath<(Stri
         // 共享 init(ftyp+moov):切一小段、取首个 moof 之前的部分。codec 配置与各 moof 段一致
         //(同输入 + 同 copy/转码 flag → ffmpeg 产出确定、跨调用兼容,Mac 已验 init+moof 可拼)。
         tracing::info!("HLS:发 init");
-        let cmd = build_frag_cmd(ffmpeg, path, 0.0, 0.1, false, false);
+        let cmd = build_frag_cmd(ffmpeg, path, 0.0, 0.1, false, false, *enc);
         let Some(full) = run_ffmpeg_collect(cmd, 8 * 1024 * 1024).await else {
             return bad(StatusCode::BAD_GATEWAY);
         };
@@ -509,7 +657,7 @@ async fn hls(State(state): State<Arc<Inner>>, AxPath((token, seg)): AxPath<(Stri
         return bad(StatusCode::NOT_FOUND);
     }
     tracing::info!(seg = n, start, "HLS:现切一段");
-    let cmd = build_frag_cmd(ffmpeg, path, start, HLS_SEG, false, false);
+    let cmd = build_frag_cmd(ffmpeg, path, start, HLS_SEG, false, false, *enc);
     let Some(full) = run_ffmpeg_collect(cmd, 256 * 1024 * 1024).await else {
         return bad(StatusCode::BAD_GATEWAY);
     };
@@ -534,8 +682,16 @@ async fn local_adaptive(
     AxPath((token, seg)): AxPath<(String, String)>,
 ) -> Response {
     let Some(entry) = lookup(&state, &token) else { return bad(StatusCode::NOT_FOUND) };
-    let Entry::FileAdaptive { path, ffmpeg, copy_video, video_mime, video_init, segments, duration } =
-        entry.as_ref()
+    let Entry::FileAdaptive {
+        path,
+        ffmpeg,
+        copy_video,
+        enc,
+        video_mime,
+        video_init,
+        segments,
+        duration,
+    } = entry.as_ref()
     else {
         return bad(StatusCode::NOT_FOUND);
     };
@@ -601,7 +757,7 @@ async fn local_adaptive(
     };
     let Some(&(start, dur)) = segments.get(n) else { return bad(StatusCode::NOT_FOUND) };
     tracing::info!(seg = n, start, dur, copy = copy_video, "自适应:现切视频段");
-    let cmd = build_frag_cmd(ffmpeg, path, start, dur, *copy_video, true);
+    let cmd = build_frag_cmd(ffmpeg, path, start, dur, *copy_video, true, *enc);
     let Some(full) = run_ffmpeg_collect(cmd, 256 * 1024 * 1024).await else {
         return bad(StatusCode::BAD_GATEWAY);
     };
@@ -671,6 +827,7 @@ fn build_frag_cmd(
     dur: f64,
     copy_video: bool,
     video_only: bool,
+    enc: VideoEncoder,
 ) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(ffmpeg);
     cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin");
@@ -692,8 +849,7 @@ fn build_frag_cmd(
     if copy_video {
         cmd.arg("-c:v").arg("copy"); // 视频已兼容:原样搬,不掉画质、CPU 近零
     } else {
-        cmd.arg("-c:v").arg("libx264").arg("-preset").arg("veryfast").arg("-crf").arg("23")
-            .arg("-pix_fmt").arg("yuv420p");
+        apply_video_encode(&mut cmd, enc); // 硬件优先(省 CPU),回落 libx264 与旧行为一致
     }
     if !video_only {
         cmd.arg("-c:a").arg("aac").arg("-af").arg(AUDIO_LOUDNESS_AF).arg("-b:a").arg("256k");
@@ -886,7 +1042,7 @@ async fn remux(
                 .arg("-c").arg("copy"); // 纯复制不转码:CPU 几乎零开销
             cmd
         }
-        Entry::FileRemux { path, ffmpeg, transcode_video, transcode_audio } => {
+        Entry::FileRemux { path, ffmpeg, transcode_video, transcode_audio, enc } => {
             let mut cmd = tokio::process::Command::new(ffmpeg);
             cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin");
             if q.t > 0.0 {
@@ -896,10 +1052,9 @@ async fn remux(
             // 首条视频可选(纯音频不报错)+ 首条音轨可选(无声轨不报错);字幕等不带。
             cmd.arg("-map").arg("0:v:0?").arg("-map").arg("0:a:0?");
             if *transcode_video {
-                // HEVC/AV1 等转 H.264:veryfast 平衡速度/画质;yuv420p 把 10bit 压回 8bit(浏览器只认),
-                // 否则 H.264 10bit 一样放不了。CPU 重,弱机可能跟不上 1x —— preset/硬件加速是真机调优项。
-                cmd.arg("-c:v").arg("libx264").arg("-preset").arg("veryfast")
-                    .arg("-crf").arg("23").arg("-pix_fmt").arg("yuv420p");
+                // HEVC/AV1 等转 H.264:硬件优先(省 CPU),回落 libx264;yuv420p 把 10bit 压回 8bit
+                //(浏览器只认),否则 H.264 10bit 一样放不了。参数收口 apply_video_encode(§4.8 单源)。
+                apply_video_encode(&mut cmd, *enc);
             } else {
                 cmd.arg("-c:v").arg("copy"); // 视频兼容:原样搬,不掉画质、CPU 近零
             }
@@ -997,6 +1152,7 @@ mod tests {
             streams: Mutex::new(HashMap::new()),
             net: crate::net::Client::new(|b| b),
             counter: AtomicU64::new(1),
+            hw_encoder: tokio::sync::OnceCell::new(),
         });
         let relay = Relay { inner };
         let a = relay.register_direct(UpStream { url: "u1".into(), ..Default::default() });
@@ -1069,6 +1225,34 @@ mod tests {
         assert!(m.contains("#EXTINF:6.000,") && m.contains("#EXTINF:2.000,"), "首段 6s、末段余量 2s");
         // 短于一段的片子也至少出一段
         assert!(build_hls_playlist(3.0, 6.0).contains("s0.m4s"));
+    }
+
+    #[test]
+    fn apply_video_encode_maps_each_encoder() {
+        let args_for = |enc| {
+            let mut c = tokio::process::Command::new("ffmpeg");
+            apply_video_encode(&mut c, enc);
+            c.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<String>>()
+        };
+        // 软件路 = 旧行为逐字节一致(libx264 veryfast crf23 + yuv420p),防回归。
+        let sw = args_for(VideoEncoder::Software);
+        assert_eq!(
+            sw.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p"]
+        );
+        // 各硬件路:首个是 -c:v <对应编码器> + high profile + 末尾 -pix_fmt yuv420p。
+        for (enc, name) in [
+            (VideoEncoder::Nvenc, "h264_nvenc"),
+            (VideoEncoder::Qsv, "h264_qsv"),
+            (VideoEncoder::Amf, "h264_amf"),
+            (VideoEncoder::VideoToolbox, "h264_videotoolbox"),
+        ] {
+            let a = args_for(enc);
+            assert_eq!(a[0].as_str(), "-c:v");
+            assert_eq!(a[1].as_str(), name);
+            assert!(a.iter().any(|s| s == "high"), "{name} 应带 -profile:v high");
+            assert_eq!(a.last().unwrap().as_str(), "yuv420p", "{name} 末尾应 -pix_fmt yuv420p");
+        }
     }
 
     #[test]
@@ -1174,7 +1358,8 @@ mod tests {
         let dur = pr.duration_seconds.expect("时长");
         let codec = pr.video_codec.clone().expect("H.264 codec");
         assert!(!pr.video_keyframes.is_empty(), "应有关键帧");
-        let init = gen_video_init(&ffmpeg, &src, true).await.expect("生成 init");
+        let init =
+            gen_video_init(&ffmpeg, &src, true, VideoEncoder::Software).await.expect("生成 init");
         assert!(has(&init, b"moov") && has(&init, b"ftyp"), "vinit 应含 ftyp+moov");
         let segments = super::super::probe::plan_copy_segments(&pr.video_keyframes, dur, HLS_SEG);
         assert!(!segments.is_empty());
@@ -1188,6 +1373,7 @@ mod tests {
             init,
             segments,
             dur,
+            VideoEncoder::Software,
         );
         let base = desc_url.strip_suffix("/desc").unwrap().to_string();
         let http = reqwest::Client::new();

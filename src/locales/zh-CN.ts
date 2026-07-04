@@ -182,7 +182,7 @@ export default {
     micCancelTitle: '取消(Esc)',
     attach: '加图片或文件',
     attRemove: '移除',
-    dropHint: '松手,把文件交给旺财',
+    dropHint: '松手,把文件交给{name}',
     copy: '复制',
     queueHint: '排队中 · 说完一起发',
     queueAtt: '(附件)',
@@ -329,7 +329,7 @@ export default {
   dataNotice: {
     missingTitle: '找不到数据了',
     missingBody:
-      '旺财的数据被搬到了下面这个位置,但现在找不到 —— 可能是存放数据的磁盘没插上 / 没连接。插回去后重新打开就能找回;也可以从全新数据重新开始。',
+      '{name}的数据被搬到了下面这个位置,但现在找不到 —— 可能是存放数据的磁盘没插上 / 没连接。插回去后重新打开就能找回;也可以从全新数据重新开始。',
     quit: '退出(去插回磁盘)',
     reset: '恢复默认(全新开始)',
     oldTitle: '搬家完成 ✓',
@@ -349,7 +349,7 @@ export default {
   },
   // 系统托盘菜单(经 set_tray_menu 注入壳层;§6 文案在前端字典)
   tray: {
-    open: '打开旺财',
+    open: '打开{name}',
     showFloat: '显示悬浮窗',
     quit: '退出',
   },
@@ -480,10 +480,10 @@ export default {
       enrollRecording: '第 {n}/{total} 遍,说句话…',
       enrollDone: '记住这个声音啦',
       enrollFailed: '没录好,再试一次',
-      enrollHint: '录了谁的声音,TA 一开口旺财就认得出,把话记到 TA 的本子上(每人录 3 小段,报名字、念句话都行;不录也能用,只是认不出谁在说)。',
+      enrollHint: '录了谁的声音,TA 一开口{name}就认得出,把话记到 TA 的本子上(每人录 3 小段,报名字、念句话都行;不录也能用,只是认不出谁在说)。',
       chats: '手机上的对话',
       chatsEmpty: '还没有远程对话。到「远程」里接上 Telegram 或钉钉,家人在手机上发一句话,这里就会出现。',
-      chatsHint: '指认之后,TA 在手机上说「提醒我」「我喜欢什么」,旺财就知道是 TA 自己的事,记在 TA 的本子上。',
+      chatsHint: '指认之后,TA 在手机上说「提醒我」「我喜欢什么」,{name}就知道是 TA 自己的事,记在 TA 的本子上。',
       unassigned: '还没指认',
       dingtalk: '钉钉',
     },
@@ -496,7 +496,7 @@ export default {
       night_on: '开',
       night_auto: '自动',
       nightWindow: '自动时段',
-      hint: '让电影、音乐音量稳一些、不忽大忽小、峰值不吓人;夜间模式会把大动态再压平些,深夜不吵到家人。旺财说话时会自动压低影视。',
+      hint: '让电影、音乐音量稳一些、不忽大忽小、峰值不吓人;夜间模式会把大动态再压平些,深夜不吵到家人。{name}说话时会自动压低影视。',
     },
     voice: {
       speaker: '它的声音',
@@ -590,7 +590,7 @@ export default {
         title: 'Telegram',
         // ⚠️ i18n 串里别写 @(vue-i18n 把 @ 当 linked-message 语法 → 编译错 → 整块 render 失败、tab 切不过去);
         // "@BotFather" 这种字面 @ 放模板硬编码文案里,不进 t()。
-        hint: '在手机 Telegram 里跟旺财对话。找 BotFather 建个 bot 拿 token,填进来再加上你的 chat id 即可。',
+        hint: '在手机 Telegram 里跟{name}对话。找 BotFather 建个 bot 拿 token,填进来再加上你的 chat id 即可。',
         token: 'Bot Token',
         tokenPlaceholder: '粘贴 BotFather 给的 token',
         allowed: '允许的 chat',
@@ -600,7 +600,7 @@ export default {
       },
       dingtalk: {
         title: '钉钉',
-        hint: '在钉钉里跟旺财对话。建个企业内部机器人(Stream 模式,免公网),把 AppKey/AppSecret 填进来。',
+        hint: '在钉钉里跟{name}对话。建个企业内部机器人(Stream 模式,免公网),把 AppKey/AppSecret 填进来。',
         appKey: 'AppKey',
         appKeyPlaceholder: '机器人的 AppKey(Client ID)',
         appSecret: 'AppSecret',
@@ -612,7 +612,7 @@ export default {
     system: {
       desktop: '开机与桌面',
       autostart: '开机自启',
-      autostartHint: '开机时让旺财自己上线、缩在托盘里候着;关掉主窗它也不退,点托盘图标随时唤回。',
+      autostartHint: '开机时让{name}自己上线、缩在托盘里候着;关掉主窗它也不退,点托盘图标随时唤回。',
       autostartDevTag: '仅正式版',
       autostartDev: '开发调试版(tauri dev)下设了不管用 —— 自启会指向临时调试程序、还连不上本地前端;装好正式版再来开。',
       floatWin: '桌面悬浮窗',
@@ -625,8 +625,8 @@ export default {
       relocate: '搬家…',
       relocating: '搬家中…',
       relocatingTitle: '正在搬家,请勿关闭',
-      relocatingSub: '复制完成后会自动重启旺财。数据多时请耐心等一会儿。',
-      relocateConfirm: '把数据搬到 {path}(约 {size} GB),完成后会自动重启旺财。',
+      relocatingSub: '复制完成后会自动重启{name}。数据多时请耐心等一会儿。',
+      relocateConfirm: '把数据搬到 {path}(约 {size} GB),完成后会自动重启{name}。',
       relocateGo: '确认搬家',
       relocateCancel: '取消',
       relocateFailed: '搬家没成功,数据仍在原处。',

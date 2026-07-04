@@ -1271,7 +1271,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             </span>
           </div>
           <p class="hint">{{ t('settings.family.membersHint') }}</p>
-          <p class="hint">{{ t('settings.family.enrollHint') }}</p>
+          <p class="hint">{{ t('settings.family.enrollHint', { name: petName }) }}</p>
 
           <p class="section">{{ t('settings.family.chats') }}</p>
           <p v-if="!chats.length" class="hint">{{ t('settings.family.chatsEmpty') }}</p>
@@ -1286,7 +1286,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               @update:model-value="(v: string) => bindChat(c, v)"
             />
           </div>
-          <p v-if="chats.length" class="hint">{{ t('settings.family.chatsHint') }}</p>
+          <p v-if="chats.length" class="hint">{{ t('settings.family.chatsHint', { name: petName }) }}</p>
         </template>
       </div>
 
@@ -1526,13 +1526,13 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             />
           </span>
         </div>
-        <p class="hint">{{ t('settings.audio.hint') }}</p>
+        <p class="hint">{{ t('settings.audio.hint', { name: petName }) }}</p>
       </div>
 
       <!-- 远程渠道:手机上跟旺财对话(Telegram/钉钉 bot)。凭证写得进读不回(同供应商 key) -->
       <div v-else-if="tab === 'remote'">
         <p class="section">{{ t('settings.remote.telegram.title') }}</p>
-        <p class="hint">{{ t('settings.remote.telegram.hint') }}</p>
+        <p class="hint">{{ t('settings.remote.telegram.hint', { name: petName }) }}</p>
 
         <div class="row">
           <span class="label">{{ t('settings.remote.enable') }}</span>
@@ -1571,7 +1571,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         </p>
 
         <p class="section dt-sec">{{ t('settings.remote.dingtalk.title') }}</p>
-        <p class="hint">{{ t('settings.remote.dingtalk.hint') }}</p>
+        <p class="hint">{{ t('settings.remote.dingtalk.hint', { name: petName }) }}</p>
         <div class="row">
           <span class="label">{{ t('settings.remote.enable') }}</span>
           <span class="chip" :class="{ on: dt.enabled }">{{ dt.enabled ? t('settings.system.on') : t('settings.system.off') }}</span>
@@ -1681,7 +1681,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             </button>
           </span>
         </div>
-        <p class="hint">{{ isDev ? t('settings.system.autostartDev') : t('settings.system.autostartHint') }}</p>
+        <p class="hint">{{ isDev ? t('settings.system.autostartDev') : t('settings.system.autostartHint', { name: petName }) }}</p>
         <div class="row">
           <span class="label">{{ t('settings.system.floatWin') }}</span>
           <span class="key-state">
@@ -1721,7 +1721,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         <p class="hint s-mono">{{ dataRoot || '—' }}</p>
         <p v-if="backupMsg" class="hint" :class="{ 'data-err': backupErr, 's-mono': !backupErr }">{{ backupMsg }}</p>
         <div v-if="pendingMove" class="data-confirm">
-          <p>{{ t('settings.system.relocateConfirm', { path: pendingMove.newRoot, size: gb(pendingMove.needBytes) }) }}</p>
+          <p>{{ t('settings.system.relocateConfirm', { path: pendingMove.newRoot, size: gb(pendingMove.needBytes), name: petName }) }}</p>
           <span class="key-state">
             <button class="link strong" @click="confirmRelocate">{{ t('settings.system.relocateGo') }}</button>
             <button class="link" @click="cancelRelocate">{{ t('settings.system.relocateCancel') }}</button>
@@ -1773,7 +1773,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
       <div class="relocate-card">
         <div class="spinner" />
         <p>{{ t('settings.system.relocatingTitle') }}</p>
-        <p class="sub">{{ t('settings.system.relocatingSub') }}</p>
+        <p class="sub">{{ t('settings.system.relocatingSub', { name: petName }) }}</p>
       </div>
     </div>
   </section>

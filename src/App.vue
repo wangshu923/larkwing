@@ -42,6 +42,9 @@ const booting = computed(() => !isFloat && phase.value === 'boot')
 // 护眼绿/暗夜=安静柔晕);skin 由 boot 过桥设到 <html data-skin>,切换即时反映。
 // 未知皮肤(脏数据)回落科幻 —— 与 useSettings.applySkin 的兜底同向。
 const settings = useSettings()
+// 助手名跟随用户设置(ui.pet_name 空 = 默认名 pet.name);托盘菜单 / 恢复弹窗等文案用它,
+// 绝不硬编「旺财 / 7274」(§6.6 名字准则:名字 = 用户数据,占位 {name} 注入,不进 i18n)。
+const petName = computed(() => settings.get('ui.pet_name') || t('pet.name'))
 const BACKDROPS: Record<string, typeof NeonBackdrop> = {
   warm: WarmBackdrop,
   green: GreenBackdrop,
@@ -71,7 +74,7 @@ async function noticeAction(kind: 'reset' | 'quit' | 'delete' | 'keep') {
 
 // 主窗专属编排(PLAN §12):托盘菜单文案 + 悬浮窗显隐(enabled × 主窗是否在前)+ 通知跳会话。
 if (!isFloat && isTauri()) {
-  void api.setTrayMenu(t('tray.open'), t('tray.showFloat'), t('tray.quit'))
+  void api.setTrayMenu(t('tray.open', { name: petName.value }), t('tray.showFloat'), t('tray.quit'))
   const floatOn = () => settings.get('ui.float.enabled') !== '0'
   // 显隐规则(§12 E 修订 2026-06-14;2026-06-19 加「别的程序全屏」让位):悬浮窗与主窗共存——
   // master 开关 ui.float.enabled 开着就常驻,不随主窗聚焦藏匿(用户:开了就一直有)。
@@ -155,7 +158,7 @@ if (!isFloat && isTauri()) {
         <div class="data-modal">
           <template v-if="dataNotice === 'missing'">
             <h3>{{ t('dataNotice.missingTitle') }}</h3>
-            <p>{{ t('dataNotice.missingBody') }}</p>
+            <p>{{ t('dataNotice.missingBody', { name: petName }) }}</p>
             <p class="path">{{ dataNoticePath }}</p>
             <div class="acts">
               <button class="m-btn primary" :disabled="dataBusy" @click="noticeAction('quit')">{{ t('dataNotice.quit') }}</button>

@@ -773,16 +773,21 @@ impl MediaRuntime {
         transcode_video: bool,
         transcode_audio: bool,
         duration: Option<f64>,
+        force_software: bool,
     ) -> (String, Option<String>) {
         let Some(dur) = duration.filter(|d| *d > 0.0) else {
             tracing::warn!(path = %path.display(), "无时长,HLS VOD 列表建不了,回落 /m/ 渐进混流(seek 仍错)");
-            return (self.remux_or_direct(relay, path, transcode_video, transcode_audio).await, None);
+            return (
+                self.remux_or_direct(relay, path, transcode_video, transcode_audio, force_software)
+                    .await,
+                None,
+            );
         };
         match self.ensure_component(Component::Ffmpeg).await {
             Ok(ffmpeg) => {
                 // HLS 段一律转码视频 + 立体声 AAC(见 relay::build_frag_cmd 三处实证),
                 // 故不再传 transcode_* —— 它们只在上面无时长回落 /m/ 时用。
-                let url = relay.register_file_hls(path.to_path_buf(), ffmpeg, dur);
+                let url = relay.register_file_hls(path.to_path_buf(), ffmpeg, dur, force_software).await;
                 (url.clone(), Some(url))
             }
             Err(e) => {
@@ -805,7 +810,7 @@ impl MediaRuntime {
         let (vi, ai) = (pr.video_incompatible, pr.audio_incompatible);
         let Some(dur) = pr.duration_seconds.filter(|d| *d > 0.0) else {
             tracing::warn!(path = %path.display(), "无时长,自适应建不了段清单,回落 muxed HLS");
-            let (su, mu) = self.hls_or_fallback(relay, path, vi, ai, pr.duration_seconds).await;
+            let (su, mu) = self.hls_or_fallback(relay, path, vi, ai, pr.duration_seconds, false).await;
             return (su, mu, PlaybackRoute::HlsTranscode);
         };
         let ffmpeg = match self.ensure_component(Component::Ffmpeg).await {
@@ -825,18 +830,25 @@ impl MediaRuntime {
         };
         if segments.is_empty() {
             tracing::warn!(path = %path.display(), "自适应段计划为空,回落 muxed HLS");
-            let (su, mu) = self.hls_or_fallback(relay, path, vi, ai, Some(dur)).await;
+            let (su, mu) = self.hls_or_fallback(relay, path, vi, ai, Some(dur), false).await;
             return (su, mu, PlaybackRoute::HlsTranscode);
         }
+        // 视频编码器:copy 路不转码(enc 用不到,免探测);转码路探硬件优先(省 CPU)。init 与各段
+        // 必须同 enc → 这里定一次,gen_video_init 与 register_file_adaptive 共用(avcC 才一致可拼)。
+        let enc = if copy_video {
+            relay::VideoEncoder::Software
+        } else {
+            relay.video_encoder(&ffmpeg).await
+        };
         // 生成视频 init(顺带据其 avcC 定精确 codec 串);任一失败 → 回落 muxed HLS。
-        let Some(init) = relay::gen_video_init(&ffmpeg, path, copy_video).await else {
+        let Some(init) = relay::gen_video_init(&ffmpeg, path, copy_video, enc).await else {
             tracing::warn!(path = %path.display(), "自适应 init 生成失败,回落 muxed HLS");
-            let (su, mu) = self.hls_or_fallback(relay, path, vi, ai, Some(dur)).await;
+            let (su, mu) = self.hls_or_fallback(relay, path, vi, ai, Some(dur), false).await;
             return (su, mu, PlaybackRoute::HlsTranscode);
         };
         let Some(codec) = probe::video_h264_codec(&init) else {
             tracing::warn!(path = %path.display(), "自适应 init 解不出 H.264 codec,回落 muxed HLS");
-            let (su, mu) = self.hls_or_fallback(relay, path, vi, ai, Some(dur)).await;
+            let (su, mu) = self.hls_or_fallback(relay, path, vi, ai, Some(dur), false).await;
             return (su, mu, PlaybackRoute::HlsTranscode);
         };
         let video_mime = format!("video/mp4; codecs=\"{codec}\"");
@@ -844,7 +856,7 @@ impl MediaRuntime {
         tracing::info!(path = %path.display(), copy = copy_video, segs = segments.len(),
             "自适应播放(音视频分离,连续音频治漂移)");
         let url = relay.register_file_adaptive(
-            path.to_path_buf(), ffmpeg, copy_video, video_mime, init, segments, dur,
+            path.to_path_buf(), ffmpeg, copy_video, video_mime, init, segments, dur, enc,
         );
         (url.clone(), Some(url), route)
     }
@@ -856,10 +868,19 @@ impl MediaRuntime {
         path: &std::path::Path,
         transcode_video: bool,
         transcode_audio: bool,
+        force_software: bool,
     ) -> String {
         match self.ensure_component(Component::Ffmpeg).await {
             Ok(ffmpeg) => {
-                relay.register_file_remux(path.to_path_buf(), ffmpeg, transcode_video, transcode_audio)
+                relay
+                    .register_file_remux(
+                        path.to_path_buf(),
+                        ffmpeg,
+                        transcode_video,
+                        transcode_audio,
+                        force_software,
+                    )
+                    .await
             }
             Err(e) => {
                 tracing::warn!(path = %path.display(), "ffmpeg 取不到,退回直传(可能黑屏/无声): {e:#}");
@@ -1003,9 +1024,10 @@ impl MediaRuntime {
                     route = Some(r);
                     su
                 } else {
-                    // 兜底重放:前端手写 MSE 播放失败 → 强制走 muxed HLS(能放的老路,会漂但不黑屏)。
+                    // 兜底重放:前端手写 MSE 播放失败 → 强制走 muxed HLS + **软件编码**(最兼容的老路,
+                    // 会漂但不黑屏;硬件编码万一在这台机上花屏/解不了,回落这一步就换回软件)。
                     let (su, mu) = self
-                        .hls_or_fallback(relay, &path, pr.video_incompatible, pr.audio_incompatible, pr.duration_seconds)
+                        .hls_or_fallback(relay, &path, pr.video_incompatible, pr.audio_incompatible, pr.duration_seconds, true)
                         .await;
                     manifest_url = mu;
                     su
@@ -1022,17 +1044,23 @@ impl MediaRuntime {
                     duration_seconds = pr.duration_seconds;
                     self.log_local_codec(&path, &pr);
                     if let Some(dur) = pr.duration_seconds.filter(|d| *d > 0.0) {
-                        // HLS 段一律转码视频 + 立体声 AAC(relay::build_frag_cmd),不传 transcode_*
-                        let url = relay.register_file_hls(path.clone(), ffmpeg, dur);
+                        // HLS 段一律转码视频 + 立体声 AAC(relay::build_frag_cmd),不传 transcode_*。
+                        // 硬件优先(force_software = 兜底重放时才置真)。
+                        let url = relay
+                            .register_file_hls(path.clone(), ffmpeg, dur, !prefer_adaptive)
+                            .await;
                         manifest_url = Some(url.clone());
                         url
                     } else {
-                        relay.register_file_remux(
-                            path.clone(),
-                            ffmpeg,
-                            pr.video_incompatible,
-                            pr.audio_incompatible,
-                        )
+                        relay
+                            .register_file_remux(
+                                path.clone(),
+                                ffmpeg,
+                                pr.video_incompatible,
+                                pr.audio_incompatible,
+                                !prefer_adaptive,
+                            )
+                            .await
                     }
                 }
                 Err(e) => {

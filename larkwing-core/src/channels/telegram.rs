@@ -33,7 +33,7 @@ const FILE_MAX_BYTES: i64 = 20 * 1024 * 1024;
 // ⚠️ core 侧静态话术(§6.6 本应数据化,如语音的场景 JSON 话术)——MVP 先内联,记债待迁。
 //    这些是渠道**操作性**提示(非人格),不经模型。
 const ONBOARD_HINT: &str =
-    "你好,我是旺财。你的 chat id 是 {id},把它加到设置·远程渠道的白名单里,我们就能聊啦。";
+    "你好,我是{name}。你的 chat id 是 {id},把它加到设置·远程渠道的白名单里,我们就能聊啦。";
 const ERR_HINT: &str = "(出了点问题,稍后再试试)";
 const UNSUPPORTED_HINT: &str = "这个我还看不了~现在能收:文字、图片、语音。";
 const VOICE_TOO_LONG_HINT: &str = "这条语音有点长,我一次只能听 60 秒内的,分开发我吧。";
@@ -92,7 +92,11 @@ async fn serve(ctx: &ChannelCtx, net: &net::Client, ct: &CancellationToken) -> R
                     continue; // 已设名单的陌生 chat:静默忽略
                 }
             } else {
-                let _ = send_message(net, &token, chat_id, &ONBOARD_HINT.replace("{id}", &chat)).await;
+                // 名字跟随用户设置(§6.6 名字准则):{name} 注入主人的 ui.pet_name(空=默认名),不硬编「旺财」。
+                let hint = ONBOARD_HINT
+                    .replace("{name}", &ctx.engine.pet_name())
+                    .replace("{id}", &chat);
+                let _ = send_message(net, &token, chat_id, &hint).await;
                 continue;
             }
 

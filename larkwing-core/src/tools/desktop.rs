@@ -96,9 +96,17 @@ async fn open_target(target: &str) -> anyhow::Result<()> {
     #[cfg(target_os = "windows")]
     let cmd = {
         // `start` 经 cmd:头一个空 "" 占位窗口标题(否则带引号的路径会被当成标题)。
-        // 文件/网址可靠;应用按名走 App Paths 注册表尽力解析(显示名可能解析不到 → 见 watch-item)。
+        // 文件/网址可靠;但应用名 `start 微信` 只认 PATH/App Paths,认不出中文显示名(实锤:
+        // 「系统找不到文件 微信」)→ 先在开始菜单按显示名找同名快捷方式(用户说的「微信」正是
+        // 那里显示的名字),命中就 start 那个 .lnk;没命中再把原名交给 start 靠 PATH/App Paths
+        // 尽力(Chrome 等注册过的仍中)。
+        let launch = if !is_url && !is_path {
+            resolve_start_menu_app(target).unwrap_or_else(|| target.to_string())
+        } else {
+            target.to_string()
+        };
         let mut c = tokio::process::Command::new("cmd");
-        c.args(["/C", "start", "", target]);
+        c.args(["/C", "start", "", &launch]);
         c
     };
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
@@ -119,14 +127,83 @@ async fn spawn_and_check(mut cmd: tokio::process::Command, what: &str) -> anyhow
     if out.status.success() {
         Ok(())
     } else {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let err = err.trim();
-        if err.is_empty() {
-            anyhow::bail!("打不开 {what}");
+        // Windows 命令行 stderr 是本地代码页(中文系统 = GBK),不是 UTF-8 → lossy 会出 � 乱码;
+        // 乱码就别原样抛给模型(否则观察成「ϵͳ�Ҳ����ļ�」),给干净兜底(§3.5 如实且可读)。
+        let raw = String::from_utf8_lossy(&out.stderr);
+        let err = raw.trim();
+        if err.is_empty() || err.contains('\u{FFFD}') {
+            anyhow::bail!("打不开 {what}(没找到这个应用或文件)");
         } else {
             anyhow::bail!("打不开 {what}:{err}");
         }
     }
+}
+
+/// 从开始菜单收集到的 (显示名, .lnk 绝对路径) 候选里,挑最匹配 `target` 的那个。
+/// 平台无关纯函数(真正扫盘的 `resolve_start_menu_app` 是 Windows-only,不便单测,逻辑抽这里)。
+/// 规则:① 显示名归一后完全相等优先(用户说「微信」→「微信.lnk」,不会误中「卸载微信」);
+/// ② 否则取「显示名包含 target、且非卸载/帮助类」中最短的(「chrome」→「Google Chrome」)。
+#[cfg(any(target_os = "windows", test))]
+fn best_shortcut_match(target: &str, entries: &[(String, String)]) -> Option<String> {
+    let t = target.trim().to_lowercase();
+    if t.is_empty() {
+        return None;
+    }
+    if let Some((_, path)) = entries.iter().find(|(name, _)| name.to_lowercase() == t) {
+        return Some(path.clone());
+    }
+    // 卸载器 / 帮助文档不是「打开这个应用」该启动的东西
+    const NOISE: [&str; 4] = ["卸载", "uninstall", "帮助", "help"];
+    entries
+        .iter()
+        .filter(|(name, _)| {
+            let n = name.to_lowercase();
+            n.contains(&t) && !NOISE.iter().any(|w| n.contains(w))
+        })
+        .min_by_key(|(name, _)| name.chars().count())
+        .map(|(_, path)| path.clone())
+}
+
+/// Windows:扫用户 + 全局开始菜单的 `Programs`(递归)找应用快捷方式,按显示名匹配 `target`,
+/// 命中返回 .lnk 绝对路径(交给 `start` 打开)。找不到返回 None(调用方回落原名给 start)。
+#[cfg(target_os = "windows")]
+fn resolve_start_menu_app(target: &str) -> Option<String> {
+    fn collect(dir: &std::path::Path, out: &mut Vec<(String, String)>, depth: u32) {
+        if depth > 5 {
+            return; // 开始菜单层级很浅,防软链环兜底
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(&path, out, depth + 1);
+            } else if path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("lnk"))
+            {
+                if let (Some(stem), Some(full)) =
+                    (path.file_stem().and_then(|s| s.to_str()), path.to_str())
+                {
+                    out.push((stem.to_string(), full.to_string()));
+                }
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    let roots = [
+        std::env::var_os("APPDATA")
+            .map(|a| std::path::Path::new(&a).join(r"Microsoft\Windows\Start Menu\Programs")),
+        std::env::var_os("ProgramData")
+            .map(|a| std::path::Path::new(&a).join(r"Microsoft\Windows\Start Menu\Programs")),
+    ];
+    for root in roots.into_iter().flatten() {
+        collect(&root, &mut entries, 0);
+    }
+    best_shortcut_match(target, &entries)
 }
 
 // ───────────────────────── system_volume:整机系统音量 ─────────────────────────
@@ -545,5 +622,30 @@ mod tests {
         assert!(!looks_like_path("微信"));
         assert!(!looks_like_path("Chrome"));
         assert!(!looks_like_path("计算器"));
+    }
+
+    #[test]
+    fn best_shortcut_match_prefers_exact_then_shortest_contains() {
+        let entries = vec![
+            ("卸载微信".to_string(), r"C:\a\卸载微信.lnk".to_string()),
+            ("微信".to_string(), r"C:\a\微信.lnk".to_string()),
+            ("Google Chrome".to_string(), r"C:\b\Google Chrome.lnk".to_string()),
+        ];
+        // 精确显示名优先,且不误中「卸载微信」
+        assert_eq!(
+            best_shortcut_match("微信", &entries).as_deref(),
+            Some(r"C:\a\微信.lnk")
+        );
+        // 大小写不敏感 + 包含匹配:「chrome」→「Google Chrome」
+        assert_eq!(
+            best_shortcut_match("chrome", &entries).as_deref(),
+            Some(r"C:\b\Google Chrome.lnk")
+        );
+        // 只有卸载器时,包含匹配也要跳过它(宁可回落 start 原名)
+        let only_uninstall = vec![("卸载微信".to_string(), r"C:\a\卸载微信.lnk".to_string())];
+        assert_eq!(best_shortcut_match("微信", &only_uninstall), None);
+        // 完全无关 → None
+        assert_eq!(best_shortcut_match("钉钉", &entries), None);
+        assert_eq!(best_shortcut_match("  ", &entries), None);
     }
 }

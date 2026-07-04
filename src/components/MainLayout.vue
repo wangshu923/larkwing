@@ -611,7 +611,7 @@ watch(messages, () => nextTick(() => {
       @drop.prevent="onDrop"
     >
       <!-- 拖文件进来时整块聊天区高亮(pointer-events:none → 不抢 drop/leave 事件) -->
-      <div v-if="dragging" class="drop-veil"><span>{{ t('chat.dropHint') }}</span></div>
+      <div v-if="dragging" class="drop-veil"><span>{{ t('chat.dropHint', { name: petName }) }}</span></div>
       <header class="chat-head" data-tauri-drag-region>
         <button v-if="!panelOpen" class="reopen" @click="panelOpen = true" :title="t('recents.expand')">›</button>
         <img :src="pack.idle[0]" class="head-av" :alt="petName" :title="t('avatar.switchTitle')" style="height: 46px; width: auto; cursor: pointer;" @click="switchCharacter" @contextmenu="openPetMenu($event)" />

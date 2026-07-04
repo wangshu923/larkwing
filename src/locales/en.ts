@@ -183,7 +183,7 @@ export default {
     micCancelTitle: 'Cancel (Esc)',
     attach: 'Attach image or file',
     attRemove: 'Remove',
-    dropHint: 'Drop to hand the file to Larkwing',
+    dropHint: 'Drop to hand the file to {name}',
     copy: 'Copy',
     queueHint: 'Queued · sends when it’s done',
     queueAtt: '(attachment)',
@@ -330,7 +330,7 @@ export default {
   dataNotice: {
     missingTitle: 'Can’t find your data',
     missingBody:
-      '7274’s data was moved to the location below, but it can’t be found right now — the drive holding it may be unplugged or disconnected. Reconnect it and reopen to get everything back, or start fresh with new data.',
+      '{name}’s data was moved to the location below, but it can’t be found right now — the drive holding it may be unplugged or disconnected. Reconnect it and reopen to get everything back, or start fresh with new data.',
     quit: 'Quit (to reconnect the drive)',
     reset: 'Reset to default (start fresh)',
     oldTitle: 'Move complete ✓',
@@ -350,7 +350,7 @@ export default {
   },
   // System tray menu (injected into the shell via set_tray_menu; §6 text lives in the frontend dict)
   tray: {
-    open: 'Open 7274',
+    open: 'Open {name}',
     showFloat: 'Show floating window',
     quit: 'Quit',
   },
@@ -481,10 +481,10 @@ export default {
       enrollRecording: 'Take {n} of {total} — say something…',
       enrollDone: 'Got their voice',
       enrollFailed: "Didn't catch it — try again",
-      enrollHint: 'Record someone\'s voice and it recognizes them the moment they speak, filing what they say in their own notebook (3 short takes each — a name or a sentence works; optional, without it it just can\'t tell who\'s speaking).',
+      enrollHint: 'Record someone\'s voice and {name} recognizes them the moment they speak, filing what they say in their own notebook (3 short takes each — a name or a sentence works; optional, without it it just can\'t tell who\'s speaking).',
       chats: 'Chats on their phones',
       chatsEmpty: 'No remote chats yet. Connect Telegram or DingTalk under "Remote", have a family member send one message, and it shows up here.',
-      chatsHint: 'Once assigned, when they say "remind me" or "I like…" on their phone, it goes into their own notebook — not anyone else\'s.',
+      chatsHint: 'Once assigned, when they say "remind me" or "I like…" on their phone, {name} files it in their own notebook — not anyone else\'s.',
       unassigned: 'Not assigned',
       dingtalk: 'DingTalk',
     },
@@ -497,7 +497,7 @@ export default {
       night_on: 'On',
       night_auto: 'Auto',
       nightWindow: 'Auto window',
-      hint: 'Keeps movie and music volume steady and tames scary peaks; night mode flattens big dynamics further so late-night audio won’t wake the household. Movies and music duck automatically while the assistant is speaking.',
+      hint: 'Keeps movie and music volume steady and tames scary peaks; night mode flattens big dynamics further so late-night audio won’t wake the household. Movies and music duck automatically while {name} is speaking.',
     },
     voice: {
       speaker: 'Its voice',
@@ -590,7 +590,7 @@ export default {
       telegram: {
         title: 'Telegram',
         // ⚠️ No "@" inside i18n strings (vue-i18n treats @ as linked-message syntax → compile error → whole block fails to render). Literal "@BotFather" lives in the template, not in t().
-        hint: 'Chat with 7274 from Telegram on your phone. Create a bot via BotFather, grab the token, paste it here, then add your chat id.',
+        hint: 'Chat with {name} from Telegram on your phone. Create a bot via BotFather, grab the token, paste it here, then add your chat id.',
         token: 'Bot Token',
         tokenPlaceholder: 'Paste the token from BotFather',
         allowed: 'Allowed chats',
@@ -600,7 +600,7 @@ export default {
       },
       dingtalk: {
         title: 'DingTalk',
-        hint: 'Chat with 7274 from DingTalk. Create an internal robot (Stream mode, no public IP) and paste its AppKey/AppSecret here.',
+        hint: 'Chat with {name} from DingTalk. Create an internal robot (Stream mode, no public IP) and paste its AppKey/AppSecret here.',
         appKey: 'AppKey',
         appKeyPlaceholder: 'Robot AppKey (Client ID)',
         appSecret: 'AppSecret',
@@ -612,7 +612,7 @@ export default {
     system: {
       desktop: 'Startup & desktop',
       autostart: 'Launch at startup',
-      autostartHint: 'Have 7274 come online at boot and wait in the tray; closing the main window won’t quit it — tap the tray icon to bring it back anytime.',
+      autostartHint: 'Have {name} come online at boot and wait in the tray; closing the main window won’t quit it — tap the tray icon to bring it back anytime.',
       autostartDevTag: 'Release build only',
       autostartDev: 'It won’t work in a dev build (tauri dev) — autostart would point at a temporary debug binary that can’t reach the local frontend; install a release build and come back.',
       floatWin: 'Desktop floating window',
@@ -625,8 +625,8 @@ export default {
       relocate: 'Relocate…',
       relocating: 'Relocating…',
       relocatingTitle: 'Moving data — please don’t close',
-      relocatingSub: '7274 will restart automatically once the copy finishes. Hang tight if there’s a lot of data.',
-      relocateConfirm: 'Move data to {path} (about {size} GB)? 7274 will restart when done.',
+      relocatingSub: '{name} will restart automatically once the copy finishes. Hang tight if there’s a lot of data.',
+      relocateConfirm: 'Move data to {path} (about {size} GB)? {name} will restart when done.',
       relocateGo: 'Move it',
       relocateCancel: 'Cancel',
       relocateFailed: 'The move didn’t finish — your data is still in place.',

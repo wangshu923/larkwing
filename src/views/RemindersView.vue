@@ -7,10 +7,14 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { api, isTauri, type Reminder } from '../lib/backend'
 import { useToast } from '../composables/useToast'
+import { useSettings } from '../composables/useSettings'
 
 const emit = defineEmits<{ (e: 'close'): void }>()
 const { t, te, locale } = useI18n()
 const toast = useToast()
+const settings = useSettings()
+// 名字跟随用户设置(ui.pet_name 空 = 默认名 pet.name);徽章绝不硬编 7274/旺财(§6.6 名字准则)。
+const petName = computed(() => settings.get('ui.pet_name') || t('pet.name'))
 
 const items = ref<Reminder[]>([])
 const loaded = ref(false)
@@ -106,7 +110,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
     <header class="view-head sep" data-tauri-drag-region>
       <div class="view-title">
         <b>{{ t('reminders.title') }}</b>
-        <span class="view-mono">7274 · REMINDERS</span>
+        <span class="view-mono">{{ petName }} · REMINDERS</span>
         <small>{{ t('reminders.tagline') }}</small>
       </div>
       <button class="view-back" @click="emit('close')">{{ t('reminders.back') }}</button>
