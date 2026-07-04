@@ -46,7 +46,7 @@ jobs:
 
       - name: 建唯一草稿 Release
         id: create
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8 # v8 起用 Node 24(v7=Node 20 已弃用,2026-09-16 从 runner 移除);API 与 v7 兼容
         env:
           NOTES_BODY: ${{ steps.notes.outputs.body }}
         with:
