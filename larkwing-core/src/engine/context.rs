@@ -352,6 +352,8 @@ mod tests {
             content: content.into(),
             created_at: 0,
             payload: payload.map(Into::into),
+            speaker_name: None,
+            trigger: None,
         }
     }
 

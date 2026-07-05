@@ -28,6 +28,10 @@ const DEFAULTS: Record<string, string> = {
   // 记忆自动提炼(PLAN §13 Phase 3):后台把聊天里值得记的事蒸馏成长期记忆。'1' 开 / '0' 关(默认开);
   // app 级,Rust APP_SETTING_KEYS + set_setting 0/1 校验逐键对应(§6.8 两边各加一行)。宁缺毋滥见 consolidate.rs
   'memory.auto_consolidate': '1',
+  // 主动关怀(情境主动,PLAN ★主动关怀里程碑):贴着你近况的轻提醒(切片1 = 悬浮窗待机轮播 L0)。
+  // '1' 开 / '0' 关(默认开);app 级,Rust APP_SETTING_KEYS + set_setting 0/1 校验逐键对应(§6.8)。
+  // 露名字的文案一律 {name} 占位、petName 注入(§6.6),绝不硬编「旺财」。
+  'care.enabled': '1',
   // 声音(PLAN §11):与 Rust 白名单逐键对应(user 级 speaker/auto_speak/rate/patience/volume,
   // app 级 input_device);档位值是契约,改要两边一起改
   'voice.speaker': '', // 默认音色单源在后端 tts::DEFAULT_SPEAKER(§4.11,前端不写死副本);空 = 未设,设置页用 voiceStatus.defaultSpeaker 高亮默认项

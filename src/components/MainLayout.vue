@@ -399,6 +399,8 @@ const FS_WRITE_KEYS = [
 ]
 const contextSuggestions = computed<string[]>(() => {
   if (!chat.ready || !chat.hasApiKey) return []
+  // 主动关怀总开关关 → 不出场景续接 chips(PLAN ★主动关怀里程碑,切片1 A 部分)
+  if (settings.get('care.enabled') === '0') return []
   // 回合进行中不出气泡(等收尾再给「下一句」建议)
   if (chat.mood !== 'idle') return []
   const keys = lastWangToolKeys.value
@@ -557,6 +559,8 @@ watch(messages, () => nextTick(() => {
           />
           <span v-else class="rc-title">{{ s.title || t('recents.untitled') }}</span>
           <div class="rc-meta">
+            <!-- 发起人显性化:家人 / 渠道指认的人显名字;系统会话显「系统」;主人自己的会话不显(是你)。 -->
+            <span v-if="s.owner_name || s.channel === 'system'" class="rc-owner">{{ s.owner_name || t('channel.system') }}</span>
             <span class="rc-time">{{ fmtTime(s.updated_at) }}</span>
             <!-- 有动静标:不在该会话时,后台/切走的回合收尾打标(done=完成 failed=失败),进入即清 -->
             <span
@@ -622,6 +626,13 @@ watch(messages, () => nextTick(() => {
         <template v-for="(m, mi) in messages" :key="m.id">
           <div v-if="streamLayout.sep[m.id]" class="day-sep"><span>{{ streamLayout.sep[m.id] }}</span></div>
           <div class="bubble" :class="[m.role, { cont: streamLayout.cont.has(m.id) }]" @contextmenu="openBubbleMenu($event, m)">
+          <!-- 说话人显性化:user 标非我的说话人名(家人插话 / 声纹 / 渠道归人);wang 标自动触发「⏰ 提醒」。
+               「我」说的 + 旺财主动回的都不标,保持干净——只在需要区分时才冒出标签。 -->
+          <span v-if="m.role === 'user' && m.speakerName" class="spk-tag spk-who">{{ m.speakerName }}</span>
+          <span v-if="m.role === 'wang' && m.trigger" class="spk-tag spk-trig">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="13" r="7" /><path d="M12 9.5V13l2 1.5" /><path d="M5 4 2.5 6.5" /><path d="M19 4 21.5 6.5" /></svg>
+            {{ t('chat.trigger.' + m.trigger) }}
+          </span>
           <!-- wang 走富文本(markdown);user 是用户原话,纯文本保留换行、不解析标记 -->
           <div v-if="m.role === 'wang'" class="md" v-html="renderMarkdown(m.text)"></div>
           <template v-else>
@@ -882,6 +893,8 @@ watch(messages, () => nextTick(() => {
 .rc-chan-dingtalk { color: var(--accent); }
 .rc-chan-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
 .rc-time { font-size: 11px; color: var(--text-dim); margin-right: auto; } /* 时间靠左,标记/渠道图标归右侧成组 */
+/* 发起人显性化:家人 / 渠道指认的人 / 系统会话在标题下一行显名;主人自己的会话不显。 */
+.rc-owner { font-size: 11px; color: var(--accent); opacity: 0.85; max-width: 84px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* 有动静标:发光小圆点(done=ok 青绿 / failed=danger 红),克制不抢标题;进入会话即清 */
 .rc-badge { width: 8px; height: 8px; border-radius: 50%; flex: none; }
 .rc-badge-done { background: var(--ok); box-shadow: 0 0 7px rgba(var(--ok-rgb), 0.85); }
@@ -970,6 +983,14 @@ watch(messages, () => nextTick(() => {
   align-self: flex-end; background: var(--bubble-me);
   border: 1px solid var(--bubble-me-line); border-bottom-right-radius: 5px; color: var(--bubble-me-text);
 }
+/* 说话人显性化:气泡内顶部小标签,只在需区分时出现(家人插话 / 自动触发)。
+   user 侧(右)右对齐、wang 侧(左)左对齐;语义 token 跟随皮肤。 */
+.spk-tag { display: block; font-size: 11px; line-height: 1; margin-bottom: 4px; opacity: 0.85; font-weight: 500; }
+.bubble.user .spk-tag { text-align: right; }
+.spk-who { color: var(--accent); }
+.spk-trig { color: var(--attn); letter-spacing: 0.3px; }
+/* ⏰ 图标走 inline SVG + currentColor,跟随 --attn 换肤(不用彩色 emoji,§6.7) */
+.spk-trig svg { width: 11px; height: 11px; vertical-align: -1.5px; margin-right: 2px; }
 
 /* —— 气泡富文本(markdown):wang 回复用,修掉逐字 span 吞换行的老问题 —— */
 .md { white-space: normal; }

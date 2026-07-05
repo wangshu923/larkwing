@@ -27,6 +27,8 @@ export interface Conversation {
   pinned: boolean
   created_at: number
   updated_at: number
+  /** 发起人显示名(engine 富化):渠道指认的家人 / 非主人发起者;主人自己的会话 = 无(是「你」)。 */
+  owner_name?: string | null
 }
 
 export interface Message {
@@ -37,6 +39,10 @@ export interface Message {
   created_at: number
   /** 工具轮附加数据(JSON,engine 私有词汇);UI 只用它判断"这行别渲染气泡"。 */
   payload?: string | null
+  /** 说话人显示名(engine 富化):user 行说话人非会话归属者(家人 / 声纹 / 渠道)时有;主人自己 = 无。 */
+  speaker_name?: string | null
+  /** 触发来源(engine 富化):assistant 行由提醒 / 定时任务自动触发时为 'reminder';普通回复 = 无。 */
+  trigger?: string | null
 }
 
 /** 聊天搜索命中(跨会话):带会话标题/渠道供列表展示;snippet 是截断的展示片段。 */
@@ -278,9 +284,19 @@ export interface FloatReminder {
   /** unix 毫秒。 */
   due_at: number
 }
+export interface CareCandidate {
+  /** 关怀类型(切片1 唯一 'resume');前端按它选 i18n 文案。 */
+  kind: string
+  /** 剧名 → 填进 care.resume 的 {title}。 */
+  title: string
+  /** 上次看的时间(unix 毫秒)。 */
+  updated_at: number
+}
 export interface FloatIdle {
   next_reminder?: FloatReminder
   latest_line?: string
+  /** 主动关怀候选(PLAN ★主动关怀里程碑):最近没看完的剧 →「继续看《X》」;care.enabled 关 = 后端不给。 */
+  care?: CareCandidate
 }
 
 export type TurnEvent =

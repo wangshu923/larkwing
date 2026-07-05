@@ -184,6 +184,7 @@ export default {
     attach: 'Attach image or file',
     attRemove: 'Remove',
     dropHint: 'Drop to hand the file to {name}',
+    trigger: { reminder: 'Reminder' },
     copy: 'Copy',
     queueHint: 'Queued · sends when it’s done',
     queueAtt: '(attachment)',
@@ -353,6 +354,10 @@ export default {
     open: 'Open {name}',
     showFloat: 'Show floating window',
     quit: 'Quit',
+  },
+  // Proactive care (PLAN ★proactive-care milestone): care-candidate copy. The name stays out of the dictionary (§6.6); only the {title} interpolation lives here.
+  care: {
+    resume: 'Keep watching “{title}”?',
   },
   // Desktop floating window (PLAN §12 form C)
   float: {
@@ -619,6 +624,8 @@ export default {
       floatOpacity: 'Floating-window opacity',
       floatUsage: 'Show usage in the idle ticker (today’s spend / balance)',
       floatHint: 'A small window that sits in a corner of your screen: it pops up for reminders, while listening, or during downloads; usually semi-transparent, it sharpens when you hover.',
+      care: 'Proactive care',
+      careHint: '{name} quietly nudges you about shows you left unfinished or things that matter when you are busy — only softly in the floating window, never out loud; stays quiet at night (10 PM–8 AM). Turn off anytime.',
       storage: 'Storage',
       dataLocation: 'Data location',
       dataReveal: 'Show in folder',

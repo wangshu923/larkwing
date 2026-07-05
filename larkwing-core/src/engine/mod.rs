@@ -237,6 +237,8 @@ const APP_SETTING_KEYS: &[&str] = &[
     "audio.night_mode",
     "audio.night_start",
     "audio.night_end",
+    // 主动关怀总开关(app 级,PLAN ★主动关怀里程碑):0/1,默认开。§6.8 两边各加一行。
+    "care.enabled",
 ];
 
 /// 语音的用户级设置(PLAN §11 逐键放行,不开 voice.* 通配——同前缀跨两个 scope)。
@@ -359,6 +361,21 @@ pub struct FloatIdle {
     /// 最近一句旺财说的话(已过滤工具轮空串 / __IGNORE__);None = 还没说过。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_line: Option<String>,
+    /// 主动关怀候选(PLAN ★主动关怀里程碑,切片1 = L0 悬浮窗待机):最近没看完的剧 →「继续看《X》」。
+    /// care.enabled 关 = None;静默时段的门在前端(本地时钟,同 audio 夜间);名字类文案前端占位渲染(§6.6)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub care: Option<CareCandidate>,
+}
+
+/// 一条主动关怀候选(中立数据,core 不产文案 §6.6):`kind` 让前端选文案 key,其余是渲染参数。
+#[derive(Debug, Clone, Serialize)]
+pub struct CareCandidate {
+    /// 类型(切片1 唯一 "resume" = 继续看某剧);前端按它选 i18n。
+    pub kind: String,
+    /// 剧名(填进前端 care.resume 的 {title})。
+    pub title: String,
+    /// 上次看的时间(unix ms):前端可据此呈现"搁了多久"或将来做筛。
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -741,7 +758,19 @@ impl Engine {
             Some(c) => self.store.chat.latest_assistant_line(c.id)?,
             None => None,
         };
-        Ok(FloatIdle { next_reminder, latest_line })
+        // 主动关怀候选(切片1):总开关缺省开、只有显式 "0" 关;开着就取最近一部有剧名的在看剧
+        // 作「继续看《X》」候选。静默时段 / 呈现节流的门在前端(useFloatIdle,本地时钟)。
+        let care = if self.store.settings.get(None, "care.enabled")?.as_deref() == Some("0") {
+            None
+        } else {
+            self.store
+                .media_progress
+                .list_recent(user.id, 1)?
+                .into_iter()
+                .next()
+                .map(|p| CareCandidate { kind: "resume".into(), title: p.title, updated_at: p.updated_at })
+        };
+        Ok(FloatIdle { next_reminder, latest_line, care })
     }
 
     pub fn new_conversation(&self, channel: &str) -> Result<Conversation, AppError> {
@@ -750,12 +779,64 @@ impl Engine {
     }
 
     pub fn list_conversations(&self) -> Result<Vec<Conversation>, AppError> {
-        let user = self.store.users.ensure_default_user()?;
-        Ok(self.store.chat.list_conversations(user.id)?)
+        let me = self.store.users.ensure_default_user()?;
+        let mut list = self.store.chat.list_conversations(me.id)?;
+        // 发起人显名(说话人显性化 §):渠道指认的家人 / 非主人发起者才标;主人自己的会话不标
+        // (是「你」)。系统会话(channel=system)靠 channel 字段前端显「系统」,不占 owner_name。
+        for c in list.iter_mut() {
+            if let Some(uid) = self.conversation_owner(c.id)? {
+                if uid != me.id {
+                    c.owner_name = self.store.users.get(uid)?.map(|u| u.name);
+                }
+            }
+        }
+        Ok(list)
     }
 
     pub fn load_conversation(&self, conv_id: i64) -> Result<Vec<Message>, AppError> {
-        Ok(self.store.chat.recent_messages(conv_id, 200)?)
+        // 从消息 payload(UserMeta JSON)解出声纹 / 渠道归人写入的说话人 id(共用同一字段)。
+        fn parse_speaker_user(payload: &str) -> Option<i64> {
+            serde_json::from_str::<UserMeta>(payload).ok().and_then(|m| m.speaker_user)
+        }
+        // 标「自动触发」:event 行(自启回合的任务语境)之后、下一条 user 行之前的 assistant
+        // 回复 = 提醒/定时任务到点触发,标 trigger 让前端显「⏰ 提醒」。
+        fn mark_triggered(msgs: &mut [Message]) {
+            let mut triggered = false;
+            for m in msgs.iter_mut() {
+                match m.role.as_str() {
+                    "event" => triggered = true,
+                    "user" => triggered = false,
+                    "assistant" if triggered => m.trigger = Some("reminder".into()),
+                    _ => {}
+                }
+            }
+        }
+        let mut msgs = self.store.chat.recent_messages(conv_id, 200)?;
+        // 「谁说的」显名:user 行说话人若非会话归属者(家人插话 / 声纹 / 渠道归人)→ 填名字;
+        // 归属者自己说的不标(是「我」)。声纹与渠道共用 payload.speaker_user,一套覆盖两者。
+        let owner = self.conversation_owner(conv_id)?;
+        for m in msgs.iter_mut() {
+            if m.role == "user" {
+                if let Some(sid) = m.payload.as_deref().and_then(parse_speaker_user) {
+                    if Some(sid) != owner {
+                        m.speaker_name = self.store.users.get(sid)?.map(|u| u.name);
+                    }
+                }
+            }
+        }
+        mark_triggered(&mut msgs);
+        Ok(msgs)
+    }
+
+    /// 会话的「归属者」= 这个会话里的「我」:渠道会话 = 指认的家人(若指认),否则会话 user_id
+    /// (桌面主人)。用于说话人显性化:归属者说的不标名、非归属者才标。
+    fn conversation_owner(&self, conv_id: i64) -> Result<Option<i64>, AppError> {
+        if let Some(t) = self.store.channels.thread_by_conv(conv_id)? {
+            if t.user_id.is_some() {
+                return Ok(t.user_id);
+            }
+        }
+        Ok(self.store.chat.get_conversation(conv_id)?.map(|c| c.user_id))
     }
 
     /// 跨会话搜索当前用户的聊天记录(排除工具 / 系统事件内部行)。最近命中在前。
@@ -979,6 +1060,15 @@ impl Engine {
             // 记忆自动提炼总开关(app 级,PLAN §13 Phase 3):0/1,默认开(缺省 = 开,见 spawn_consolidate)。
             // 关 = 不再后台蒸馏(手动 consolidate_conversation 入口不受影响);现读即生效,无需重启。
             "memory.auto_consolidate" => {
+                if !["0", "1"].contains(&value) {
+                    return Err(invalid("开关需为 0 或 1"));
+                }
+                self.store.settings.set(None, key, value)?;
+                Ok(())
+            }
+            // 主动关怀总开关(app 级,PLAN ★主动关怀里程碑):0/1,默认开(缺省 = 开,见 float_idle 关怀候选)。
+            // 关 = 悬浮窗不投关怀候选、in-chat 场景续接 chips 也收起;现读即生效,无需重启。
+            "care.enabled" => {
                 if !["0", "1"].contains(&value) {
                     return Err(invalid("开关需为 0 或 1"));
                 }
@@ -2194,6 +2284,34 @@ mod tests {
         let _ = std::fs::remove_file(dir.join("t.db"));
         let store = Store::open(&dir.join("t.db")).unwrap();
         Engine::new(store, crate::scenes::Scenes::builtin())
+    }
+
+    /// 说话人显性化(§):load_conversation 富化 —— 非归属者说话人标名(声纹 / 渠道共用 speaker_user),
+    /// 归属者(主人)自己说的不标;event 行之后的 assistant 标 reminder,普通对话回复不标。
+    #[test]
+    fn load_conversation_enriches_speaker_and_trigger() {
+        let eng = engine("load-enrich");
+        let me = eng.store.users.ensure_default_user().unwrap();
+        let fam = eng.store.users.create("小明").unwrap();
+        let conv = eng.store.chat.create_conversation(me.id, DEFAULT_SCENE_ID).unwrap();
+        // 主人自己打字(无 payload)→ 不标名(是「我」)
+        eng.store.chat.append_message(conv.id, "user", "主人说的").unwrap();
+        // 家人插话(payload.speaker_user = 家人)→ 标家人名
+        let meta = format!(r#"{{"speaker_user":{}}}"#, fam.id);
+        eng.store.chat.append_message_full(conv.id, "user", "家人说的", Some(&meta)).unwrap();
+        // 提醒到点:event 行 + assistant 转述 → assistant 标 reminder
+        eng.store.chat.append_message(conv.id, "event", "【定时任务到点】喝水").unwrap();
+        eng.store.chat.append_message(conv.id, "assistant", "该喝水啦").unwrap();
+        // 普通对话:user 清触发标记 → 后续 assistant 不标
+        eng.store.chat.append_message(conv.id, "user", "在吗").unwrap();
+        eng.store.chat.append_message(conv.id, "assistant", "在的").unwrap();
+
+        let msgs = eng.load_conversation(conv.id).unwrap();
+        let find = |c: &str| msgs.iter().find(|m| m.content == c).unwrap().clone();
+        assert_eq!(find("主人说的").speaker_name, None, "归属者(主人)自己说的不标名");
+        assert_eq!(find("家人说的").speaker_name.as_deref(), Some("小明"), "家人插话标名");
+        assert_eq!(find("该喝水啦").trigger.as_deref(), Some("reminder"), "event 后 assistant 标自动触发");
+        assert_eq!(find("在的").trigger, None, "普通对话回复不标触发");
     }
 
     /// 自动提炼计数:前 N-1 轮不触发、第 N 轮触发并归零、不同会话各自独立。

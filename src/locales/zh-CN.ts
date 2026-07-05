@@ -183,6 +183,7 @@ export default {
     attach: '加图片或文件',
     attRemove: '移除',
     dropHint: '松手,把文件交给{name}',
+    trigger: { reminder: '提醒' },
     copy: '复制',
     queueHint: '排队中 · 说完一起发',
     queueAtt: '(附件)',
@@ -352,6 +353,10 @@ export default {
     open: '打开{name}',
     showFloat: '显示悬浮窗',
     quit: '退出',
+  },
+  // 主动关怀(PLAN ★主动关怀里程碑):关怀候选文案。名字不进词典(§6.6),这里只有剧名 {title} 插值。
+  care: {
+    resume: '继续看《{title}》?',
   },
   // 桌面悬浮窗(PLAN §12 形态 C)
   float: {
@@ -619,6 +624,8 @@ export default {
       floatOpacity: '悬浮窗透明度',
       floatUsage: '待机轮播带用量(今日花费 / 余额)',
       floatHint: '一个停在屏幕角落的小窗:有提醒、在听你说话、在下载时冒出来;平时半透明,鼠标移上去变清楚。',
+      care: '主动关怀',
+      careHint: '{name} 会在你忙别的时,悄悄提醒你没看完的剧或要紧的事——只在悬浮窗轻轻出现,不出声打扰;夜里(22:00–08:00)不打扰。可随时关。',
       storage: '存储',
       dataLocation: '数据位置',
       dataReveal: '在文件夹中显示',

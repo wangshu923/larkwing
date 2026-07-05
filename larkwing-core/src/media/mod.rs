@@ -563,7 +563,7 @@ impl MediaRuntime {
         let total = entries.len();
         let target = entries[index].url.clone();
         // 落进度(起播即记)。失败不挡播放 —— 续播是锦上添花。
-        let _ = self.inner.store.media_progress.set(user_id, &key, &entries[index].id, 0.0);
+        let _ = self.inner.store.media_progress.set(user_id, &key, &entries[index].id, &entries[index].title, 0.0);
         *self.inner.playlist.lock().unwrap() =
             Some(Playlist { series_key: key, entries, index, audio_only });
         (Some(PlaylistPos { index, total, resumed }), target)
@@ -609,7 +609,7 @@ impl MediaRuntime {
             pl.index = new;
             let e = &pl.entries[pl.index];
             // 切集即落进度(下次续播接得上)。
-            let _ = self.inner.store.media_progress.set(user_id, &pl.series_key, &e.id, 0.0);
+            let _ = self.inner.store.media_progress.set(user_id, &pl.series_key, &e.id, &e.title, 0.0);
             (
                 e.url.clone(),
                 pl.audio_only,

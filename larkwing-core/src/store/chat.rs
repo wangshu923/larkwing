@@ -57,6 +57,10 @@ pub struct Conversation {
     pub pinned: bool,
     pub created_at: i64,
     pub updated_at: i64,
+    /// 发起人显示名(engine 富化,非 DB 列):渠道指认的家人 / 非主人发起者;
+    /// 主人自己的会话 = None(是「你」,不标)。IPC 增量字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_name: Option<String>,
 }
 
 /// 持久形态(≠ llm::ChatMessage 调用形态)。role 开放为 TEXT:user/assistant/tool。
@@ -69,6 +73,14 @@ pub struct Message {
     pub created_at: i64,
     /// 工具轮附加数据(JSON,engine 私有词汇);普通消息为 None。IPC 上是增量字段。
     pub payload: Option<String>,
+    /// 说话人显示名(engine 富化,非 DB 列):user 行的说话人若非会话归属者(家人插话 /
+    /// 声纹 / 渠道归人)则填其名;归属者自己说的 = None(是「我」,不标)。IPC 增量字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker_name: Option<String>,
+    /// 触发来源(engine 富化,非 DB 列):assistant 行若由定时任务 / 提醒自动触发则为
+    /// Some("reminder"),普通对话回复 = None。前端据此标「⏰ 提醒」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
 }
 
 /// 跨会话搜索命中:带会话标题 / 渠道供列表展示;`snippet` 是截断的展示标签(非数据,§6.5)。
@@ -138,6 +150,7 @@ impl ChatRepo {
                 pinned: false,
                 created_at: now,
                 updated_at: now,
+                owner_name: None,
             })
         })
     }
@@ -271,6 +284,8 @@ impl ChatRepo {
                 content: content.into(),
                 created_at: now,
                 payload: payload.map(Into::into),
+                speaker_name: None,
+                trigger: None,
             })
         })
     }
@@ -424,6 +439,7 @@ fn row_to_conversation(r: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation> 
         pinned: r.get(5)?,
         created_at: r.get(6)?,
         updated_at: r.get(7)?,
+        owner_name: None,
     })
 }
 
@@ -435,6 +451,8 @@ fn row_to_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         content: r.get(3)?,
         created_at: r.get(4)?,
         payload: r.get(5)?,
+        speaker_name: None,
+        trigger: None,
     })
 }
 

@@ -16,7 +16,7 @@ import { i18n } from '../i18n'
 import { useSettings } from './useSettings'
 
 export interface IdleItem {
-  kind: 'reminder' | 'cost' | 'balance'
+  kind: 'reminder' | 'care' | 'cost' | 'balance'
   text: string
 }
 
@@ -48,6 +48,12 @@ function showUsage(): boolean {
   return useSettings().get('ui.float.show_usage') === '1'
 }
 
+// 主动关怀静默时段:22:00–08:00 本地不出关怀候选(强默认、不暴露;起步值,与 audio 夜间同为前端本地时钟判断)。
+function inQuietHours(): boolean {
+  const h = new Date().getHours()
+  return h >= 22 || h < 8
+}
+
 async function refresh() {
   if (!isTauri()) return
   try {
@@ -69,6 +75,7 @@ function wire() {
     if (new URLSearchParams(location.search).get('demo')?.includes('float')) {
       state.data = {
         next_reminder: { content: '吃药', due_at: Date.now() + 3 * 3600_000 },
+        care: { kind: 'resume', title: '星海漫游', updated_at: Date.now() - 26 * 3600_000 },
       }
     }
   } else {
@@ -91,6 +98,12 @@ const items = computed<IdleItem[]>(() => {
   const r = state.data?.next_reminder
   if (r) out.push({ kind: 'reminder', text: `${hhmm(r.due_at)}  ${r.content}` })
   // (去掉"最近一句旺财说的话":用户反馈意义不大)
+  // 主动关怀候选(PLAN ★主动关怀里程碑,切片1 = L0):后端已按 care.enabled 决定给不给,
+  // 这里只加"静默时段"的门(22:00–08:00 本地不打扰;同 audio 夜间也在前端算本地时钟)。
+  const care = state.data?.care
+  if (care?.kind === 'resume' && !inQuietHours()) {
+    out.push({ kind: 'care', text: t('care.resume', { title: care.title }) })
+  }
   if (showUsage()) {
     if (state.today) {
       out.push({ kind: 'cost', text: t('float.todayCost', { amount: `$${state.today.cost_usd.toFixed(3)}` }) })

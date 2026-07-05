@@ -448,6 +448,11 @@ const floatShowUsage = computed(() => settings.get('ui.float.show_usage') === '1
 function toggleFloatUsage() {
   settings.set('ui.float.show_usage', floatShowUsage.value ? '0' : '1')
 }
+// 主动关怀总开关(PLAN ★主动关怀里程碑):关 = 悬浮窗不投关怀候选、in-chat 场景续接 chips 也收起。
+const careEnabled = computed(() => settings.get('care.enabled') !== '0')
+function toggleCare() {
+  settings.set('care.enabled', careEnabled.value ? '0' : '1')
+}
 
 // 数据目录「搬家」(datadir):选目录 → 预检 → 内联确认 → 执行(HUD 进度,完后自动重启)。
 const dataRoot = ref('')
@@ -1708,6 +1713,14 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           </span>
         </div>
         <p class="hint">{{ t('settings.system.floatHint') }}</p>
+        <div class="row">
+          <span class="label">{{ t('settings.system.care') }}</span>
+          <span class="key-state">
+            <span class="chip" :class="{ on: careEnabled }">{{ careEnabled ? t('settings.system.on') : t('settings.system.off') }}</span>
+            <button class="link" @click="toggleCare">{{ careEnabled ? t('settings.system.turnOff') : t('settings.system.turnOn') }}</button>
+          </span>
+        </div>
+        <p class="hint">{{ t('settings.system.careHint', { name: petName }) }}</p>
 
         <p class="section">{{ t('settings.system.storage') }}</p>
         <div class="row">

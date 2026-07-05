@@ -61,6 +61,10 @@ export interface UiMessage {
   trace?: { steps: TraceStep[]; reasoning?: string }
   /** 这条消息的时刻(unix ms):用户气泡 hover 显时间。历史取 created_at,在飞取发送时刻。 */
   at?: number
+  /** 说话人名(多人会话:家人插话 / 声纹 / 渠道归人才有;「我」说的为空)。user 气泡据此标名。 */
+  speakerName?: string
+  /** 自动触发来源('reminder'):助手回复由提醒到点触发,气泡标「⏰ 提醒」。空 = 普通回复。 */
+  trigger?: string
 }
 
 const state = reactive({
@@ -108,6 +112,9 @@ onProvidersUsable(() => {
 
 function toUi(m: Message): UiMessage {
   const ui: UiMessage = { id: m.id, role: m.role === 'user' ? 'user' : 'wang', text: m.content, at: m.created_at }
+  // 说话人显性化(engine 富化):user 行「谁说的」名字(非我才有)/ assistant 行自动触发标记。
+  if (m.speaker_name) ui.speakerName = m.speaker_name
+  if (m.trigger) ui.trigger = m.trigger
   // 历史里的附件小票:从 user 行 payload(UserMeta)解出。图带 file → 稍后 resolveThumbs
   // 拉回缩略图(填 dataUrl);拉到前 / doc / 旧数据显「📷/📄 名字」兜底。
   if (m.role === 'user' && m.payload) {
