@@ -15,7 +15,7 @@
 // 静默失败:自动查失败只 console(被动 §3.5);下载/安装失败给任务红条 / toast。
 import { reactive } from 'vue'
 import { check, type Update, type DownloadEvent } from '@tauri-apps/plugin-updater'
-import { isTauri, api } from '../lib/backend'
+import { emitUpdateState, isTauri, api } from '../lib/backend'
 import { i18n } from '../i18n'
 import { useSettings } from './useSettings'
 import { useTasks } from './useTasks'
@@ -44,11 +44,13 @@ function effectiveProxy(): string | undefined {
   return enabled && addr ? addr : undefined
 }
 
-/** 把 check() 结果落到 state;有新版返 true,够得到但无更新返 false。 */
+/** 把 check() 结果落到 state;有新版返 true,够得到但无更新返 false。
+ *  同时把绝对态广播给悬浮窗(待机轮播出「发现新版本」可点条;主窗仍是唯一执行位)。 */
 function adopt(update: Update | null): boolean {
   if (update) {
     pending = update
     state.available = { version: update.version, notes: update.body ?? '' }
+    emitUpdateState('available', update.version)
     return true
   }
   return false
@@ -87,6 +89,7 @@ async function download() {
   if (!pending || downloading) return
   downloading = true
   state.available = null // 收起「发现新版」卡,进度去任务 HUD
+  emitUpdateState('none') // 悬浮窗那条同步收起(下载中,进度看主窗 HUD)
   const task = useTasks().startLocal({ kind: 'download', label: { key: 'task.update' } })
   let total = 0
   let got = 0
@@ -123,9 +126,12 @@ async function download() {
     }
     task.done()
     state.downloaded = true
+    emitUpdateState('downloaded', pending?.version) // 悬浮窗改显「点击重启生效」
   } catch (e) {
     console.error('下载更新失败', e)
     task.fail({ key: 'task.err.download' })
+    // 失败不静默吞条目(§3.5):恢复「发现新版」卡 + 悬浮窗条(adopt 幂等),留给用户重试
+    if (pending) adopt(pending)
   } finally {
     // 成功 / 失败都复位:否则下载成功后 downloading 永为 true,长驻进程里第二次更新点「更新」
     // 会在入口 `if (!pending || downloading) return` 静默早退、按钮无反应(破「不静默失败」§3.5)。
@@ -148,6 +154,7 @@ async function install() {
 function dismiss() {
   state.available = null
   state.downloaded = false
+  emitUpdateState('none') // 主窗按了「稍后」→ 悬浮窗那条也收(别两处各唠各的)
 }
 
 let autoStarted = false

@@ -783,6 +783,28 @@ export function onFloatSay(cb: (text: string) => void): void {
   void listen<{ text: string }>('lw:float-say', (e) => cb(e.payload.text))
 }
 
+/** 程序更新状态 → 悬浮窗镜像(待机轮播出「发现新版本」可点条)。主窗是唯一更新执行位
+ *  (useUpdater 只在主窗跑),状态一变就广播绝对态(available/downloaded/none),幂等不怕重放;
+ *  事件不缓存、先到先丢 —— 错过就等下一轮每日复查再发,浮窗这条是锦上添花不是真相源。 */
+export type UpdatePhase = 'none' | 'available' | 'downloaded'
+export function emitUpdateState(phase: UpdatePhase, version?: string) {
+  if (isTauri()) void emit('lw:update-state', { phase, version })
+}
+export function onUpdateState(cb: (phase: UpdatePhase, version?: string) => void): void {
+  if (!isTauri()) return
+  void listen<{ phase: UpdatePhase; version?: string }>('lw:update-state', (e) =>
+    cb(e.payload.phase, e.payload.version),
+  )
+}
+/** 悬浮窗点「更新」条 → 主窗执行:没下载 = 开始下载(进任务 HUD);已下载 = 装 + 重启。 */
+export function emitFloatUpdate() {
+  if (isTauri()) void emit('lw:float-update', {})
+}
+export function onFloatUpdate(cb: () => void): void {
+  if (!isTauri()) return
+  void listen('lw:float-update', () => cb())
+}
+
 /** 数据目录「搬家」:当前根 / 待清理旧根 / 失效路径(字段随 Rust camelCase)。 */
 export interface DataLocation {
   root: string
@@ -891,6 +913,8 @@ export const api = {
   /** 旁听仲裁(唤醒确认层「呼名+续句」):临时回合无 Channel,终态经全局车道 kind=overheard*。 */
   sendOverheard: (convId: number, text: string, speaker?: number) =>
     invoke<void>('send_overheard', { convId, text, speaker }),
+  /** 浏览器采集推流(层1 AEC 采集端):16k mono i16 LE 帧,raw body 免 JSON(~10Hz)。 */
+  voicePushAudio: (pcm: Uint8Array) => invoke<void>('voice_push_audio', pcm),
   /** 唤醒回合念完 → 开 6s 跟进窗(免唤醒接话)。 */
   voiceFollowUp: () => invoke<void>('voice_follow_up'),
   /** 换音色/语速/在线离线档后:唤醒在跑则后台重建应答音(不重启唤醒/麦);没开唤醒则 no-op。 */

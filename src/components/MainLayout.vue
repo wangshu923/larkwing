@@ -4,6 +4,7 @@ import { useI18n } from 'vue-i18n'
 import { useChat, type TurnStats, type UiMessage, type UiAttachment } from '../composables/useChat'
 import { useSettings } from '../composables/useSettings'
 import { onOverheard, onTranscribed, useVoice } from '../composables/useVoice'
+import { useMicBridge } from '../composables/useMicBridge'
 import { useSpeech } from '../composables/useSpeech'
 import { useContextMenu } from '../composables/useContextMenu'
 import { useCharacter } from '../composables/useCharacter'
@@ -223,6 +224,8 @@ onOverheard((text, speaker) => {
     console.error('旁听仲裁发送失败', e)
   })
 })
+// 浏览器采集桥(层1 AEC 采集端):采集源=browser 时按需开 getUserMedia 推流;仅主窗挂。
+useMicBridge()
 
 // —— 朗读(B 期):状态/停念/重听;正在念时点麦克风 = 停念+开听(一步打断) ——
 const speech = useSpeech()

@@ -25,7 +25,7 @@ fn main() {
         let mut s: Vec<f32> = w.samples().to_vec();
         let rate = w.sample_rate();
         if rate != 16_000 {
-            let mut rs = sherpa_onnx::LinearResampler::create(rate, 16_000)
+            let rs = sherpa_onnx::LinearResampler::create(rate, 16_000)
                 .expect("重采样器创建失败");
             s = rs.resample(&s, true);
         }

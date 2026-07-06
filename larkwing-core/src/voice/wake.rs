@@ -17,7 +17,7 @@ use anyhow::{anyhow, Context, Result};
 use super::asr::{Asr, SherpaAsr};
 use super::prompts::{PromptBank, PromptKind, SharedPromptBank};
 use super::speaker::SpeakerId;
-use super::{collect_utterance, hangover_secs, new_vad, open_capture, peak_normalize, CaptureOut};
+use super::{collect_utterance, hangover_secs, new_vad, peak_normalize, CaptureOut};
 use crate::bus::{VoiceEvent, VoicePhase};
 
 pub(super) enum WakeCmd {
@@ -224,7 +224,7 @@ fn wake_loop(d: &WakeDeps, cmd: &Receiver<WakeCmd>) -> Result<()> {
 
     let hangover = hangover_secs(&d.rt.patience());
     let vad = new_vad(&d.vad_model, hangover)?;
-    let mut pipe = open_capture(d.rt.input_device())?;
+    let mut pipe = d.rt.open_capture_auto()?;
     let mut dump = WatchDump::from_env(); // 诊断:设了 LARKWING_KWS_DUMP_DIR 才落盘
     let mut suspended = false;
     let mut phase = Phase::Watch;
@@ -277,7 +277,7 @@ fn wake_loop(d: &WakeDeps, cmd: &Receiver<WakeCmd>) -> Result<()> {
         if matches!(phase, Phase::Watch) && !suspended && (force_reopen || last_frame.elapsed() > WATCHDOG_SILENCE) {
             tracing::warn!(silent_s = last_frame.elapsed().as_secs(), force = force_reopen, "麦克风无帧,重开采集");
             force_reopen = false;
-            match open_capture(d.rt.input_device()) {
+            match d.rt.open_capture_auto() {
                 Ok(p) => pipe = p,
                 Err(e) => {
                     tracing::error!(err = %format!("{e:#}"), "重开采集失败,2s 后重试");

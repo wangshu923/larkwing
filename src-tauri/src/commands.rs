@@ -94,6 +94,24 @@ pub fn boot(state: State<'_, AppState>) -> Result<BootSnapshot, AppError> {
     state.engine.boot()
 }
 
+/// 浏览器采集推流(层1 AEC 采集端):前端 getUserMedia 消完回声的 16k mono **i16 LE** 帧,
+/// raw body 免 JSON(~10Hz × 3.2KB)。采集源=cpal 时无 tap 在收,推了也只是丢弃——
+/// 源的取舍由 `voice.capture.source` 决定,这条命令只管搬运。
+#[tauri::command]
+pub fn voice_push_audio(
+    state: State<'_, AppState>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<(), AppError> {
+    if let tauri::ipc::InvokeBody::Raw(bytes) = request.body() {
+        let pcm: Vec<f32> = bytes
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32_768.0)
+            .collect();
+        state.voice.push_audio(pcm);
+    }
+    Ok(())
+}
+
 /// 旁听仲裁(唤醒确认层「呼名+续句」):整句交模型判是不是叫它。临时回合、无 Channel
 /// (engine 内消费);终态经全局车道 kind=overheard(转正)/ overheard_dismissed(蒸发)。
 #[tauri::command]
@@ -648,6 +666,16 @@ pub fn delete_voice_clone(state: State<'_, AppState>, clone_id: String) -> Resul
     state.voice.delete_clone(&clone_id).map_err(AppError::internal)
 }
 
+/// RFC 6265 式域匹配(够用版):host 与 cookie 域相等,或是其子域(点开头域去点比后缀)。
+/// 只给 mac 的 cookie 轮询自滤用(见 media_login 内注释)。
+#[cfg(target_os = "macos")]
+fn cookie_domain_matches(host: &str, domain: Option<&str>) -> bool {
+    let Some(d) = domain.map(|d| d.trim_start_matches('.')).filter(|d| !d.is_empty()) else {
+        return false;
+    };
+    host == d || host.ends_with(&format!(".{d}"))
+}
+
 /// 扫码登录:开一扇加载站点登录页的窗口,轮询原生 CookieManager(SESSDATA 是
 /// HttpOnly,JS 拿不到,必须走原生),扫码成功 → cookie 入库 → 自动关窗。
 /// title 由前端字典传入(文案唯一产地在前端;原生窗口标题没法事后翻译)。
@@ -669,11 +697,17 @@ pub async fn media_login(
     }
     let login_url: tauri::Url = spec.login_url.parse().map_err(AppError::internal)?;
     let cookie_url: tauri::Url = spec.cookie_url.parse().map_err(AppError::internal)?;
-    tauri::WebviewWindowBuilder::new(&app, LABEL, tauri::WebviewUrl::External(login_url))
+    let builder = tauri::WebviewWindowBuilder::new(&app, LABEL, tauri::WebviewUrl::External(login_url))
         .title(title)
-        .inner_size(460.0, 640.0)
-        .build()
-        .map_err(AppError::internal)?;
+        .inner_size(460.0, 640.0);
+    // mac WKWebView 默认 UA 缺 Version/Safari 版本段,B 站登录页判「浏览器版本过低」拒开;
+    // 补成真 Safari 的冻结形 UA(各段 Apple 已冻结不陈化)。Windows WebView2 自带现代
+    // Chrome UA、扫码已真机验过 → 不动。
+    #[cfg(target_os = "macos")]
+    let builder = builder.user_agent(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
+    );
+    builder.build().map_err(AppError::internal)?;
 
     // cookie 域兜底:host 去掉 www. 前缀加点(原生 API 偶尔不回 domain 字段)
     let fallback_domain = cookie_url
@@ -681,12 +715,27 @@ pub async fn media_login(
         .map(|h| format!(".{}", h.trim_start_matches("www.")))
         .unwrap_or_default();
     let media = state.media.clone();
+    #[cfg(target_os = "macos")]
+    let host = cookie_url.host_str().unwrap_or_default().to_string();
     tauri::async_runtime::spawn(async move {
         for _ in 0..200 {
             tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
             // 用户手动关窗 = 放弃登录,轮询随之收摊
             let Some(win) = app.get_webview_window(LABEL) else { return };
-            let cookies = match win.cookies_for_url(cookie_url.clone()) {
+            // mac 上 wry 的 cookies_for_url 按「cookie 域 == URL 域」精确比较,
+            // `.bilibili.com` 的登录 cookie 对 www 主机永远匹配不上(2026-07-06 实锤,
+            // 登录成功却读不到 SESSDATA)→ 取全量、自己按域后缀匹配;Windows 走
+            // WebView2 原生匹配(已真机验过,且原生 API 偶尔不回 domain 字段,套自滤
+            // 会误杀)→ 维持 cookies_for_url 不动。
+            #[cfg(target_os = "macos")]
+            let cookies = win.cookies().map(|all| {
+                all.into_iter()
+                    .filter(|c| cookie_domain_matches(&host, c.domain()))
+                    .collect::<Vec<_>>()
+            });
+            #[cfg(not(target_os = "macos"))]
+            let cookies = win.cookies_for_url(cookie_url.clone());
+            let cookies = match cookies {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::debug!("登录 cookie 轮询失败: {e}");
@@ -1117,4 +1166,25 @@ pub fn reveal_data_dir(state: State<'_, AppState>) -> Result<(), AppError> {
         std::process::Command::new("xdg-open").arg(&path).spawn()
     };
     spawned.map(|_| ()).map_err(AppError::internal)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::cookie_domain_matches;
+
+    #[test]
+    fn cookie_domain_matching_covers_dotted_and_host_only() {
+        // 带点主域 cookie(SESSDATA 形)对子域必须命中 —— 2026-07-06 登录读不到 cookie 的 bug 本体
+        assert!(cookie_domain_matches("www.bilibili.com", Some(".bilibili.com")));
+        assert!(cookie_domain_matches("www.bilibili.com", Some("bilibili.com")));
+        assert!(cookie_domain_matches("bilibili.com", Some(".bilibili.com")));
+        // host-only 精确命中
+        assert!(cookie_domain_matches("www.bilibili.com", Some("www.bilibili.com")));
+        // 兄弟子域 / 无关域 / 后缀陷阱 / 缺失域都不命中
+        assert!(!cookie_domain_matches("www.bilibili.com", Some("passport.bilibili.com")));
+        assert!(!cookie_domain_matches("www.bilibili.com", Some("hdslb.com")));
+        assert!(!cookie_domain_matches("notbilibili.com", Some("bilibili.com")));
+        assert!(!cookie_domain_matches("www.bilibili.com", None));
+        assert!(!cookie_domain_matches("www.bilibili.com", Some(".")));
+    }
 }

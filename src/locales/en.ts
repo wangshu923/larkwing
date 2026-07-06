@@ -378,6 +378,8 @@ export default {
     pause: 'Pause', // mini media controls (forwarded to main)
     resume: 'Resume',
     stop: 'Stop',
+    updateAvail: 'New version v{version} available', // clickable idle card: click = summon main and start the update
+    updateReady: 'Update downloaded — click to restart',
   },
   settings: {
     title: 'Settings',
@@ -593,6 +595,8 @@ export default {
         stop: 'Stop',
         record: 'Record 15s',
         download: 'Download wav',
+        capture: 'Browser capture',
+        captureHint: 'ON = wake/dictation hear the echo-cancelled mic (system default mic); OFF = raw capture. Takes effect immediately.',
       },
     },
     remote: {

@@ -10,7 +10,7 @@ import { useAgentMood } from '../composables/useAgentMood'
 import { useFloat } from '../composables/useFloat'
 import { useFloatIdle } from '../composables/useFloatIdle'
 import { useSettings } from '../composables/useSettings'
-import { emitFloatSay, emitOpenConversation, floatWin, type TextRef } from '../lib/backend'
+import { emitFloatSay, emitFloatUpdate, emitOpenConversation, floatWin, type TextRef } from '../lib/backend'
 import titanIdle from '../assets/titan-idle-1.png'
 import dogIdle from '../assets/dog-idle.png'
 import catIdle from '../assets/cat-idle.png'
@@ -139,13 +139,23 @@ function openNotice(convId: number) {
   openMain()
 }
 
-// 关怀候选可点(L0 静默呈现 → 递出去那句能一键说出口):待机轮播当前条带 say 即关怀条
-// (useFloatIdle 只给 care 填 say)。点击 = 唤主窗 + 替用户把那句发出去;发送/念答全在主窗,
-// 悬浮窗仍只读不发回合(§12)。
-const careSay = computed(() => idle.current.value?.say ?? '')
-function onCareTap() {
-  if (!careSay.value) return
-  emitFloatSay(careSay.value)
+// 可点的待机条(统一渲染成可点卡,点击 = 唤主窗 + 让主窗执行;悬浮窗仍只读不发回合 §12):
+// ① 关怀候选(带 say = 替用户发出去的那句,useFloatIdle 只给 care 填)→ lw:float-say;
+// ② 程序更新(kind=update)→ lw:float-update(主窗按状态开始下载 / 装+重启)。
+const idleAct = computed(() => {
+  const cur = idle.current.value
+  if (!cur) return null
+  if (cur.say) {
+    const say = cur.say
+    return { text: cur.text, run: () => emitFloatSay(say) }
+  }
+  if (cur.kind === 'update') return { text: cur.text, run: () => emitFloatUpdate() }
+  return null
+})
+function onIdleTap() {
+  const act = idleAct.value
+  if (!act) return
+  act.run()
   openMain()
 }
 
@@ -234,11 +244,11 @@ onUnmounted(() => stopMoved())
           </div>
         </template>
 
-        <!-- 待机:轮播当前条(下个提醒/关怀候选…) / 问候;关怀条可点 = 替你把那句发给主窗 -->
+        <!-- 待机:轮播当前条(下个提醒/关怀候选/发现新版…) / 问候;可点条(关怀/更新)渲染成卡 -->
         <template v-if="!state.notices.length && !listening && !nowPlaying && !running.length">
-          <div v-if="careSay" class="care-go" @click.stop="onCareTap">
-            <span class="n-text">{{ idle.current.value?.text }}</span>
-            <i class="care-arrow">▶</i>
+          <div v-if="idleAct" class="idle-act" @click.stop="onIdleTap">
+            <span class="n-text">{{ idleAct.text }}</span>
+            <i class="act-arrow">▶</i>
           </div>
           <div v-else class="empty">{{ idle.current.value?.text ?? t('float.idle') }}</div>
         </template>
@@ -498,8 +508,8 @@ onUnmounted(() => stopMoved())
 }
 .mctl:hover { background: rgba(var(--accent-rgb), 0.22); color: var(--f-cy); }
 .empty { font-size: 11.5px; color: var(--f-txt2); text-align: center; padding: 18px 0; }
-/* 关怀候选(可点卡,与 .notice 同观感):点了 = 唤主窗 + 替你把那句发出去 */
-.care-go {
+/* 可点待机条(关怀候选/发现新版,与 .notice 同观感):点了 = 唤主窗 + 主窗执行 */
+.idle-act {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -510,6 +520,6 @@ onUnmounted(() => stopMoved())
   cursor: pointer;
   transition: border-color 0.15s, background 0.15s;
 }
-.care-go:hover { border-color: var(--f-cy); background: rgba(var(--accent-rgb), 0.12); }
-.care-arrow { flex: 0 0 auto; font-style: normal; font-size: 9px; color: var(--f-cy); }
+.idle-act:hover { border-color: var(--f-cy); background: rgba(var(--accent-rgb), 0.12); }
+.act-arrow { flex: 0 0 auto; font-style: normal; font-size: 9px; color: var(--f-cy); }
 </style>

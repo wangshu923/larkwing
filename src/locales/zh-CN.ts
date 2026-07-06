@@ -377,6 +377,8 @@ export default {
     pause: '暂停', // 迷你播控(转发主窗)
     resume: '继续',
     stop: '停止播放',
+    updateAvail: '发现新版本 v{version}', // 待机可点条:点击 = 唤主窗开始下载更新
+    updateReady: '更新已下载,点击重启生效',
   },
   settings: {
     title: '设置',
@@ -592,6 +594,8 @@ export default {
         stop: '停止',
         record: '录 15 秒',
         download: '下载 wav',
+        capture: '浏览器采集',
+        captureHint: '开 = 唤醒/听写改吃"消完回声"的麦克风(用系统默认麦);关 = 原始采集。切换即生效。',
       },
     },
     remote: {

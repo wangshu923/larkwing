@@ -8,6 +8,7 @@ import {
   api,
   isTauri,
   onAppEvent,
+  onUpdateState,
   type AccountBalance,
   type DayUsage,
   type FloatIdle,
@@ -16,7 +17,7 @@ import { i18n } from '../i18n'
 import { useSettings } from './useSettings'
 
 export interface IdleItem {
-  kind: 'reminder' | 'care' | 'cost' | 'balance'
+  kind: 'reminder' | 'care' | 'update' | 'cost' | 'balance'
   text: string
   /** 点击要替用户发出去的那句(仅关怀候选有):悬浮窗点它 → emitFloatSay + 唤主窗。 */
   say?: string
@@ -29,6 +30,8 @@ const state = reactive({
   data: null as FloatIdle | null,
   today: null as DayUsage | null,
   balance: null as AccountBalance | null,
+  /** 程序更新状态(主窗 useUpdater 广播的镜像;主窗是唯一执行位,这里只显示 + 转发点击)。 */
+  update: null as { phase: 'available' | 'downloaded'; version: string } | null,
   tick: 0,
   paused: false,
 })
@@ -79,12 +82,17 @@ function wire() {
         next_reminder: { content: '吃药', due_at: Date.now() + 3 * 3600_000 },
         care: { kind: 'resume', title: '星海漫游', updated_at: Date.now() - 26 * 3600_000 },
       }
+      state.update = { phase: 'available', version: '9.9.9' }
     }
   } else {
     void refresh()
     // 旺财说了话 / 提醒到点 → 最近一句 & 待办都可能变,顺手刷
     onAppEvent((ev) => {
       if (ev.type === 'conversation') void refresh()
+    })
+    // 程序更新状态镜像(主窗 useUpdater 广播绝对态,幂等):有新版/已下载 → 待机轮播出可点条
+    onUpdateState((phase, version) => {
+      state.update = phase === 'none' ? null : { phase, version: version ?? '' }
     })
   }
   // 轮播节拍:tick++,current 取模轮转(只剩一条则恒定;hover 暂停)
@@ -95,6 +103,14 @@ function wire() {
 
 const items = computed<IdleItem[]>(() => {
   const out: IdleItem[] = []
+  // 程序有新版(主窗广播的镜像):最可行动的一条,排最前;点击 = 唤主窗直接走更新流(FloatWindow 分发)。
+  const up = state.update
+  if (up) {
+    out.push({
+      kind: 'update',
+      text: up.phase === 'downloaded' ? t('float.updateReady') : t('float.updateAvail', { version: up.version }),
+    })
+  }
   // 待机轮播只显示 OS 不会主动告诉你的事:下个提醒 +(opt-in)今日花费/余额。
   // 「在等唤醒」不进文字条(用户:留头像的竖耳环示意即可),空池由 FloatWindow 回退到「我有空」。
   const r = state.data?.next_reminder

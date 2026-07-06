@@ -20,6 +20,7 @@ import { useUpdater } from './composables/useUpdater'
 import {
   api,
   isTauri,
+  onFloatUpdate,
   onForegroundFullscreen,
   onOpenConversation,
   onShowFloat,
@@ -114,7 +115,14 @@ if (!isFloat && isTauri()) {
     void syncOwnFs()
   })
   // 一键更新(清单 ⑤·A):启动查一次(每日节流)+ 每 6h 复查;有新版右下角弹更新卡。失败静默。
-  useUpdater().startAutoCheck()
+  const updater = useUpdater()
+  updater.startAutoCheck()
+  // 悬浮窗「发现新版本」条点击 → 主窗执行(唯一更新执行位):没下载 = 开始下载(进 HUD);
+  // 已下载 = 装 + 重启。download/install 自带 pending 守卫,状态错位时点了只是安静没动作。
+  onFloatUpdate(() => {
+    if (updater.state.downloaded) void updater.install()
+    else void updater.download()
+  })
   // boot 后查一次数据位置:失效 → 恢复弹窗;有旧数据残留 → 清理弹窗(主动来找用户,不用回设置页)。
   onMounted(async () => {
     try {

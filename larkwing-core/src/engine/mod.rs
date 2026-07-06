@@ -232,6 +232,9 @@ const APP_SETTING_KEYS: &[&str] = &[
     "voice.wake.sensitivity",
     "voice.asr.model",
     "voice.tts_backend",
+    // 采集源(app 级,层1 AEC 采集端):cpal(默认)| browser(前端 getUserMedia 消完回声推流)。
+    // 默认 cpal 零回归,Windows 真机验过再转正。§6.8 两边各加一行。
+    "voice.capture.source",
     "weather.qweather.host",
     "weather.qweather.project_id",
     "weather.qweather.credential_id",
@@ -979,6 +982,13 @@ impl Engine {
                 Ok(())
             }
             "voice.input_device" => {
+                self.store.settings.set(None, key, value)?;
+                Ok(())
+            }
+            "voice.capture.source" => {
+                if !["cpal", "browser"].contains(&value) {
+                    return Err(invalid("未知的采集源"));
+                }
                 self.store.settings.set(None, key, value)?;
                 Ok(())
             }

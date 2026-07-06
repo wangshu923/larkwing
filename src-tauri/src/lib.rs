@@ -393,6 +393,7 @@ pub fn run() {
       commands::voice_refresh_prompts,
       commands::voice_wake_resume,
       commands::voice_wake_suspend,
+      commands::voice_push_audio,
       commands::voice_calibrate_wake,
       commands::voice_calibrate_cancel,
       commands::list_family,

@@ -5,10 +5,36 @@
 // 自播声音在麦克风流里被消到什么程度 —— 决定「采集迁前端 + 删自激闸门」那一大步走不走。
 // 用法:让 app 放电影 / 说话 → AEC 开/关各录一段 → 看电平差 + 听回放 + 下载 wav 对比。
 // 全部浏览器 API、不碰 core;Mac 预览跑通链路,力度数字必须 Windows 真机拿(§8.1)。
-import { ref, onUnmounted } from 'vue'
+import { computed, ref, onUnmounted } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { api, isTauri } from '../lib/backend'
+import { useSettings } from '../composables/useSettings'
 
 const { t } = useI18n()
+const settings = useSettings()
+
+// —— 采集源切换(层1 接入):browser = 唤醒/听写改吃 getUserMedia 消完回声的推流。
+//    切换即写设置;唤醒开着就重启一次让循环换管(restartWakeIfRunning 同款)。
+const capBrowser = computed(() => settings.get('voice.capture.source') === 'browser')
+const switching = ref(false)
+async function toggleCapture() {
+  if (switching.value) return
+  switching.value = true
+  try {
+    await settings.set('voice.capture.source', capBrowser.value ? 'cpal' : 'browser')
+    if (isTauri()) {
+      const s = await api.voiceStatus()
+      if (s.wakeRunning) {
+        await api.voiceWakeSet(false)
+        await api.voiceWakeSet(true)
+      }
+    }
+  } catch (e) {
+    console.error('切换采集源失败', e)
+  } finally {
+    switching.value = false
+  }
+}
 
 const open = ref(false)
 const aecOn = ref(true)
@@ -198,6 +224,12 @@ onUnmounted(() => {
         <button class="aec-btn" :disabled="!running" @click="recordToggle()">
           {{ recording ? `⏹ ${recSecs}s` : t('settings.voice.aec.record') }}
         </button>
+      </div>
+      <div class="aec-row">
+        <button class="aec-btn" :class="{ on: capBrowser }" :disabled="switching" @click="toggleCapture()">
+          {{ t('settings.voice.aec.capture') }} {{ capBrowser ? 'ON' : 'OFF' }}
+        </button>
+        <span class="aec-read">{{ t('settings.voice.aec.captureHint') }}</span>
       </div>
       <div class="aec-meter">
         <div class="aec-fill" :style="{ width: `${Math.round(level * 100)}%` }"></div>

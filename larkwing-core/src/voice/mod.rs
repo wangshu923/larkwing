@@ -106,6 +106,10 @@ struct Inner {
     speaker: tokio::sync::OnceCell<Arc<speaker::SpeakerId>>,
     /// 唤醒循环(开关 = voice.wake.enabled;同时只有一个)。
     wake: std::sync::Mutex<Option<WakeHandle>>,
+    /// 浏览器推流采集的扇出表(层1 AEC 采集端):`voice.capture.source=browser` 时
+    /// `open_capture_auto` 往这儿挂 tap,壳层 `voice_push_audio` 命令喂 16k mono f32 帧。
+    /// tap 的管子 drop 了 send 自然失败 → 下次推帧时剪除(与 cpal「pipe drop 即关麦」同语义)。
+    push_taps: std::sync::Mutex<Vec<std::sync::mpsc::SyncSender<Vec<f32>>>>,
 }
 
 #[derive(Clone)]
@@ -169,6 +173,7 @@ impl VoiceRuntime {
                 clones_dir: dir.join("clones"),
                 speaker: tokio::sync::OnceCell::new(),
                 wake: std::sync::Mutex::new(None),
+                push_taps: std::sync::Mutex::new(Vec::new()),
             }),
         }
     }
@@ -369,7 +374,7 @@ impl VoiceRuntime {
         let joined = tokio::task::spawn_blocking(move || -> Result<(Vec<f32>, String)> {
             let hangover = hangover_secs(&rt.patience());
             let vad = new_vad(&vad_model, hangover)?;
-            let pipe = open_capture(rt.input_device())?;
+            let pipe = rt.open_capture_auto()?;
             rt.publish(VoiceEvent::State { phase: VoicePhase::Listening });
             let out = collect_utterance(&pipe, &vad, &rt, None, START_TIMEOUT, hangover)?;
             drop(pipe);
@@ -612,7 +617,7 @@ impl VoiceRuntime {
         tokio::task::spawn_blocking(move || -> Result<Vec<f32>> {
             let hangover = hangover_secs(&rt.patience());
             let vad = new_vad(&vad_model, hangover)?;
-            let pipe = open_capture(rt.input_device())?;
+            let pipe = rt.open_capture_auto()?;
             let mut embeds = Vec::with_capacity(ENROLL_SAMPLES as usize);
             for done in 0..ENROLL_SAMPLES {
                 rt.publish(VoiceEvent::Enroll {
@@ -751,7 +756,7 @@ impl VoiceRuntime {
                 rt.publish(VoiceEvent::CalibProgress { step: take + 1, total });
                 rt.publish(VoiceEvent::State { phase: VoicePhase::Listening });
                 let vad = new_vad(&vad_model, hangover)?;
-                let pipe = open_capture(rt.input_device())?;
+                let pipe = rt.open_capture_auto()?;
                 let out = collect_utterance(&pipe, &vad, &rt, Some(&ctl), START_TIMEOUT, hangover)?;
                 drop(pipe);
                 rt.publish(VoiceEvent::State { phase: VoicePhase::Idle });
@@ -1306,6 +1311,53 @@ impl VoiceRuntime {
     fn input_device(&self) -> Option<String> {
         self.inner.store.settings.get(None, "voice.input_device").ok().flatten()
     }
+
+    // ---- 采集双源(层1 AEC 采集端,2026-07-06):cpal(现状默认)↔ 浏览器推流 ----
+    // 浏览器源 = 前端 getUserMedia({echoCancellation}) 消完回声再推 16k PCM 过来
+    // (WebView2=Chromium AEC3;参考=它自己在播的全部音频)。默认 cpal 零回归,
+    // 真机验过再转正默认(watch-items 见 PLAN §11)。
+
+    /// 当前采集源(`voice.capture.source`,app 级):browser = 前端推流;其余 = cpal。
+    fn capture_source(&self) -> String {
+        self.inner
+            .store
+            .settings
+            .get(None, "voice.capture.source")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "cpal".into())
+    }
+
+    /// 按采集源开管:唤醒/听写/标定/录声纹统一走这个口(接缝换源,下游零感知)。
+    pub(super) fn open_capture_auto(&self) -> Result<CapturePipe> {
+        if self.capture_source() == "browser" {
+            tracing::info!("采集源 = 浏览器推流(AEC 采集端)");
+            return Ok(self.open_push_pipe());
+        }
+        open_capture(self.input_device())
+    }
+
+    /// 挂一个浏览器推流 tap:帧已是 16k mono(前端 AudioContext 定死),免重采样。
+    /// 管子 drop → 下次推帧 send 失败 → 自动从扇出表剪除(与「pipe drop 即关麦」同语义)。
+    fn open_push_pipe(&self) -> CapturePipe {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(64);
+        self.inner.push_taps.lock().expect("push_taps lock").push(tx);
+        CapturePipe { rx, resampler: None, _guard: CaptureGuard::Push }
+    }
+
+    /// 壳层 `voice_push_audio` 命令入口:16k mono f32 帧扇出给所有在收的管。
+    /// 队列满 = 丢帧(cpal 同款,绝不阻塞 IPC);死管(接收端 drop)就地剪除。
+    pub fn push_audio(&self, pcm: Vec<f32>) {
+        if pcm.is_empty() {
+            return;
+        }
+        let mut taps = self.inner.push_taps.lock().expect("push_taps lock");
+        taps.retain(|tx| match tx.try_send(pcm.clone()) {
+            Ok(()) => true,
+            Err(std::sync::mpsc::TrySendError::Full(_)) => true, // 消费端慢:丢这帧,管还活着
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+        });
+    }
 }
 
 /// 设置页「麦克风」下拉的数据源(B 期 UI 用;放 core 因为 cpal 在这)。
@@ -1327,7 +1379,15 @@ enum SessionOutcome {
 pub(super) struct CapturePipe {
     pub(super) rx: std::sync::mpsc::Receiver<Vec<f32>>,
     resampler: Option<sherpa_onnx::LinearResampler>,
-    _stream: cpal::Stream,
+    /// 采集源守卫:cpal = 持流(drop 即关麦);浏览器推流 = 无本地资源
+    /// (tap 生命周期靠 push_audio 的 send 失败自动剪除,语义与"drop 即关"对齐)。
+    _guard: CaptureGuard,
+}
+
+enum CaptureGuard {
+    /// 只为持有(drop 即关麦),不读字段。
+    Cpal(#[allow(dead_code)] cpal::Stream),
+    Push,
 }
 
 impl CapturePipe {
@@ -1413,7 +1473,7 @@ pub(super) fn open_capture(device_name: Option<String>) -> Result<CapturePipe> {
     } else {
         None
     };
-    Ok(CapturePipe { rx, resampler, _stream: stream })
+    Ok(CapturePipe { rx, resampler, _guard: CaptureGuard::Cpal(stream) })
 }
 
 /// VAD(2MB 模型,毫秒级创建;唤醒循环常驻一只,capture 间 reset)。
@@ -1532,7 +1592,7 @@ fn run_session(
 ) -> Result<SessionOutcome> {
     let hangover = hangover_secs(&rt.patience());
     let vad = new_vad(vad_model, hangover)?;
-    let pipe = open_capture(rt.input_device())?;
+    let pipe = rt.open_capture_auto()?;
     rt.publish(VoiceEvent::State { phase: VoicePhase::Listening });
     let out = collect_utterance(&pipe, &vad, rt, Some(&ctl), START_TIMEOUT, hangover)?;
     drop(pipe); // 识别前先放麦克风
@@ -1604,7 +1664,7 @@ fn calib_text_matches(heard: &str, word: &str) -> bool {
 /// 录一段定长底噪/负样本(不靠 VAD,原样收 16k);标定用它度量误触。
 /// 先丢 ~0.4s:跳过开流暂态 + 上一遍唤醒词的尾音/回声,免把它当成"底噪里有唤醒词"误触。
 fn capture_ambient(rt: &VoiceRuntime) -> Result<Vec<f32>> {
-    let pipe = open_capture(rt.input_device())?;
+    let pipe = rt.open_capture_auto()?;
     let settle = Instant::now();
     while settle.elapsed() < Duration::from_millis(400) {
         let _ = pipe.rx.recv_timeout(Duration::from_millis(50));
@@ -1627,6 +1687,52 @@ fn capture_ambient(rt: &VoiceRuntime) -> Result<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_rt(name: &str) -> VoiceRuntime {
+        let dir = std::env::temp_dir().join(format!("lw-voice-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(dir.join("t.db"));
+        let store = Store::open(&dir.join("t.db")).unwrap();
+        VoiceRuntime::new(dir, store, Bus::new(), Scenes::builtin())
+    }
+
+    // ---- 采集双源(层1 AEC 采集端) ----
+
+    #[test]
+    fn capture_source_defaults_to_cpal_and_dispatches_push() {
+        let rt = test_rt("capsrc");
+        assert_eq!(rt.capture_source(), "cpal", "默认 cpal(零回归,真机验过再转正)");
+        rt.inner.store.settings.set(None, "voice.capture.source", "browser").unwrap();
+        assert_eq!(rt.capture_source(), "browser");
+        // browser 源开管不碰麦克风硬件,永远成功
+        let pipe = rt.open_capture_auto().expect("push pipe 打开");
+        rt.push_audio(vec![0.1_f32; 160]);
+        let got =
+            pipe.rx.recv_timeout(std::time::Duration::from_millis(200)).expect("收到推流帧");
+        assert_eq!(got.len(), 160);
+        assert_eq!(pipe.to_16k(&got).len(), 160, "推流已是 16k,直通不重采样");
+    }
+
+    #[test]
+    fn push_audio_fans_out_and_prunes_dead_taps() {
+        let rt = test_rt("fanout");
+        rt.inner.store.settings.set(None, "voice.capture.source", "browser").unwrap();
+        let a = rt.open_capture_auto().unwrap();
+        let b = rt.open_capture_auto().unwrap();
+        rt.push_audio(vec![0.2_f32; 8]);
+        assert!(a.rx.recv_timeout(std::time::Duration::from_millis(200)).is_ok(), "tap A 收到");
+        assert!(
+            b.rx.recv_timeout(std::time::Duration::from_millis(200)).is_ok(),
+            "tap B 收到(扇出 = cpal 双流同语义)"
+        );
+        drop(a); // 管子 drop = 「关麦」
+        rt.push_audio(vec![0.3_f32; 8]);
+        assert_eq!(rt.inner.push_taps.lock().unwrap().len(), 1, "死管在下次推帧时剪除");
+        assert!(
+            b.rx.recv_timeout(std::time::Duration::from_millis(200)).is_ok(),
+            "幸存 tap 不受影响"
+        );
+    }
 
     #[test]
     fn patience_maps_to_locked_hangover_values() {
