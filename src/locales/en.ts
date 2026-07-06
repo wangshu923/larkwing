@@ -44,6 +44,8 @@ export default {
     watch_set: 'Keeping an eye on the weather…',
     web_search: 'Searching the web…',
     web_fetch: 'Reading the page…',
+    note_todo: 'Noting it to follow up…',
+    finish_todo: 'Checking it off…',
     unknown: 'Tinkering…',
   },
   // Task HUD: keys map 1:1 to core Text.key (bus.rs); named interpolation params

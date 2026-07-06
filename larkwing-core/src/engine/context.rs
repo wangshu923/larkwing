@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::llm::{ChatMessage, ChatRequest, ToolDef};
 use crate::scenes::Scene;
-use crate::store::{Briefing, Memory, Message};
+use crate::store::{Briefing, Memory, Message, Todo};
 
 use super::{AssistantPayload, ToolRowPayload, UserMeta};
 
@@ -207,12 +207,29 @@ pub(super) fn cap_messages_tail(messages: &mut Vec<ChatMessage>, budget: usize) 
     }
 }
 
+/// 主动关怀·对话跟进(★主动关怀里程碑 切片2):受 `care.enabled` 收口的一段**克制倾向** ——
+/// 开着才进前缀(关掉整段不进,前缀随之变;设置很少动,可接受)。人格中立(§5):是"偶尔顺口
+/// 关心一句"的行为纪律、不是性格。分寸靠强约束 + eval 反例守(闲聊别硬塞)。**跨会话由头依赖记忆
+/// 是否记下**(§13;松动"宁缺毋滥"要另议)——本段先吃"已记住的事 + 当前会话里没了结的话头"。
+/// §6.6:不硬编助手名(全用第二人称"你")。
+const CARE_FOLLOWUP: &str = "\n\n## 主动关心(自然、克制)\n\
+你记得用户提过、还没了结的事 —— 想做 / 想买 / 想去的打算,或之前聊到、牵挂的近况。\
+话题自然又相关时,你可以顺口轻轻关心一句进展;但这是锦上添花、不是任务:\
+绝不每轮都提、绝不追着问、绝不硬把话题拐过去,用户没接住就自然放下、别重复。\
+没有真正相关又值得一提的,就正常聊、什么都不提。";
+
+/// 进前缀的"未了的事"条数上限(★主动关怀 切片2·B):有限量、不让待办把前缀撑大(§4.8)。
+/// 起步值,真用可调(§13.7)。
+pub(super) const TODO_PREFIX_LIMIT: usize = 5;
+
 pub(super) fn build_context(
     scene: &Scene,
     user_name: Option<&str>,
     user_style: Option<&str>,
+    care_enabled: bool,
     memories: &[Memory],
     briefings: &[Briefing],
+    todos: &[Todo],
     history: &[Message],
     history_base: usize,
     budget: usize,
@@ -229,6 +246,10 @@ pub(super) fn build_context(
     system.push_str(&scene.persona.replace("{name}", name));
     system.push_str("\n\n");
     system.push_str(LAWS);
+    // 主动关怀·对话跟进(切片2):受 care.enabled 收口的克制倾向;关掉即整段不进前缀(前缀随设置变)。
+    if care_enabled {
+        system.push_str(CARE_FOLLOWUP);
+    }
     // 用户的一句话性格设定:叠加在中性底座之上的性格/口吻层(底座不预设性格 → 加性、非覆盖;
     // 它是这家人给 7274 挑的性格)。仍放在出厂人设之后:稳定层排序 + 与底座format(简短等)相左时按它来。
     if let Some(style) = user_style.map(str::trim).filter(|s| !s.is_empty()) {
@@ -249,6 +270,18 @@ pub(super) fn build_context(
         system.push_str("\n\n## 任务需知(环境与资源)\n");
         for b in briefings {
             system.push_str(&format!("- [{}] {}\n", b.domain, b.content));
+        }
+    }
+    // 未了的事(★主动关怀 切片2·B):开着关怀 + 有开着的待办才进(list_open 已限量);办完让模型用
+    // finish_todo 了结(§3.5 不静默,了结后不再露面)。跟进的**分寸**在 CARE_FOLLOWUP,这里只摆数据。
+    if care_enabled && !todos.is_empty() {
+        system.push_str(
+            "\n\n## 你还惦记着帮 TA 留意的事(合适时顺口关心进展;TA 说做完 / 不做了就用 finish_todo 了结)\n",
+        );
+        for t in todos {
+            system.push_str("- ");
+            system.push_str(&t.content);
+            system.push('\n');
         }
     }
 
@@ -384,8 +417,10 @@ mod tests {
             scene,
             name,
             style,
+            false, // care 跟进倾向:结构测试默认不带(on/off 由 care_followup_gated_by_flag 专项覆盖)
             mems,
             briefs,
+            &[], // todos:结构测试默认不带(open_todos 段由专项测试覆盖)
             history,
             0,
             MAX_TAIL_BUDGET_CHARS,
@@ -416,6 +451,40 @@ mod tests {
         let none = bc(scene, None, None, &[], &[], &[], &[]);
         assert!(!none.system.contains("## 任务需知"));
         assert_eq!(none.system, bc(scene, None, None, &[], &[], &[], &[]).system);
+    }
+
+    #[test]
+    fn care_followup_gated_by_flag() {
+        let scenes = Scenes::builtin();
+        let scene = scenes.default_scene();
+        // care 开 → 克制跟进倾向进前缀
+        let on = build_context(
+            scene, None, None, true, &[], &[], &[], &[], 0, MAX_TAIL_BUDGET_CHARS, &[],
+            &HashMap::new(),
+        );
+        assert!(on.system.contains("## 主动关心"), "care 开 → 跟进倾向进前缀");
+        // care 关 → 整段不进(bc 默认 false)
+        let off = bc(scene, None, None, &[], &[], &[], &[]);
+        assert!(!off.system.contains("## 主动关心"), "care 关 → 不进前缀");
+    }
+
+    #[test]
+    fn open_todos_shown_only_when_care_on() {
+        let scenes = Scenes::builtin();
+        let scene = scenes.default_scene();
+        let todos = vec![Todo { id: 1, content: "给妈妈买生日礼物".into(), created_at: 0 }];
+        // care 开 + 有待办 → 段进前缀、内容在
+        let on = build_context(
+            scene, None, None, true, &[], &[], &todos, &[], 0, MAX_TAIL_BUDGET_CHARS, &[],
+            &HashMap::new(),
+        );
+        assert!(on.system.contains("还惦记着") && on.system.contains("给妈妈买生日礼物"));
+        // care 关 → 不进(哪怕有待办)
+        let off = build_context(
+            scene, None, None, false, &[], &[], &todos, &[], 0, MAX_TAIL_BUDGET_CHARS, &[],
+            &HashMap::new(),
+        );
+        assert!(!off.system.contains("还惦记着"));
     }
 
     #[test]
@@ -680,6 +749,8 @@ mod tests {
             scene,
             None,
             None,
+            false,
+            &[],
             &[],
             &[],
             &history,

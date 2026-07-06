@@ -26,6 +26,26 @@ pub fn suite() -> Vec<Scenario> {
             .check(tool_called("remember"))
             .check(memory_written(None, "花生"))
             .check(memory_written(Some("identity"), "花生")),
+        // 说话人归属遵循度(§一家人法条 + 说话人显性化 watch-item):家人说的「我…」偏好该记到
+        // TA 名下、不记到主人头上(声纹 / 渠道归人共用 speaker_user;say_as 模拟入站带标记)。
+        // 真模型才验得出「〔某某说〕→ 我=TA」这条法条听不听话。
+        Scenario::turn("speaker-attribution-family")
+            .note("家人说的偏好归 TA、不归主人(§一家人法条遵循度)")
+            .seed(|s, _u| {
+                let _ = s.users.create("小明");
+            })
+            .say_as("小明", "记一下,我不吃香菜")
+            .check(tool_called("remember"))
+            .check(memory_written(None, "香菜"))
+            .check(custom("香菜归小明、不归主人", |o| {
+                // 全家记忆里:有一条「香菜」归非主人(小明)、且没有「香菜」错记到主人名下。
+                let has = |is_owner: bool| {
+                    o.all_memories
+                        .iter()
+                        .any(|m| m.content.contains("香菜") && (m.user_id == o.owner_id) == is_owner)
+                };
+                has(false) && !has(true)
+            })),
         // 一次性琐事不该记(§13.3 三道筛子:以后用不上的不写)。
         Scenario::turn("no-capture-oneoff")
             .note("一次性琐事不该 remember(§13.3 三道筛子)")

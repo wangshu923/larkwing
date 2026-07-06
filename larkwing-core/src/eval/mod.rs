@@ -16,11 +16,11 @@ pub mod scenarios;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::engine::{AssistantPayload, Engine, ToolRowPayload, TraceStep, TurnEvent};
+use crate::engine::{AssistantPayload, Engine, ToolRowPayload, TraceStep, TurnEvent, UserMeta};
 use crate::llm::registry::ProviderSpec;
 use crate::llm::LlmProvider;
 use crate::scenes::Scenes;
-use crate::store::Store;
+use crate::store::{Memory, Store};
 
 pub use grader::{
     briefing_written, custom, distilled_at_least, distilled_contains, distilled_empty,
@@ -30,7 +30,7 @@ pub use grader::{
 
 /// 驱动方式:一串用户消息(各排到回合收尾)/ 预置一段历史后调 consolidate。
 enum Drive {
-    Turn(Vec<String>),
+    Turn(Vec<(String, Option<String>)>),
     Consolidate(Vec<(String, String)>),
 }
 
@@ -84,7 +84,16 @@ impl Scenario {
     /// 追加一条用户消息(turn 场景)。
     pub fn say(mut self, text: &str) -> Self {
         if let Drive::Turn(v) = &mut self.drive {
-            v.push(text.into());
+            v.push((text.into(), None));
+        }
+        self
+    }
+
+    /// 追加一条「某位家人说的」用户消息(turn 场景):`speaker` = 家人显示名(seed 里 `users.create` 的),
+    /// 驱动时按名查 id 填进 `UserMeta.speaker_user`,模拟声纹 / 渠道归人入站 —— 测说话人归属遵循度。
+    pub fn say_as(mut self, speaker: &str, text: &str) -> Self {
+        if let Drive::Turn(v) = &mut self.drive {
+            v.push((text.into(), Some(speaker.into())));
         }
         self
     }
@@ -241,8 +250,19 @@ fn trunc(s: &str, n: usize) -> String {
 }
 
 /// 驱动一条用户消息到回合收尾,返回结局(把 Delta/ToolUse/Usage 都喝掉,只认终态)。
-async fn drive_turn(engine: &Engine, conv_id: i64, text: &str) -> Outcome {
-    let mut rx = match engine.send_message(conv_id, text.to_string(), None, Vec::new()).await {
+async fn drive_turn(
+    engine: &Engine,
+    store: &Store,
+    conv_id: i64,
+    text: &str,
+    speaker: Option<&str>,
+) -> Outcome {
+    // 「某位家人说的」→ 按显示名查 id 填 speaker_user(模拟声纹 / 渠道归人入站);无 = 主人本人打字。
+    let meta = speaker.and_then(|name| {
+        let id = store.users.list().ok()?.into_iter().find(|u| u.name == name)?.id;
+        Some(UserMeta { speaker_user: Some(id), ..Default::default() })
+    });
+    let mut rx = match engine.send_message(conv_id, text.to_string(), meta, Vec::new()).await {
         Ok(rx) => rx,
         Err(e) => return Outcome::Error(format!("{:?}: {}", e.kind, e.message)),
     };
@@ -301,8 +321,17 @@ where
         }
 
         // 驱动前快照:之后只看「本次新写入」的记忆 / 需知,与 seed 隔离。
-        let pre_mem: HashSet<i64> =
-            store.memory.list(user.id).unwrap_or_default().iter().map(|m| m.id).collect();
+        // 全家记忆(多说话人场景:小明说的记到小明名下,observed 要看得到 → 遍历所有用户;
+        // 单主人场景 = 只主人,与原来等价)。
+        let read_all_mem = |st: &Store| -> Vec<Memory> {
+            st.users
+                .list()
+                .unwrap_or_default()
+                .iter()
+                .flat_map(|u| st.memory.list(u.id).unwrap_or_default())
+                .collect()
+        };
+        let pre_mem: HashSet<i64> = read_all_mem(&store).iter().map(|m| m.id).collect();
         let pre_brief: HashSet<i64> =
             store.briefings.list_for(user.id).unwrap_or_default().iter().map(|b| b.id).collect();
 
@@ -310,8 +339,8 @@ where
         let outcome = match &sc.drive {
             Drive::Turn(says) => {
                 let mut last = Outcome::Done;
-                for s in says {
-                    last = drive_turn(&engine, conv.id, s).await;
+                for (text, spk) in says {
+                    last = drive_turn(&engine, &store, conv.id, text, spk.as_deref()).await;
                 }
                 last
             }
@@ -332,7 +361,7 @@ where
         let trace = collect_trace(&store, conv.id);
         // 全量快照 + 由它派生「本次新写入」差集。supersede / maintain 删+重插会复用 rowid,差集会漏看
         // (correction-supersedes 0/5 假阴);删除 / 替换侧的断言走 all_memories(memory_with_source 等)。
-        let all_memories = store.memory.list(user.id).unwrap_or_default();
+        let all_memories = read_all_mem(&store);
         let memories: Vec<_> =
             all_memories.iter().filter(|m| !pre_mem.contains(&m.id)).cloned().collect();
         let briefings: Vec<_> = store
@@ -349,7 +378,7 @@ where
         }
 
         let observed =
-            Observed { trace, memories, all_memories, briefings, distilled, outcome: outcome.clone() };
+            Observed { owner_id: user.id, trace, memories, all_memories, briefings, distilled, outcome: outcome.clone() };
 
         let mut all_ok = matches!(outcome, Outcome::Done);
         if !all_ok {

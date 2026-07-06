@@ -12,6 +12,7 @@ pub mod jobs;
 pub mod media_progress;
 pub mod memory;
 pub mod settings;
+pub mod todos;
 pub mod usage;
 pub mod users;
 pub mod voiceprints;
@@ -33,6 +34,7 @@ pub use jobs::{Job, JobRepo};
 pub use media_progress::{MediaProgressRepo, Progress};
 pub use memory::{MaintenanceLog, Memory, MemoryRepo};
 pub use settings::SettingsRepo;
+pub use todos::{Todo, TodoRepo};
 pub use usage::{UsageRepo, UsageRound, UsageTotals};
 pub use users::{User, UserRepo};
 pub use voiceprints::VoiceprintRepo;
@@ -52,6 +54,7 @@ pub struct Store {
     pub fsops: FsOpRepo,
     pub voiceprints: VoiceprintRepo,
     pub media_progress: MediaProgressRepo,
+    pub todos: TodoRepo,
 }
 
 impl Store {
@@ -70,6 +73,7 @@ impl Store {
             fsops::MIGRATIONS,
             voiceprints::MIGRATIONS,
             media_progress::MIGRATIONS,
+            todos::MIGRATIONS,
         ]
         .concat();
         db.migrate(&all)?;
@@ -85,7 +89,8 @@ impl Store {
             jobs: JobRepo::new(db.clone()),
             fsops: FsOpRepo::new(db.clone()),
             voiceprints: VoiceprintRepo::new(db.clone()),
-            media_progress: MediaProgressRepo::new(db),
+            media_progress: MediaProgressRepo::new(db.clone()),
+            todos: TodoRepo::new(db),
         })
     }
 }

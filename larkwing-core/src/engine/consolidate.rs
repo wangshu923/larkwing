@@ -184,6 +184,10 @@ pub(crate) async fn run(
             tracing::debug!(target: "larkwing::memory", user = user_id, ?rep, "记忆维护轮");
         }
     }
+    // 未了的事·过期自清(★主动关怀 切片2·B):搭同一后台维护轮;open 且太久没动的静默了结,免无限
+    // 累积(进前缀本就 list_open 限量,这里管 DB 长期清爽)。起步 30 天,真用可调(§13.7);尽力件。
+    const TODO_STALE_MS: i64 = 30 * 86_400_000;
+    let _ = store.todos.expire_stale(user_id, crate::store::now_ms(), TODO_STALE_MS);
     Ok(added)
 }
 

@@ -11,6 +11,8 @@ use crate::store::memory::Memory;
 
 /// 一次驱动(turn 串 / consolidate)跑完后能观察到的一切。
 pub struct Observed {
+    /// 会话归属者(主人)的 user id —— 判「记忆归到谁名下」用(多说话人:小明说的该记小明、非主人)。
+    pub owner_id: i64,
     /// 本次运行所有回合的工具步(扁平化;`TraceStep` 含 name/args/result/status)。
     pub trace: Vec<TraceStep>,
     /// 本次驱动**新写入**的记忆(按 id 差集剔除 seed 预置的,只看这一跑新增的)。
@@ -203,7 +205,7 @@ mod tests {
 
     fn obs(trace: Vec<TraceStep>, memories: Vec<Memory>, distilled: usize) -> Observed {
         let all_memories = memories.clone();
-        Observed { trace, memories, all_memories, briefings: vec![], distilled, outcome: Outcome::Done }
+        Observed { owner_id: 1, trace, memories, all_memories, briefings: vec![], distilled, outcome: Outcome::Done }
     }
 
     #[test]
@@ -259,6 +261,7 @@ mod tests {
         // 被 id 差集漏掉 → memories(差集)为空,但 all_memories(全量)有这条 source=correction。
         let correction = Memory { source: "correction".into(), ..mem("fact", "用户改喝拿铁了") };
         let o = Observed {
+            owner_id: 1,
             trace: vec![],
             memories: vec![], // 差集为空 —— 正是 rowid 复用导致的漏检
             all_memories: vec![correction],

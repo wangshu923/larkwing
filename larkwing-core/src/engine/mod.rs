@@ -1937,12 +1937,21 @@ impl Engine {
             } else {
                 Default::default()
             };
+            let care_enabled = store.settings.get(None, "care.enabled")?.as_deref() != Some("0");
+            // 未了的事(★主动关怀 切片2·B):开着关怀才取(归说话人 mem_user;限量进前缀)
+            let care_todos = if care_enabled {
+                store.todos.list_open(mem_user, context::TODO_PREFIX_LIMIT)?
+            } else {
+                Vec::new()
+            };
             let mut request = context::build_context(
                 &scene,
                 pet_name.as_deref(),
                 Some(&style),
+                care_enabled,
                 &memories,
                 &briefings,
+                &care_todos,
                 &history,
                 page_base,
                 budget,
@@ -2189,13 +2198,23 @@ impl Engine {
                     .get(Some(user_id), "persona.style")?
                     .unwrap_or_else(|| context::DEFAULT_PERSONA_STYLE.into());
                 let pet_name = store.settings.get(Some(user_id), "ui.pet_name")?;
+                let care_enabled =
+                    store.settings.get(None, "care.enabled")?.as_deref() != Some("0");
+                // 未了的事(★主动关怀 切片2·B):开着关怀才取(归 user_id;限量进前缀)
+                let care_todos = if care_enabled {
+                    store.todos.list_open(user_id, context::TODO_PREFIX_LIMIT)?
+                } else {
+                    Vec::new()
+                };
                 // 历史 = 空(新鲜上下文);注入消息与回放翻译同一字节形
                 let mut request = context::build_context(
                     &scene,
                     pet_name.as_deref(),
                     Some(&style),
+                    care_enabled,
                     &memories,
                     &briefings,
+                    &care_todos,
                     &[],
                     0,
                     budget,

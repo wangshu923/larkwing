@@ -160,7 +160,8 @@ mod tests {
              "fs_list", "fs_find",
              "fs_read_text", "fs_move", "fs_copy", "fs_mkdir", "fs_trash", "fs_write_text",
              "fs_append", "fs_edit", "fs_undo",
-             "reminder_set", "reminder_list", "reminder_cancel", "watch_set", "web_search", "web_fetch"]
+             "reminder_set", "reminder_list", "reminder_cancel", "watch_set", "web_search", "web_fetch",
+             "note_todo", "finish_todo"]
         );
         assert!(!s.few_shots.is_empty(), "companion 必须带 few-shot 示范");
         // 反例纪律:至少一段"不调工具直接聊"的示范

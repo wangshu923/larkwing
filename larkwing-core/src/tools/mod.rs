@@ -13,6 +13,7 @@ mod now;
 mod recall;
 mod remember;
 mod reminder;
+mod todo;
 mod watch;
 mod weather;
 mod web;
@@ -115,6 +116,8 @@ impl Tools {
         tools.register(Arc::new(now::Now::new()));
         tools.register(Arc::new(remember::Remember::new()));
         tools.register(Arc::new(recall::Recall::new()));
+        tools.register(Arc::new(todo::NoteTodo::new()));
+        tools.register(Arc::new(todo::FinishTodo::new()));
         tools.register(Arc::new(briefing::BriefingWrite::new()));
         tools.register(Arc::new(briefing::BriefingLookup::new()));
         tools.register(Arc::new(briefing::BriefingRemove::new()));

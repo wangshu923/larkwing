@@ -43,6 +43,8 @@ export default {
     watch_set: '盯上天气…',
     web_search: '上网查查…',
     web_fetch: '细读网页中…',
+    note_todo: '记下这件事…',
+    finish_todo: '划掉一件心事…',
     unknown: '鼓捣小玩意儿…',
   },
   // 任务 HUD:key 与 core 的 Text.key 一一对应(bus.rs);params 命名插值
