@@ -133,6 +133,19 @@ pub enum VoiceEvent {
     SpeechStarted,
     /// 喊名命中(C 期):前端开全区间 duck(到回待唤醒才恢复)。
     WakeTriggered,
+    /// KWS 报了候选、确认层在核(命中→静默续录到断句→ASR 三段式,§8.2 精度方向):
+    /// 前端提前 duck + 轻视觉「在听」;**不出声**(出声等确认——误唤醒最烦的是突然出声)。
+    WakeCandidate,
+    /// 确认层拒绝(转写里没有唤醒词 = KWS 幻听):前端恢复 duck、视觉回 idle。零打扰。
+    WakeRejected,
+    /// 呼名+续句(「天天,暂停」/「看天天向上」):整句交模型仲裁是不是在叫它
+    /// (前端调 send_overheard 起临时回合)。text = 含前文的整句转写;
+    /// speaker_id = 声纹认出的家人,None = 没认出/没开声纹。
+    Overheard {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        speaker_id: Option<i64>,
+    },
     /// 识别定稿:前端拿文本走既有 send 链。via: mic(听写,屏幕排版)| wake(语音会话,必念)。
     /// speaker_id = 声纹识别出的家人(PLAN §11 D),None = 没认出/没开声纹 → 走会话用户。
     Transcribed {

@@ -50,6 +50,11 @@ pub enum TurnEvent {
     Done { message_id: i64 },
     Failed { kind: ErrorKind, message: String },
     Cancelled,
+    /// 旁听临时回合(send_overheard):模型判「不是叫我」→ 整轮蒸发,什么都没落库
+    /// (仅 tracing + usage 流水)。engine 内消费/测试用;前端无 Channel,收不到。
+    Dismissed,
+    /// 旁听转正:悬置的 user 行已落库(模型开口/干活了),此后事件与普通回合无异。
+    Committed { message_id: i64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1807,6 +1812,144 @@ impl Engine {
         }
     }
 
+    /// 旁听仲裁回合(唤醒确认层「呼名+续句」三段式,§8.2 精度方向):名字被喊到但不一定
+    /// 是叫它(「天天,暂停」vs「看天天向上」),整句交模型判。**临时回合**:用户行悬置不落库
+    /// —— 模型只回 __IGNORE__ = 整轮蒸发(零 UI/历史/记忆痕迹,只留 tracing + usage 流水);
+    /// 开口/调工具 = 连用户行一起转正落库。无前端 Channel(wake_turn 同款引擎内消费),
+    /// 终态经全局车道:kind="overheard"(转正 → 前端刷新+念)/ "overheard_dismissed"
+    /// (蒸发 → 前端只恢复 duck)。与在飞回合冲突 → 直接放弃(真输入优先,旁听是机会性的)。
+    pub async fn send_overheard(
+        &self,
+        conv_id: i64,
+        text: String,
+        speaker: Option<i64>,
+    ) -> Result<(), AppError> {
+        // 任何早退都发 dismissed 信号:前端 duck 等着它恢复(§3.5 不静默吊着)
+        let dismissed = |bus: &crate::bus::Bus| {
+            bus.publish(crate::bus::AppEvent::Conversation(crate::bus::ConversationActivity {
+                conv_id,
+                kind: "overheard_dismissed".into(),
+                outcome: crate::bus::TurnOutcome::Done,
+            }));
+        };
+        let candidates = self.llm.read().expect("llm lock poisoned").clone();
+        if candidates.is_empty() {
+            tracing::info!(conv = conv_id, "旁听仲裁:没有可用大脑,放弃");
+            dismissed(&self.bus);
+            return Ok(());
+        }
+        // 忙检(wake_turn 同款 is_finished):在飞就放弃 —— 别为仲裁打断真对话
+        {
+            let sessions = self.sessions.lock().expect("sessions lock poisoned");
+            let busy = sessions
+                .get(&conv_id)
+                .and_then(|s| s.inflight.as_ref())
+                .is_some_and(|h| !h.join.is_finished());
+            if busy {
+                tracing::info!(conv = conv_id, "旁听仲裁:会话有在飞回合,放弃");
+                dismissed(&self.bus);
+                return Ok(());
+            }
+        }
+        let Some(conversation) = self.store.chat.get_conversation(conv_id)? else {
+            dismissed(&self.bus);
+            return Ok(());
+        };
+        let scene = self
+            .scenes
+            .get(&conversation.scene_id)
+            .unwrap_or_else(|| self.scenes.default_scene())
+            .clone();
+        let tool_subset = self.tools.subset(&scene.tools);
+        let tool_defs: Vec<ToolDef> = tool_subset.iter().map(|t| t.spec().def()).collect();
+        let budget = tail_budget(&candidates);
+
+        let store = self.store.clone();
+        let conv_user = conversation.user_id;
+        let text_for_ctx = text.clone();
+        let (mut request, mem_user, payload) = tokio::task::spawn_blocking(
+            move || -> anyhow::Result<(crate::llm::ChatRequest, i64, Option<String>)> {
+                let mem_user = resolve_mem_user(&store, conv_user, speaker)?;
+                // 旁听形态物化成 payload(转正落库用同一份;〔旁听〕〔语音〕标记由它驱动)。
+                // speak=true:屋里有人开口 = 语音交互,回应要念(§3.4)。
+                let meta = UserMeta {
+                    input: "overheard".into(),
+                    speak: true,
+                    speaker_user: speaker,
+                    ..Default::default()
+                };
+                let payload = serde_json::to_string(&meta).ok();
+                let total = store.chat.count_messages(conv_id)? as usize;
+                let page_base = total.saturating_sub(context::HISTORY_PAGE_MAX);
+                let mut history = store.chat.messages_page(
+                    conv_id,
+                    page_base as i64,
+                    (total - page_base) as i64,
+                )?;
+                // 虚拟 user 行(**不落库**):与真实行走同一条装配路 → 标记/说话人渲染字节一致;
+                // id=0 只当窗口锚点用。转正时 turn.rs 才把同内容+同 payload 真正写库。
+                history.push(crate::store::Message {
+                    id: 0,
+                    conversation_id: conv_id,
+                    role: "user".into(),
+                    content: text_for_ctx,
+                    created_at: crate::store::now_ms(),
+                    payload: payload.clone(),
+                    speaker_name: None,
+                    trigger: None,
+                });
+                let request = assemble_request(
+                    &store, &scene, conv_id, conv_user, mem_user, &history, page_base, budget,
+                    &tool_defs,
+                )?;
+                Ok((request, mem_user, payload))
+            },
+        )
+        .await
+        .map_err(AppError::internal)??;
+
+        // 「此刻」背景照带:仲裁「天天暂停」正需要知道在播什么(不落库、不破缓存)
+        self.inject_ambient(&mut request);
+
+        let pending = turn::PendingUser { content: text, payload };
+        let mut rx = match self
+            .launch(conv_id, mem_user, candidates, request, tool_subset, 0, Some(pending))
+            .await
+        {
+            Ok(rx) => rx,
+            Err(e) => {
+                tracing::info!(conv = conv_id, err = %e.message, "旁听仲裁建连失败,放弃");
+                dismissed(&self.bus);
+                return Ok(());
+            }
+        };
+        // 引擎内消费(wake_turn 同款):转正才喊「会话有动静」;蒸发只发 duck 恢复信号
+        let bus = self.bus.clone();
+        tokio::spawn(async move {
+            let mut committed = false;
+            let mut outcome = crate::bus::TurnOutcome::Done;
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    TurnEvent::Committed { .. } => committed = true,
+                    TurnEvent::Failed { .. } => outcome = crate::bus::TurnOutcome::Failed,
+                    _ => {}
+                }
+            }
+            let (kind, outcome) = if committed {
+                ("overheard", outcome)
+            } else {
+                // 未转正的失败/取消/蒸发对用户全无可见变化 → 统一走 dismissed 信号
+                ("overheard_dismissed", crate::bus::TurnOutcome::Done)
+            };
+            bus.publish(crate::bus::AppEvent::Conversation(crate::bus::ConversationActivity {
+                conv_id,
+                kind: kind.into(),
+                outcome,
+            }));
+        });
+        Ok(())
+    }
+
     /// 回合入口。同会话已有在飞 → 自动取消旧的再开新的(会话管控)。
     /// 前置错误走 Err(镜像 llm 两阶段);开流后走 TurnEvent。
     pub async fn send_message(
@@ -1876,42 +2019,11 @@ impl Engine {
                 .then(|| stored_content.chars().take(title::INPUT_MAX_CHARS).collect::<String>());
             // 记忆归人(§6):声纹识别出且确属真实用户 → 本回合用 TA;否则会话归属者
             // (访客/电视声识别不出 → fallback,绝不误记到家人名下,robot 同款立场)
-            let mem_user = match eff_meta.speaker_user {
-                Some(sid) if sid != conv_user && store.users.get(sid)?.is_some() => sid,
-                _ => conv_user,
-            };
+            let mem_user = resolve_mem_user(&store, conv_user, eff_meta.speaker_user)?;
             // touch **会话归属者**而非说话人:last_active_at 是「这台电脑前用 app 的人」的信号,
             // boot 的 ensure_default_user 按它恢复当前用户 —— 若 touch 说话人,家人在手机渠道
             // 说一句就会「最近活跃」,主人重启 app 竟被切成 TA 的视角(渠道归人启用后才暴露)。
             store.users.touch(conv_user)?;
-            // 记忆只取常驻·画像层进前缀(§13.3 ②;按需层靠 recall 工具取),写时已执法预算
-            // → 前缀有界、字节稳定,记得再多也不胀前缀(修掉「全量进前缀」雷,§13.1)
-            let memories = store.memory.list_resident(mem_user)?;
-            // 观测:这回合带进前缀的常驻记忆(测「用到了记忆吗」—— recall 不一定触发,
-            // 大多数记忆是从这里被动进上下文的;§4.4 进库前的轻量日志版)
-            tracing::info!(
-                target: "larkwing::memory",
-                conv = conv_id, resident = memories.len(),
-                "turn ctx → {}",
-                memories.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join(" | ")
-            );
-            // 任务需知:只有常驻条目进前缀(预算在写入时执法,这里无条件全装);
-            // 非常驻的归 briefing_lookup 工具按需取
-            let briefings: Vec<crate::store::Briefing> = store
-                .briefings
-                .list_for(mem_user)?
-                .into_iter()
-                .filter(|b| b.resident)
-                .collect();
-            // 性格设定用**会话归属者**(家给 7274 的人设,跟说话人无关 → 前缀字节稳定,
-            // 一家人轮流说话不会让缓存失效);没设过=出厂默认句,空串=纯出厂人设
-            let style = store
-                .settings
-                .get(Some(conv_user), "persona.style")?
-                .unwrap_or_else(|| context::DEFAULT_PERSONA_STYLE.into());
-            // 用户给助手起的名字(ui.pet_name):与性格设定同走会话归属者 → 前缀字节稳定;
-            // 没设过/空 = 出厂名,build_context 不注入
-            let pet_name = store.settings.get(Some(conv_user), "ui.pet_name")?;
             let total = store.chat.count_messages(conv_id)? as usize;
             // I/O 上界分页:最多取 HISTORY_PAGE_MAX 条,真窗口由 build_context 内字数预算裁;
             // page_base = 该页首条的绝对下标,喂 windowed_start 做整块锚定(缓存稳定)。
@@ -1921,43 +2033,12 @@ impl Engine {
                 page_base as i64,
                 (total - page_base) as i64,
             )?;
-            // 说话人标记原料(渠道归人/声纹,§6 记忆归人的可见面):历史里出现过 speaker
-            // 才查家人表(id→名,排除会话归属者:主人自己不标);常态会话 = 空 map 零查询。
-            let speakers: std::collections::HashMap<i64, String> = if history
-                .iter()
-                .any(|m| m.payload.as_deref().is_some_and(|p| p.contains("speaker_user")))
-            {
-                store
-                    .users
-                    .list()?
-                    .into_iter()
-                    .filter(|u| u.id != conv_user)
-                    .map(|u| (u.id, u.name))
-                    .collect()
-            } else {
-                Default::default()
-            };
-            let care_enabled = store.settings.get(None, "care.enabled")?.as_deref() != Some("0");
-            // 未了的事(★主动关怀 切片2·B):开着关怀才取(归说话人 mem_user;限量进前缀)
-            let care_todos = if care_enabled {
-                store.todos.list_open(mem_user, context::TODO_PREFIX_LIMIT)?
-            } else {
-                Vec::new()
-            };
-            let mut request = context::build_context(
-                &scene,
-                pet_name.as_deref(),
-                Some(&style),
-                care_enabled,
-                &memories,
-                &briefings,
-                &care_todos,
-                &history,
-                page_base,
-                budget,
+            // 原料读取 + 装配收口 assemble_request(与 send_overheard 共用 → 两个入口的
+            // 稳定前缀字节级相同,共享 provider 前缀缓存 §4.8)
+            let mut request = assemble_request(
+                &store, &scene, conv_id, conv_user, mem_user, &history, page_base, budget,
                 &tool_defs,
-                &speakers,
-            );
+            )?;
             // 当轮注入图片 parts:挂到最后一条 user 消息上,持久前缀(few-shot/历史)字节不动 →
             // 缓存不破,也不为历史里的旧图反复付 vision 费(图当轮;文档文字已并进落库内容)。
             if !image_parts.is_empty() {
@@ -1969,17 +2050,6 @@ impl Engine {
                 {
                     parts.extend(image_parts);
                 }
-            }
-            // 反应模式(最快/轻度/中度/重度):每回合取值,改完下一句话就生效,无需重建 provider
-            let thinking = match store.settings.get(None, "llm.thinking")?.as_deref() {
-                Some("off") => crate::llm::Thinking::Off,
-                Some("light") => crate::llm::Thinking::Light,
-                Some("heavy") => crate::llm::Thinking::Heavy,
-                // 缺省/"medium"/旧值"on"/未知 → 中度(默认反应模式)
-                _ => crate::llm::Thinking::Medium,
-            };
-            if thinking != crate::llm::Thinking::Off {
-                request.options.thinking = Some(thinking);
             }
             Ok((request, user_msg.id, mem_user, title_seed))
         })
@@ -2003,7 +2073,7 @@ impl Engine {
 
         // 4+5. 开流 + spawn 回合(与 wake_turn 共用尾段)。ToolCtx.user_id = mem_user:
         // remember 写到说话人(记忆归人);会话归属仍是 conv_user。
-        self.launch(conv_id, mem_user, candidates, request, tool_subset, user_msg_id).await
+        self.launch(conv_id, mem_user, candidates, request, tool_subset, user_msg_id, None).await
     }
 
     /// 插队(PLAN §9 B):把一条消息塞进**正在跑的回合**,它在下一次 LLM 调用就带上(不打断)。
@@ -2048,6 +2118,7 @@ impl Engine {
     /// 全军覆没报主选的错误(最有代表性)。开流之后的失败不切换 —— 半截话已经
     /// 流向用户,静默换供应商重说会精神分裂,走既有 Failed 友好兜底。
     /// 工具轮的 2+ 次开流粘住本次选中的 provider(Turn 持有它)。
+    #[allow(clippy::too_many_arguments)] // 私有装配尾段:每个参数都有单独语义,收拢成 struct 反而绕
     async fn launch(
         &self,
         conv_id: i64,
@@ -2056,6 +2127,7 @@ impl Engine {
         mut request: crate::llm::ChatRequest,
         tool_subset: Vec<Arc<dyn crate::tools::Tool>>,
         user_msg_id: i64,
+        overheard: Option<turn::PendingUser>,
     ) -> Result<mpsc::Receiver<TurnEvent>, AppError> {
         // 防溢出安全阀(model-aware):工具循环累积的 ToolResult / 背景状态在 build_context 之后
         // 才注入(绕过初始窗口),单条可达数万字 → 开流前对累积的 messages 再按预算封顶一道(§0.2.0)。
@@ -2090,6 +2162,7 @@ impl Engine {
         let model =
             request.options.model.clone().unwrap_or_else(|| provider.model_id().to_string());
         let inject = Arc::new(Mutex::new(InjectState::default())); // 插队队列:Turn 与 inject 命令共用
+        let is_overheard = overheard.is_some();
         let join = tokio::spawn(
             turn::Turn {
                 store: self.store.clone(),
@@ -2107,6 +2180,7 @@ impl Engine {
                 media: self.media.clone(),
                 rx: rx_llm,
                 inject: inject.clone(),
+                overheard,
             }
             .run(),
         );
@@ -2114,7 +2188,9 @@ impl Engine {
             let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
             let slot = sessions.entry(conv_id).or_default();
             slot.inflight = Some(TurnHandle { token, join });
-            slot.inject = Some(inject);
+            // 旁听仲裁不收插队:用户此刻打字 = inject 落空 → 前端走普通发送 →
+            // send_message 的 cancel 把未转正的仲裁整轮挤掉(真输入优先,零痕迹)。
+            slot.inject = if is_overheard { None } else { Some(inject) };
         }
         Ok(rx)
     }
@@ -2242,8 +2318,9 @@ impl Engine {
 
         // 自启回合也带「此刻」背景(任务到点时音乐可能正放着);不落库、不破缓存
         self.inject_ambient(&mut request);
-        let mut rx =
-            self.launch(conv_id, user_id, candidates, request, tool_subset, event_msg_id).await?;
+        let mut rx = self
+            .launch(conv_id, user_id, candidates, request, tool_subset, event_msg_id, None)
+            .await?;
 
         // 无人挂流:自己消费到收尾,记下终态,然后经全局事件车道喊一声
         // (UI 据此刷新列表;用户不在该会话时按 outcome 在列表项打标)
@@ -2280,6 +2357,101 @@ fn cheapest_candidate(
 /// 本回合的上下文尾部字数预算:按**主候选**(首位 = 主选,99% 会服务它)的上下文窗口算
 /// (model-aware:大窗口装文档、小窗口防溢出)。窗口未知 → 回落默认。极少数主选挂、回落到
 /// 更小模型且 request 偏大时,开流 400 走既有 Failed 兜底(不静默,§3.5),不为罕见复合失败牺牲常路。
+/// 记忆归人(§6):声纹/渠道识别出的说话人确属真实用户 → 本回合记忆/工具归 TA;
+/// 否则会话归属者(访客/电视声识别不出 → fallback,绝不误记到家人名下)。
+fn resolve_mem_user(store: &Store, conv_user: i64, speaker_user: Option<i64>) -> anyhow::Result<i64> {
+    Ok(match speaker_user {
+        Some(sid) if sid != conv_user && store.users.get(sid)?.is_some() => sid,
+        _ => conv_user,
+    })
+}
+
+/// 上下文原料装配(send_message / send_overheard 共用;阻塞,调用方包 spawn_blocking):
+/// 常驻记忆 / 需知 / 人设 / 名字 / 说话人表 / 关怀 → build_context → thinking 档。
+/// **纯读不写**(用户行落库 / touch / 定题种子归 send_message 自己)—— 原料清单只此一处,
+/// 两个入口的稳定前缀因此字节级相同、共享 provider 前缀缓存(§4.8)。
+/// history 由调用方备好:send_message = 落完用户行的整页;overheard = 整页 + 一条不落库的虚拟 user 行。
+#[allow(clippy::too_many_arguments)]
+fn assemble_request(
+    store: &Store,
+    scene: &crate::scenes::Scene,
+    conv_id: i64,
+    conv_user: i64,
+    mem_user: i64,
+    history: &[crate::store::Message],
+    page_base: usize,
+    budget: usize,
+    tool_defs: &[ToolDef],
+) -> anyhow::Result<crate::llm::ChatRequest> {
+    // 记忆只取常驻·画像层进前缀(§13.3 ②;按需层靠 recall 工具取),写时已执法预算
+    // → 前缀有界、字节稳定,记得再多也不胀前缀(修掉「全量进前缀」雷,§13.1)
+    let memories = store.memory.list_resident(mem_user)?;
+    // 观测:这回合带进前缀的常驻记忆(测「用到了记忆吗」—— recall 不一定触发,
+    // 大多数记忆是从这里被动进上下文的;§4.4 进库前的轻量日志版)
+    tracing::info!(
+        target: "larkwing::memory",
+        conv = conv_id, resident = memories.len(),
+        "turn ctx → {}",
+        memories.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join(" | ")
+    );
+    // 任务需知:只有常驻条目进前缀(预算在写入时执法,这里无条件全装);
+    // 非常驻的归 briefing_lookup 工具按需取
+    let briefings: Vec<crate::store::Briefing> =
+        store.briefings.list_for(mem_user)?.into_iter().filter(|b| b.resident).collect();
+    // 性格设定用**会话归属者**(家给 7274 的人设,跟说话人无关 → 前缀字节稳定,
+    // 一家人轮流说话不会让缓存失效);没设过=出厂默认句,空串=纯出厂人设
+    let style = store
+        .settings
+        .get(Some(conv_user), "persona.style")?
+        .unwrap_or_else(|| context::DEFAULT_PERSONA_STYLE.into());
+    // 用户给助手起的名字(ui.pet_name):与性格设定同走会话归属者 → 前缀字节稳定;
+    // 没设过/空 = 出厂名,build_context 不注入
+    let pet_name = store.settings.get(Some(conv_user), "ui.pet_name")?;
+    // 说话人标记原料(渠道归人/声纹,§6 记忆归人的可见面):历史里出现过 speaker
+    // 才查家人表(id→名,排除会话归属者:主人自己不标);常态会话 = 空 map 零查询。
+    let speakers: std::collections::HashMap<i64, String> = if history
+        .iter()
+        .any(|m| m.payload.as_deref().is_some_and(|p| p.contains("speaker_user")))
+    {
+        store.users.list()?.into_iter().filter(|u| u.id != conv_user).map(|u| (u.id, u.name)).collect()
+    } else {
+        Default::default()
+    };
+    let care_enabled = store.settings.get(None, "care.enabled")?.as_deref() != Some("0");
+    // 未了的事(★主动关怀 切片2·B):开着关怀才取(归说话人 mem_user;限量进前缀)
+    let care_todos = if care_enabled {
+        store.todos.list_open(mem_user, context::TODO_PREFIX_LIMIT)?
+    } else {
+        Vec::new()
+    };
+    let mut request = context::build_context(
+        scene,
+        pet_name.as_deref(),
+        Some(&style),
+        care_enabled,
+        &memories,
+        &briefings,
+        &care_todos,
+        history,
+        page_base,
+        budget,
+        tool_defs,
+        &speakers,
+    );
+    // 反应模式(最快/轻度/中度/重度):每回合取值,改完下一句话就生效,无需重建 provider
+    let thinking = match store.settings.get(None, "llm.thinking")?.as_deref() {
+        Some("off") => crate::llm::Thinking::Off,
+        Some("light") => crate::llm::Thinking::Light,
+        Some("heavy") => crate::llm::Thinking::Heavy,
+        // 缺省/"medium"/旧值"on"/未知 → 中度(默认反应模式)
+        _ => crate::llm::Thinking::Medium,
+    };
+    if thinking != crate::llm::Thinking::Off {
+        request.options.thinking = Some(thinking);
+    }
+    Ok(request)
+}
+
 fn tail_budget(candidates: &[(String, Arc<dyn LlmProvider>)]) -> usize {
     match candidates.first() {
         Some((_, p)) => {

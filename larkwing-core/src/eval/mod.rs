@@ -30,7 +30,8 @@ pub use grader::{
 
 /// 驱动方式:一串用户消息(各排到回合收尾)/ 预置一段历史后调 consolidate。
 enum Drive {
-    Turn(Vec<(String, Option<String>)>),
+    /// (text, 说话人显示名, 旁听形态)—— 旁听 = payload input=overheard+speak,装配〔旁听〕标记。
+    Turn(Vec<(String, Option<String>, bool)>),
     Consolidate(Vec<(String, String)>),
 }
 
@@ -84,7 +85,7 @@ impl Scenario {
     /// 追加一条用户消息(turn 场景)。
     pub fn say(mut self, text: &str) -> Self {
         if let Drive::Turn(v) = &mut self.drive {
-            v.push((text.into(), None));
+            v.push((text.into(), None, false));
         }
         self
     }
@@ -93,7 +94,18 @@ impl Scenario {
     /// 驱动时按名查 id 填进 `UserMeta.speaker_user`,模拟声纹 / 渠道归人入站 —— 测说话人归属遵循度。
     pub fn say_as(mut self, speaker: &str, text: &str) -> Self {
         if let Drive::Turn(v) = &mut self.drive {
-            v.push((text.into(), Some(speaker.into())));
+            v.push((text.into(), Some(speaker.into()), false));
+        }
+        self
+    }
+
+    /// 追加一条「旁听」消息(唤醒确认层「呼名+续句」形态,payload input=overheard+speak):
+    /// 装配出〔旁听〕〔语音〕标记,测模型的仲裁遵循度 —— 不是叫它就该只回 __IGNORE__,
+    /// 是叫它就该正常办事(LAWS「旁听」节,2026-07-06)。走 send_message(评的是模型判断,
+    /// 不是引擎的悬置/蒸发机制 —— 那有集成测试守)。
+    pub fn say_overheard(mut self, text: &str) -> Self {
+        if let Drive::Turn(v) = &mut self.drive {
+            v.push((text.into(), None, true));
         }
         self
     }
@@ -256,12 +268,19 @@ async fn drive_turn(
     conv_id: i64,
     text: &str,
     speaker: Option<&str>,
+    overheard: bool,
 ) -> Outcome {
     // 「某位家人说的」→ 按显示名查 id 填 speaker_user(模拟声纹 / 渠道归人入站);无 = 主人本人打字。
-    let meta = speaker.and_then(|name| {
+    let mut meta = speaker.and_then(|name| {
         let id = store.users.list().ok()?.into_iter().find(|u| u.name == name)?.id;
         Some(UserMeta { speaker_user: Some(id), ..Default::default() })
     });
+    // 旁听形态(唤醒确认层「呼名+续句」):input=overheard + speak → 装配〔旁听〕〔语音〕标记
+    if overheard {
+        let m = meta.get_or_insert_with(Default::default);
+        m.input = "overheard".into();
+        m.speak = true;
+    }
     let mut rx = match engine.send_message(conv_id, text.to_string(), meta, Vec::new()).await {
         Ok(rx) => rx,
         Err(e) => return Outcome::Error(format!("{:?}: {}", e.kind, e.message)),
@@ -339,8 +358,10 @@ where
         let outcome = match &sc.drive {
             Drive::Turn(says) => {
                 let mut last = Outcome::Done;
-                for (text, spk) in says {
-                    last = drive_turn(&engine, &store, conv.id, text, spk.as_deref()).await;
+                for (text, spk, overheard) in says {
+                    last =
+                        drive_turn(&engine, &store, conv.id, text, spk.as_deref(), *overheard)
+                            .await;
                 }
                 last
             }
@@ -377,8 +398,26 @@ where
             tokens.add_totals(&u);
         }
 
-        let observed =
-            Observed { owner_id: user.id, trace, memories, all_memories, briefings, distilled, outcome: outcome.clone() };
+        // 本次运行的 assistant 回复(按时间序):旁听仲裁类断言看末条(__IGNORE__ / 正经搭腔)
+        let replies: Vec<String> = store
+            .chat
+            .recent_messages(conv.id, 200)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| m.role == "assistant")
+            .map(|m| m.content)
+            .collect();
+
+        let observed = Observed {
+            owner_id: user.id,
+            trace,
+            memories,
+            all_memories,
+            briefings,
+            replies,
+            distilled,
+            outcome: outcome.clone(),
+        };
 
         let mut all_ok = matches!(outcome, Outcome::Done);
         if !all_ok {

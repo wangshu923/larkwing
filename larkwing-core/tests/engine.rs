@@ -516,3 +516,79 @@ async fn wake_turn_fires_after_completed_turn_in_same_conv() {
     let fired = engine.wake_turn(&job).await.unwrap();
     assert!(fired, "聊过的会话到点必须能触发:忙检要看 join 是否真在跑,不是句柄在不在");
 }
+
+// ---- 旁听临时回合(唤醒确认层「呼名+续句」仲裁;§8.2 精度方向,2026-07-06) ----
+
+/// 等旁听终态(全局车道 kind=overheard*);10s 兜底防挂死。
+async fn wait_overheard_kind(
+    bus: &mut tokio::sync::broadcast::Receiver<larkwing_core::bus::AppEvent>,
+) -> String {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Ok(larkwing_core::bus::AppEvent::Conversation(c)) = bus.recv().await {
+                if c.kind.starts_with("overheard") {
+                    return c.kind;
+                }
+            }
+        }
+    })
+    .await
+    .expect("10s 内必须收到旁听终态事件")
+}
+
+/// 蒸发:模型只回 __IGNORE__ → 悬置 user 行不落、无 assistant 行、零痕迹;
+/// 终态 kind="overheard_dismissed"(前端只恢复 duck,连列表都不刷)。
+#[tokio::test(flavor = "multi_thread")]
+async fn overheard_ignore_evaporates_without_trace() {
+    let (store, engine, conv_id) = setup("overheard-drop", 1);
+    engine.set_provider(Some(Arc::new(FakeLlm::scripted(vec![FakeTurn {
+        text: "__IGNORE__".into(),
+        tool_calls: vec![],
+        usage: Default::default(),
+    }]))));
+    let mut bus = engine.bus().subscribe();
+    engine.send_overheard(conv_id, "看天天向上真好看".into(), None).await.unwrap();
+    assert_eq!(wait_overheard_kind(&mut bus).await, "overheard_dismissed", "仲裁判「不是叫我」");
+    let msgs = store.chat.recent_messages(conv_id, 10).unwrap();
+    assert!(msgs.is_empty(), "蒸发 = 零落库,实际 {msgs:?}");
+}
+
+/// 转正:模型开口回应 → 悬置 user 行(带〔旁听〕payload)与回复一起落库,
+/// 终态 kind="overheard"(前端刷新 + 念出来)。
+#[tokio::test(flavor = "multi_thread")]
+async fn overheard_reply_commits_user_and_assistant() {
+    let (store, engine, conv_id) = setup("overheard-commit", 1);
+    engine.set_provider(Some(Arc::new(FakeLlm::scripted(vec![FakeTurn {
+        text: "好嘞,这就来".into(),
+        tool_calls: vec![],
+        usage: Default::default(),
+    }]))));
+    let mut bus = engine.bus().subscribe();
+    engine.send_overheard(conv_id, "天天放首歌".into(), None).await.unwrap();
+    assert_eq!(wait_overheard_kind(&mut bus).await, "overheard");
+    let msgs = store.chat.recent_messages(conv_id, 10).unwrap();
+    assert_eq!(msgs.len(), 2, "user + assistant 都转正落库,实际 {msgs:?}");
+    assert_eq!(msgs[0].role, "user");
+    assert_eq!(msgs[0].content, "天天放首歌");
+    let payload = msgs[0].payload.as_deref().unwrap_or("");
+    assert!(payload.contains("overheard"), "旁听形态物化进 payload: {payload}");
+    assert_eq!(msgs[1].role, "assistant");
+    assert_eq!(msgs[1].content, "好嘞,这就来");
+}
+
+/// 会话有在飞回合 → 仲裁直接放弃(真输入优先),发 dismissed 信号、不打扰在飞回合。
+#[tokio::test(flavor = "multi_thread")]
+async fn overheard_yields_to_inflight_turn() {
+    let (store, engine, conv_id) = setup("overheard-busy", 30);
+    let mut bus = engine.bus().subscribe();
+    // 起一个慢回合占住会话(30ms/字 × 回声句,足够旁听撞上)
+    let mut rx = engine.send_message(conv_id, "慢慢说一句".into(), None, vec![]).await.unwrap();
+    engine.send_overheard(conv_id, "天天在吗".into(), None).await.unwrap();
+    assert_eq!(wait_overheard_kind(&mut bus).await, "overheard_dismissed", "忙时放弃仲裁");
+    while rx.recv().await.is_some() {} // 在飞回合正常走完
+    let msgs = store.chat.recent_messages(conv_id, 10).unwrap();
+    assert!(
+        msgs.iter().all(|m| m.content != "天天在吗"),
+        "放弃的仲裁不落任何行: {msgs:?}"
+    );
+}

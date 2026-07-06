@@ -94,6 +94,18 @@ pub fn boot(state: State<'_, AppState>) -> Result<BootSnapshot, AppError> {
     state.engine.boot()
 }
 
+/// 旁听仲裁(唤醒确认层「呼名+续句」):整句交模型判是不是叫它。临时回合、无 Channel
+/// (engine 内消费);终态经全局车道 kind=overheard(转正)/ overheard_dismissed(蒸发)。
+#[tauri::command]
+pub async fn send_overheard(
+    state: State<'_, AppState>,
+    conv_id: i64,
+    text: String,
+    speaker: Option<i64>,
+) -> Result<(), AppError> {
+    state.engine.send_overheard(conv_id, text, speaker).await
+}
+
 /// 流式走 Tauri v2 Channel(按调用隔离,不用全局事件广播)。
 /// command 立即返回;TurnEvent 持续推送直到 Done/Failed/Cancelled。
 /// meta = 输入形态(语音会话模式,PLAN §11):省略 = 打字默认形。

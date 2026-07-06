@@ -44,6 +44,17 @@ function onVolume(e: Event) {
 const video = ref<HTMLVideoElement | null>(null)
 const show = computed(() => state.current?.kind === 'video')
 
+// 浮层出现 = 模态接管:把焦点从底下的元素(典型 = 聊天输入框)拿走,否则 onKey 的
+// 「输入框让位」会把快捷键全吞掉——打字"放个片"回车起播,焦点仍在 textarea,
+// 空格/方向键全打进被浮层盖住的输入框(全屏与否同病;进全屏那次点击恰好移走焦点才显得"全屏才灵")。
+watch(
+  show,
+  (s) => {
+    if (s) (document.activeElement as HTMLElement | null)?.blur()
+  },
+  { immediate: true },
+)
+
 // 进度条:拖动中只动视觉(scrub),无视 timeupdate 抢拇指;松手(change)才真 seek 一次。
 // —— 否则 @input 每 tick 都 seek:本地是 currentTime 风暴,混流是每 tick 重启 ffmpeg。
 const dragging = ref(false)
@@ -89,9 +100,15 @@ function onKey(e: KeyboardEvent) {
     void toggleFullscreen()
     return
   }
-  // 正在输入框/可编辑区打字 → 让位,别抢键
+  // 正在真文本输入(输入框/可编辑区打字)→ 让位,别抢键。浮层自己的滑杆(range)不算:
+  // 拖完进度条/音量条焦点留在滑杆上,快捷键要照常生效(行为恒定,不随焦点漂)。
   const t = e.target as HTMLElement | null
-  if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return
+  if (
+    t &&
+    (t.isContentEditable ||
+      (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) && (t as HTMLInputElement).type !== 'range'))
+  )
+    return
   // 带修饰键的组合留给系统/其它快捷键
   if (e.ctrlKey || e.metaKey || e.altKey) return
   // 没有在播放的内容就不接管(避免在别的视图误吞键)

@@ -25,6 +25,9 @@ pub struct Observed {
     pub all_memories: Vec<Memory>,
     /// 本次驱动**新写入**的需知。
     pub briefings: Vec<Briefing>,
+    /// 本次运行落库的 assistant 回复文本(按时间序;工具轮空串也在)。
+    /// 旁听仲裁类断言用:末条是不是 __IGNORE__ / 有没有正经搭腔。
+    pub replies: Vec<String>,
     /// consolidate 新增条数(turn 类驱动恒 0)。
     pub distilled: usize,
     /// 收尾结局。
@@ -205,7 +208,7 @@ mod tests {
 
     fn obs(trace: Vec<TraceStep>, memories: Vec<Memory>, distilled: usize) -> Observed {
         let all_memories = memories.clone();
-        Observed { owner_id: 1, trace, memories, all_memories, briefings: vec![], distilled, outcome: Outcome::Done }
+        Observed { owner_id: 1, trace, memories, all_memories, briefings: vec![], replies: vec![], distilled, outcome: Outcome::Done }
     }
 
     #[test]
@@ -266,6 +269,7 @@ mod tests {
             memories: vec![], // 差集为空 —— 正是 rowid 复用导致的漏检
             all_memories: vec![correction],
             briefings: vec![],
+            replies: vec![],
             distilled: 1,
             outcome: Outcome::Done,
         };

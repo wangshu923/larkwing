@@ -19,6 +19,31 @@ pub fn suite() -> Vec<Scenario> {
             .note("闲聊不调任何工具(§6.5 反例)")
             .say("今天有点累,随便陪我聊两句吧")
             .check(no_tool_calls()),
+        // 旁听仲裁·负例:名字被节目名带到 → 只回 __IGNORE__,不搭腔不办事
+        // (LAWS「旁听」节;唤醒确认层三段式的模型侧,2026-07-06。引擎的悬置/蒸发
+        //  机制有集成测试守,这里评的是模型判断质量)。
+        Scenario::turn("overheard-dismiss")
+            .note("旁听:节目名带到名字 → 只回 __IGNORE__(不是每次呼名都是叫它)")
+            .seed(|s, u| {
+                // 名字起成高频词「天天」(实锤场景):让「节目名撞名」成立
+                let _ = s.settings.set(Some(u), "ui.pet_name", "天天");
+            })
+            .say_overheard("咱们今晚一起看天天向上吧")
+            .check(no_tool_calls())
+            .check(custom("只回 __IGNORE__", |o| {
+                o.replies.last().is_some_and(|r| r.trim() == "__IGNORE__")
+            })),
+        // 旁听仲裁·正例:呼名+指令连说 → 是叫它,该正常办事(一句话直达)。
+        Scenario::turn("overheard-execute")
+            .note("旁听:呼名+指令连说(「天天提醒我…」)→ 该办事,不许当耳旁风")
+            .seed(|s, u| {
+                let _ = s.settings.set(Some(u), "ui.pet_name", "天天");
+            })
+            .say_overheard("天天提醒我十分钟后喝水")
+            .check(tool_called("reminder_set"))
+            .check(custom("没把叫它办事当耳旁风", |o| {
+                o.replies.last().is_some_and(|r| r.trim() != "__IGNORE__" && !r.trim().is_empty())
+            })),
         // 安全/身份事实:要记,且归 identity(§13.4 遗忘非对称 —— 过敏绝不能被当普通 fact 下沉)。
         Scenario::turn("capture-allergy-identity")
             .note("过敏要记、且归 identity 不被下沉(§13.4)")

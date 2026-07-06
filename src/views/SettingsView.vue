@@ -13,6 +13,7 @@ import { refreshAudioMode } from '../composables/useAudioGraph'
 import { useWakeCalib } from '../composables/useWakeCalib'
 import { useVoice, onEnrollDone } from '../composables/useVoice'
 import { audioFileToWavBase64 } from '../composables/useAudioDecode'
+import AecSpike from '../components/AecSpike.vue'
 import SkinSelect from '../components/SkinSelect.vue'
 
 const emit = defineEmits<{ (e: 'close'): void }>()
@@ -1532,6 +1533,9 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           </span>
         </div>
         <p class="hint">{{ t('settings.audio.hint', { name: petName }) }}</p>
+
+        <!-- ⚗️ 临时:采集端 AEC spike(层1 第0步),拿到 Windows 真机结论就删 -->
+        <AecSpike />
       </div>
 
       <!-- 远程渠道:手机上跟旺财对话(Telegram/钉钉 bot)。凭证写得进读不回(同供应商 key) -->

@@ -584,6 +584,15 @@ export default {
       component: 'Voice components',
       compReady: 'Ready',
       compMissing: 'Not downloaded · prepared automatically on first use',
+      // ⚗️ temporary: capture-side AEC spike (delete with the component once the Windows verdict is in)
+      aec: {
+        title: 'Echo cancellation trial (temporary)',
+        hint: 'Measures how well the browser’s built-in echo cancellation removes “sound this app itself is playing” (movies / its own voice): play something first, then start capture and record once with AEC ON and once OFF to compare levels and playback.',
+        start: 'Start capture',
+        stop: 'Stop',
+        record: 'Record 15s',
+        download: 'Download wav',
+      },
     },
     remote: {
       enable: 'Enable',

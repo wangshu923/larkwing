@@ -3,7 +3,7 @@ import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useChat, type TurnStats, type UiMessage, type UiAttachment } from '../composables/useChat'
 import { useSettings } from '../composables/useSettings'
-import { onTranscribed, useVoice } from '../composables/useVoice'
+import { onOverheard, onTranscribed, useVoice } from '../composables/useVoice'
 import { useSpeech } from '../composables/useSpeech'
 import { useContextMenu } from '../composables/useContextMenu'
 import { useCharacter } from '../composables/useCharacter'
@@ -32,7 +32,7 @@ const petName = computed(() => settings.get('ui.pet_name') || t('pet.name'))
 const textScale = computed(() => (settings.get('ui.text_scale') === 'large' ? '16.5px' : '14px'))
 const activeRail = ref<'chat' | 'reminders' | 'memory' | 'ops' | 'settings'>('chat')
 
-const { state: chat, send: chatSend, cancel, selectConversation, newConversation, ensureVoiceConv, saveApiKey, dequeue, inject, renameConversation, togglePinConversation, deleteConversation } = useChat()
+const { state: chat, send: chatSend, cancel, selectConversation, newConversation, ensureVoiceConv, overheardTargetConv, saveApiKey, dequeue, inject, renameConversation, togglePinConversation, deleteConversation } = useChat()
 const messages = computed(() => chat.messages)
 
 // 日期分隔条文案:今天 / 昨天 / 月-日(跨年带年份)。core 不产文案,这里走 i18n。
@@ -216,6 +216,13 @@ onTranscribed(async (text, via, speaker) => {
   if (via === 'wake') await ensureVoiceConv() // 唤醒走语音专属会话;mic/打字进当前会话(交互二分)
   chatSend(text, via, speaker)
 })
+// 旁听(呼名+续句,唤醒确认层):整句交模型仲裁 —— 临时回合,这里不渲染不切会话
+// (蒸发必须零痕迹);转正后的念话/上屏由 ConversationActivity(kind=overheard)驱动。
+onOverheard((text, speaker) => {
+  api.sendOverheard(overheardTargetConv(), text, speaker).catch((e) => {
+    console.error('旁听仲裁发送失败', e)
+  })
+})
 
 // —— 朗读(B 期):状态/停念/重听;正在念时点麦克风 = 停念+开听(一步打断) ——
 const speech = useSpeech()
@@ -287,6 +294,8 @@ function submitKey() {
 // 听写态(VoiceEvent)优先盖过回合态;工具泡优先于通用"思考中":
 // label 是字典键(tool.*),未知键(新工具配旧前端)兜底 tool.unknown —— 增量演化约定
 const statusText = computed(() => {
+  // 唤醒确认层在核(候选):视觉先亮「在听」,出声等确认(§8.2 精度方向的体感设计)
+  if (voice.state.candidate) return t('status.listening')
   if (voice.state.phase === 'listening') return t('status.listening')
   if (voice.state.phase === 'transcribing') return t('status.transcribing')
   if (chat.toolAction && chat.mood === 'thinking') {
@@ -788,7 +797,7 @@ watch(messages, () => nextTick(() => {
               @input="autoGrow"
               @paste="onPaste"
             ></textarea>
-            <button class="mic-inline" @click="micToggle()" :title="t('chat.micTitle')">
+            <button class="mic-inline" :class="{ candidate: voice.state.candidate }" @click="micToggle()" :title="t('chat.micTitle')">
               <svg viewBox="0 0 24 24"><rect x="9.2" y="3.2" width="5.6" height="10.4" rx="2.8" /><path d="M5.8 11.2a6.2 6.2 0 0 0 12.4 0M12 17.6v3.2M8.8 20.8h6.4" /></svg>
             </button>
           </span>
@@ -1048,6 +1057,12 @@ textarea.field { resize: none; font-family: inherit; line-height: 1.5; max-heigh
   border-radius: 8px; transition: color .15s, background .15s;
 }
 .mic-inline:hover { color: var(--accent); background: rgba(var(--accent-rgb), 0.12); }
+/* 唤醒确认层在核:麦克风轻呼吸(视觉秒应、出声等确认;语义 token,换肤跟随) */
+.mic-inline.candidate { color: var(--accent); animation: mic-breathe 0.9s ease-in-out infinite; }
+@keyframes mic-breathe {
+  0%, 100% { background: rgba(var(--accent-rgb), 0.08); }
+  50% { background: rgba(var(--accent-rgb), 0.28); }
+}
 .mic-inline svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; display: block; }
 
 /* —— 媒体附件(PLAN §9):加图/文件按钮 + 待发托盘 + 气泡里的图/小票 —— */

@@ -347,6 +347,7 @@ pub fn run() {
     .invoke_handler(tauri::generate_handler![
       commands::boot,
       commands::send_message,
+      commands::send_overheard,
       commands::inject_message,
       commands::cancel_generation,
       commands::new_conversation,

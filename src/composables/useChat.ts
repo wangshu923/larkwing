@@ -413,6 +413,26 @@ async function boot() {
       return
     }
     if (ev.type !== 'conversation') return
+    // 旁听蒸发:零痕迹 —— 不刷列表、不打 badge、不重拉(duck 恢复归 useVoice 管)
+    if (ev.data.kind === 'overheard_dismissed') return
+    // 旁听转正 = 屋里有人在跟它说话(语音交互必念 §3.4):**不管当前开着哪个会话都念**;
+    // 正看着该会话且空闲就顺手重拉上屏,不在则照常打 badge
+    if (ev.data.kind === 'overheard') {
+      lastVoiceActivity = Date.now() // 真语音互动:续语音会话 TTL
+      api
+        .loadConversation(ev.data.conv_id)
+        .then((msgs) => {
+          const last = msgs.filter(visible).at(-1)
+          if (
+            last &&
+            last.role === 'assistant' &&
+            useSettings().get('voice.auto_speak') !== 'off'
+          ) {
+            useSpeech().speakText(last.content)
+          }
+        })
+        .catch(() => {})
+    }
     refreshConversations()
     // 不在该会话界面:列表项按终态打标(完成 / 失败),进入会话即清(selectConversation)
     if (ev.data.conv_id !== state.convId) {
@@ -942,6 +962,24 @@ async function ensureVoiceConv() {
   lastVoiceActivity = Date.now()
 }
 
+/** 旁听仲裁的目标会话:与唤醒同归语音会话,但**不切 UI、不建新会话**——仲裁可能整轮蒸发,
+ *  蒸发必须零痕迹(空会话冒出来/界面被切走都算痕迹)。无存活语音会话 → 落最近的桌面会话
+ *  (仲裁还能借它的上下文);绝不落远程渠道会话(屋里的话别写进手机线程)。 */
+function overheardTargetConv(): number {
+  const alive =
+    voiceConvId != null &&
+    state.conversations.some((c) => c.id === voiceConvId) &&
+    (mediaBusy() || Date.now() - lastVoiceActivity <= VOICE_CONV_TTL)
+  if (alive) return voiceConvId!
+  const desk = (id: number) => {
+    const ch = state.conversations.find((c) => c.id === id)?.channel ?? 'ui'
+    return ch === 'ui' || ch === 'system' || ch === 'voice'
+  }
+  if (desk(state.convId)) return state.convId
+  const fallback = state.conversations.find((c) => desk(c.id))
+  return fallback?.id ?? state.convId
+}
+
 async function saveApiKey(key: string) {
   if (!state.inTauri) return
   try {
@@ -1014,5 +1052,5 @@ function fakeStream(msg: UiMessage, full: string, speak = false) {
 export function useChat() {
   void boot()
   wireVoiceActivity()
-  return { state, send, cancel, selectConversation, newConversation, ensureVoiceConv, saveApiKey, dequeue, inject, renameConversation, togglePinConversation, deleteConversation }
+  return { state, send, cancel, selectConversation, newConversation, ensureVoiceConv, overheardTargetConv, saveApiKey, dequeue, inject, renameConversation, togglePinConversation, deleteConversation }
 }

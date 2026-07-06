@@ -583,6 +583,15 @@ export default {
       component: '语音组件',
       compReady: '已就绪',
       compMissing: '未下载 · 首次使用时自动准备',
+      // ⚗️ 临时:采集端 AEC spike(拿到 Windows 真机结论就连组件一起删)
+      aec: {
+        title: '回声消除试验(临时)',
+        hint: '验证浏览器自带回声消除对「自己放的电影/说话声」的消除力度:让它先放点声音,再开采集,AEC 开/关各录一段对比电平和回放。',
+        start: '开始采集',
+        stop: '停止',
+        record: '录 15 秒',
+        download: '下载 wav',
+      },
     },
     remote: {
       enable: '启用',

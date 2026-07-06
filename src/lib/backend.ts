@@ -404,6 +404,12 @@ export type VoiceEvent =
   | { type: 'speech_started' }
   // 喊名命中(C 期):前端开全区间 duck(到回待唤醒才恢复)
   | { type: 'wake_triggered' }
+  // KWS 报了候选、确认层在核(命中→静默续录→ASR 三段式):提前 duck + 轻视觉,不出声
+  | { type: 'wake_candidate' }
+  // 确认层拒绝(转写无唤醒词 = KWS 幻听):恢复 duck、视觉回 idle,零打扰
+  | { type: 'wake_rejected' }
+  // 呼名+续句(「天天暂停」/「看天天向上」):整句交模型仲裁(前端调 sendOverheard)
+  | { type: 'overheard'; data: { text: string; speaker_id?: number } }
   // via: mic = 听写(屏幕排版) | wake = 语音会话(必念);speaker_id = 声纹认出的家人
   | { type: 'transcribed'; data: { text: string; via: 'mic' | 'wake' | string; speaker_id?: number } }
   | {
@@ -872,6 +878,9 @@ export const api = {
   voiceStatus: () => invoke<VoiceStatus>('voice_status'),
   /** 免手唤醒开关(写设置+起停一体;首次开会下 KWS 模型 + 预合成应答音,较慢)。 */
   voiceWakeSet: (enabled: boolean) => invoke<VoiceStatus>('voice_wake_set', { enabled }),
+  /** 旁听仲裁(唤醒确认层「呼名+续句」):临时回合无 Channel,终态经全局车道 kind=overheard*。 */
+  sendOverheard: (convId: number, text: string, speaker?: number) =>
+    invoke<void>('send_overheard', { convId, text, speaker }),
   /** 唤醒回合念完 → 开 6s 跟进窗(免唤醒接话)。 */
   voiceFollowUp: () => invoke<void>('voice_follow_up'),
   /** 换音色/语速/在线离线档后:唤醒在跑则后台重建应答音(不重启唤醒/麦);没开唤醒则 no-op。 */

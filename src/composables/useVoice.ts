@@ -6,6 +6,7 @@
 import { reactive } from 'vue'
 import { api, isTauri, onAppEvent, onWakeChanged, type VoicePhase } from '../lib/backend'
 import { useMedia } from './useMedia'
+import { useSpeech } from './useSpeech'
 
 const state = reactive({
   phase: 'idle' as VoicePhase,
@@ -17,6 +18,8 @@ const state = reactive({
   lastEnd: '',
   /** 唤醒交互区间(喊名命中 → 回待唤醒):duck 全程保持,UI 可标"语音会话中"。 */
   wakeActive: false,
+  /** 确认层在核(KWS 候选 → 三段式定夺):轻视觉「在听」,不出声;拒绝/定夺即灭。 */
+  candidate: false,
   /** 免手唤醒此刻在跑(事实,来自 voiceStatus / lw:wake);悬浮窗待机栏据此显「等你喊…」。 */
   wakeArmed: false,
   /** 当前唤醒词(显示用;默认「小七」)。 */
@@ -37,6 +40,13 @@ export function onEnrollDone(cb: (userId: number, ok: boolean) => void) {
 let onText: ((text: string, via: 'mic' | 'wake', speaker?: number) => void) | null = null
 export function onTranscribed(cb: (text: string, via: 'mic' | 'wake', speaker?: number) => void) {
   onText = cb
+}
+
+/** 旁听(呼名+续句)→ sendOverheard 的接线口(MainLayout 注入,同 onTranscribed 手法):
+ *  由它决定目标会话(语音会话/当前桌面会话),这里不认识 useChat。 */
+let onOverheardCb: ((text: string, speaker?: number) => void) | null = null
+export function onOverheard(cb: (text: string, speaker?: number) => void) {
+  onOverheardCb = cb
 }
 
 let wired = false
@@ -68,6 +78,35 @@ function applyPhase(p: VoicePhase) {
 
 /** 唤醒区间收尾(告退/跟进窗安静结束/回合周期兜底/出错):恢复外放音量。 */
 const WAKE_END_REASONS = new Set(['farewell', 'follow_up_idle', 'wake_done', 'error'])
+
+/** 空闲(非唤醒区间、非听写)才恢复 duck:确认层拒绝/旁听蒸发后归位用。 */
+function maybeRestoreDuck() {
+  if (!state.wakeActive && state.phase === 'idle') restoreDuck()
+}
+
+// —— 旁听 duck 生命周期:候选时提前压低(确认层的 ASR 别被电影轰),之后三条路 ——
+// ① 三段式判成经典唤醒 → wake_triggered 接管(既有 wakeActive 区间);
+// ② 判幻听 wake_rejected / 仲裁蒸发 overheard_dismissed → 恢复;
+// ③ 仲裁转正 overheard → 等念完再恢复(轮询 useSpeech;30s 兜底防吊死)。
+let overheardGuard: ReturnType<typeof setTimeout> | undefined
+let speechWait: ReturnType<typeof setInterval> | undefined
+function clearOverheardTimers() {
+  clearTimeout(overheardGuard)
+  clearInterval(speechWait)
+  overheardGuard = speechWait = undefined
+}
+function restoreAfterSpeech() {
+  clearOverheardTimers()
+  const speech = useSpeech()
+  const startedAt = Date.now()
+  speechWait = setInterval(() => {
+    const talking = speech.state.playing || speech.state.busy
+    if (!talking || Date.now() - startedAt > 30_000) {
+      clearOverheardTimers()
+      maybeRestoreDuck()
+    }
+  }, 300)
+}
 
 function flashEndReason(reason: string) {
   if (WAKE_END_REASONS.has(reason)) {
@@ -104,6 +143,17 @@ function wire() {
     if (keywords.length) state.wakeKeywords = keywords
   })
   onAppEvent((ev) => {
+    // 旁听终态(engine 内消费的临时回合,经会话车道回来):恢复 duck 的另一半在这
+    if (ev.type === 'conversation') {
+      const k = ev.data.kind
+      if (k === 'overheard_dismissed') {
+        clearOverheardTimers()
+        maybeRestoreDuck()
+      } else if (k === 'overheard') {
+        restoreAfterSpeech() // 转正:回应要念,念完再恢复外放
+      }
+      return
+    }
     if (ev.type !== 'voice') return
     const v = ev.data
     switch (v.type) {
@@ -116,8 +166,26 @@ function wire() {
       case 'speech_started':
         state.heard = true
         break
+      case 'wake_candidate':
+        // 确认层在核:提前 duck(压低电影给 ASR 让路)+ 轻视觉「在听」,不出声
+        state.candidate = true
+        duck()
+        break
+      case 'wake_rejected':
+        // 幻听拒绝:零打扰归位
+        state.candidate = false
+        maybeRestoreDuck()
+        break
+      case 'overheard':
+        // 呼名+续句 → 交模型仲裁;duck 保持,30s 兜底(仲裁挂了也别永远压着电影)
+        state.candidate = false
+        clearOverheardTimers()
+        overheardGuard = setTimeout(maybeRestoreDuck, 30_000)
+        onOverheardCb?.(v.data.text, v.data.speaker_id)
+        break
       case 'wake_triggered':
         // 喊名命中:全区间 duck(robot capture_duck 的扩展版——罩到回合念完)
+        state.candidate = false
         state.wakeActive = true
         state.lastEnd = ''
         duck()

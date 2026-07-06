@@ -35,6 +35,32 @@ impl Drop for MoodGuard {
     }
 }
 
+/// 旁听临时回合(唤醒确认层「呼名+续句」仲裁)的**悬置用户行**:先不落库,模型开口 /
+/// 调真工具那一刻才随首次持久化一起写入(= 转正);只回 __IGNORE__ / 空 = 整轮蒸发——
+/// 不进 UI、不进历史、不进记忆,只留 tracing 与 usage 流水(观测归观测,§6.4)。
+pub(super) struct PendingUser {
+    pub content: String,
+    pub payload: Option<String>,
+}
+
+/// 旁听转正:把悬置的 user 行落库(此后与普通回合无异)。幂等(take 后为 None);
+/// 返回 false = user 行落库失败,调用方按落库失败收尾。
+async fn commit_overheard(
+    store: &Store,
+    conv_id: i64,
+    pending: &mut Option<PendingUser>,
+    tx: &mpsc::Sender<TurnEvent>,
+) -> bool {
+    let Some(p) = pending.take() else { return true };
+    match persist_row(store, conv_id, "user", &p.content, p.payload.as_deref()).await {
+        Some(id) => {
+            let _ = tx.send(TurnEvent::Committed { message_id: id }).await;
+            true
+        }
+        None => false,
+    }
+}
+
 pub(super) struct Turn {
     pub store: Store,
     pub conv_id: i64,
@@ -61,6 +87,9 @@ pub(super) struct Turn {
     pub rx: mpsc::Receiver<ChatEvent>,
     /// 插队队列(PLAN §9 B):与 engine.inject 命令共用;回合在轮间/收尾前排空它。
     pub inject: Arc<Mutex<super::InjectState>>,
+    /// 旁听临时回合的悬置用户行(send_overheard 传入):Some = 本回合是旁听仲裁——
+    /// 转正前 Delta/Thinking/mood 全静音(可能整轮蒸发,不给用户看半截);None = 普通回合。
+    pub overheard: Option<PendingUser>,
 }
 
 /// 一轮流式消费的结局。
@@ -96,6 +125,7 @@ impl Turn {
             media,
             mut rx,
             inject,
+            mut overheard,
         } = self;
         // 本回合防溢出预算:按**实际服务的** provider 的窗口算(可能是 fallback,故比建连前的主候选更准)。
         let budget = super::context::tail_budget_chars(
@@ -105,7 +135,10 @@ impl Turn {
         // mood 上总线(PLAN §12 修订):悬浮窗据此显「正在想/正在说」;
         // Guard 在任一出口(done/failed/cancelled/落库失败/建连失败)收回 Idle。
         let bus = media.bus().clone();
-        bus.publish(AppEvent::Mood(Mood::Thinking));
+        // 旁听未转正期间不点 mood 灯(可能整轮蒸发,悬浮窗别"正在想"两秒又灭 —— 零痕迹)
+        if overheard.is_none() {
+            bus.publish(AppEvent::Mood(Mood::Thinking));
+        }
         let _mood = MoodGuard(bus.clone());
         // 回合任一出口闸上注入队列(Failed/Cancelled 退出后别再往死队列里塞)
         let _inject_guard = InjectGuard(inject.clone());
@@ -124,15 +157,25 @@ impl Turn {
         let mut stall: usize = 0; // 连续无进展(全重复 / 全失败)轮数
         let mut seen_calls: HashSet<String> = HashSet::new(); // 本回合已发过的工具调用指纹
         loop {
+            // 旁听未转正 = 静音消费(Delta/Thinking/mood 不外发;蒸发时用户从头到尾无感)
+            let muted = overheard.is_some();
             let (text, reasoning, tool_calls, reasoning_state) =
-                match drain(&token, &tx, &bus, rx, conv_id, round_start).await {
+                match drain(&token, &tx, &bus, rx, conv_id, round_start, muted).await {
                     RoundEnd::Cancelled { partial } => {
-                        persist_partial(&store, conv_id, &partial).await;
+                        // 旁听未转正被取消(真输入把仲裁挤掉了):什么都没发生过,不落 partial
+                        if overheard.is_none() {
+                            persist_partial(&store, conv_id, &partial).await;
+                        }
                         let _ = tx.send(TurnEvent::Cancelled).await;
                         return;
                     }
                     RoundEnd::Failed { partial, kind, message } => {
-                        persist_partial(&store, conv_id, &partial).await;
+                        // 旁听未转正就失败(仲裁自身出错):没有可见变化,只留日志
+                        if overheard.is_none() {
+                            persist_partial(&store, conv_id, &partial).await;
+                        } else {
+                            tracing::warn!(conv = conv_id, %message, "旁听仲裁失败(未转正,无可见变化)");
+                        }
                         let _ = tx.send(TurnEvent::Failed { kind, message }).await;
                         return;
                     }
@@ -160,6 +203,26 @@ impl Turn {
             if tool_calls.is_empty() || round >= MAX_TOOL_ROUNDS || stall >= MAX_STALL_ROUNDS {
                 if !tool_calls.is_empty() {
                     tracing::warn!(conv = conv_id, "工具轮到顶 / 空转仍想调用,丢弃调用强制收尾");
+                }
+                // 旁听仲裁判决点:模型只回 __IGNORE__ / 空 = 「不是叫我」→ 整轮蒸发
+                // (user 行还悬着没落,直接 return = 不进 UI/历史/记忆;只留这行日志和 usage 流水)
+                if overheard.is_some() {
+                    let verdict = text.trim();
+                    if verdict.is_empty() || verdict == "__IGNORE__" {
+                        tracing::info!(conv = conv_id, "旁听仲裁:不是叫我 → 整轮蒸发");
+                        let _ = tx.send(TurnEvent::Dismissed).await;
+                        return;
+                    }
+                    // 开口了 = 转正:先落悬置的 user 行,再走正常收尾
+                    if !commit_overheard(&store, conv_id, &mut overheard, &tx).await {
+                        let _ = tx
+                            .send(TurnEvent::Failed {
+                                kind: ErrorKind::Internal,
+                                message: "旁听转正落库失败".into(),
+                            })
+                            .await;
+                        return;
+                    }
                 }
                 // 收尾前看插队(原子):空 → 置 finishing 收尾;非空 → 取出注入(先落本段回复再 apply)
                 let pending = take_or_finish(&inject);
@@ -212,7 +275,20 @@ impl Turn {
             }
 
             // ---- 工具轮 ----
-            bus.publish(AppEvent::Mood(Mood::Thinking)); // 工具执行中 = 思考态(本轮若已 Speaking 过则切回)
+            // 旁听 + 要调真工具 = 干活即转正(工具有副作用,必须先把悬置 user 行落了,
+            // 历史完形:user → assistant(tool_calls) → tool 顺序不乱)
+            if overheard.is_some()
+                && !commit_overheard(&store, conv_id, &mut overheard, &tx).await
+            {
+                let _ = tx
+                    .send(TurnEvent::Failed {
+                        kind: ErrorKind::Internal,
+                        message: "旁听转正落库失败".into(),
+                    })
+                    .await;
+                return;
+            }
+            bus.publish(AppEvent::Mood(Mood::Thinking)); // 工具执行中 = 思考态(本轮若已 Speaking 过则切回;旁听转正后首次点灯)
             let payload = serde_json::to_string(&AssistantPayload {
                 tool_calls: tool_calls.clone(),
                 reasoning: reasoning.clone(),
@@ -465,6 +541,7 @@ mod tests {
 
 /// 消费一轮流:文本/思考边攒边转发,Done 收口。取消 = drop rx,provider 任务随之中止。
 /// started = 本轮开流(建连)时刻:TTFT 锁存在第一个增量事件,elapsed 盖章在收尾。
+/// muted = 旁听未转正:增量与 mood 都不外发(只攒),整轮可能蒸发 —— 不给用户看半截。
 async fn drain(
     token: &CancellationToken,
     tx: &mpsc::Sender<TurnEvent>,
@@ -472,6 +549,7 @@ async fn drain(
     mut rx: mpsc::Receiver<ChatEvent>,
     conv_id: i64,
     started: std::time::Instant,
+    muted: bool,
 ) -> RoundEnd {
     let mut buffer = String::new(); // turn 级状态:攒文本,流完一次落库(不逐 token 写)
     let mut reasoning = String::new(); // 坑 #4:工具轮的 reasoning 要回传,顺手攒下
@@ -489,17 +567,23 @@ async fn drain(
                 Some(ChatEvent::Delta(t)) => {
                     if !spoke {
                         spoke = true;
-                        bus.publish(AppEvent::Mood(Mood::Speaking)); // 首字出 = 说话态(悬浮窗)
+                        if !muted {
+                            bus.publish(AppEvent::Mood(Mood::Speaking)); // 首字出 = 说话态(悬浮窗)
+                        }
                     }
                     ttft_ms.get_or_insert_with(|| started.elapsed().as_millis() as i64);
                     buffer.push_str(&t);
                     // UI 不听了也继续攒:落库不依赖前端在场
-                    let _ = tx.send(TurnEvent::Delta(t)).await;
+                    if !muted {
+                        let _ = tx.send(TurnEvent::Delta(t)).await;
+                    }
                 }
                 Some(ChatEvent::Thinking(t)) => {
                     ttft_ms.get_or_insert_with(|| started.elapsed().as_millis() as i64);
                     reasoning.push_str(&t);
-                    let _ = tx.send(TurnEvent::Thinking(t)).await;
+                    if !muted {
+                        let _ = tx.send(TurnEvent::Thinking(t)).await;
+                    }
                 }
                 Some(ChatEvent::ReasoningState(v)) => {
                     // 不透明 reasoning 状态:攒下,Done 时随 Finished 带出(逐字保真,不解析)
