@@ -9,7 +9,7 @@ import { useContextMenu } from '../composables/useContextMenu'
 import { useCharacter } from '../composables/useCharacter'
 import { useMedia } from '../composables/useMedia'
 import { fmtMs, fmtTokens, fmtUsd } from '../lib/fmt'
-import { openExternal, api, type SearchHit } from '../lib/backend'
+import { onFloatSay, openExternal, api, type SearchHit } from '../lib/backend'
 import { renderMarkdown } from '../lib/md'
 import { copyText } from '../lib/clipboard'
 import MemoryView from '../views/MemoryView.vue'
@@ -382,6 +382,12 @@ const showSuggestions = computed(
 function sendSuggestion(text: string) {
   chatSend(text, 'typed')
 }
+// 悬浮窗关怀候选点击 → 主窗替用户把那句发出去(同建议气泡);切回聊天页让人看见它开始干活。
+// 只主窗挂 MainLayout(悬浮窗渲染 FloatWindow),不会自收自发。
+onFloatSay((text) => {
+  activeRail.value = 'chat'
+  chatSend(text, 'typed')
+})
 
 // 场景触发建议气泡(§3.3 发现性):跟着当下状态走、替用户说下一句。点一下=正常发送。
 // 档位(specific 先于 ambient):刚整理完文件 > 刚设好提醒 > 正在放歌;回合收尾(idle)才显,

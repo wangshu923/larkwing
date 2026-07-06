@@ -12,6 +12,9 @@ const { t } = useI18n()
 
 const open = ref(false)
 const aecOn = ref(true)
+// 降噪独立开关(默认关):2026-07-06 Mac 实测 AEC+NS 双开会把双讲人声啃到 ASR 全灭
+// (音乐消得极好但人也没了)——NS 疑似真凶,拆开单测才能归因。
+const nsOn = ref(false)
 const running = ref(false)
 const recording = ref(false)
 const level = ref(0) // 实时 RMS 0..1
@@ -44,7 +47,7 @@ async function start() {
     stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: aecOn.value,
-        noiseSuppression: aecOn.value,
+        noiseSuppression: nsOn.value,
         autoGainControl: false, // 增益锁死:电平对比才有意义
         channelCount: 1,
       },
@@ -160,6 +163,14 @@ async function toggleAec() {
   }
 }
 
+async function toggleNs() {
+  nsOn.value = !nsOn.value
+  if (running.value) {
+    stop()
+    await start()
+  }
+}
+
 onUnmounted(() => {
   stop()
   if (wavUrl.value) URL.revokeObjectURL(wavUrl.value)
@@ -181,6 +192,9 @@ onUnmounted(() => {
         <button class="aec-btn" :class="{ on: aecOn }" @click="toggleAec()">
           AEC {{ aecOn ? 'ON' : 'OFF' }}
         </button>
+        <button class="aec-btn" :class="{ on: nsOn }" @click="toggleNs()">
+          降噪 {{ nsOn ? 'ON' : 'OFF' }}
+        </button>
         <button class="aec-btn" :disabled="!running" @click="recordToggle()">
           {{ recording ? `⏹ ${recSecs}s` : t('settings.voice.aec.record') }}
         </button>
@@ -192,7 +206,7 @@ onUnmounted(() => {
       <p v-if="err" class="aec-err mono">{{ err }}</p>
       <div v-if="wavUrl" class="aec-row">
         <audio :src="wavUrl" controls class="aec-audio"></audio>
-        <a class="aec-btn" :href="wavUrl" :download="`aec-${aecOn ? 'on' : 'off'}.wav`">
+        <a class="aec-btn" :href="wavUrl" :download="`aec-${aecOn ? 'on' : 'off'}-ns-${nsOn ? 'on' : 'off'}.wav`">
           {{ t('settings.voice.aec.download') }}
         </a>
       </div>

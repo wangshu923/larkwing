@@ -359,6 +359,7 @@ export default {
   // 主动关怀(PLAN ★主动关怀里程碑):关怀候选文案。名字不进词典(§6.6),这里只有剧名 {title} 插值。
   care: {
     resume: '继续看《{title}》?',
+    resumeSay: '继续看《{title}》', // 点击关怀条替用户发出去的那句(祈使句,不带问号)
   },
   // 桌面悬浮窗(PLAN §12 形态 C)
   float: {

@@ -47,3 +47,7 @@ __pycache__/
 CLAUDE.md
 PLAN.md
 .claude/
+
+# ── 本地试验录音(AEC spike 等,分析用不进仓库)──────────────────
+/aec*.wav
+/*.wav

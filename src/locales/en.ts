@@ -360,6 +360,7 @@ export default {
   // Proactive care (PLAN ★proactive-care milestone): care-candidate copy. The name stays out of the dictionary (§6.6); only the {title} interpolation lives here.
   care: {
     resume: 'Keep watching “{title}”?',
+    resumeSay: 'Keep watching “{title}”', // sent as the user's message when the care card is clicked (imperative, no question mark)
   },
   // Desktop floating window (PLAN §12 form C)
   float: {

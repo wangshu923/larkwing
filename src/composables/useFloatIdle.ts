@@ -18,6 +18,8 @@ import { useSettings } from './useSettings'
 export interface IdleItem {
   kind: 'reminder' | 'care' | 'cost' | 'balance'
   text: string
+  /** 点击要替用户发出去的那句(仅关怀候选有):悬浮窗点它 → emitFloatSay + 唤主窗。 */
+  say?: string
 }
 
 const ROTATE_MS = 6000
@@ -102,7 +104,11 @@ const items = computed<IdleItem[]>(() => {
   // 这里只加"静默时段"的门(22:00–08:00 本地不打扰;同 audio 夜间也在前端算本地时钟)。
   const care = state.data?.care
   if (care?.kind === 'resume' && !inQuietHours()) {
-    out.push({ kind: 'care', text: t('care.resume', { title: care.title }) })
+    out.push({
+      kind: 'care',
+      text: t('care.resume', { title: care.title }),
+      say: t('care.resumeSay', { title: care.title }),
+    })
   }
   if (showUsage()) {
     if (state.today) {

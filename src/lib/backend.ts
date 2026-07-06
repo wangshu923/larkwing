@@ -773,6 +773,16 @@ export function onMediaControl(cb: (action: string, value?: number) => void): vo
   )
 }
 
+/** 悬浮窗关怀候选点击 → 主窗替用户把那句发出去(同建议气泡「替用户说一句」§3.2;
+ *  悬浮窗只读不发回合,发送/落库/念答全在主窗。只悬浮窗发、只主窗收 → 无回声环。 */
+export function emitFloatSay(text: string) {
+  if (isTauri()) void emit('lw:float-say', { text })
+}
+export function onFloatSay(cb: (text: string) => void): void {
+  if (!isTauri()) return
+  void listen<{ text: string }>('lw:float-say', (e) => cb(e.payload.text))
+}
+
 /** 数据目录「搬家」:当前根 / 待清理旧根 / 失效路径(字段随 Rust camelCase)。 */
 export interface DataLocation {
   root: string
