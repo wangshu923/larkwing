@@ -55,6 +55,7 @@ async function checkUpdate() {
 const voiceInfo = ref<VoiceStatus | null>(null)
 watch(tab, (v) => {
   if (v === 'voice' && !voiceInfo.value) void loadVoice()
+  if (v === 'voice') void loadWebMics() // 每次进声音页刷新浏览器麦列表(设备可热插拔)
   if (v === 'system') {
     void loadAutostart()
     void loadDataLocation()
@@ -253,10 +254,38 @@ const asrOpts = computed(() => [
   { value: 'firered-ctc', label: t('settings.voice.asr_accurate') },
 ])
 /** 麦克风下拉项(默认 + 设备列表)。 */
-const micOpts = computed(() => [
-  { value: '', label: t('settings.voice.micDefault') },
-  ...(voiceInfo.value?.devices ?? []).map((d) => ({ value: d, label: d })),
-])
+// 麦克风双列表(采集双源,2026-07-06 收尾):browser 源(默认)= enumerateDevices 的
+// deviceId(存 voice.input_device_web);cpal 源 = 人类可读设备名(存 voice.input_device)。
+// 两套命名空间分键,切源各回各的选择。浏览器设备的 label 要麦克风权限到手后才有
+// (桥起过一次即有),没有就编号兜底。
+const captureSource = computed(() => settings.get('voice.capture.source') || 'browser')
+const webMics = ref<{ value: string; label: string }[]>([])
+async function loadWebMics() {
+  try {
+    const devs = await navigator.mediaDevices.enumerateDevices()
+    webMics.value = devs
+      .filter((d) => d.kind === 'audioinput' && d.deviceId && d.deviceId !== 'default')
+      .map((d, i) => ({
+        value: d.deviceId,
+        label: d.label || t('settings.voice.micUnnamed', { n: i + 1 }),
+      }))
+  } catch {
+    webMics.value = []
+  }
+}
+const micOpts = computed(() =>
+  captureSource.value === 'browser'
+    ? [{ value: '', label: t('settings.voice.micDefault') }, ...webMics.value]
+    : [
+        { value: '', label: t('settings.voice.micDefault') },
+        ...(voiceInfo.value?.devices ?? []).map((d) => ({ value: d, label: d })),
+      ],
+)
+const micValue = computed(() =>
+  captureSource.value === 'browser'
+    ? settings.get('voice.input_device_web')
+    : settings.get('voice.input_device'),
+)
 
 // 自定义音色:选本地音频文件 → 前端解码/重采样成 16k → 后端转写出草稿 → 起名/改稿 → 保存。
 const cloneFile = ref<HTMLInputElement | null>(null)
@@ -397,8 +426,13 @@ async function previewSpeaker(id: string) {
   }
 }
 function setMic(v: string) {
+  if (captureSource.value === 'browser') {
+    // 浏览器采集:换麦由 useMicBridge 热重启(停旧流起新流),core 推流管不动 → 不用重启唤醒
+    void settings.set('voice.input_device_web', v)
+    return
+  }
   void settings.set('voice.input_device', v)
-  void restartWakeIfRunning() // 换麦立即生效:运行中的唤醒也重开采集用新设备
+  void restartWakeIfRunning() // cpal:换麦立即生效,运行中的唤醒重开采集用新设备
 }
 
 // 唯一脉冲:全局任何时刻最多一个光点,指向当前唯一需要行动的事(现在 = 缺钥匙)
@@ -1449,7 +1483,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           <span class="label">{{ t('settings.voice.micDevice') }}</span>
           <SkinSelect
             class="v-mic"
-            :model-value="settings.get('voice.input_device')"
+            :model-value="micValue"
             :options="micOpts"
             :aria-label="t('settings.voice.micDevice')"
             @update:model-value="setMic"

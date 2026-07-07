@@ -65,13 +65,16 @@ function syncBusy() {
   state.busy = turnActive || current != null || queue.length > 0
 }
 
-/** 念话期间唤醒循环丢帧(自激防护:KWS 别把 TTS 的声音当唤醒词);去重只发翻转沿。 */
+/** 念话期间唤醒循环丢帧(自激防护:KWS 别把 TTS 的声音当唤醒词);去重只发翻转沿。
+ *  **只在 cpal 采集下需要**(2026-07-06 收尾):浏览器采集(默认)的麦自带 AEC,TTS 是
+ *  它自己播的、天然被消 → 不挂起 = 念话中喊它可打断(barge-in 解锁);切回 cpal 闸门自动回来。 */
 let suspendSent = false
 function syncWakeSuspend() {
   if (!isTauri()) return
-  if (state.playing !== suspendSent) {
-    suspendSent = state.playing
-    api.voiceWakeSuspend(state.playing).catch(() => {})
+  const want = state.playing && settings.get('voice.capture.source') !== 'browser'
+  if (want !== suspendSent) {
+    suspendSent = want
+    api.voiceWakeSuspend(want).catch(() => {})
   }
 }
 

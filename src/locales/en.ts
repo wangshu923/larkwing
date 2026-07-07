@@ -262,6 +262,7 @@ export default {
   toast: {
     deleteFailed: 'Couldn’t delete that… try again?',
     actionFailed: 'That didn’t go through… try again?',
+    captureFallback: 'Browser capture didn’t start — switched back to the system microphone',
   },
   // one-click update (backlog ⑤·A): the "new version" card + manual-check feedback
   update: {
@@ -576,6 +577,7 @@ export default {
       volume: 'Speaking volume',
       micDevice: 'Microphone',
       micDefault: 'System default',
+      micUnnamed: 'Microphone {n}',
       ttsBackend: 'Voice source',
       tts_online: 'Online',
       tts_offline: 'Offline',

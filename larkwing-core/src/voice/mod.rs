@@ -1318,6 +1318,8 @@ impl VoiceRuntime {
     // 真机验过再转正默认(watch-items 见 PLAN §11)。
 
     /// 当前采集源(`voice.capture.source`,app 级):browser = 前端推流;其余 = cpal。
+    /// **默认 browser(2026-07-06 转正)**:getUserMedia 消完自播回声的耳朵是治自我唤醒
+    /// 的根;显式设过 cpal 的沿用。前端 useSettings DEFAULTS 镜像同值(§6.8/§4.11)。
     fn capture_source(&self) -> String {
         self.inner
             .store
@@ -1325,7 +1327,7 @@ impl VoiceRuntime {
             .get(None, "voice.capture.source")
             .ok()
             .flatten()
-            .unwrap_or_else(|| "cpal".into())
+            .unwrap_or_else(|| "browser".into())
     }
 
     /// 按采集源开管:唤醒/听写/标定/录声纹统一走这个口(接缝换源,下游零感知)。
@@ -1699,11 +1701,12 @@ mod tests {
     // ---- 采集双源(层1 AEC 采集端) ----
 
     #[test]
-    fn capture_source_defaults_to_cpal_and_dispatches_push() {
+    fn capture_source_defaults_to_browser_and_dispatches_push() {
         let rt = test_rt("capsrc");
-        assert_eq!(rt.capture_source(), "cpal", "默认 cpal(零回归,真机验过再转正)");
+        assert_eq!(rt.capture_source(), "browser", "默认 browser(2026-07-06 转正:AEC 耳朵)");
+        rt.inner.store.settings.set(None, "voice.capture.source", "cpal").unwrap();
+        assert_eq!(rt.capture_source(), "cpal", "显式设过 cpal 的沿用");
         rt.inner.store.settings.set(None, "voice.capture.source", "browser").unwrap();
-        assert_eq!(rt.capture_source(), "browser");
         // browser 源开管不碰麦克风硬件,永远成功
         let pipe = rt.open_capture_auto().expect("push pipe 打开");
         rt.push_audio(vec![0.1_f32; 160]);

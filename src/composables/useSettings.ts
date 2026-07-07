@@ -42,7 +42,8 @@ const DEFAULTS: Record<string, string> = {
   'voice.input_device': '',
   'voice.wake.sensitivity': '100', // 唤醒灵敏度 0~100(global)→ KWS 阈值;'100' = 最灵敏(默认偏召回,保障叫得应,见 AGENT.md §8.2)
   'voice.asr.model': 'sense-voice', // 中文识别模型档(global):sense-voice(快,默认)/ firered-ctc(更准,听不清/孩子选它);值与 Rust 校验同源,模型用时下载
-  'voice.capture.source': 'cpal', // 采集源(层1 AEC 采集端):cpal(默认零回归)/ browser(getUserMedia 消完回声推流);真机验过再转正默认
+  'voice.capture.source': 'browser', // 采集源(层1 AEC 采集端):browser(默认,2026-07-06 转正——getUserMedia 消完回声推流,治自我唤醒的根)/ cpal(回落);与 Rust capture_source 默认镜像(§6.8/§4.11)
+  'voice.input_device_web': '', // 浏览器采集的麦克风 deviceId(空=系统默认);与 cpal 的 voice.input_device 分键(两套命名空间)
 
 
 

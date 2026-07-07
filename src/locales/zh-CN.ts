@@ -261,6 +261,7 @@ export default {
   toast: {
     deleteFailed: '没删掉,再试一下?',
     actionFailed: '刚才那下没成功,再试一次?',
+    captureFallback: '浏览器采集没起来,已切回系统麦克风',
   },
   // 一键更新(清单 ⑤·A):发现新版的卡片 + 手动检查的反馈
   update: {
@@ -575,6 +576,7 @@ export default {
       volume: '朗读音量',
       micDevice: '麦克风',
       micDefault: '系统默认',
+      micUnnamed: '麦克风 {n}',
       ttsBackend: '嗓音来源',
       tts_online: '在线',
       tts_offline: '离线',
