@@ -1530,6 +1530,27 @@ impl Engine {
         Ok(self.store.briefings.list_for(uid)?)
     }
 
+    /// 回忆页「没办完的事」分组:开着的待办(切片2 小账,工具 `note_todo` 记的)。
+    /// user_id=None → 当前主人;Some → 主人查看某家人(同 list_memories 的主人管理面)。
+    /// 上限给宽(远超前缀 `TODO_PREFIX_LIMIT`,那是喂模型的限量,这里是给人看的全量)。
+    pub fn list_todos(&self, user_id: Option<i64>) -> Result<Vec<crate::store::Todo>, AppError> {
+        let uid = self.resolve_user(user_id)?;
+        Ok(self.store.todos.list_open(uid, 200)?)
+    }
+
+    /// 回忆页勾掉一件事(办完 / 不用了):按 (user,id) 限定了结,不删行——与工具
+    /// `finish_todo` 同语义(done 后不再进前缀、不再露面)。
+    pub fn finish_todo(&self, user_id: Option<i64>, id: i64) -> Result<(), AppError> {
+        let uid = self.resolve_user(user_id)?;
+        if !self.store.todos.close(uid, id)? {
+            return Err(AppError {
+                kind: ErrorKind::NotFound,
+                message: format!("待办 {id} 不存在"),
+            });
+        }
+        Ok(())
+    }
+
     pub fn delete_briefing(&self, id: i64) -> Result<(), AppError> {
         if !self.store.briefings.remove_by_id(id)? {
             return Err(AppError {

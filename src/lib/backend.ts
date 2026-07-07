@@ -83,6 +83,13 @@ export interface MaintenanceLog {
   createdAt: number
 }
 
+/** 一件没办完的事(切片2 小账,回忆页第三分组):只列 open 态,勾掉即了结。 */
+export interface Todo {
+  id: number
+  content: string
+  created_at: number
+}
+
 /** 家庭备忘一条(任务需知,PLAN §9):scope 'home' | 'user:<id>'。 */
 export interface Briefing {
   id: number
@@ -977,6 +984,10 @@ export const api = {
   /** 家里的事(家庭备忘)。userId 省略 = 当前主人;传家人 id = TA 视角(home 共享那份都在)。 */
   listBriefings: (userId?: number) => invoke<Briefing[]>('list_briefings', { userId }),
   deleteBriefing: (id: number) => invoke<void>('delete_briefing', { id }),
+  /** 没办完的事(切片2 小账)。userId 语义同 listMemories(主人管理面)。 */
+  listTodos: (userId?: number) => invoke<Todo[]>('list_todos', { userId }),
+  /** 勾掉一件待办(办完 / 不用了):了结不删行,之后不再进前缀。 */
+  finishTodo: (id: number, userId?: number) => invoke<void>('finish_todo', { id, userId }),
   /** 提醒页:当前用户待触发的提醒 + 取消(jobs 域,按时间升序)。 */
   listReminders: () => invoke<Reminder[]>('list_reminders'),
   cancelReminder: (id: number) => invoke<void>('cancel_reminder', { id }),

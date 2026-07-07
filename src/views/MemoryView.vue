@@ -4,7 +4,7 @@
 // 纯浏览器预览:假数据看视觉。
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { api, isTauri, type Briefing, type FamilyMember, type Memory } from '../lib/backend'
+import { api, isTauri, type Briefing, type FamilyMember, type Memory, type Todo } from '../lib/backend'
 import { useContextMenu } from '../composables/useContextMenu'
 import { hydrateUser, useSettings } from '../composables/useSettings'
 import { useToast } from '../composables/useToast'
@@ -28,13 +28,15 @@ function toggleAuto() {
 
 const memories = ref<Memory[]>([])
 const briefings = ref<Briefing[]>([])
+/** 没办完的事(切片2 小账):只列 open,勾掉即了结(done 不删行,之后不再进前缀)。 */
+const todos = ref<Todo[]>([])
 const loaded = ref(false)
 /** 加载是否出错:与「空着」分开 —— 出错显「没加载出来 + 重试」,而非误导成「还没有记忆」。 */
 const error = ref(false)
-/** 两步删除:第一次点变"确定删?",再点才真删;键带前缀区分两组(m-1 / b-1)。 */
+/** 两步删除:第一次点变"确定删?",再点才真删;键带前缀区分三组(m-1 / b-1 / t-1)。 */
 const arming = ref<string | null>(null)
 
-const total = computed(() => memories.value.length + briefings.value.length)
+const total = computed(() => memories.value.length + briefings.value.length + todos.value.length)
 
 // 看谁的记忆(§渠道归人第二步「主人查看家人记忆」):主人换视角看家人的小本本 —— **不是切换用户**,
 // 只是过滤视图。共享的「家里的事」(home-scope 需知)对谁都在,只有归人的小本本随人切。
@@ -63,9 +65,14 @@ async function loadEntries() {
   }
   error.value = false
   try {
-    const [m, b] = await Promise.all([api.listMemories(targetId.value), api.listBriefings(targetId.value)])
+    const [m, b, td] = await Promise.all([
+      api.listMemories(targetId.value),
+      api.listBriefings(targetId.value),
+      api.listTodos(targetId.value),
+    ])
     memories.value = m
     briefings.value = b
+    todos.value = td
   } catch (e) {
     console.error('加载回忆页失败', e)
     error.value = true
@@ -109,6 +116,13 @@ function loadFakeEntries() {
     { id: 1, domain: 'media', content: '电影在 \\\\nas\\film;动画片在 \\\\nas\\kids', scope: 'home', resident: true, created_at: Date.now() - 86400_000, updated_at: 0 },
     { id: 2, domain: 'appliance', content: '路由器在客厅电视柜后面', scope: 'home', resident: true, created_at: Date.now() - 3600_000, updated_at: 0 },
   ]
+  todos.value =
+    viewUser.value === 2
+      ? [{ id: 20, content: '想学骑平衡车', created_at: Date.now() - 2 * 86400_000 }]
+      : [
+          { id: 21, content: '周末想去修车', created_at: Date.now() - 86400_000 },
+          { id: 22, content: '给妈妈挑生日礼物', created_at: Date.now() - 3 * 86400_000 },
+        ]
 }
 
 /** 真删记忆(乐观更新,失败补回)。hover ✕ 走两步确认后调它;右键菜单直接调(右键本身已是明确动作)。 */
@@ -156,6 +170,29 @@ async function removeBriefing(b: Briefing) {
   await doRemoveBriefing(b)
 }
 
+/** 勾掉一件没办完的事(办完 / 不用了;乐观更新,失败补回)。语义 = 了结,不是删除。 */
+async function doFinishTodo(td: Todo) {
+  const idx = todos.value.findIndex((x) => x.id === td.id)
+  if (idx >= 0) todos.value.splice(idx, 1)
+  if (!isTauri()) return
+  try {
+    await api.finishTodo(td.id, targetId.value)
+  } catch (e) {
+    console.error('了结待办失败', e)
+    if (idx >= 0) todos.value.splice(idx, 0, td)
+    toast.error(t('toast.actionFailed'))
+  }
+}
+
+async function finishTodo(td: Todo) {
+  if (arming.value !== `t-${td.id}`) {
+    arming.value = `t-${td.id}`
+    return
+  }
+  arming.value = null
+  await doFinishTodo(td)
+}
+
 // 右键菜单:复制内容 / 删除(右键的删除直达,不走 hover 那套两步确认)
 function openMemoryMenu(e: MouseEvent, m: Memory) {
   openMenu(e, [
@@ -169,6 +206,14 @@ function openBriefingMenu(e: MouseEvent, b: Briefing) {
     { label: t('ctx.copy'), action: () => copyText(b.content) },
     { separator: true },
     { label: t('ctx.delete'), danger: true, action: () => doRemoveBriefing(b) },
+  ])
+}
+function openTodoMenu(e: MouseEvent, td: Todo) {
+  openMenu(e, [
+    { label: t('ctx.copy'), action: () => copyText(td.content) },
+    { separator: true },
+    // 待办的动作是「了结」不是「删除」(done 后不再露面),不标 danger
+    { label: t('memory.todoFinish'), action: () => doFinishTodo(td) },
   ])
 }
 
@@ -258,6 +303,24 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             @click.stop="removeMemory(m)"
           >
             {{ arming === `m-${m.id}` ? t('memory.confirm') : '✕' }}
+          </button>
+        </div>
+      </TransitionGroup>
+
+      <!-- 没办完的事(切片2 小账):聊天里提过还没了结的打算;办完/不用了就勾掉 -->
+      <p v-if="todos.length" class="lp-group">{{ t('memory.groupTodos') }}</p>
+      <TransitionGroup name="lp" tag="div">
+        <div v-for="td in todos" :key="`t-${td.id}`" class="lp-card top" @contextmenu="openTodoMenu($event, td)">
+          <span class="lp-dot sm warn"></span>
+          <span class="lp-text multiline">{{ td.content }}</span>
+          <span class="lp-date top">{{ fmtDate(td.created_at) }}</span>
+          <button
+            class="lp-act hoveronly"
+            :class="{ armed: arming === `t-${td.id}` }"
+            :title="t('memory.todoFinish')"
+            @click.stop="finishTodo(td)"
+          >
+            {{ arming === `t-${td.id}` ? t('memory.todoConfirm') : '✓' }}
           </button>
         </div>
       </TransitionGroup>

@@ -417,6 +417,8 @@ pub fn run() {
       commands::memory_maintenance_log,
       commands::list_briefings,
       commands::delete_briefing,
+      commands::list_todos,
+      commands::finish_todo,
       commands::list_reminders,
       commands::cancel_reminder,
       commands::list_fsops,

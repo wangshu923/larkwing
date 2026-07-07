@@ -115,6 +115,18 @@ impl TodoRepo {
         })
     }
 
+    /// 回忆页勾掉一件事(办完 / 不用了):按 (user,id) 限定了结,勾不到别人的。
+    /// 返回是否命中(false = 不存在或已了结)。与 `mark_done` 同语义,只是 UI 按 id 直达。
+    pub fn close(&self, user_id: i64, id: i64) -> Result<bool> {
+        self.db.with(|c| {
+            let n = c.execute(
+                "UPDATE todos SET done=1, updated_at=?3 WHERE user_id=?1 AND id=?2 AND done=0",
+                rusqlite::params![user_id, id, now_ms()],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
     /// 过期自清:open 且创建至今超过 `max_age_ms` 的,静默了结,免无限累积。返回清掉条数。
     /// 搭后台维护轮跑(注入 `now` 可单测)。
     pub fn expire_stale(&self, user_id: i64, now: i64, max_age_ms: i64) -> Result<usize> {
@@ -165,6 +177,19 @@ mod tests {
         // 完全不沾边 = miss
         s.todos.add(1, "练字").unwrap();
         assert!(!s.todos.mark_done(1, "报税").unwrap());
+    }
+
+    #[test]
+    fn close_by_id_scoped_to_user() {
+        let s = store("close");
+        let id = s.todos.add(1, "给自行车打气").unwrap();
+        // 别人勾不到我的
+        assert!(!s.todos.close(2, id).unwrap());
+        assert_eq!(s.todos.list_open(1, 10).unwrap().len(), 1);
+        // 本人勾掉 → 不再 open;重复勾 = 没命中
+        assert!(s.todos.close(1, id).unwrap());
+        assert!(s.todos.list_open(1, 10).unwrap().is_empty());
+        assert!(!s.todos.close(1, id).unwrap());
     }
 
     #[test]

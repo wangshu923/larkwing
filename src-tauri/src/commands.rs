@@ -313,6 +313,25 @@ pub fn delete_briefing(state: State<'_, AppState>, id: i64) -> Result<(), AppErr
     state.engine.delete_briefing(id)
 }
 
+/// 回忆页「没办完的事」分组:开着的待办。user_id 省略 = 当前主人;传家人 id = 主人查看 TA 的。
+#[tauri::command]
+pub fn list_todos(
+    state: State<'_, AppState>,
+    user_id: Option<i64>,
+) -> Result<Vec<larkwing_core::store::Todo>, AppError> {
+    state.engine.list_todos(user_id)
+}
+
+/// 回忆页勾掉一件待办(办完 / 不用了)。user_id 语义同上(主人管理面)。
+#[tauri::command]
+pub fn finish_todo(
+    state: State<'_, AppState>,
+    user_id: Option<i64>,
+    id: i64,
+) -> Result<(), AppError> {
+    state.engine.finish_todo(user_id, id)
+}
+
 /// 提醒页:当前用户待触发的提醒(定时任务,按时间升序)。
 #[tauri::command]
 pub fn list_reminders(state: State<'_, AppState>) -> Result<Vec<larkwing_core::engine::ReminderItem>, AppError> {
