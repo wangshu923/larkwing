@@ -228,5 +228,33 @@ pub fn suite() -> Vec<Scenario> {
                         || m.content.contains("十点半")
                 })
             })),
+        // ── ★主动关怀 切片2·B:待办小账「记 / 结」分寸守卫(2026-07-07)──
+        // 跟进倾向(CARE_FOLLOWUP)+ note_todo/finish_todo 的分寸只在真模型下显现(FakeLlm 不看提示词)。
+        // 守双向:明确未了的打算该记、闲话/情绪/一次性别硬塞,且别擅自了结。纯「追问语气」是 LLM-judge
+        // territory(§16.3 未做),这里只机测工具动作。care.enabled 缺省即开(engine 仅显式 "0" 才关),
+        // 故 eval fresh 库里跟进倾向 + open 待办本就生效,无需 seed 开关。
+        // 反例·别硬塞待办:一句闲话 + 情绪,没有「以后要办」的打算 → 不记待办(note_todo 描述明确:
+        // 一次性闲话、纯情绪都别记)。= consolidate-restraint 的待办版;光有反例是弱测,故配下面正例。
+        Scenario::turn("care-no-forced-todo")
+            .note("闲话/情绪不该塞进待办小账(note_todo restraint;切片2·B『别硬塞』)")
+            .say("今天下午晒了会儿太阳,挺舒服的,就是有点犯困")
+            .check(tool_not_called("note_todo")),
+        // 正例·该记的记:明确一个「想做、还没做」的未了打算 → 记一笔(restraint 的双向搭档,证明它
+        // 不是「一律不记」)。用一次性待办事(车年检)而非持久偏好,降低被路由去 remember 的歧义。
+        Scenario::turn("care-notes-open-loop")
+            .note("明确的『想做还没做』→ note_todo 记一笔(切片2·B 正例)")
+            .say("我这周得把车开去做个年检,一直没抽出空,别忘了这事")
+            .check(tool_called("note_todo")),
+        // 反例·别擅自了结 / 别纠着待办乱动:已惦记着一件 open 待办,这回用户说的是**不相干**的闲话
+        // (没说那件事办了 / 不办了)→ 既不该 finish_todo(无了结信号),也不该把闲话变成新待办。
+        // = 「不追问」的可机测切片(顺口关心一句是允许的〔无工具动作、不触发本 check〕,擅自动手才算回归)。
+        Scenario::turn("care-no-premature-finish")
+            .note("有 open 待办 + 用户说不相干的话 → 不擅自 finish_todo、不把闲话记成新待办(切片2·B『不追问』)")
+            .seed(|s, u| {
+                let _ = s.todos.add(u, "打算周末去把驾照的体检做了");
+            })
+            .say("哎今天上班可真累,回来路上还堵了快一个小时")
+            .check(tool_not_called("finish_todo"))
+            .check(tool_not_called("note_todo")),
     ]
 }
