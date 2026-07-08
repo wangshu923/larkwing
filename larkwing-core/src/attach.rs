@@ -7,6 +7,38 @@ pub fn is_image(mime: &str) -> bool {
     mime.starts_with("image/")
 }
 
+/// 渠道预检:按文件名 / mime 判「是 `extract_doc_text` 能抽出文字的文档类型」——**不看字节**,
+/// 给远程渠道在下载前用(别白下 20MB 压缩包再发现读不了)。与 `extract_doc_text` 的分发保持
+/// 同步;`looks_utf8` 字节兜底不在此列(没扩展名没 mime 的纯文本经渠道会被拒,如实回「看不了」)。
+pub fn doc_supported(name: &str, mime: &str) -> bool {
+    const DOC_MIMES: &[&str] = &[
+        "application/pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ];
+    let lower = name.to_ascii_lowercase();
+    const DOC_EXTS: &[&str] = &[".pdf", ".docx", ".pptx", ".xlsx"];
+    DOC_MIMES.contains(&mime)
+        || mime.starts_with("text/")
+        || DOC_EXTS.iter().any(|e| lower.ends_with(e))
+        || is_texty(&lower)
+}
+
+/// 按扩展名认图(渠道「以文件发送」的原图:钉钉 file / TG document 无可靠 mime 时用)。
+pub fn image_mime_by_ext(name: &str) -> Option<&'static str> {
+    let lower = name.to_ascii_lowercase();
+    const MAP: &[(&str, &str)] = &[
+        (".jpg", "image/jpeg"),
+        (".jpeg", "image/jpeg"),
+        (".png", "image/png"),
+        (".gif", "image/gif"),
+        (".webp", "image/webp"),
+        (".bmp", "image/bmp"),
+    ];
+    MAP.iter().find(|(e, _)| lower.ends_with(e)).map(|(_, m)| *m)
+}
+
 /// 文档抽文字(0.2.0「文档支持」):txt/md/源码直读;OOXML(docx/pptx/xlsx)解 zip 取正文,
 /// xlsx 转 CSV 保住行列结构;PDF 抽文字层(扫描件无文字层 → None,栅格化转图是 stretch)。
 /// 老二进制 .doc/.ppt/.xls 不支持。None = 抽不出文字,调用方按「读不出内容」兜底。
@@ -212,6 +244,28 @@ mod tests {
         assert_eq!(extract_doc_text("note.md", "", b"# Title").as_deref(), Some("# Title"));
         // 全空白 → None
         assert!(extract_doc_text("a.txt", "text/plain", b"   ").is_none());
+    }
+
+    #[test]
+    fn doc_supported_matches_extractor_dispatch() {
+        // 抽得动的文档类型(mime 或扩展名任一)→ true
+        assert!(doc_supported("报告.pdf", ""));
+        assert!(doc_supported("x", "application/pdf"));
+        assert!(doc_supported("课程表.xlsx", "application/octet-stream"), "钉钉 file 无 mime 靠扩展名");
+        assert!(doc_supported("notes.md", ""));
+        assert!(doc_supported("x", "text/plain"));
+        // 抽不动的(压缩包/视频/无名):false → 渠道回「看不了」,不白下载
+        assert!(!doc_supported("片子.mp4", "video/mp4"));
+        assert!(!doc_supported("打包.zip", "application/zip"));
+        assert!(!doc_supported("老文档.doc", "application/msword"), "老二进制不支持");
+        assert!(!doc_supported("", ""));
+    }
+
+    #[test]
+    fn image_ext_recognized_for_channels() {
+        assert_eq!(image_mime_by_ext("原图.JPG"), Some("image/jpeg"));
+        assert_eq!(image_mime_by_ext("截屏.png"), Some("image/png"));
+        assert_eq!(image_mime_by_ext("报告.pdf"), None);
     }
 
     #[test]

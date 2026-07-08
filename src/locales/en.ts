@@ -365,6 +365,8 @@ export default {
   care: {
     resume: 'Keep watching “{title}”?',
     resumeSay: 'Keep watching “{title}”', // sent as the user's message when the care card is clicked (imperative, no question mark)
+    todo: 'Still on the list: {title}', // open todo (store/todos) surfaced in the idle rotation
+    todoSay: 'Help me figure out “{title}”',
   },
   // Desktop floating window (PLAN §12 form C)
   float: {

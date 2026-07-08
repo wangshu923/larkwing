@@ -10,6 +10,7 @@
 //! channels 是边界适配器、只消费它们的公开 API(voice/media 均不反向依赖本模块)。
 
 mod dingtalk;
+mod render;
 mod telegram;
 
 use std::collections::HashMap;

@@ -80,7 +80,10 @@ function wire() {
     if (new URLSearchParams(location.search).get('demo')?.includes('float')) {
       state.data = {
         next_reminder: { content: '吃药', due_at: Date.now() + 3 * 3600_000 },
-        care: { kind: 'resume', title: '星海漫游', updated_at: Date.now() - 26 * 3600_000 },
+        cares: [
+          { kind: 'resume', title: '星海漫游', updated_at: Date.now() - 26 * 3600_000 },
+          { kind: 'todo', title: '给车做年检', updated_at: Date.now() - 50 * 3600_000 },
+        ],
       }
       state.update = { phase: 'available', version: '9.9.9' }
     }
@@ -116,15 +119,19 @@ const items = computed<IdleItem[]>(() => {
   const r = state.data?.next_reminder
   if (r) out.push({ kind: 'reminder', text: `${hhmm(r.due_at)}  ${r.content}` })
   // (去掉"最近一句旺财说的话":用户反馈意义不大)
-  // 主动关怀候选(PLAN ★主动关怀里程碑,切片1 = L0):后端已按 care.enabled 决定给不给,
-  // 这里只加"静默时段"的门(22:00–08:00 本地不打扰;同 audio 夜间也在前端算本地时钟)。
-  const care = state.data?.care
-  if (care?.kind === 'resume' && !inQuietHours()) {
-    out.push({
-      kind: 'care',
-      text: t('care.resume', { title: care.title }),
-      say: t('care.resumeSay', { title: care.title }),
-    })
+  // 主动关怀候选(PLAN ★主动关怀里程碑,L0):后端已按 care.enabled 决定给不给,这里只加
+  // "静默时段"的门(22:00–08:00 本地不打扰;同 audio 夜间也在前端算本地时钟)。
+  // kind → 文案:resume 继续看剧 / todo 没办完的事;未知 kind 忽略(IPC 向前兼容 §6.8)。
+  if (!inQuietHours()) {
+    for (const care of state.data?.cares ?? []) {
+      const key = care.kind === 'resume' ? 'resume' : care.kind === 'todo' ? 'todo' : null
+      if (!key) continue
+      out.push({
+        kind: 'care',
+        text: t(`care.${key}`, { title: care.title }),
+        say: t(`care.${key}Say`, { title: care.title }),
+      })
+    }
   }
   if (showUsage()) {
     if (state.today) {

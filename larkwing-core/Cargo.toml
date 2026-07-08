@@ -57,6 +57,9 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 pdf-extract = "0.9"
 # xlsx → CSV(attach.rs):用成熟读取器处理共享串/类型/日期,比手撸单元格解析稳。pptx 仍走 zip+strip。
 calamine = "0.26"
+# 渠道出站富格式(channels/render.rs):模型 markdown → Telegram HTML / 判钉钉 markdown。
+# 成熟解析器处理嵌套/转义边界,比手写正则稳;纯解析零 IO。
+pulldown-cmark = { version = "0.13", default-features = false }
 
 # 系统音量(tools/desktop.rs 的 system_volume):Windows 走 Core Audio(IAudioEndpointVolume)。
 # 仅 Windows 编译(Mac 走 osascript、Linux 不支持,都不需要);windows 0.61 与 src-tauri 同版本,

@@ -364,6 +364,8 @@ export default {
   care: {
     resume: '继续看《{title}》?',
     resumeSay: '继续看《{title}》', // 点击关怀条替用户发出去的那句(祈使句,不带问号)
+    todo: '还记着:{title}', // 没办完的事(store/todos 小账)进待机轮播
+    todoSay: '帮我看看「{title}」这件事怎么办',
   },
   // 桌面悬浮窗(PLAN §12 形态 C)
   float: {

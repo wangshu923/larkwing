@@ -51,6 +51,13 @@ async fn main() -> anyhow::Result<()> {
         None => "默认 medium(回合 + 提炼;2026-06-19 起提炼也默认开思考)".into(),
     };
     eprintln!("思考档:{thinking_label}");
+    // LLM-judge(§16.3):判官 = specs 里档位最高的那个,run_suite 里固定一个(列间可比)。
+    if let Some(j) = specs
+        .iter()
+        .max_by_key(|s| larkwing_core::llm::catalog::tier_of(&s.model))
+    {
+        eprintln!("LLM-judge 判官:{}({})—— judge-* 场景由它评自由文本质量", j.id, j.model);
+    }
     if std::env::var("EVAL_VERBOSE").is_err() {
         eprintln!("(想看失败 run 的现场:加 EVAL_VERBOSE=1)");
     }

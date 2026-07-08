@@ -5,7 +5,10 @@
 //!
 //! 手机端补齐(2026-07-07,对齐 TG):图(picture / richText 带图)与语音(audio)也能收——
 //! downloadCode 经 `robot/messageFiles/download` 换直链下载;语音优先用钉钉自带的 `recognition`
-//! 转写(有就不下载不占本地 ASR),没有才走 TG 同款 ffmpeg 解码 → 本地 ASR。其余类型如实回「看不了」。
+//! 转写(有就不下载不占本地 ASR),没有才走 TG 同款 ffmpeg 解码 → 本地 ASR。文件(file)里能抽
+//! 文字的文档 / 原图也收(2026-07-08)。其余类型如实回「看不了」。
+//! 出站富格式(2026-07-08):回复像 markdown → msgtype `markdown`(渲染归钉钉客户端,语法宽容
+//! 不会拒收);纯文本仍走 `text` 类型(markdown 折叠单换行,短句寒暄别过)。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,7 +20,7 @@ use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
-use super::{drive_turn, ChannelCtx};
+use super::{drive_turn, render, ChannelCtx};
 use crate::engine::InAttachment;
 use crate::net;
 
@@ -31,7 +34,8 @@ const FILE_MAX_BYTES: usize = 20 * 1024 * 1024;
 
 // ⚠️ core 侧静态话术(§6.6 本应数据化,同 telegram):渠道操作性提示,不经模型。
 const ERR_HINT: &str = "(出了点问题,稍后再试试)";
-const UNSUPPORTED_HINT: &str = "这个我还看不了~在钉钉上现在能收:文字、图片、语音。";
+const UNSUPPORTED_HINT: &str =
+    "这个我还看不了~在钉钉上现在能收:文字、图片、语音,和常见文档(PDF/Word/Excel/PPT/文本)。";
 const VOICE_TOO_LONG_HINT: &str = "这条语音有点长,我一次只能听 60 秒内的,分开发我吧。";
 const VOICE_PREPARING_HINT: &str =
     "我先去准备一下「听力」(第一次要在电脑上下载语音组件,可能要几分钟),弄好后你再发一遍哈。";
@@ -127,7 +131,9 @@ enum Payload {
     Picture { download_code: String, caption: String },
     /// 语音:钉钉自带 `recognition` 转写(有就直接用);否则 downloadCode 下载走本地 ASR。
     Audio { download_code: Option<String>, duration_ms: i64, recognition: Option<String> },
-    /// 认得出是消息、但看不了的类型(视频/文件…)→ 回提示(§3.5 已读必回)。
+    /// 文件:能抽文字的文档 / 文件方式发的原图收(handle_file 按文件名判);其余回「看不了」。
+    File { download_code: String, file_name: String },
+    /// 认得出是消息、但看不了的类型(视频…)→ 回提示(§3.5 已读必回)。
     Unsupported,
 }
 
@@ -161,6 +167,10 @@ async fn handle_message(
         Payload::Audio { download_code, duration_ms, recognition } => {
             let (code, dur, rec) = (download_code.clone(), *duration_ms, recognition.clone());
             handle_audio(ctx, net, app_key, app_secret, &m, code.as_deref(), dur, rec).await;
+        }
+        Payload::File { download_code, file_name } => {
+            let (code, name) = (download_code.clone(), file_name.clone());
+            handle_file(ctx, net, app_key, app_secret, &m, &code, &name).await;
         }
         Payload::Unsupported => {
             let _ = reply_webhook(net, &m.webhook, UNSUPPORTED_HINT).await;
@@ -271,6 +281,39 @@ async fn handle_audio(
     run_reply(ctx, net, m, text, Vec::new(), Some("voice_msg")).await;
 }
 
+/// 文件:能抽文字的文档 / 文件方式发的原图 → 下载走桌面同缝 `InAttachment`(engine 自动
+/// 抽文字进 history / 图当轮注入,§9;抽不出的 engine 落「读不出」占位、模型如实说);
+/// 压缩包等收不了的类型如实回「看不了」。钉钉 file 消息无 mime,全靠文件名判。
+async fn handle_file(
+    ctx: &ChannelCtx,
+    net: &net::Client,
+    app_key: &str,
+    app_secret: &str,
+    m: &BotMessage,
+    download_code: &str,
+    file_name: &str,
+) {
+    let image_mime = crate::attach::image_mime_by_ext(file_name);
+    if image_mime.is_none() && !crate::attach::doc_supported(file_name, "") {
+        let _ = reply_webhook(net, &m.webhook, UNSUPPORTED_HINT).await;
+        return;
+    }
+    let bytes = match download_media(net, app_key, app_secret, download_code).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(err = %format!("{e:#}"), "钉钉文件下载失败");
+            let _ = reply_webhook(net, &m.webhook, ERR_HINT).await;
+            return;
+        }
+    };
+    let att = InAttachment {
+        name: file_name.to_string(),
+        mime: image_mime.unwrap_or("").to_string(), // 文档无 mime:engine 按扩展名分发
+        data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+    };
+    run_reply(ctx, net, m, String::new(), vec![att], None).await;
+}
+
 /// 语音消息的转写链(错误统一冒泡给上面兜 ERR_HINT)。
 async fn audio_to_text(
     ctx: &ChannelCtx,
@@ -345,11 +388,20 @@ pub(super) async fn push(
 ) -> Result<()> {
     let token = access_token(net, app_key, app_secret).await?;
     let url = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend";
+    // 富格式与回复同判定:像 markdown → sampleMarkdown(title=首行摘要);否则纯文本
+    let (msg_key, msg_param) = if render::looks_markdown(text) {
+        (
+            "sampleMarkdown",
+            serde_json::json!({ "title": render::md_title(text), "text": text }).to_string(),
+        )
+    } else {
+        ("sampleText", serde_json::json!({ "content": text }).to_string())
+    };
     let body = serde_json::json!({
         "robotCode": app_key,
         "userIds": [staff_id],
-        "msgKey": "sampleText",
-        "msgParam": serde_json::json!({ "content": text }).to_string(),
+        "msgKey": msg_key,
+        "msgParam": msg_param,
     });
     let resp = net
         .send(url, |c| c.post(url).header("x-acs-dingtalk-access-token", &token).json(&body))
@@ -397,9 +449,18 @@ async fn open_connection(net: &net::Client, app_key: &str, app_secret: &str) -> 
     Ok((endpoint.to_string(), ticket.to_string()))
 }
 
-/// 回复:POST sessionWebhook 发文本(钉钉的回复入口,临时有效期)。
+/// 回复:POST sessionWebhook(钉钉的回复入口,临时有效期)。富格式 = 回复像 markdown 就发
+/// markdown 类型(钉钉客户端渲染子集,不认识的语法显示原字符、不会拒收 —— 无需降级路);
+/// 纯文本仍走 text 类型(markdown 会把单换行折叠成一段,短句寒暄别过 markdown)。
 async fn reply_webhook(net: &net::Client, webhook: &str, text: &str) -> Result<()> {
-    let body = serde_json::json!({ "msgtype": "text", "text": { "content": text } });
+    let body = if render::looks_markdown(text) {
+        serde_json::json!({
+            "msgtype": "markdown",
+            "markdown": { "title": render::md_title(text), "text": text }
+        })
+    } else {
+        serde_json::json!({ "msgtype": "text", "text": { "content": text } })
+    };
     let resp = net.send(webhook, |c| c.post(webhook).json(&body)).await.context("钉钉 sessionWebhook 请求失败")?;
     if !resp.status().is_success() {
         anyhow::bail!("钉钉 sessionWebhook HTTP {}", resp.status());
@@ -461,7 +522,19 @@ fn parse_bot_message(frame: &Value) -> Option<BotMessage> {
             }
         }
         "richText" => parse_rich_text(&data),
-        _ => Payload::Unsupported, // video / file / …:已读必回(§3.5)
+        "file" => match content_download_code(&data) {
+            Some(code) => Payload::File {
+                download_code: code,
+                file_name: data
+                    .pointer("/content/fileName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            },
+            None => Payload::Unsupported, // 形不完整:如实回提示,别静默
+        },
+        _ => Payload::Unsupported, // video / …:已读必回(§3.5)
     };
 
     let conv_id = data.get("conversationId").and_then(Value::as_str).unwrap_or("");
@@ -615,6 +688,23 @@ mod tests {
                 recognition: Some("在吗".into())
             }
         );
+
+        // 文件:downloadCode + fileName 进载荷(收不收由 handle_file 按名字判)
+        let m = parse_bot_message(&frame_of(serde_json::json!({
+            "msgtype": "file", "conversationType": "1", "conversationId": "c1",
+            "sessionWebhook": "https://x",
+            "content": { "downloadCode": "dc-file", "fileName": " 课程表.xlsx " }
+        })))
+        .unwrap();
+        assert_eq!(
+            m.payload,
+            Payload::File { download_code: "dc-file".into(), file_name: "课程表.xlsx".into() }
+        );
+        // 缺 downloadCode 的文件 → Unsupported
+        let m = parse_bot_message(&frame_of(serde_json::json!({
+            "msgtype": "file", "sessionWebhook": "https://x", "content": { "fileName": "x.pdf" } })))
+        .unwrap();
+        assert_eq!(m.payload, Payload::Unsupported);
 
         // 视频等其它类型 → Unsupported(回「看不了」);缺 downloadCode 的图同理
         let m = parse_bot_message(&frame_of(serde_json::json!({

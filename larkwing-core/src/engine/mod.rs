@@ -372,20 +372,21 @@ pub struct FloatIdle {
     /// 最近一句旺财说的话(已过滤工具轮空串 / __IGNORE__);None = 还没说过。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_line: Option<String>,
-    /// 主动关怀候选(PLAN ★主动关怀里程碑,切片1 = L0 悬浮窗待机):最近没看完的剧 →「继续看《X》」。
-    /// care.enabled 关 = None;静默时段的门在前端(本地时钟,同 audio 夜间);名字类文案前端占位渲染(§6.6)。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub care: Option<CareCandidate>,
+    /// 主动关怀候选(PLAN ★主动关怀里程碑,L0 悬浮窗待机):最近没看完的剧「继续看《X》」+
+    /// 拖最久的 open 待办「还没办:X」(切片2 小账的 L0 半边),各最多一条、进待机轮播池轮着显。
+    /// care.enabled 关 = 空;静默时段的门在前端(本地时钟,同 audio 夜间);文案前端按 kind 选(§6.6)。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cares: Vec<CareCandidate>,
 }
 
 /// 一条主动关怀候选(中立数据,core 不产文案 §6.6):`kind` 让前端选文案 key,其余是渲染参数。
 #[derive(Debug, Clone, Serialize)]
 pub struct CareCandidate {
-    /// 类型(切片1 唯一 "resume" = 继续看某剧);前端按它选 i18n。
+    /// 类型("resume" = 继续看某剧 / "todo" = 没办完的事);前端按它选 i18n,未知 kind 忽略。
     pub kind: String,
-    /// 剧名(填进前端 care.resume 的 {title})。
+    /// 渲染参数:剧名 / 待办内容(填进前端 care.* 的 {title})。
     pub title: String,
-    /// 上次看的时间(unix ms):前端可据此呈现"搁了多久"或将来做筛。
+    /// 上次看 / 记下的时间(unix ms):前端可据此呈现"搁了多久"或将来做筛。
     pub updated_at: i64,
 }
 
@@ -769,19 +770,19 @@ impl Engine {
             Some(c) => self.store.chat.latest_assistant_line(c.id)?,
             None => None,
         };
-        // 主动关怀候选(切片1):总开关缺省开、只有显式 "0" 关;开着就取最近一部有剧名的在看剧
-        // 作「继续看《X》」候选。静默时段 / 呈现节流的门在前端(useFloatIdle,本地时钟)。
-        let care = if self.store.settings.get(None, "care.enabled")?.as_deref() == Some("0") {
-            None
-        } else {
-            self.store
-                .media_progress
-                .list_recent(user.id, 1)?
-                .into_iter()
-                .next()
-                .map(|p| CareCandidate { kind: "resume".into(), title: p.title, updated_at: p.updated_at })
-        };
-        Ok(FloatIdle { next_reminder, latest_line, care })
+        // 主动关怀候选:总开关缺省开、只有显式 "0" 关;开着给两路——最近一部有剧名的在看剧
+        // (「继续看《X》」)+ 拖最久的 open 待办(「还没办:X」,切片2 小账的 L0 半边)。
+        // 静默时段 / 呈现节流的门在前端(useFloatIdle,本地时钟)。
+        let mut cares = Vec::new();
+        if self.store.settings.get(None, "care.enabled")?.as_deref() != Some("0") {
+            if let Some(p) = self.store.media_progress.list_recent(user.id, 1)?.into_iter().next() {
+                cares.push(CareCandidate { kind: "resume".into(), title: p.title, updated_at: p.updated_at });
+            }
+            if let Some(td) = self.store.todos.oldest_open(user.id)? {
+                cares.push(CareCandidate { kind: "todo".into(), title: td.content, updated_at: td.created_at });
+            }
+        }
+        Ok(FloatIdle { next_reminder, latest_line, cares })
     }
 
     pub fn new_conversation(&self, channel: &str) -> Result<Conversation, AppError> {

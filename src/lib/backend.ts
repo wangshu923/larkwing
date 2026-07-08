@@ -292,18 +292,18 @@ export interface FloatReminder {
   due_at: number
 }
 export interface CareCandidate {
-  /** 关怀类型(切片1 唯一 'resume');前端按它选 i18n 文案。 */
+  /** 关怀类型('resume' 继续看剧 / 'todo' 没办完的事);前端按它选 i18n 文案,未知 kind 忽略。 */
   kind: string
-  /** 剧名 → 填进 care.resume 的 {title}。 */
+  /** 剧名 / 待办内容 → 填进 care.* 的 {title}。 */
   title: string
-  /** 上次看的时间(unix 毫秒)。 */
+  /** 上次看 / 记下的时间(unix 毫秒)。 */
   updated_at: number
 }
 export interface FloatIdle {
   next_reminder?: FloatReminder
   latest_line?: string
-  /** 主动关怀候选(PLAN ★主动关怀里程碑):最近没看完的剧 →「继续看《X》」;care.enabled 关 = 后端不给。 */
-  care?: CareCandidate
+  /** 主动关怀候选(PLAN ★主动关怀里程碑):继续看剧 + 拖最久的待办,各最多一条;care.enabled 关 = 后端不给。 */
+  cares?: CareCandidate[]
 }
 
 export type TurnEvent =

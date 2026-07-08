@@ -1,10 +1,13 @@
 //! Telegram bot 适配器:raw Bot API over `net::Client`(**不用 teloxide**——它自带 reqwest 会绕过
-//! net::Client / 破 §4.6 代理选路)。入站 `getUpdates` 长轮询(offset 防重放),出站 `sendMessage`
-//! (**纯文本、不带 parse_mode** —— 绕开 MarkdownV2 转义地狱这个 robot 大坑)。免公网、免 SDK。
+//! net::Client / 破 §4.6 代理选路)。入站 `getUpdates` 长轮询(offset 防重放),出站 `sendMessage`。
+//! 富格式(2026-07-08,输出后处理、不动 prompt §7.7):回复像 markdown → `render::to_telegram_html`
+//! 转 **HTML parse_mode**(受控标签,绕开 MarkdownV2 全字符转义地狱这个 robot 大坑),失败降级
+//! 纯文本重发;纯文本回复仍不带 parse_mode 零处理。免公网、免 SDK。
 //! 国内 api.telegram.org 多半要代理:net 直连失败自动落代理(§4.6),无需本模块操心。
 //!
 //! 手机端补全(v0.2.4):语音消息(getFile 下载 → ffmpeg 解 16k PCM → 本地 ASR)与照片
-//! (取最大尺寸 → 桌面同缝 InAttachment 当轮注入)都能收;其余类型如实回「看不了」(§3.5 不静默)。
+//! (取最大尺寸 → 桌面同缝 InAttachment 当轮注入)都能收;文档(document)里能抽文字的 /
+//! 「以文件发送」的原图也收(2026-07-08);其余类型如实回「看不了」(§3.5 不静默)。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +17,7 @@ use base64::Engine as _;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use super::{drive_turn, split_message, ChannelCtx};
+use super::{drive_turn, render, split_message, ChannelCtx};
 use crate::engine::InAttachment;
 use crate::net;
 
@@ -22,6 +25,11 @@ const CHANNEL: &str = "telegram";
 const API: &str = "https://api.telegram.org";
 /// Telegram 单条上限 4096;留余量。
 const TG_MAX: usize = 4000;
+/// 富格式路的**源文**分片上限:HTML 转义 + 标签会膨胀,给足余量;切完逐片转 HTML,
+/// 标签永不跨片(片内未闭合的 markdown 记号被解析器当字面,显示稍糙但不炸)。
+const TG_RICH_SRC_MAX: usize = 3200;
+/// Telegram 硬上限(字符):转出的 HTML 超过它就该片降级纯文本(源片 ≤3200 必然安全)。
+const TG_HARD_MAX: usize = 4096;
 /// 长轮询服务端挂起窗口(秒);net client 超时须 > 它。
 const POLL_TIMEOUT_S: u64 = 50;
 /// 语音消息转写上限(秒):本地 ASR(SenseVoice/FireRed)超长段落精度掉、耗时涨,
@@ -35,7 +43,8 @@ const FILE_MAX_BYTES: i64 = 20 * 1024 * 1024;
 const ONBOARD_HINT: &str =
     "你好,我是{name}。你的 chat id 是 {id},把它加到设置·远程渠道的白名单里,我们就能聊啦。";
 const ERR_HINT: &str = "(出了点问题,稍后再试试)";
-const UNSUPPORTED_HINT: &str = "这个我还看不了~现在能收:文字、图片、语音。";
+const UNSUPPORTED_HINT: &str = "这个我还看不了~现在能收:文字、图片、语音,和常见文档(PDF/Word/Excel/PPT/文本)。";
+const FILE_TOO_BIG_HINT: &str = "这个文件有点大,20MB 以内的我才收得动。";
 const VOICE_TOO_LONG_HINT: &str = "这条语音有点长,我一次只能听 60 秒内的,分开发我吧。";
 const VOICE_PREPARING_HINT: &str =
     "我先去准备一下「听力」(第一次要在电脑上下载语音组件,可能要几分钟),弄好后你再发一遍哈。";
@@ -113,6 +122,22 @@ async fn serve(ctx: &ChannelCtx, net: &net::Client, ct: &CancellationToken) -> R
                     handle_photo(ctx, net, &token, chat_id, &chat, sender.as_deref(), &file_id, caption)
                         .await;
                 }
+                Incoming::Document { file_id, file_name, mime, size, caption } => {
+                    handle_document(
+                        ctx,
+                        net,
+                        &token,
+                        chat_id,
+                        &chat,
+                        sender.as_deref(),
+                        &file_id,
+                        &file_name,
+                        &mime,
+                        size,
+                        caption,
+                    )
+                    .await;
+                }
                 // 已读必回(§3.5 不静默):看不了的类型如实说,别让家人对着空气等
                 Incoming::Unsupported => {
                     let _ = send_message(net, &token, chat_id, UNSUPPORTED_HINT).await;
@@ -137,10 +162,8 @@ async fn reply_turn(
 ) {
     match drive_turn(&ctx.engine, CHANNEL, chat, text, sender, attachments, input).await {
         Ok(Some(reply)) => {
-            for piece in split_message(&reply, TG_MAX) {
-                if let Err(e) = send_message(net, token, chat_id, &piece).await {
-                    tracing::warn!(err = %format!("{e:#}"), "Telegram 发送失败");
-                }
+            if let Err(e) = send_rich(net, token, chat_id, &reply).await {
+                tracing::warn!(err = %format!("{e:#}"), "Telegram 发送失败");
             }
         }
         Ok(None) => {} // 折进在飞回合(inject),不单独回
@@ -229,6 +252,51 @@ async fn handle_photo(
     reply_turn(ctx, net, token, chat_id, chat, caption, sender, vec![att], None).await;
 }
 
+/// 文档(document):文件方式发来的东西——能抽文字的文档下载后走桌面同缝 `InAttachment`
+/// (engine 自动抽文字并进 history,§9;扫描件等抽不出的由 engine 落「读不出」占位、模型如实说);
+/// 「以文件发送」的原图按扩展名认出当图收;其余(压缩包/视频文件…)如实回「看不了」。
+#[allow(clippy::too_many_arguments)]
+async fn handle_document(
+    ctx: &ChannelCtx,
+    net: &net::Client,
+    token: &str,
+    chat_id: i64,
+    chat: &str,
+    sender: Option<&str>,
+    file_id: &str,
+    file_name: &str,
+    mime: &str,
+    size: i64,
+    caption: String,
+) {
+    // 收不收先判(下载前):图(mime 或扩展名认出)/ 能抽文字的文档;都不是 = 看不了
+    let as_image = crate::attach::is_image(mime)
+        .then(|| mime.to_string())
+        .or_else(|| crate::attach::image_mime_by_ext(file_name).map(str::to_string));
+    if as_image.is_none() && !crate::attach::doc_supported(file_name, mime) {
+        let _ = send_message(net, token, chat_id, UNSUPPORTED_HINT).await;
+        return;
+    }
+    if size > FILE_MAX_BYTES {
+        let _ = send_message(net, token, chat_id, FILE_TOO_BIG_HINT).await;
+        return;
+    }
+    let bytes = match download_file(net, token, file_id).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(err = %format!("{e:#}"), "Telegram 文件下载失败");
+            let _ = send_message(net, token, chat_id, ERR_HINT).await;
+            return;
+        }
+    };
+    let att = InAttachment {
+        name: if file_name.is_empty() { "file".into() } else { file_name.to_string() },
+        mime: as_image.unwrap_or_else(|| mime.to_string()),
+        data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+    };
+    reply_turn(ctx, net, token, chat_id, chat, caption, sender, vec![att], None).await;
+}
+
 /// 启动时取"最后一条积压之后"的 offset(offset=-1 拿最后一条;+1 = 跳过积压)。
 async fn latest_offset(net: &net::Client, token: &str) -> i64 {
     match get_updates(net, token, -1, 0).await {
@@ -267,12 +335,46 @@ async fn send_message(net: &net::Client, token: &str, chat_id: i64, text: &str) 
     Ok(())
 }
 
-/// 提醒推回手机(mod.rs outbound_loop 用):主动往 chat 发一段文本,长文分片。
-pub(super) async fn push(net: &net::Client, token: &str, chat_id: i64, text: &str) -> Result<()> {
-    for piece in split_message(text, TG_MAX) {
-        send_message(net, token, chat_id, &piece).await?;
+/// HTML 富格式发送(parse_mode=HTML;render 只产受控标签)。失败冒泡给 send_rich 降级。
+async fn send_html(net: &net::Client, token: &str, chat_id: i64, html: &str) -> Result<()> {
+    let url = format!("{API}/bot{token}/sendMessage");
+    let body = serde_json::json!({ "chat_id": chat_id, "text": html, "parse_mode": "HTML" });
+    let resp = net.send(&url, |c| c.post(&url).json(&body)).await.context("sendMessage 请求失败")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let detail = resp.text().await.unwrap_or_default();
+        anyhow::bail!("sendMessage(HTML) HTTP {status}: {detail}");
     }
     Ok(())
+}
+
+/// 富格式出口(回合回复 / 提醒推送共用):回复像 markdown → 逐片转 Telegram HTML 发;
+/// 纯文本走老路零处理。**双层降级**(§3.5 不静默失败):转出超硬限 → 该片直接发纯文本源;
+/// HTML 被 Telegram 拒(4xx)→ 该片纯文本原文重发一次——宁可格式糙,消息必达。
+async fn send_rich(net: &net::Client, token: &str, chat_id: i64, text: &str) -> Result<()> {
+    if !render::looks_markdown(text) {
+        for piece in split_message(text, TG_MAX) {
+            send_message(net, token, chat_id, &piece).await?;
+        }
+        return Ok(());
+    }
+    for piece in split_message(text, TG_RICH_SRC_MAX) {
+        let html = render::to_telegram_html(&piece);
+        if html.chars().count() > TG_HARD_MAX {
+            send_message(net, token, chat_id, &piece).await?;
+            continue;
+        }
+        if let Err(e) = send_html(net, token, chat_id, &html).await {
+            tracing::warn!(err = %format!("{e:#}"), "Telegram HTML 发送失败,该片降级纯文本重发");
+            send_message(net, token, chat_id, &piece).await?;
+        }
+    }
+    Ok(())
+}
+
+/// 提醒推回手机(mod.rs outbound_loop 用):主动往 chat 发一段文本;与回合回复同走富格式出口。
+pub(super) async fn push(net: &net::Client, token: &str, chat_id: i64, text: &str) -> Result<()> {
+    send_rich(net, token, chat_id, text).await
 }
 
 /// getFile 取下载路径 → 拉字节(语音/照片共用);Bot API 20MB 封顶,超限如实报错。
@@ -302,14 +404,16 @@ enum Incoming {
     Text(String),
     Voice { file_id: String, duration: i64 },
     Photo { file_id: String, caption: String },
-    /// 认得出是媒体/内容消息、但看不了的类型(贴纸/视频/文件…)→ 回提示。
+    /// 文件方式发来的东西(文档/原图/任意文件):收不收由 handle_document 按名字+mime 判。
+    Document { file_id: String, file_name: String, mime: String, size: i64, caption: String },
+    /// 认得出是媒体/内容消息、但看不了的类型(贴纸/视频…)→ 回提示。
     /// 服务性消息(入群/置顶等)不在此列,照旧静默跳过。
     Unsupported,
 }
 
 /// 明确「看不了但该回一句」的消息键(服务性消息不算,别对入群通知喊话)。
 const UNSUPPORTED_KEYS: &[&str] =
-    &["sticker", "video", "document", "audio", "video_note", "animation", "contact", "location", "venue", "poll"];
+    &["sticker", "video", "audio", "video_note", "animation", "contact", "location", "venue", "poll"];
 
 /// 从 update 取 (chat_id, 形态, 发送者昵称);非消息帧(edited/回执等)→ None。
 /// 昵称 = from.first_name(+ last_name),只给家人页认脸,取不到无妨。
@@ -340,6 +444,19 @@ fn parse_update(upd: &Value) -> Option<(i64, Incoming, Option<String>)> {
         // photo 是从小到大的多档尺寸,取最后(最大)那档
         Incoming::Photo {
             file_id: sizes.last()?.get("file_id").and_then(Value::as_str)?.to_string(),
+            caption: msg
+                .get("caption")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+        }
+    } else if let Some(d) = msg.get("document") {
+        Incoming::Document {
+            file_id: d.get("file_id").and_then(Value::as_str)?.to_string(),
+            file_name: d.get("file_name").and_then(Value::as_str).unwrap_or("").trim().to_string(),
+            mime: d.get("mime_type").and_then(Value::as_str).unwrap_or("").to_string(),
+            size: d.get("file_size").and_then(Value::as_i64).unwrap_or(0),
             caption: msg
                 .get("caption")
                 .and_then(Value::as_str)
@@ -424,12 +541,57 @@ mod tests {
     }
 
     #[test]
+    fn parse_update_document_carries_name_mime_and_caption() {
+        // document 消息:名字/mime/大小/caption 全带出(收不收由 handle_document 判,parse 不管)
+        let doc = serde_json::json!({ "message": {
+            "chat": { "id": 9 },
+            "document": { "file_id": "df1", "file_name": " 课程表.pdf ", "mime_type": "application/pdf", "file_size": 1234 },
+            "caption": " 帮我看看 "
+        }});
+        assert_eq!(
+            parse_update(&doc),
+            Some((
+                9,
+                Incoming::Document {
+                    file_id: "df1".into(),
+                    file_name: "课程表.pdf".into(),
+                    mime: "application/pdf".into(),
+                    size: 1234,
+                    caption: "帮我看看".into()
+                },
+                None
+            ))
+        );
+        // 字段缺省(有些客户端不发 file_name/mime):照收,空值交 handle 判
+        let bare = serde_json::json!({ "message": {
+            "chat": { "id": 9 }, "document": { "file_id": "df2" }
+        }});
+        assert_eq!(
+            parse_update(&bare),
+            Some((
+                9,
+                Incoming::Document {
+                    file_id: "df2".into(),
+                    file_name: String::new(),
+                    mime: String::new(),
+                    size: 0,
+                    caption: String::new()
+                },
+                None
+            ))
+        );
+        // 连 file_id 都没有:形不完整 → 跳过
+        let broken_doc = serde_json::json!({ "message": { "chat": { "id": 9 }, "document": {} } });
+        assert_eq!(parse_update(&broken_doc), None);
+    }
+
+    #[test]
     fn parse_update_unsupported_vs_service() {
-        // 贴纸/文件 → Unsupported(要回「看不了」,§3.5 不静默)
+        // 贴纸/视频 → Unsupported(要回「看不了」,§3.5 不静默)
         let sticker = serde_json::json!({ "message": { "chat": { "id": 1 }, "sticker": {} } });
         assert_eq!(parse_update(&sticker), Some((1, Incoming::Unsupported, None)));
-        let doc = serde_json::json!({ "message": { "chat": { "id": 1 }, "document": {} } });
-        assert_eq!(parse_update(&doc), Some((1, Incoming::Unsupported, None)));
+        let video = serde_json::json!({ "message": { "chat": { "id": 1 }, "video": {} } });
+        assert_eq!(parse_update(&video), Some((1, Incoming::Unsupported, None)));
         // 服务性消息(入群通知等)→ 静默跳过,别对着系统事件喊话
         let service =
             serde_json::json!({ "message": { "chat": { "id": 1 }, "new_chat_members": [{}] } });

@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use crate::engine::{AssistantPayload, Engine, ToolRowPayload, TraceStep, TurnEvent, UserMeta};
 use crate::llm::registry::ProviderSpec;
-use crate::llm::LlmProvider;
+use crate::llm::{ChatMessage, ChatOptions, ChatRequest, LlmProvider, ToolChoice};
 use crate::scenes::Scenes;
 use crate::store::{Memory, Store};
 
@@ -28,10 +28,20 @@ pub use grader::{
     tool_called, tool_not_called, tool_status, Check, Observed, Outcome,
 };
 
+/// turn 驱动的一条用户输入(形态随场景:家人说的 / 旁听 / 语音)。
+struct SayLine {
+    text: String,
+    /// 说话人显示名(seed 里 `users.create` 的)→ 按名查 id 填 `speaker_user`。None = 主人打字。
+    speaker: Option<String>,
+    /// 旁听形态(唤醒确认层「呼名+续句」):input=overheard + speak,装配〔旁听〕〔语音〕标记。
+    overheard: bool,
+    /// 语音形态:speak=true,装配〔语音〕标记(说话守则生效)—— judge 语音风格场景用。
+    spoken: bool,
+}
+
 /// 驱动方式:一串用户消息(各排到回合收尾)/ 预置一段历史后调 consolidate。
 enum Drive {
-    /// (text, 说话人显示名, 旁听形态)—— 旁听 = payload input=overheard+speak,装配〔旁听〕标记。
-    Turn(Vec<(String, Option<String>, bool)>),
+    Turn(Vec<SayLine>),
     Consolidate(Vec<(String, String)>),
 }
 
@@ -45,6 +55,10 @@ pub struct Scenario {
     drive: Drive,
     seed: Option<SeedFn>,
     checks: Vec<Check>,
+    /// LLM-judge 评审标准(§16.3):自由文本质量(语气 / 分寸 / 风格)——同步 `Check` 断言
+    /// 机制事实,judge 断言「说得好不好」。None = 纯机制场景(绝大多数)。判官不在(没配
+    /// key)时该断言跳过、只跑同步 checks。
+    judge: Option<String>,
 }
 
 impl Scenario {
@@ -57,6 +71,7 @@ impl Scenario {
             drive: Drive::Turn(Vec::new()),
             seed: None,
             checks: Vec::new(),
+            judge: None,
         }
     }
 
@@ -69,6 +84,7 @@ impl Scenario {
             drive: Drive::Consolidate(Vec::new()),
             seed: None,
             checks: Vec::new(),
+            judge: None,
         }
     }
 
@@ -82,20 +98,27 @@ impl Scenario {
         self
     }
 
+    fn push_line(&mut self, line: SayLine) {
+        if let Drive::Turn(v) = &mut self.drive {
+            v.push(line);
+        }
+    }
+
     /// 追加一条用户消息(turn 场景)。
     pub fn say(mut self, text: &str) -> Self {
-        if let Drive::Turn(v) = &mut self.drive {
-            v.push((text.into(), None, false));
-        }
+        self.push_line(SayLine { text: text.into(), speaker: None, overheard: false, spoken: false });
         self
     }
 
     /// 追加一条「某位家人说的」用户消息(turn 场景):`speaker` = 家人显示名(seed 里 `users.create` 的),
     /// 驱动时按名查 id 填进 `UserMeta.speaker_user`,模拟声纹 / 渠道归人入站 —— 测说话人归属遵循度。
     pub fn say_as(mut self, speaker: &str, text: &str) -> Self {
-        if let Drive::Turn(v) = &mut self.drive {
-            v.push((text.into(), Some(speaker.into()), false));
-        }
+        self.push_line(SayLine {
+            text: text.into(),
+            speaker: Some(speaker.into()),
+            overheard: false,
+            spoken: false,
+        });
         self
     }
 
@@ -104,9 +127,14 @@ impl Scenario {
     /// 是叫它就该正常办事(LAWS「旁听」节,2026-07-06)。走 send_message(评的是模型判断,
     /// 不是引擎的悬置/蒸发机制 —— 那有集成测试守)。
     pub fn say_overheard(mut self, text: &str) -> Self {
-        if let Drive::Turn(v) = &mut self.drive {
-            v.push((text.into(), None, true));
-        }
+        self.push_line(SayLine { text: text.into(), speaker: None, overheard: true, spoken: false });
+        self
+    }
+
+    /// 追加一条「语音交互」消息(speak=true → 装配〔语音〕标记,说话守则生效):
+    /// 测语音回合的口语短句 / 不出记号遵循度(配 `.judge`)。
+    pub fn say_spoken(mut self, text: &str) -> Self {
+        self.push_line(SayLine { text: text.into(), speaker: None, overheard: false, spoken: true });
         self
     }
 
@@ -126,6 +154,13 @@ impl Scenario {
 
     pub fn check(mut self, c: Check) -> Self {
         self.checks.push(c);
+        self
+    }
+
+    /// 挂一条 LLM-judge 评审标准(§16.3):写「什么算过 / 什么算不过」的可判定标准,
+    /// 别写模糊形容词(「自然」「亲切」判官没法一致执行)。一个场景最多一条。
+    pub fn judge(mut self, rubric: &str) -> Self {
+        self.judge = Some(rubric.into());
         self
     }
 }
@@ -178,6 +213,9 @@ pub struct ScenarioResult {
     pub failed_checks: Vec<(String, u32)>,
     /// 非正常收尾(报错 / 取消)次数。
     pub bad_outcomes: u32,
+    /// LLM-judge 基础设施故障次数(网络 / 回复解析不出):**不算 fail**(评审挂了 ≠ 被测差),
+    /// 但要在报告露头 —— 全是 judge_errors 的「全过」不可信。
+    pub judge_errors: u32,
     /// 本场景 N 次运行的 token / 成本合计(见 `TokenTally` 注意事项)。
     pub tokens: TokenTally,
 }
@@ -262,26 +300,25 @@ fn trunc(s: &str, n: usize) -> String {
 }
 
 /// 驱动一条用户消息到回合收尾,返回结局(把 Delta/ToolUse/Usage 都喝掉,只认终态)。
-async fn drive_turn(
-    engine: &Engine,
-    store: &Store,
-    conv_id: i64,
-    text: &str,
-    speaker: Option<&str>,
-    overheard: bool,
-) -> Outcome {
+async fn drive_turn(engine: &Engine, store: &Store, conv_id: i64, line: &SayLine) -> Outcome {
     // 「某位家人说的」→ 按显示名查 id 填 speaker_user(模拟声纹 / 渠道归人入站);无 = 主人本人打字。
-    let mut meta = speaker.and_then(|name| {
+    let mut meta = line.speaker.as_deref().and_then(|name| {
         let id = store.users.list().ok()?.into_iter().find(|u| u.name == name)?.id;
         Some(UserMeta { speaker_user: Some(id), ..Default::default() })
     });
     // 旁听形态(唤醒确认层「呼名+续句」):input=overheard + speak → 装配〔旁听〕〔语音〕标记
-    if overheard {
+    if line.overheard {
         let m = meta.get_or_insert_with(Default::default);
         m.input = "overheard".into();
         m.speak = true;
     }
-    let mut rx = match engine.send_message(conv_id, text.to_string(), meta, Vec::new()).await {
+    // 语音形态:speak → 装配〔语音〕标记(说话守则生效)
+    if line.spoken {
+        let m = meta.get_or_insert_with(Default::default);
+        m.input = "voice".into();
+        m.speak = true;
+    }
+    let mut rx = match engine.send_message(conv_id, line.text.clone(), meta, Vec::new()).await {
         Ok(rx) => rx,
         Err(e) => return Outcome::Error(format!("{:?}: {}", e.kind, e.message)),
     };
@@ -299,15 +336,78 @@ async fn drive_turn(
     outcome
 }
 
+/// LLM-judge 的判定内核(§16.3):对话转写 + rubric → 判官,回 (pass, reason)。
+/// `Err` = 判官基础设施故障(网络 / 回复解析不出),与被测质量无关 —— 调用方计 judge_errors。
+/// 判官吃**用户可见对话**(user/assistant 行,tool/event 不进 —— 评的是「说出来的话」);
+/// 强制 JSON 单对象输出,解析容忍 ```json 围栏 / 前后废话(同 consolidate::parse 的抠法)。
+async fn run_judge(
+    judge: &Arc<dyn LlmProvider>,
+    rubric: &str,
+    transcript: &str,
+) -> anyhow::Result<(bool, String)> {
+    const SYSTEM: &str = "你是严格的对话质量评审。只按给定的评审标准判定,不自由发挥、不看标准之外的方面。只输出一个 JSON 对象:{\"pass\":true|false,\"reason\":\"一句话依据\"}";
+    let body = format!("【评审标准】\n{rubric}\n\n【对话记录】\n{transcript}\n\n按标准判定这段对话里助手的表现,输出 JSON。");
+    let req = ChatRequest {
+        system: SYSTEM.into(),
+        messages: vec![ChatMessage::User { content: body, parts: vec![] }],
+        options: ChatOptions::default(),
+        tools: vec![],
+        tool_choice: ToolChoice::default(),
+    };
+    let text = judge.chat(req).await.map_err(|e| anyhow::anyhow!("判官调用失败: {e:?}"))?;
+    let slice = match (text.find('{'), text.rfind('}')) {
+        (Some(a), Some(b)) if b > a => &text[a..=b],
+        _ => anyhow::bail!("判官回复不含 JSON: {}", trunc(&text, 120)),
+    };
+    let v: serde_json::Value =
+        serde_json::from_str(slice).map_err(|e| anyhow::anyhow!("判官 JSON 解析失败: {e}"))?;
+    let pass = v.get("pass").and_then(serde_json::Value::as_bool).ok_or_else(|| {
+        anyhow::anyhow!("判官 JSON 缺 pass 字段: {}", trunc(slice, 120))
+    })?;
+    let reason = v.get("reason").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+    Ok((pass, reason))
+}
+
+/// 判官吃的对话转写:user/assistant 行(tool/event 内部行不进),每条截断防刷 token。
+fn judge_transcript(store: &Store, conv_id: i64) -> String {
+    let mut out = String::new();
+    for m in store.chat.recent_messages(conv_id, 100).unwrap_or_default() {
+        let who = match m.role.as_str() {
+            "user" => "用户",
+            "assistant" if !m.content.trim().is_empty() => "助手",
+            _ => continue,
+        };
+        out.push_str(&format!("{who}: {}\n", trunc(&m.content, 600)));
+    }
+    out
+}
+
 /// 跑一个场景 `runs` 次(每次全新临时库 → run 间零串扰),返回通过率结果。
 /// `make` 每次造一个**新** provider:真用 `|| spec.build()`;自测 `|| Arc::new(FakeLlm::scripted(..))`。
 /// 一次 run 通过 = 正常收尾(Done)且**所有**断言都过(pass^k 风格)。
+/// 判官走 `run_scenario_judged`;本入口 = 无判官(带 `.judge` 的场景只跑同步 checks)。
 pub async fn run_scenario<F>(make: F, sc: &Scenario, runs: u32) -> ScenarioResult
+where
+    F: Fn() -> Arc<dyn LlmProvider>,
+{
+    run_scenario_judged(make, None, sc, runs).await
+}
+
+/// `run_scenario` 的带判官版:场景挂了 `.judge(rubric)` 且 `judge` 在 → 同步 checks 全过后
+/// 再过判官;判官说不过 = 该 run fail(计 "LLM-judge");判官自身故障 = 计 judge_errors、
+/// **不算 fail**(评审挂了 ≠ 被测差,报告里露头)。
+pub async fn run_scenario_judged<F>(
+    make: F,
+    judge: Option<&Arc<dyn LlmProvider>>,
+    sc: &Scenario,
+    runs: u32,
+) -> ScenarioResult
 where
     F: Fn() -> Arc<dyn LlmProvider>,
 {
     let mut passed = 0u32;
     let mut bad_outcomes = 0u32;
+    let mut judge_errors = 0u32;
     let mut failed: HashMap<String, u32> = HashMap::new();
     let mut tokens = TokenTally::default();
     let verbose = std::env::var("EVAL_VERBOSE").is_ok();
@@ -358,10 +458,8 @@ where
         let outcome = match &sc.drive {
             Drive::Turn(says) => {
                 let mut last = Outcome::Done;
-                for (text, spk, overheard) in says {
-                    last =
-                        drive_turn(&engine, &store, conv.id, text, spk.as_deref(), *overheard)
-                            .await;
+                for line in says {
+                    last = drive_turn(&engine, &store, conv.id, line).await;
                 }
                 last
             }
@@ -431,6 +529,28 @@ where
                 *failed.entry(c.name.clone()).or_insert(0) += 1;
             }
         }
+        // LLM-judge(§16.3):机制断言全过、判官在场,才值得花判官一跳(挂了的 run 不必再评)。
+        let mut judge_reason = String::new();
+        if all_ok {
+            if let (Some(rubric), Some(j)) = (&sc.judge, judge) {
+                match run_judge(j, rubric, &judge_transcript(&store, conv.id)).await {
+                    Ok((true, _)) => {}
+                    Ok((false, reason)) => {
+                        all_ok = false;
+                        judge_reason = reason;
+                        run_failed.push("LLM-judge");
+                        *failed.entry("LLM-judge 未过".into()).or_insert(0) += 1;
+                    }
+                    Err(e) => {
+                        // 评审基础设施故障 ≠ 被测差:不 fail,但计数露头 + verbose 打出来
+                        judge_errors += 1;
+                        if verbose {
+                            eprintln!("[verbose] {} run#{run} ⚠ judge 出错: {e:#}", sc.id);
+                        }
+                    }
+                }
+            }
+        }
         if all_ok {
             passed += 1;
         } else if verbose {
@@ -458,6 +578,9 @@ where
                 }
             }
             eprintln!("    未过:{}", run_failed.join(" / "));
+            if !judge_reason.is_empty() {
+                eprintln!("    判官理由:{}", trunc(&judge_reason, 160));
+            }
         }
     }
 
@@ -470,22 +593,29 @@ where
         total: runs,
         failed_checks,
         bad_outcomes,
+        judge_errors,
         tokens,
     }
 }
 
 /// 跑整套场景 × 每个 provider,产出可打印的矩阵报告。
+/// LLM-judge 的判官 = specs 里**档位最高**的那个(§16.3「判官用强模型」;与 background_provider
+/// 的 cheapest 对偶)。判官**全程固定一个**:多 provider 矩阵时各列被同一把尺子量,列间才可比。
 pub async fn run_suite(
     scenarios: &[Scenario],
     specs: Vec<ProviderSpec>,
     opts: RunOpts,
 ) -> Vec<SuiteReport> {
+    let judge: Option<Arc<dyn LlmProvider>> = specs
+        .iter()
+        .max_by_key(|s| crate::llm::catalog::tier_of(&s.model))
+        .map(|s| s.build());
     let mut reports = Vec::new();
     for spec in &specs {
         let mut results = Vec::new();
         for sc in scenarios {
             let runs = opts.runs_override.unwrap_or(sc.runs);
-            results.push(run_scenario(|| spec.build(), sc, runs).await);
+            results.push(run_scenario_judged(|| spec.build(), judge.as_ref(), sc, runs).await);
         }
         reports.push(SuiteReport {
             provider_id: spec.id.clone(),
@@ -542,7 +672,7 @@ pub fn render_matrix(reports: &[SuiteReport]) -> String {
         let _ = writeln!(out, "\n── {} ({}) ──", rep.provider_id, rep.provider_model);
         let mut any = false;
         for r in &rep.results {
-            if r.passed == r.total {
+            if r.passed == r.total && r.judge_errors == 0 {
                 continue;
             }
             any = true;
@@ -552,6 +682,9 @@ pub fn render_matrix(reports: &[SuiteReport]) -> String {
             }
             if r.bad_outcomes > 0 {
                 let _ = writeln!(out, "      ⚠ 非正常收尾 {}/{} 次(报错/取消)", r.bad_outcomes, r.total);
+            }
+            if r.judge_errors > 0 {
+                let _ = writeln!(out, "      ⚠ LLM-judge 自身出错 {}/{} 次(该几次未被评审,不算 fail)", r.judge_errors, r.total);
             }
         }
         if !any {
@@ -676,6 +809,60 @@ mod tests {
         };
         let r = run_scenario(make, &sc, 1).await;
         assert_eq!(r.passed, 1, "工具跑过即使收尾无可见文字也要被检出(collect_trace 不依赖可见气泡)");
+    }
+
+    // ── LLM-judge 通道自测(判官逻辑 FakeLlm 可验,免 key)──────────────
+
+    /// 被测:一轮纯文本回复;判官:scripted 回指定 verdict。
+    /// `id` 必须各测试唯一:temp_db 按场景 id 命名,同 id 并行会互删对方的临时库。
+    fn judged_run(
+        id: &str,
+        judge_reply: &str,
+    ) -> (impl Fn() -> Arc<dyn LlmProvider>, Arc<dyn LlmProvider>, Scenario) {
+        let sc = Scenario::turn(id)
+            .say("给我讲讲为什么天是蓝的")
+            .judge("回复必须口语短句");
+        let make = || -> Arc<dyn LlmProvider> {
+            Arc::new(FakeLlm::scripted(vec![FakeTurn { text: "因为大气散射呀".into(), ..Default::default() }]))
+        };
+        let judge: Arc<dyn LlmProvider> = Arc::new(FakeLlm::scripted(vec![FakeTurn {
+            text: judge_reply.into(),
+            ..Default::default()
+        }]));
+        (make, judge, sc)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn judge_pass_keeps_run_green() {
+        let (make, judge, sc) = judged_run("t-judged-pass", r#"{"pass":true,"reason":"短句口语"}"#);
+        let r = run_scenario_judged(make, Some(&judge), &sc, 1).await;
+        assert_eq!(r.passed, 1, "判官说过就过;失败项={:?}", r.failed_checks);
+        assert_eq!(r.judge_errors, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn judge_fail_flunks_run() {
+        // 判官回复带围栏废话也要能抠出 JSON
+        let (make, judge, sc) =
+            judged_run("t-judged-fail", "评审如下\n```json\n{\"pass\":false,\"reason\":\"太书面\"}\n```");
+        let r = run_scenario_judged(make, Some(&judge), &sc, 1).await;
+        assert_eq!(r.passed, 0, "判官说不过 = run fail(判官不是橡皮图章)");
+        assert!(r.failed_checks.iter().any(|(n, _)| n.contains("LLM-judge")));
+        assert_eq!(r.judge_errors, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn judge_absent_or_broken_does_not_fail_run() {
+        // 没配判官:带 .judge 的场景只跑同步 checks,照常过
+        let (make, _, sc) = judged_run("t-judged-absent", "");
+        let r = run_scenario(make, &sc, 1).await;
+        assert_eq!(r.passed, 1, "无判官 → judge 断言跳过");
+
+        // 判官在但回复解析不出:评审基础设施故障 ≠ 被测差 → 不 fail,计 judge_errors 露头
+        let (make, judge, sc) = judged_run("t-judged-broken", "我觉得还行吧");
+        let r = run_scenario_judged(make, Some(&judge), &sc, 1).await;
+        assert_eq!(r.passed, 1, "judge 故障不算被测 fail");
+        assert_eq!(r.judge_errors, 1, "但必须计数露头(全过+全故障 ≠ 可信全过)");
     }
 
     // token tally:两轮 usage 累加进 ScenarioResult.tokens(取自引擎记账,fresh DB)。

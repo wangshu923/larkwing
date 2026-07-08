@@ -86,6 +86,19 @@ impl TodoRepo {
         })
     }
 
+    /// 拖最久的一件 open(悬浮窗关怀候选用):最近记的用户自己还记得,老的才是「它帮你记着」。
+    pub fn oldest_open(&self, user_id: i64) -> Result<Option<Todo>> {
+        self.db.with(|c| {
+            Ok(c.query_row(
+                "SELECT id, content, created_at FROM todos
+                 WHERE user_id=?1 AND done=0 ORDER BY created_at ASC, id ASC LIMIT 1",
+                rusqlite::params![user_id],
+                |r| Ok(Todo { id: r.get(0)?, content: r.get(1)?, created_at: r.get(2)? }),
+            )
+            .optional()?)
+        })
+    }
+
     /// 了结:用户说做完 / 不做了。先试完全相同,再退子串包含,命中最近一条 open → done。
     /// 返回是否命中(没命中 → 工具层如实告知,别静默 §3.5)。
     pub fn mark_done(&self, user_id: i64, needle: &str) -> Result<bool> {
@@ -163,6 +176,18 @@ mod tests {
         assert_eq!(open[0].id, b, "新→旧");
         // 归人隔离
         assert!(s.todos.list_open(2, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn oldest_open_picks_first_recorded_and_skips_done() {
+        let s = store("oldest");
+        let a = s.todos.add(1, "给车做年检").unwrap();
+        s.todos.add(1, "回小王电话").unwrap();
+        assert_eq!(s.todos.oldest_open(1).unwrap().unwrap().id, a, "拖最久的在前");
+        // 最老那件了结后,轮到下一件;全了结 → None;归人隔离
+        assert!(s.todos.close(1, a).unwrap());
+        assert_eq!(s.todos.oldest_open(1).unwrap().unwrap().content, "回小王电话");
+        assert!(s.todos.oldest_open(2).unwrap().is_none());
     }
 
     #[test]
