@@ -359,8 +359,12 @@ pub fn suite() -> Vec<Scenario> {
             .line("assistant", "记下了,这周办车年检。")
             .check(distilled_at_least(1))
             .check(custom("每天至多三句(句数计数走机测)", |o| {
+                // 句末标点:。+ 全角/半角叹问号(全角用转义写死,避免肉眼混淆半角重复)
                 o.replies.iter().all(|r| {
-                    r.chars().filter(|c| matches!(c, '。' | '!' | '?' | '!' | '?')).count() <= 3
+                    r.chars()
+                        .filter(|c| matches!(c, '。' | '!' | '?' | '\u{FF01}' | '\u{FF1F}'))
+                        .count()
+                        <= 3
                 })
             }))
             .judge(
