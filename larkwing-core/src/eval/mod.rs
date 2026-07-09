@@ -39,10 +39,12 @@ struct SayLine {
     spoken: bool,
 }
 
-/// 驱动方式:一串用户消息(各排到回合收尾)/ 预置一段历史后调 consolidate。
+/// 驱动方式:一串用户消息(各排到回合收尾)/ 预置一段历史后调 consolidate /
+/// 预置「昨天的对话」后调家庭日记蒸馏(engine/diary,水位线补写)。
 enum Drive {
     Turn(Vec<SayLine>),
     Consolidate(Vec<(String, String)>),
+    Diary(Vec<(String, String)>),
 }
 
 type SeedFn = Box<dyn Fn(&Store, i64) + Send + Sync>;
@@ -82,6 +84,21 @@ impl Scenario {
             note: String::new(),
             runs: 5,
             drive: Drive::Consolidate(Vec::new()),
+            seed: None,
+            checks: Vec::new(),
+            judge: None,
+        }
+    }
+
+    /// 家庭日记场景:预置一段「昨天的对话」(`.line(role, content)`)后调 `engine::diary::run`
+    /// (水位线拨到前天、now 拨到明天 → 预置的今天成了待补的「昨天」)。产出语义:
+    /// `distilled` = 写的天数;`replies` = 日记内容(每天一条)—— 机测句数/关键词直接用。
+    pub fn diary(id: &str) -> Scenario {
+        Scenario {
+            id: id.into(),
+            note: String::new(),
+            runs: 5,
+            drive: Drive::Diary(Vec::new()),
             seed: None,
             checks: Vec::new(),
             judge: None,
@@ -138,9 +155,9 @@ impl Scenario {
         self
     }
 
-    /// 追加一条预置历史(consolidate 场景;role = user/assistant)。
+    /// 追加一条预置历史(consolidate / diary 场景;role = user/assistant)。
     pub fn line(mut self, role: &str, content: &str) -> Self {
-        if let Drive::Consolidate(v) = &mut self.drive {
+        if let Drive::Consolidate(v) | Drive::Diary(v) = &mut self.drive {
             v.push((role.into(), content.into()));
         }
         self
@@ -475,6 +492,29 @@ where
                     Err(e) => Outcome::Error(format!("{:?}: {}", e.kind, e.message)),
                 }
             }
+            Drive::Diary(transcript) => {
+                // 消息落在「真实今天」;水位线拨到前天、now 拨到明天 → 今天成了待补的
+                // 「昨天」(engine/diary 单测同款时间戏法)。直调 diary::run(pub(crate)),
+                // provider 再 make 一个(scripted FakeLlm 每次 make 都带完整剧本)。
+                for (role, content) in transcript {
+                    let _ = store.chat.append_message(conv.id, role, content);
+                }
+                let today = chrono::Local::now().date_naive();
+                let _ = store.settings.set(
+                    None,
+                    crate::engine::diary::WATERMARK_KEY,
+                    &(today - chrono::Duration::days(1)).to_string(),
+                );
+                let provider = make();
+                let tomorrow = crate::store::now_ms() + 86_400_000;
+                match crate::engine::diary::run(&provider, &store, tomorrow).await {
+                    Ok(n) => {
+                        distilled = n;
+                        Outcome::Done
+                    }
+                    Err(e) => Outcome::Error(format!("{e:#}")),
+                }
+            }
         };
 
         let trace = collect_trace(&store, conv.id);
@@ -496,15 +536,20 @@ where
             tokens.add_totals(&u);
         }
 
-        // 本次运行的 assistant 回复(按时间序):旁听仲裁类断言看末条(__IGNORE__ / 正经搭腔)
-        let replies: Vec<String> = store
-            .chat
-            .recent_messages(conv.id, 200)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|m| m.role == "assistant")
-            .map(|m| m.content)
-            .collect();
+        // 本次运行的 assistant 回复(按时间序):旁听仲裁类断言看末条(__IGNORE__ / 正经搭腔)。
+        // Diary 场景例外:replies = 日记产出(每天一条,预置的 assistant 行是原料不是产出)。
+        let replies: Vec<String> = if matches!(sc.drive, Drive::Diary(_)) {
+            store.diary.list(30).unwrap_or_default().into_iter().map(|d| d.content).collect()
+        } else {
+            store
+                .chat
+                .recent_messages(conv.id, 200)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|m| m.role == "assistant")
+                .map(|m| m.content)
+                .collect()
+        };
 
         let observed = Observed {
             owner_id: user.id,
@@ -530,10 +575,17 @@ where
             }
         }
         // LLM-judge(§16.3):机制断言全过、判官在场,才值得花判官一跳(挂了的 run 不必再评)。
+        // Diary 场景的判官材料 = 原料对话 + 日记产出(判「编造」得让判官看见材料里有什么)。
         let mut judge_reason = String::new();
         if all_ok {
             if let (Some(rubric), Some(j)) = (&sc.judge, judge) {
-                match run_judge(j, rubric, &judge_transcript(&store, conv.id)).await {
+                let mut transcript = judge_transcript(&store, conv.id);
+                if matches!(sc.drive, Drive::Diary(_)) {
+                    for d in store.diary.list(30).unwrap_or_default() {
+                        transcript.push_str(&format!("【{} 的日记】{}\n", d.date, d.content));
+                    }
+                }
+                match run_judge(j, rubric, &transcript).await {
                     Ok((true, _)) => {}
                     Ok((false, reason)) => {
                         all_ok = false;
@@ -863,6 +915,26 @@ mod tests {
         let r = run_scenario_judged(make, Some(&judge), &sc, 1).await;
         assert_eq!(r.passed, 1, "judge 故障不算被测 fail");
         assert_eq!(r.judge_errors, 1, "但必须计数露头(全过+全故障 ≠ 可信全过)");
+    }
+
+    // Diary 通道全链:预置「昨天的对话」→ 蒸馏 → distilled 计天数、replies = 日记内容
+    // (预置的 assistant 行是原料不是产出,不得混进 replies)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn diary_drive_distills_and_exposes_entries() {
+        let today = chrono::Local::now().date_naive();
+        let json = format!("[{{\"date\":\"{today}\",\"content\":\"陪着放了会儿动画片。\"}}]");
+        let sc = Scenario::diary("t-diary-drive")
+            .line("user", "放一集汪汪队吧")
+            .line("assistant", "放上了,第三集。")
+            .check(distilled_at_least(1))
+            .check(custom("replies = 日记产出而非原料", |o| {
+                o.replies.len() == 1 && o.replies[0].contains("动画片")
+            }));
+        let make = move || -> Arc<dyn LlmProvider> {
+            Arc::new(FakeLlm::scripted(vec![FakeTurn { text: json.clone(), ..Default::default() }]))
+        };
+        let r = run_scenario(make, &sc, 1).await;
+        assert_eq!(r.passed, 1, "diary 全链该过;失败项={:?}", r.failed_checks);
     }
 
     // token tally:两轮 usage 累加进 ScenarioResult.tokens(取自引擎记账,fresh DB)。

@@ -140,6 +140,31 @@ impl TodoRepo {
         })
     }
 
+    /// 区间内有动静的待办(创建或了结落在 `[from_ms, to_ms)`,全家不分人):家庭日记取料用。
+    /// 返回 (content, done, created_at, updated_at)。
+    pub fn changed_between(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Vec<(String, bool, i64, i64)>> {
+        self.db.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT content, done, created_at, updated_at FROM todos
+                 WHERE (created_at >= ?1 AND created_at < ?2)
+                    OR (updated_at >= ?1 AND updated_at < ?2)
+                 ORDER BY updated_at ASC",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![from_ms, to_ms], |r| {
+                Ok((r.get(0)?, r.get::<_, i64>(1)? != 0, r.get(2)?, r.get(3)?))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
     /// 过期自清:open 且创建至今超过 `max_age_ms` 的,静默了结,免无限累积。返回清掉条数。
     /// 搭后台维护轮跑(注入 `now` 可单测)。
     pub fn expire_stale(&self, user_id: i64, now: i64, max_age_ms: i64) -> Result<usize> {

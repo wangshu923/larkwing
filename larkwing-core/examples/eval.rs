@@ -5,6 +5,7 @@
 //!   DEEPSEEK_API_KEY=… GEMINI_API_KEY=… EVAL_RUNS=5 cargo run -p larkwing-core --example eval
 //!   EVAL_VERBOSE=1 …  # 失败的 run 打印现场(工具轨迹 / 新记忆 / 提炼数 / 末条回复 / 没过的断言)
 //!   EVAL_THINKING=… # 思考档覆盖 off/light/medium/heavy(=1 等非档位值 → heavy);不设 = 默认 medium(回合 + 提炼)
+//!   EVAL_FILTER=judge …  # 按场景 id 子串过滤(逗号分隔、任一命中);调 rubric / 排障单独重跑,不必整套烧钱
 //!
 //! 判官逻辑本身的自测(免 key):cargo test -p larkwing-core eval
 
@@ -38,7 +39,21 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let runs: Option<u32> = std::env::var("EVAL_RUNS").ok().and_then(|s| s.parse().ok());
-    let scenarios = scenarios::suite();
+    let mut scenarios = scenarios::suite();
+    // EVAL_FILTER=judge / EVAL_FILTER=care,voice:按场景 id 子串过滤(逗号分隔、任一命中)。
+    // 调 rubric / 单场景排障时只重跑命中的几个,不必整套重烧钱。
+    if let Ok(f) = std::env::var("EVAL_FILTER") {
+        let pats: Vec<String> =
+            f.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        if !pats.is_empty() {
+            scenarios.retain(|s| pats.iter().any(|p| s.id.contains(p.as_str())));
+            eprintln!("场景过滤 EVAL_FILTER={f} → 命中 {} 个", scenarios.len());
+            if scenarios.is_empty() {
+                eprintln!("没有场景命中过滤条件,退出。");
+                return Ok(());
+            }
+        }
+    }
     eprintln!(
         "跑 {} 个场景 × {} 个 provider(每场景 {} 次)…\n",
         scenarios.len(),

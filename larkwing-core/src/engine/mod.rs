@@ -2,6 +2,7 @@
 
 mod consolidate;
 mod context;
+pub(crate) mod diary; // pub(crate):eval 的 Drive::Diary 直调 run(评蒸馏质量)
 mod title;
 mod turn;
 mod usage;
@@ -9,7 +10,7 @@ mod usage;
 pub use usage::{DayUsage, MsgStats, UsageDigest};
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use serde::Serialize;
@@ -21,7 +22,7 @@ use serde::Deserialize;
 use crate::llm::registry::{resolve_env, Protocol, ProviderRegistry, ProviderSpec, Strategy};
 use crate::llm::{LlmError, LlmProvider, ToolCall, ToolDef};
 use crate::scenes::{Scenes, DEFAULT_SCENE_ID};
-use crate::store::{Briefing, Conversation, Memory, Message, SearchHit, Store, User};
+use crate::store::{Briefing, Conversation, DiaryEntry, Memory, Message, SearchHit, Store, User};
 use crate::tools::Tools;
 
 // ---------- engine ↔ UI 的词汇表 ----------
@@ -549,6 +550,9 @@ pub struct Engine {
     /// 全局事件车道(与 media 同一条):自启回合完成时喊"会话有动静"。
     bus: crate::bus::Bus,
     sessions: Mutex<HashMap<i64, SessionSlot>>,
+    /// 家庭日记(engine/diary.rs)后台补写的防重入 + 限流(app 级瞬态,丢了 = 下个节拍再试)。
+    diary_inflight: Arc<AtomicBool>,
+    diary_last_try: AtomicI64,
 }
 
 impl Engine {
@@ -581,6 +585,8 @@ impl Engine {
             media,
             bus,
             sessions: Mutex::new(HashMap::new()),
+            diary_inflight: Arc::new(AtomicBool::new(false)),
+            diary_last_try: AtomicI64::new(0),
         })
     }
 
@@ -1478,6 +1484,58 @@ impl Engine {
             }
             flag.store(false, Ordering::Release);
         });
+    }
+
+    /// 家庭日记「这些日子」后台补写(engine/diary.rs,2026-07-09):scheduler 每个节拍喊一声,
+    /// 这里做便宜闸门 —— care.enabled 显式关 = 不写;每小时最多真试一次(失败也计,水位线没跨日时
+    /// 这就是全部开销);防重入;**匿名 provider(model_id 空)不跑**(spawn_title 同款挡板:
+    /// FakeLlm 剧本队列是共享弹出,后台杂活去弹会偷走测试/eval 的脚本回合)。尽力件,绝不阻塞调用方。
+    pub fn spawn_diary(&self, now_ms: i64) {
+        const TRY_INTERVAL_MS: i64 = 3_600_000;
+        if self.store.settings.get(None, "care.enabled").ok().flatten().as_deref() == Some("0") {
+            return; // 随主动关怀总开关收口(§3 一个开关,不添新概念)
+        }
+        let last = self.diary_last_try.load(Ordering::Acquire);
+        if now_ms.saturating_sub(last) < TRY_INTERVAL_MS {
+            return;
+        }
+        if self.diary_inflight.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.diary_last_try.store(now_ms, Ordering::Release);
+        let release = |flag: &Arc<AtomicBool>| flag.store(false, Ordering::Release);
+        let Some(provider) = self.background_provider() else {
+            release(&self.diary_inflight);
+            return;
+        };
+        if provider.model_id().is_empty() {
+            release(&self.diary_inflight);
+            return;
+        }
+        let store = self.store.clone();
+        let flag = self.diary_inflight.clone();
+        tokio::spawn(async move {
+            match diary::run(&provider, &store, now_ms).await {
+                Ok(n) if n > 0 => {
+                    tracing::info!(target: "larkwing::diary", days = n, "家庭日记:补写 {n} 天")
+                }
+                Ok(_) => tracing::debug!(target: "larkwing::diary", "家庭日记:无需补写"),
+                Err(e) => {
+                    tracing::warn!(target: "larkwing::diary", "家庭日记补写失败(尽力件,下个节拍再试): {e:#}")
+                }
+            }
+            flag.store(false, Ordering::Release);
+        });
+    }
+
+    /// 回忆页「这些日子」:日记流(日期新→旧)。home 共有一本,不随「看谁的」切换。
+    pub fn list_diary(&self, limit: usize) -> Result<Vec<DiaryEntry>, AppError> {
+        Ok(self.store.diary.list(limit)?)
+    }
+
+    /// 删掉一天的日记(回忆页右键)。
+    pub fn delete_diary(&self, id: i64) -> Result<bool, AppError> {
+        Ok(self.store.diary.delete(id)?)
     }
 
     /// 后台给新会话起标题(engine/title.rs,方案 A):非流式调**最便宜档** provider(与提炼同一条

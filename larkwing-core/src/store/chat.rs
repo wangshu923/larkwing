@@ -368,6 +368,24 @@ impl ChatRepo {
         })
     }
 
+    /// 跨会话按时间区间取用户可见对话(`[from_ms, to_ms)`,升序,封顶 limit):家庭日记蒸馏取料用。
+    /// 只收 user/assistant 且内容非空(tool/event 内部行、静默回合不进日记)。
+    pub fn messages_between(&self, from_ms: i64, to_ms: i64, limit: i64) -> Result<Vec<Message>> {
+        self.db.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, conversation_id, role, content, created_at, payload
+                 FROM messages
+                 WHERE created_at >= ?1 AND created_at < ?2
+                   AND role IN ('user','assistant') AND content <> ''
+                 ORDER BY created_at ASC, id ASC LIMIT ?3",
+            )?;
+            let list = stmt
+                .query_map(rusqlite::params![from_ms, to_ms, limit], row_to_message)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(list)
+        })
+    }
+
     /// 跨会话搜索(当前用户):`messages.content` 子串匹配,排除 tool/event 内部行
     /// (`role IN (user, assistant)`)。substring `LIKE` 即可(同 recall 立场,历史量小够用;
     /// 真要语义查找走 §13.9 检索核心)。最近命中在前。

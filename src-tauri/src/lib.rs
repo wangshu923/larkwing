@@ -419,6 +419,8 @@ pub fn run() {
       commands::delete_briefing,
       commands::list_todos,
       commands::finish_todo,
+      commands::list_diary,
+      commands::delete_diary,
       commands::list_reminders,
       commands::cancel_reminder,
       commands::list_fsops,

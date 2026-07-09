@@ -332,6 +332,20 @@ pub fn finish_todo(
     state.engine.finish_todo(user_id, id)
 }
 
+/// 回忆页「这些日子」:家庭日记流(日期新→旧)。home 共有一本,不随「看谁的」切换。
+#[tauri::command]
+pub fn list_diary(
+    state: State<'_, AppState>,
+) -> Result<Vec<larkwing_core::store::DiaryEntry>, AppError> {
+    state.engine.list_diary(120)
+}
+
+/// 回忆页右键删掉一天的日记。
+#[tauri::command]
+pub fn delete_diary(state: State<'_, AppState>, id: i64) -> Result<bool, AppError> {
+    state.engine.delete_diary(id)
+}
+
 /// 提醒页:当前用户待触发的提醒(定时任务,按时间升序)。
 #[tauri::command]
 pub fn list_reminders(state: State<'_, AppState>) -> Result<Vec<larkwing_core::engine::ReminderItem>, AppError> {

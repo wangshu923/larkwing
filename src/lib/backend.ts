@@ -90,6 +90,14 @@ export interface Todo {
   created_at: number
 }
 
+/** 一天的家庭日记(「这些日子」,home 共有一本):date = 'YYYY-MM-DD'。 */
+export interface DiaryEntry {
+  id: number
+  date: string
+  content: string
+  created_at: number
+}
+
 /** 家庭备忘一条(任务需知,PLAN §9):scope 'home' | 'user:<id>'。 */
 export interface Briefing {
   id: number
@@ -988,6 +996,9 @@ export const api = {
   listTodos: (userId?: number) => invoke<Todo[]>('list_todos', { userId }),
   /** 勾掉一件待办(办完 / 不用了):了结不删行,之后不再进前缀。 */
   finishTodo: (id: number, userId?: number) => invoke<void>('finish_todo', { id, userId }),
+  /** 「这些日子」家庭日记(home 共有,不随「看谁的」切)。 */
+  listDiary: () => invoke<DiaryEntry[]>('list_diary'),
+  deleteDiary: (id: number) => invoke<boolean>('delete_diary', { id }),
   /** 提醒页:当前用户待触发的提醒 + 取消(jobs 域,按时间升序)。 */
   listReminders: () => invoke<Reminder[]>('list_reminders'),
   cancelReminder: (id: number) => invoke<void>('cancel_reminder', { id }),

@@ -4,7 +4,7 @@
 // 纯浏览器预览:假数据看视觉。
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { api, isTauri, type Briefing, type FamilyMember, type Memory, type Todo } from '../lib/backend'
+import { api, isTauri, type Briefing, type DiaryEntry, type FamilyMember, type Memory, type Todo } from '../lib/backend'
 import { useContextMenu } from '../composables/useContextMenu'
 import { hydrateUser, useSettings } from '../composables/useSettings'
 import { useToast } from '../composables/useToast'
@@ -30,13 +30,17 @@ const memories = ref<Memory[]>([])
 const briefings = ref<Briefing[]>([])
 /** 没办完的事(切片2 小账):只列 open,勾掉即了结(done 不删行,之后不再进前缀)。 */
 const todos = ref<Todo[]>([])
+/** 这些日子(家庭日记):后台按日蒸馏,home 共有一本、不随「看谁的」切。 */
+const diary = ref<DiaryEntry[]>([])
 const loaded = ref(false)
 /** 加载是否出错:与「空着」分开 —— 出错显「没加载出来 + 重试」,而非误导成「还没有记忆」。 */
 const error = ref(false)
 /** 两步删除:第一次点变"确定删?",再点才真删;键带前缀区分三组(m-1 / b-1 / t-1)。 */
 const arming = ref<string | null>(null)
 
-const total = computed(() => memories.value.length + briefings.value.length + todos.value.length)
+const total = computed(
+  () => memories.value.length + briefings.value.length + todos.value.length + diary.value.length,
+)
 
 // 看谁的记忆(§渠道归人第二步「主人查看家人记忆」):主人换视角看家人的小本本 —— **不是切换用户**,
 // 只是过滤视图。共享的「家里的事」(home-scope 需知)对谁都在,只有归人的小本本随人切。
@@ -65,14 +69,16 @@ async function loadEntries() {
   }
   error.value = false
   try {
-    const [m, b, td] = await Promise.all([
+    const [m, b, td, dy] = await Promise.all([
       api.listMemories(targetId.value),
       api.listBriefings(targetId.value),
       api.listTodos(targetId.value),
+      api.listDiary(),
     ])
     memories.value = m
     briefings.value = b
     todos.value = td
+    diary.value = dy
   } catch (e) {
     console.error('加载回忆页失败', e)
     error.value = true
@@ -123,6 +129,10 @@ function loadFakeEntries() {
           { id: 21, content: '周末想去修车', created_at: Date.now() - 86400_000 },
           { id: 22, content: '给妈妈挑生日礼物', created_at: Date.now() - 3 * 86400_000 },
         ]
+  diary.value = [
+    { id: 31, date: '2026-07-08', content: '陪着看了两集《汪汪队》,把车年检的事记下了。', created_at: Date.now() - 86400_000 },
+    { id: 30, date: '2026-07-06', content: '下午放了会儿儿歌,家里挺热闹的。', created_at: Date.now() - 3 * 86400_000 },
+  ]
 }
 
 /** 真删记忆(乐观更新,失败补回)。hover ✕ 走两步确认后调它;右键菜单直接调(右键本身已是明确动作)。 */
@@ -193,6 +203,29 @@ async function finishTodo(td: Todo) {
   await doFinishTodo(td)
 }
 
+/** 删掉一天的日记(乐观更新,失败补回)。 */
+async function doRemoveDiary(d: DiaryEntry) {
+  const idx = diary.value.findIndex((x) => x.id === d.id)
+  if (idx >= 0) diary.value.splice(idx, 1)
+  if (!isTauri()) return
+  try {
+    await api.deleteDiary(d.id)
+  } catch (e) {
+    console.error('删除日记失败', e)
+    if (idx >= 0) diary.value.splice(idx, 0, d)
+    toast.error(t('toast.deleteFailed'))
+  }
+}
+
+async function removeDiary(d: DiaryEntry) {
+  if (arming.value !== `d-${d.id}`) {
+    arming.value = `d-${d.id}`
+    return
+  }
+  arming.value = null
+  await doRemoveDiary(d)
+}
+
 // 右键菜单:复制内容 / 删除(右键的删除直达,不走 hover 那套两步确认)
 function openMemoryMenu(e: MouseEvent, m: Memory) {
   openMenu(e, [
@@ -216,11 +249,23 @@ function openTodoMenu(e: MouseEvent, td: Todo) {
     { label: t('memory.todoFinish'), action: () => doFinishTodo(td) },
   ])
 }
+function openDiaryMenu(e: MouseEvent, d: DiaryEntry) {
+  openMenu(e, [
+    { label: t('ctx.copy'), action: () => copyText(`${d.date} ${d.content}`) },
+    { separator: true },
+    { label: t('ctx.delete'), danger: true, action: () => doRemoveDiary(d) },
+  ])
+}
 
 /** 记忆/备忘是长期事实,绝对日期比"几小时前"更称职。 */
 function fmtDate(ts: number): string {
   const d = new Date(ts)
   return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`
+}
+
+/** 日记的 'YYYY-MM-DD' → 与其他分组一致的 YYYY/M/D 显示。 */
+function fmtDiaryDate(date: string): string {
+  return date.split('-').map(Number).join('/')
 }
 
 /** 「上次想起」用相对时间(召回新鲜度才是重点,与创建日的绝对显示不同)。 */
@@ -338,6 +383,23 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             @click.stop="removeBriefing(b)"
           >
             {{ arming === `b-${b.id}` ? t('memory.confirm') : '✕' }}
+          </button>
+        </div>
+      </TransitionGroup>
+
+      <!-- 这些日子(家庭日记):后台把「上次到这次之间」的日子按日蒸馏成一两句;home 共有一本 -->
+      <p v-if="diary.length" class="lp-group">{{ t('memory.groupDiary') }}</p>
+      <TransitionGroup name="lp" tag="div">
+        <div v-for="d in diary" :key="`d-${d.id}`" class="lp-card top" @contextmenu="openDiaryMenu($event, d)">
+          <span class="lp-dot sm"></span>
+          <span class="lp-text multiline">{{ d.content }}</span>
+          <span class="lp-date top">{{ fmtDiaryDate(d.date) }}</span>
+          <button
+            class="lp-act hoveronly"
+            :class="{ armed: arming === `d-${d.id}` }"
+            @click.stop="removeDiary(d)"
+          >
+            {{ arming === `d-${d.id}` ? t('memory.confirm') : '✕' }}
           </button>
         </div>
       </TransitionGroup>

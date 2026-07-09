@@ -104,6 +104,7 @@ export default {
     groupYou: '关于你',
     groupHome: '家里的事',
     groupTodos: '没办完的事',
+    groupDiary: '这些日子',
     todoConfirm: '办完了?',
     todoFinish: '办完了,勾掉',
     recalled: '想起 {n} 次 · 上次 {ago}',

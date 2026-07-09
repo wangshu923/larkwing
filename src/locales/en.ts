@@ -105,6 +105,7 @@ export default {
     groupYou: 'About you',
     groupHome: 'About home',
     groupTodos: 'Not done yet',
+    groupDiary: 'These days',
     todoConfirm: 'Done?',
     todoFinish: 'Done, check it off',
     recalled: 'recalled {n}× · last {ago}',

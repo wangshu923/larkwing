@@ -7,6 +7,7 @@ pub mod briefings;
 pub mod channels;
 pub mod chat;
 pub mod cloned_voices;
+pub mod diary;
 pub mod fsops;
 pub mod jobs;
 pub mod media_progress;
@@ -22,6 +23,7 @@ pub use channels::{ChannelRepo, ChannelThread};
 pub use chat::{ChatRepo, Conversation, Message, SearchHit};
 pub use cloned_voices::{ClonedVoice, ClonedVoiceRepo};
 pub use db::Db;
+pub use diary::{DiaryEntry, DiaryRepo};
 pub(crate) use db::now_ms; // 给 engine/consolidate 跑维护轮时取 now(db 模块本身私有)
 
 /// 转义 LIKE 通配符(`% _ \`)让查询串当字面量匹配(配 SQL 里 `ESCAPE '\'`)。
@@ -55,6 +57,7 @@ pub struct Store {
     pub voiceprints: VoiceprintRepo,
     pub media_progress: MediaProgressRepo,
     pub todos: TodoRepo,
+    pub diary: DiaryRepo,
 }
 
 impl Store {
@@ -74,6 +77,7 @@ impl Store {
             voiceprints::MIGRATIONS,
             media_progress::MIGRATIONS,
             todos::MIGRATIONS,
+            diary::MIGRATIONS,
         ]
         .concat();
         db.migrate(&all)?;
@@ -90,7 +94,8 @@ impl Store {
             fsops: FsOpRepo::new(db.clone()),
             voiceprints: VoiceprintRepo::new(db.clone()),
             media_progress: MediaProgressRepo::new(db.clone()),
-            todos: TodoRepo::new(db),
+            todos: TodoRepo::new(db.clone()),
+            diary: DiaryRepo::new(db),
         })
     }
 }

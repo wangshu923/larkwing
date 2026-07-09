@@ -30,6 +30,9 @@ pub async fn run(engine: Arc<Engine>) {
 
 /// 单步(可测):处理当下所有到点任务。
 pub async fn tick(engine: &Engine, now: i64) -> anyhow::Result<()> {
+    // 家庭日记搭同一节拍(engine/diary.rs):跨了没写的日历日才真跑,内部自带限流/防重入/
+    // FakeLlm 挡板,fire-and-forget 绝不拖慢下面的提醒。
+    engine.spawn_diary(now);
     let store = engine.store().clone();
     let due = tokio::task::spawn_blocking(move || store.jobs.due(now)).await??;
     let mut weather: Option<WeatherClient> = None; // 仅在遇到条件提醒时懒建(避免无谓建 HTTP 客户端)
