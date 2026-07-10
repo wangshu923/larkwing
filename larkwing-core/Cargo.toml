@@ -28,7 +28,8 @@ getrandom = "0.2"
 glob = "0.3"
 msedge-tts = "0.4.0"
 pinyin = "0.11.0"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks", "gzip"] }
+# multipart:渠道出站文件(TG sendDocument / 钉钉 media/upload 的表单上传,channels/outbound.rs)
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks", "gzip", "multipart"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 # web 工具的 HTML 解析(搜索结果页 + 正文抽取)
 scraper = "0.23"
@@ -60,10 +61,29 @@ calamine = "0.26"
 # 渠道出站富格式(channels/render.rs):模型 markdown → Telegram HTML / 判钉钉 markdown。
 # 成熟解析器处理嵌套/转义边界,比手写正则稳;纯解析零 IO。
 pulldown-cmark = { version = "0.13", default-features = false }
+# web 页内链接的相对地址解析(web.rs::extract_links):reqwest 本就带着它,显式声明版本对齐。
+url = "2"
+# web_download 默认落「下载」文件夹(Windows Known Folder 定位,含本地化名);仅此一用。
+dirs = "6"
+# qr_decode(tools/qr.rs):图片解码 + 二维码识别。image 只开常见图格式;识别用 rxing
+# (ZXing 纯 Rust 移植,HybridBinarizer+TryHarder——真实拍照〔斜角/光照不均〕召回远强于
+# rqrr,2026-07-10 真图实锤 rqrr 认不出手机拍的单据码、rxing 一把过,遂换)。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp"] }
+# rxing 把 image 钉死 =0.25.8 → 工作区 image 用 `cargo update -p image --precise 0.25.8`
+# 对齐(patch 级,无行为差;default-features=false 上游编不过,只能整包要)。
+rxing = "0.8"
+# pdfium 组件包是 .tgz(components::untar_gz_entry;tar 已在,补 gzip 解码)
+flate2 = "1"
+# pdf_to_png(tools/pdf.rs):pdfium 动态绑定(库文件走组件用时下载,不编译期链接)
+pdfium-render = "0.9"
 
 # 系统音量(tools/desktop.rs 的 system_volume):Windows 走 Core Audio(IAudioEndpointVolume)。
 # 仅 Windows 编译(Mac 走 osascript、Linux 不支持,都不需要);windows 0.61 与 src-tauri 同版本,
 # 不引入新版本。开「打开」工具不需要 windows crate(走进程 start/open),只音量用它。
+[dev-dependencies]
+# qr_decode 测试:现生成二维码图 → 解码往返(与 image 0.25 对齐的渲染后端)
+qrcode = "0.14"
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
   "Win32_Foundation",

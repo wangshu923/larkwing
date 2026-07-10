@@ -24,8 +24,8 @@ pub(super) enum WakeCmd {
     Stop,
     /// 丢帧(听写中 / TTS 在念):防 KWS 自激与误吃。
     Suspend(bool),
-    /// 回合念完:开 6s 跟进窗(免唤醒接话)。
-    FollowUp,
+    /// 回合念完:开跟进窗(免唤醒接话)。媒体在播 → 短窗(窗内媒体一直被 duck 压着,能短就短)。
+    FollowUp { media_playing: bool },
     /// 回合失败/取消/不念:直接回待唤醒。
     Resume,
 }
@@ -38,6 +38,8 @@ pub(super) enum WakeCmd {
 pub(super) const KWS_SCORE: f32 = 1.5;
 const WAKE_START_TIMEOUT: Duration = Duration::from_secs(6); // 应答后没人开口
 const FOLLOW_UP_WINDOW: Duration = Duration::from_secs(6); // 跟进窗(robot 终值)
+/// 媒体在播时的跟进窗(2026-07-10 用户拍板「暂定 3s」):窗内电影/音乐一直被压到 20%,短些少打扰。
+const FOLLOW_UP_WINDOW_MEDIA: Duration = Duration::from_secs(3);
 const AWAIT_TURN_CAP: Duration = Duration::from_secs(180); // 前端没回信的兜底
 const WATCHDOG_SILENCE: Duration = Duration::from_secs(30); // 监听态多久无帧 → 重开采集(robot 同款)
 
@@ -73,7 +75,8 @@ pub(super) struct WakeDeps {
 enum Phase {
     Watch,
     AwaitTurn(Instant),
-    FollowUp,
+    /// window = 本轮跟进窗长(FollowUp 指令按「媒体在不在播」定,见 FOLLOW_UP_WINDOW*)。
+    FollowUp { window: Duration },
 }
 
 impl Phase {
@@ -81,7 +84,7 @@ impl Phase {
         match self {
             Phase::Watch => "Watch",
             Phase::AwaitTurn(_) => "AwaitTurn",
-            Phase::FollowUp => "FollowUp",
+            Phase::FollowUp { .. } => "FollowUp",
         }
     }
 }
@@ -248,13 +251,22 @@ fn wake_loop(d: &WakeDeps, cmd: &Receiver<WakeCmd>) -> Result<()> {
                         pipe.drain(); // 恢复时清积压,别把挂起期的声音当唤醒词
                     }
                 }
-                Ok(WakeCmd::FollowUp) => {
+                Ok(WakeCmd::FollowUp { media_playing }) => {
                     if matches!(phase, Phase::AwaitTurn(_)) {
-                        phase = Phase::FollowUp;
+                        phase = Phase::FollowUp {
+                            window: if media_playing { FOLLOW_UP_WINDOW_MEDIA } else { FOLLOW_UP_WINDOW },
+                        };
                     }
                 }
                 Ok(WakeCmd::Resume) => {
                     pipe.drain();
+                    // 收尾必须知会前端(ListenEnded):前端靠它关唤醒区间/恢复媒体音量。
+                    // 此前这里静默回 Watch → 失败/取消的唤醒回合 duck 永不恢复,媒体一直压在
+                    // 20%(真机「音量隔了好几分钟才变大」一族的半边;另半边=前端漏发 Resume
+                    // 卡到 AWAIT_TURN_CAP 兜底)。已在 Watch 则不发(无区间可关,免噪声)。
+                    if !matches!(phase, Phase::Watch) {
+                        d.rt.publish(VoiceEvent::ListenEnded { reason: "wake_done".into() });
+                    }
                     phase = Phase::Watch;
                 }
                 Err(TryRecvError::Empty) => break,
@@ -337,13 +349,14 @@ fn wake_loop(d: &WakeDeps, cmd: &Receiver<WakeCmd>) -> Result<()> {
                     phase = Phase::Watch;
                 }
             }
-            Phase::FollowUp => {
+            Phase::FollowUp { window } => {
                 // 跟进窗:免唤醒接话;安静结束不追问(robot 纪律:对话自然结束别烦人)
                 pipe.drain();
                 vad.reset();
+                d.rt.arm_wake_ctl(); // 在听时点停也要响应(取消 → 走 None 安静回 Watch;定稿 → 正常识别)
                 d.rt.publish(VoiceEvent::State { phase: VoicePhase::Listening });
                 let out =
-                    collect_utterance(&pipe, &vad, &d.rt, None, FOLLOW_UP_WINDOW, hangover)?;
+                    collect_utterance(&pipe, &vad, &d.rt, Some(d.rt.wake_ctl()), window, hangover)?;
                 phase = match transcribe(d, out)? {
                     Some((text, speaker_id)) => {
                         d.rt.publish(VoiceEvent::Transcribed { text, via: "wake".into(), speaker_id });
@@ -388,27 +401,122 @@ pub(super) enum Triage {
     Reject,
 }
 
-/// 转写归一成「音节串」:汉字 → 无调拼音;连续 ASCII 字母/数字 → 一个小写 token;
-/// 标点/空白丢弃。同音字(甜甜/田田/天天)因此等价 —— 确认层不因 ASR 选错字而误杀
-/// (§8.2「宁松勿严」在确认层的兑现)。
-pub(super) fn to_syllables(s: &str) -> Vec<String> {
+/// 字母 → 中文读法(中国人念字母缩写的通行读音,选贴近实际发音的字)。
+/// 名字派生唤醒词与确认层转写归一**共用这一张表**:KWS 把「BT」编成「逼踢」的拼音去听,
+/// ASR 转写出拉丁原文「BT」时也展开成同一串音节 —— 两头对得上,真呼叫才不会被当幻听。
+pub(super) const LETTER_READINGS: [&str; 26] = [
+    "诶",     // A
+    "逼",     // B
+    "西",     // C
+    "迪",     // D
+    "衣",     // E
+    "艾弗",   // F
+    "鸡",     // G
+    "艾曲",   // H
+    "艾",     // I
+    "杰",     // J
+    "开",     // K
+    "艾勒",   // L
+    "艾姆",   // M
+    "恩",     // N
+    "欧",     // O
+    "批",     // P
+    "抠",     // Q
+    "阿尔",   // R
+    "艾丝",   // S
+    "踢",     // T
+    "优",     // U
+    "威",     // V
+    "达不溜", // W
+    "艾克斯", // X
+    "歪",     // Y
+    "贼",     // Z
+];
+
+/// 数字 → 中文读法(逐位念:7274 → 七二七四)。
+pub(super) const DIGIT_READINGS: [&str; 10] =
+    ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
+
+/// 没改名(或名字派生不出)时的唤醒词:默认名 BT 的两种叫法 —— 小名「BT(逼踢)」+
+/// 全号读法「七二七四」(2026-07-10 用户拍板:默认名 7274→BT,唤醒词 = 名字派生,
+/// 原独立唤醒词设置与默认词「小七」一并退役)。改了名就纯跟名字,这组附带词作废。
+pub(super) const DEFAULT_WAKE_WORDS: [&str; 2] = ["逼踢", "七二七四"];
+
+/// 名字 → 可唤醒形(§8.2「起什么名字就怎么唤醒」):中文原样、数字转读法、字母缩写按
+/// 字母读音(BT→逼踢);分隔符/标点/表情丢弃。英文单词式名字(≥3 个字母且含小写,如
+/// Buddy)是按英文单词念的、字母读音救不了(英文 KWS 实测零召回,§7.5)→ None,
+/// 调用方回落 `DEFAULT_WAKE_WORDS` 并让 UI 如实提示(§3.5 不静默哑掉)。
+pub(super) fn derive_wake_word(name: &str) -> Option<String> {
     use pinyin::ToPinyin;
-    let mut out = Vec::new();
-    let mut ascii = String::new();
-    for ch in s.chars() {
-        if ch.is_ascii_alphanumeric() {
-            ascii.push(ch.to_ascii_lowercase());
-            continue;
-        }
-        if !ascii.is_empty() {
-            out.push(std::mem::take(&mut ascii));
-        }
-        if let Some(py) = ch.to_pinyin() {
-            out.push(py.plain().to_string());
+    let chars: Vec<char> = name.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch.is_ascii_alphabetic() {
+            let mut j = i;
+            while j < chars.len() && chars[j].is_ascii_alphabetic() {
+                j += 1;
+            }
+            let run = &chars[i..j];
+            if run.len() >= 3 && run.iter().any(|c| c.is_ascii_lowercase()) {
+                return None; // 英文单词名:整个名字判「语音喊不了」
+            }
+            for c in run {
+                out.push_str(LETTER_READINGS[(c.to_ascii_uppercase() as u8 - b'A') as usize]);
+            }
+            i = j;
+        } else if ch.is_ascii_digit() {
+            out.push_str(DIGIT_READINGS[(ch as u8 - b'0') as usize]);
+            i += 1;
+        } else {
+            // 只收「有拼音」的字(KWS 按拼音 token 听);emoji/标点/空格当分隔符丢弃,
+            // 否则一个表情就让 encode_keywords 整词丢弃、唤醒无声哑掉。
+            if ch.to_pinyin().is_some() {
+                out.push(ch);
+            }
+            i += 1;
         }
     }
-    if !ascii.is_empty() {
-        out.push(ascii);
+    (!out.is_empty()).then_some(out)
+}
+
+/// 名字 → 唤醒词表(纯函数,可单测)。返回 (词表, 是否回落默认):
+/// 空名 = 没改名 → 默认词组(不算回落);起了名但派生不出 → 默认词组 + fallback=true
+/// (UI 据此如实提示「这个名字语音喊不了」)。
+pub(super) fn resolve_wake_words(pet_name: &str) -> (Vec<String>, bool) {
+    let name = pet_name.trim();
+    if name.is_empty() {
+        return (DEFAULT_WAKE_WORDS.iter().map(|s| s.to_string()).collect(), false);
+    }
+    match derive_wake_word(name) {
+        Some(w) => (vec![w], false),
+        None => (DEFAULT_WAKE_WORDS.iter().map(|s| s.to_string()).collect(), true),
+    }
+}
+
+/// 转写归一成「音节串」:汉字 → 无调拼音;ASCII 字母/数字按中文读法展开(BT → bi ti、
+/// 7 → qi,与名字派生同一张表 —— ASR 吐拉丁原文也能对上派生的唤醒词);标点/空白丢弃。
+/// 同音字(甜甜/田田/天天)因此等价 —— 确认层不因 ASR 选错字而误杀(§8.2「宁松勿严」)。
+pub(super) fn to_syllables(s: &str) -> Vec<String> {
+    use pinyin::ToPinyin;
+    fn push_reading(out: &mut Vec<String>, reading: &str) {
+        use pinyin::ToPinyin;
+        for c in reading.chars() {
+            if let Some(py) = c.to_pinyin() {
+                out.push(py.plain().to_string());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for ch in s.chars() {
+        if ch.is_ascii_alphabetic() {
+            push_reading(&mut out, LETTER_READINGS[(ch.to_ascii_uppercase() as u8 - b'A') as usize]);
+        } else if ch.is_ascii_digit() {
+            push_reading(&mut out, DIGIT_READINGS[(ch as u8 - b'0') as usize]);
+        } else if let Some(py) = ch.to_pinyin() {
+            out.push(py.plain().to_string());
+        }
     }
     out
 }
@@ -496,7 +604,8 @@ fn on_hit(
     hangover: f32,
     ring: &[f32],
 ) -> Result<Phase> {
-    d.rt.publish(VoiceEvent::WakeCandidate); // 前端:提前 duck + 轻视觉「在听」,不出声
+    d.rt.publish(VoiceEvent::WakeCandidate); // 前端:提前 duck + 轻视觉「在听」
+    super::prompts::play_chirp_async(); // 即时「叮」:第一时间告诉用户听到了(真唤醒/旁听的判定仍在后台跑)
     vad.reset();
     let tail = confirm_tail(pipe, vad)?;
     vad.reset();
@@ -548,10 +657,20 @@ fn on_wake(
     d.rt.publish(VoiceEvent::WakeTriggered);
     ack_and_drain(&prompts, pipe, PromptKind::Ack); // 边播应答音边清麦,播完即开录(0 间隙)
 
+    // 武装「停 / 定稿」信号一次(整轮共用):清掉上一轮遗留;之后由 listen_stop 写(在听时前端点
+    // ✕ / 定稿键)。**不在循环内重置** —— 追问间隙(「没听清」仍显停控件)用户点停也要认,重置会冲掉它。
+    d.rt.arm_wake_ctl();
     for attempt in 0..2 {
         vad.reset();
         d.rt.publish(VoiceEvent::State { phase: VoicePhase::Listening });
-        let out = collect_utterance(pipe, vad, &d.rt, None, WAKE_START_TIMEOUT, hangover)?;
+        let out = collect_utterance(pipe, vad, &d.rt, Some(d.rt.wake_ctl()), WAKE_START_TIMEOUT, hangover)?;
+        if matches!(out, CaptureOut::Cancelled) {
+            // 用户点了「取消」(✕):安静回待唤醒,不追问不告退(定稿键走 CTL_ACCEPT → 落到下面正常识别)
+            d.rt.publish(VoiceEvent::ListenEnded { reason: "wake_done".into() });
+            d.rt.publish(VoiceEvent::State { phase: VoicePhase::Idle });
+            pipe.drain();
+            return Ok(Phase::Watch);
+        }
         if let Some((text, speaker_id)) = transcribe(d, out)? {
             d.rt.publish(VoiceEvent::Transcribed { text, via: "wake".into(), speaker_id });
             d.rt.publish(VoiceEvent::State { phase: VoicePhase::Idle });
@@ -798,9 +917,57 @@ mod tests {
     }
 
     #[test]
-    fn syllables_mix_ascii_and_hanzi() {
-        assert_eq!(to_syllables("天天 OK 啦"), vec!["tian", "tian", "ok", "la"]);
-        assert_eq!(to_syllables("BT7274"), vec!["bt7274"], "连续 ASCII 归一个 token");
+    fn syllables_expand_ascii_by_chinese_readings() {
+        // ASCII 按中文读法展开(与名字派生同一张表):ASR 吐拉丁原文也对得上派生词
+        assert_eq!(to_syllables("BT"), vec!["bi", "ti"]);
+        assert_eq!(to_syllables("7274"), vec!["qi", "er", "qi", "si"]);
+        assert_eq!(to_syllables("天天 OK 啦"), vec!["tian", "tian", "ou", "kai", "la"]);
+    }
+
+    #[test]
+    fn derive_wake_word_from_name() {
+        // 中文原样 / 数字读法 / 字母缩写按字母读音 / 分隔符与 emoji 丢弃
+        assert_eq!(derive_wake_word("天天"), Some("天天".into()));
+        assert_eq!(derive_wake_word("BT"), Some("逼踢".into()));
+        assert_eq!(derive_wake_word("bt"), Some("逼踢".into()), "短字母串不看大小写");
+        assert_eq!(derive_wake_word("小7"), Some("小七".into()));
+        assert_eq!(derive_wake_word("7274"), Some("七二七四".into()));
+        assert_eq!(derive_wake_word("BT-7274"), Some("逼踢七二七四".into()), "分隔符丢弃");
+        assert_eq!(derive_wake_word("GPT"), Some("鸡批踢".into()), "全大写=缩写,逐字母读");
+        assert_eq!(derive_wake_word("天天🐶"), Some("天天".into()), "emoji 当分隔符,不许它毒死整词");
+        // 英文单词式(≥3 字母且含小写)是按单词念的,字母读音救不了 → None(回落默认词)
+        assert_eq!(derive_wake_word("Buddy"), None);
+        assert_eq!(derive_wake_word("Max"), None);
+        assert_eq!(derive_wake_word("小Buddy"), None, "带单词段的名字整个判喊不了");
+        assert_eq!(derive_wake_word(""), None);
+        assert_eq!(derive_wake_word("!!"), None, "全是派生不出的字符");
+    }
+
+    #[test]
+    fn resolve_wake_words_fallback_semantics() {
+        // 空名 = 没改名 → 默认词组,不算回落;派生失败 → 默认词组 + fallback 提示位
+        let (words, fb) = resolve_wake_words("");
+        assert_eq!(words, DEFAULT_WAKE_WORDS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert!(!fb);
+        let (words, fb) = resolve_wake_words("天天");
+        assert_eq!(words, vec!["天天".to_string()]);
+        assert!(!fb);
+        let (words, fb) = resolve_wake_words("Buddy");
+        assert_eq!(words, DEFAULT_WAKE_WORDS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert!(fb, "起了名但喊不了 → 回落 + 提示");
+    }
+
+    #[test]
+    fn triage_matches_latin_transcript_against_derived_keyword() {
+        // 名字 BT → 唤醒词「逼踢」;ASR 常吐拉丁原文「BT」——两头经同一张读音表归一后必须相等,
+        // 否则确认层会把真呼叫当幻听拒掉(这正是派生表与 to_syllables 共用一张的原因)。
+        let k = kw(&["逼踢"]);
+        assert!(matches!(triage_transcript("BT", &k), Triage::Wake), "拉丁原文孤立呼名");
+        assert!(matches!(triage_transcript("逼踢", &k), Triage::Wake));
+        assert!(matches!(triage_transcript("必提", &k), Triage::Wake), "同音字等价(无调拼音)");
+        assert!(matches!(triage_transcript("BT暂停", &k), Triage::Overheard), "呼名+续句交仲裁");
+        let k74 = kw(&["七二七四"]);
+        assert!(matches!(triage_transcript("7274", &k74), Triage::Wake), "数字原文对得上读法");
     }
 
     #[test]

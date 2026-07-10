@@ -304,9 +304,49 @@ pub(super) fn play_pcm_blocking_signaled(
     Ok(())
 }
 
+// —— 唤醒候选即时反馈音「叮」(2026-07-10:治「不知道有没有唤醒」)——
+// KWS 一命中(候选)就响一声,第一时间告诉用户「听到了」;确认层随后在后台判定真唤醒/旁听/
+// 幻听(有声应答仍在定夺之后 = 保留原应答)。**纯正弦短音**是关键:silero VAD 不把它当人声
+// (不污染孤立呼名的「静默续录」判定),ASR 也不会把它转成字;浏览器采集(默认)AEC3 直接消掉。
+// 参数是单一真相源、可调(§4.11):清亮不刺耳、短到不打断人说话。
+const CHIRP_RATE: u32 = 24_000;
+const CHIRP_FREQ: f32 = 1_320.0; // ≈E6
+const CHIRP_SECS: f32 = 0.11;
+const CHIRP_GAIN: f32 = 0.28;
+
+fn chirp_pcm() -> Vec<f32> {
+    let n = (CHIRP_RATE as f32 * CHIRP_SECS) as usize;
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / CHIRP_RATE as f32;
+            let attack = (t / 0.004).min(1.0); // 4ms 淡入,起头不爆音
+            let decay = (-t / (CHIRP_SECS * 0.35)).exp(); // 钟形衰减,收尾不咔哒
+            (2.0 * std::f32::consts::PI * CHIRP_FREQ * t).sin() * attack * decay * CHIRP_GAIN
+        })
+        .collect()
+}
+
+/// 非阻塞播「叮」:开条短线程 cpal 直出,绝不拖住唤醒确认层的静默续录。best-effort(播不出只少一声)。
+pub(super) fn play_chirp_async() {
+    std::thread::spawn(|| {
+        if let Err(e) = play_pcm_blocking(&chirp_pcm(), CHIRP_RATE) {
+            tracing::warn!(err = %format!("{e:#}"), "唤醒提示音播放失败");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chirp_is_short_bounded_pure_tone() {
+        // 即时反馈音必须短、幅值受控(不刺耳)、无 NaN —— 参数漂了这条会亮。
+        let pcm = chirp_pcm();
+        assert_eq!(pcm.len(), (CHIRP_RATE as f32 * CHIRP_SECS) as usize);
+        assert!(pcm.iter().all(|s| s.is_finite() && s.abs() <= CHIRP_GAIN + 1e-6));
+        assert!(pcm.iter().any(|s| s.abs() > 0.05), "不能是静音");
+    }
 
     #[test]
     fn decode_wav_roundtrips_pcm_f32_to_wav() {

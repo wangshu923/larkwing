@@ -66,7 +66,8 @@ pub fn validate_name(name: &str) -> Result<()> {
 }
 
 /// 目标已存在 → 在扩展名前加 ` (N)`,取最小可用 N(资源管理器口径)。**永不覆盖。**
-fn dedupe_path(dst: &Path) -> PathBuf {
+/// pub:web_download / pdf_to_png / 壳层 webrender 下载接管,产出文件同守这条(§7.2 可逆三规①)。
+pub fn dedupe_path(dst: &Path) -> PathBuf {
     if !dst.exists() {
         return dst.to_path_buf();
     }
@@ -84,6 +85,40 @@ fn dedupe_path(dst: &Path) -> PathBuf {
         }
     }
     dst.to_path_buf() // 理论兜底(几乎不可能走到)
+}
+
+/// 外来文件名(服务器/网页给的)的**替换式**清洗:非法字符换 `_`、去尾点/空格、
+/// 保留名前缀 `_`,实在不成兜底「下载文件」。与 `validate_name` 的「退回重拟」分工:
+/// 模型起的名退回让它重拟;外来名没有重拟环节,只能清洗(web_download / webrender 下载共用)。
+pub fn sanitize_filename(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || (c as u32) < 0x20
+            {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim().trim_end_matches([' ', '.']).to_string();
+    let mut name = if cleaned.is_empty() { "下载文件".to_string() } else { cleaned };
+    if validate_name(&name).is_err() {
+        name = format!("_{name}");
+    }
+    if validate_name(&name).is_err() {
+        name = "下载文件".to_string();
+    }
+    name
+}
+
+/// 系统「下载」文件夹(Windows Known Folder / mac ~/Downloads);找不到回落用户主目录。
+/// web_download 缺省落点 / webrender 下载接管共用。
+pub fn default_download_dir() -> PathBuf {
+    dirs::download_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 /// dst 是已存在的文件夹 → 解析成"移/复制**进**它里面,保留原名"(文件管理器直觉);

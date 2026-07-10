@@ -51,7 +51,8 @@ export interface UiAttachment {
 
 export interface UiMessage {
   id: number
-  role: 'user' | 'wang'
+  /** event = 定时任务到点的系统线(「⏰ 到点了」居中细线,不是气泡)。 */
+  role: 'user' | 'wang' | 'event'
   text: string
   /** 仅本次会话内产生的回复有;历史消息不回填(流水在库里,要看走分析)。 */
   stats?: TurnStats
@@ -63,8 +64,6 @@ export interface UiMessage {
   at?: number
   /** 说话人名(多人会话:家人插话 / 声纹 / 渠道归人才有;「我」说的为空)。user 气泡据此标名。 */
   speakerName?: string
-  /** 自动触发来源('reminder'):助手回复由提醒到点触发,气泡标「⏰ 提醒」。空 = 普通回复。 */
-  trigger?: string
 }
 
 const state = reactive({
@@ -111,10 +110,10 @@ onProvidersUsable(() => {
 })
 
 function toUi(m: Message): UiMessage {
-  const ui: UiMessage = { id: m.id, role: m.role === 'user' ? 'user' : 'wang', text: m.content, at: m.created_at }
-  // 说话人显性化(engine 富化):user 行「谁说的」名字(非我才有)/ assistant 行自动触发标记。
+  const role = m.role === 'user' ? 'user' : m.role === 'event' ? 'event' : 'wang'
+  const ui: UiMessage = { id: m.id, role, text: m.content, at: m.created_at }
+  // 说话人显性化(engine 富化):user 行「谁说的」名字(非我才有)。
   if (m.speaker_name) ui.speakerName = m.speaker_name
-  if (m.trigger) ui.trigger = m.trigger
   // 历史里的附件小票:从 user 行 payload(UserMeta)解出。图带 file → 稍后 resolveThumbs
   // 拉回缩略图(填 dataUrl);拉到前 / doc / 旧数据显「📷/📄 名字」兜底。
   if (m.role === 'user' && m.payload) {
@@ -152,13 +151,13 @@ async function resolveThumbs() {
   }
 }
 
-/** 内部行不进聊天流:'tool' 行、'event' 行(定时触发,7274 的转述才是给人看的)、
- *  空话的 assistant 行(纯 tool_call 轮)、__IGNORE__ 行(唤醒跟进窗听到环境音,
- *  模型按法条判定"不是对我说的"——机制标记,永不示人)。 */
+/** 内部行不进聊天流:'tool' 行、空话的 assistant 行(纯 tool_call 轮)、__IGNORE__ 行
+ *  (唤醒跟进窗听到环境音,模型按法条判定"不是对我说的"——机制标记,永不示人)。
+ *  'event' 行(定时任务到点)**保留**:渲染成居中的「⏰ 到点了」系统线,交代"是定好的
+ *  安排叫醒了它"——下面的回复就是它自己说的话(所以回复气泡不再打「提醒」标签)。 */
 function visible(m: Message): boolean {
   return (
     m.role !== 'tool' &&
-    m.role !== 'event' &&
     !(m.role === 'assistant' && (!m.content || m.content.trim() === '__IGNORE__'))
   )
 }
@@ -174,6 +173,55 @@ function pushOpening() {
     id: localId--,
     role: 'wang',
     text: state.openingLine || t('chat.openingFallback'),
+  })
+}
+
+/** 浏览器预览的样例对话(?demo):「设提醒 → 到点触发」全链视觉——确认小票、
+ *  「⏰ 到点了」系统线、触发回复;确认轮故意两段(说话→调工具→再说话 = 落库两条
+ *  assistant 行),验证聊天流把同轮各段合并成一个气泡。纯看样式,假数据不走逻辑。 */
+function pushReminderDemo() {
+  const now = Date.now()
+  state.messages.push({ id: localId--, role: 'user', text: '1分钟后叫我喝水', at: now - 90_000 })
+  state.messages.push({
+    id: localId--,
+    role: 'wang',
+    text: '我看一下现在的时间。',
+    at: now - 89_000,
+    trace: {
+      steps: [{ name: 'now', ui_key: 'tool.now', args: '{}', result: '2026-07-10 21:59:03 星期五', status: 'ok' }],
+    },
+  })
+  state.messages.push({
+    id: localId--,
+    role: 'wang',
+    text: '收到,一分钟后叫你。',
+    at: now - 88_000,
+    trace: {
+      steps: [
+        {
+          name: 'reminder_set',
+          ui_key: 'tool.reminder_set',
+          args: '{"content":"叫用户喝水,顺便起来活动一下","first_at":"2026-07-10 22:00:03","repeat":"once"}',
+          result: '已设好:07-10 22:00 · 一次',
+          status: 'ok',
+        },
+      ],
+    },
+  })
+  state.messages.push({ id: localId--, role: 'event', text: '叫用户喝水,顺便起来活动一下', at: now })
+  state.messages.push({ id: localId--, role: 'wang', text: '该喝水了!起来接杯水,顺便活动活动肩膀~', at: now })
+  // 记忆回执小票样例:remember 成功 → 气泡末尾「记住了 · …」(点击去记忆页)
+  state.messages.push({ id: localId--, role: 'user', text: '对了,我不吃香菜,记一下', at: now })
+  state.messages.push({
+    id: localId--,
+    role: 'wang',
+    text: '好,记住啦,以后避开香菜。',
+    at: now,
+    trace: {
+      steps: [
+        { name: 'remember', ui_key: 'tool.remember', args: '{"fact":"用户不吃香菜","kind":"fact"}', result: '已记下', status: 'ok' },
+      ],
+    },
   })
 }
 
@@ -387,6 +435,8 @@ async function boot() {
       { id: 3, user_id: 1, scene_id: 'companion', channel: 'system', title: '吃药提醒', pinned: false, created_at: 0, updated_at: Date.now() - 86400_000 },
     ]
     pushOpening()
+    // ?demo:看「设提醒 → 到点」链路的样式(小票 / 系统线 / 触发回复)
+    if (new URLSearchParams(location.search).has('demo')) pushReminderDemo()
     if (!state.hasApiKey) pushNoLlmHint()
     if (state.hasApiKey) {
       // 灯带的假读数(纯看视觉)
@@ -594,7 +644,8 @@ function send(
       (busy) => {
         if (busy) return
         stop()
-        api.voiceFollowUp().catch(() => {})
+        // 媒体在播 → 3s 短窗(跟进窗全程压着媒体音量,能短就短);状态读在念完这一刻,不在 done 时
+        api.voiceFollowUp(useMedia().state.status === 'playing').catch(() => {})
       },
       { immediate: true },
     )
@@ -643,12 +694,27 @@ function send(
       // 回合属于已切走的会话(发出后切到别的会话):绝不碰当前视图,只在收尾给列表打标。
       // 放在 turnSeq 闸前 —— 切走后又在新会话发消息(turnSeq 已涨)时,旧回合的标也不漏。
       if (sentConv !== state.convId) {
+        // 唤醒回合的收尾通知不能漏(此前这条早退路一个都不发 → core 卡 AwaitTurn 直到
+        // 180s 兜底,duck 把媒体音量压好几分钟——真机实锤的主谋):done = 把残余念完再开
+        // 跟进窗;失败/取消 = 闭嘴回待唤醒。非唤醒回合这些全是 no-op。
+        if (ev.type === 'done') {
+          if (speak) speech.endTurn() // turnActive 落下 busy 才会 false,跟进窗才开得出去
+          wakeFollowUp()
+        } else if (ev.type === 'failed' || ev.type === 'cancelled') {
+          speech.abort()
+          wakeResume()
+        }
         if (ev.type === 'done') state.convBadges[sentConv] = 'done'
         else if (ev.type === 'failed') state.convBadges[sentConv] = 'failed'
         if (ev.type === 'done' || ev.type === 'failed') refreshConversations()
         return
       }
-      if (myTurn !== turnSeq) return // 旧回合的迟到事件:新回合已接管,丢弃不串台
+      if (myTurn !== turnSeq) {
+        // 旧回合的迟到事件:新回合已接管,丢弃不串台。但唤醒回合的终态仍要通知唤醒循环
+        // (新回合已占麦 → 不开跟进窗,直接回待唤醒;否则 core 同样卡到 180s 兜底)。
+        if (ev.type === 'done' || ev.type === 'failed' || ev.type === 'cancelled') wakeResume()
+        return
+      }
       switch (ev.type) {
         case 'delta':
           fullText += ev.data
@@ -701,10 +767,11 @@ function send(
           break
         }
         case 'segment': {
-          // 带文字的工具轮(PLAN §9):这段回复在落库里是独立 assistant 行 —— 封口当前气泡
-          // (钉 message_id 供 done 后 hydrateTrace 把「想了想」挂上)、另起新泡接后续文字。
-          // 让在飞气泡结构 = 落库/重启结构(否则 trace 实时挂不上、重启才"多出一个气泡")。
-          // 不重置 turnHadTrace:整轮算一次,done 时一并补拉各段轨迹各就各位。
+          // 带文字的工具轮(PLAN §9):这段回复在落库里是独立 assistant 行 —— 封口当前段
+          // (钉 message_id 供 done 后 hydrateTrace 把「想了想」挂上)、另起新段接后续文字。
+          // 让在飞消息结构 = 落库/重启结构(否则 trace 实时挂不上、重启才"多出一段")。
+          // 观感上不碎:MainLayout::streamGroups 会把同轮相邻 wang 段合并渲染成一个气泡,
+          // 这里只管数据段。不重置 turnHadTrace:整轮算一次,done 时一并补拉各段轨迹各就各位。
           twFlush() // 当前段已收到的字立刻放完
           wang.id = ev.data.message_id
           state.messages.push({ id: localId--, role: 'wang', text: '' })
@@ -776,9 +843,13 @@ function send(
       if (sentConv !== state.convId) {
         state.convBadges[sentConv] = 'failed'
         refreshConversations()
+        wakeResume() // 唤醒回合的前置错误也要回待唤醒(否则卡 180s 兜底;非唤醒 = no-op)
         return
       }
-      if (myTurn !== turnSeq) return // 旧回合的迟到失败:新回合已接管,忽略
+      if (myTurn !== turnSeq) {
+        wakeResume() // 同上:被接管的唤醒回合终态不能漏通知
+        return // 旧回合的迟到失败:新回合已接管,忽略
+      }
       // 前置错误(AppError):没 key / 会话不存在 / 建连失败
       speech.abort()
       wakeResume()

@@ -13,7 +13,6 @@ import { refreshAudioMode } from '../composables/useAudioGraph'
 import { useWakeCalib } from '../composables/useWakeCalib'
 import { useVoice, onEnrollDone } from '../composables/useVoice'
 import { audioFileToWavBase64 } from '../composables/useAudioDecode'
-import AecSpike from '../components/AecSpike.vue'
 import SkinSelect from '../components/SkinSelect.vue'
 
 const emit = defineEmits<{ (e: 'close'): void }>()
@@ -70,7 +69,8 @@ async function loadVoice() {
       vadReady: false,
       kwsReady: false,
       wakeRunning: false,
-      keywords: ['示例唤醒词'], // 预览占位(非默认值副本——默认唤醒词单源在后端 voice/mod.rs::wake_keywords,§4.11)
+      keywords: ['示例唤醒词'], // 预览占位(非默认值副本——唤醒词=名字派生,单源在后端 voice/mod.rs::wake_keywords,§4.11)
+      wakeFallback: false,
       devices: ['MacBook 麦克风(预览)', 'USB 会议麦(预览)'],
       speakers: [
         { id: 'zh-CN-XiaoxiaoNeural', name: '晓晓 · 温柔' },
@@ -88,9 +88,6 @@ async function loadVoice() {
       console.error('读取语音状态失败', e)
     }
   }
-  // 唤醒词框实绑当前词(既显示又可改),不靠 placeholder —— 消除"空框/灰字"歧义,
-  // 且唤醒词只此一处可填(第一层那行改成只读状态,不再像输入框)
-  keywordsDraft.value = (voiceInfo.value?.keywords ?? []).join('、')
 }
 // 喊名字唤醒(C 期):开关 = voice_wake_set 一体化入口(写库 + 起停;首次开会
 // 下 KWS 模型 + 预合成应答音,按钮转菊花)。wakeRunning 是事实,失败自然回弹。
@@ -98,28 +95,12 @@ const wakeBusy = ref(false)
 // 开启失败的可见出口(铁律 §3.5:能点的必有反应、出错有友好退路)。原先失败只
 // console.error → Win 上看不到任何反馈,开关只闪一下就回弹 = 用户眼里"打不开"。
 const wakeError = ref('')
-// 唤醒词合法性,与后端 encode_keywords 同口径:逐词必须纯中文,否则整词被丢弃;
-// 一个能用的都没有 = 根本起不来(就是唤醒词填 "BT" 这种坑)。空 = 用默认词,不算问题。
-function keywordIssue(text: string): 'ok' | 'all-bad' | 'some-bad' {
-  const words = text.split(/[、,，;；\s]+/).map((s) => s.trim()).filter(Boolean)
-  if (words.length === 0) return 'ok'
-  const good = words.filter((w) => /^[一-鿿]+$/.test(w)) // 纯中文(CJK 基本区)
-  if (good.length === 0) return 'all-bad'
-  return good.length < words.length ? 'some-bad' : 'ok'
-}
 async function toggleWake() {
   if (wakeBusy.value) return
   const target = !(voiceInfo.value?.wakeRunning ?? false)
   wakeError.value = ''
-  // 拦在最前(也拦在调后端之前):唤醒词全不是中文时后端必抛(keywords_buf 为空),
-  // 与其白跑一趟再静默回弹,不如就地给精确话(这正是 "BT" 打不开的根因)。
-  if (target) {
-    const eff = keywordsDraft.value.trim() || (voiceInfo.value?.keywords ?? []).join('、')
-    if (keywordIssue(eff) === 'all-bad') {
-      wakeError.value = t('settings.voice.keywordsAllInvalid')
-      return
-    }
-  }
+  // 唤醒词 = 名字派生(后端 wake_keywords 单源):派生不出会自动回落默认词,
+  // 永远编得出 → 原「全非中文拦在最前」的预检不再需要,喊不了在下面 wakeFallback 提示。
   if (!isTauri()) {
     if (voiceInfo.value) voiceInfo.value.wakeRunning = target // 预览:纯看交互
     return
@@ -136,31 +117,13 @@ async function toggleWake() {
     wakeBusy.value = false
   }
 }
-// 唤醒词:失焦保存;开着唤醒时重启循环让新词立即生效。边打边提示非中文(拦输入)
-const keywordsDraft = ref('')
-const keywordWarn = computed(() => keywordIssue(keywordsDraft.value))
-watch(keywordsDraft, () => (wakeError.value = '')) // 一动词就清掉上次开启失败的红字,别让它发霉
-async function saveKeywords() {
-  const v = keywordsDraft.value.trim()
-  if (!v) return
-  await settings.set('voice.wake.keywords', v)
-  if (isTauri() && voiceInfo.value?.wakeRunning) {
-    try {
-      await api.voiceWakeSet(false)
-      const s = await api.voiceWakeSet(true)
-      voiceInfo.value = s
-      emitWakeChanged(s.wakeRunning, s.keywords)
-    } catch (e) {
-      console.error('唤醒词生效失败', e)
-      wakeError.value = t('settings.voice.wakeFailed')
-    }
-  } else if (isTauri()) {
-    voiceInfo.value = await api.voiceStatus().catch(() => voiceInfo.value)
-    if (voiceInfo.value) emitWakeChanged(voiceInfo.value.wakeRunning, voiceInfo.value.keywords)
-  }
-}
+// 名字只有一个音(单派生词且单字)→ 提示喊起来可能不灵(召回物理,标定也难救)
+const wakeShortName = computed(() => {
+  const k = voiceInfo.value?.keywords ?? []
+  return !voiceInfo.value?.wakeFallback && k.length === 1 && (k[0]?.length ?? 0) === 1
+})
 
-// 影响"正在监听的唤醒循环"的设置(阈值/唤醒词/麦克风/耐心)改完 → 自动 off→on 重启,
+// 影响"正在监听的唤醒循环"的设置(阈值/名字→唤醒词/麦克风/耐心)改完 → 自动 off→on 重启,
 // 让新值立即生效,不让用户手动重启(这不是服务器,改一下就重启体验差)。重启很轻
 // (模型已缓存,只重建 spotter/VAD/采集,无声、亚秒级);唤醒没开就只存库,下次开自然用上。
 async function restartWakeIfRunning() {
@@ -259,6 +222,15 @@ const asrOpts = computed(() => [
 // 两套命名空间分键,切源各回各的选择。浏览器设备的 label 要麦克风权限到手后才有
 // (桥起过一次即有),没有就编号兜底。
 const captureSource = computed(() => settings.get('voice.capture.source') || 'browser')
+// 回声消除开关 = 采集源的用户语言(§7.5 正式位,2026-07-10 从试验块挪来;试验块已删):
+// 开 = browser 采集(getUserMedia AEC3,消掉自己放的电影/说话声);关 = cpal 原始采集。
+// 切换即写 + 重启唤醒换管;browser 起不来时 useMicBridge 自愈回落 cpal + toast,
+// 这颗开关是显式的一键回退。NS/AGC 不暴露(实验定案:NS 双开啃双讲人声,锁死在代码)。
+async function onEchoCancel(v: string) {
+  await settings.set('voice.capture.source', v === '1' ? 'browser' : 'cpal')
+  await restartWakeIfRunning()
+  if (v === '1') void loadWebMics() // 切回 browser 源顺手刷新设备列表
+}
 const webMics = ref<{ value: string; label: string }[]>([])
 async function loadWebMics() {
   try {
@@ -751,10 +723,22 @@ const petName = computed(() => settings.get('ui.pet_name') || t('pet.name'))
 // 消除"空框=到底叫啥"的歧义。存库仍保持"空 = 跟随默认名":清空或填回默认名
 // 都存空,默认名将来变(换肤/宪法)时自动跟随,不在库里钉死字面量。
 const petDraft = ref(petName.value)
-function savePetName() {
+async function savePetName() {
   const v = petDraft.value.trim()
-  settings.set('ui.pet_name', v && v !== t('pet.name') ? v : '')
+  const next = v && v !== t('pet.name') ? v : ''
+  const changed = next !== (settings.get('ui.pet_name') || '')
+  await settings.set('ui.pet_name', next)
   petDraft.value = petName.value // 回填:清空后框里也显示回默认名,始终与标题一致
+  // 名字就是唤醒词(派生,§8.2):改名 → 开着唤醒就重启循环换词即时生效;
+  // 没开也刷一下状态,让「听哪个词」跟着新名字走。
+  if (changed && isTauri()) {
+    if (voiceInfo.value?.wakeRunning) {
+      await restartWakeIfRunning()
+    } else {
+      voiceInfo.value = await api.voiceStatus().catch(() => voiceInfo.value)
+      if (voiceInfo.value) emitWakeChanged(voiceInfo.value.wakeRunning, voiceInfo.value.keywords)
+    }
+  }
 }
 
 // 我的性格:一句话人格覆盖层(进稳定前缀,下一句话生效);空 = 纯出厂人设
@@ -1412,23 +1396,14 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         <!-- 失败有了去处:不再只闪一下回弹(铁律 §3.5) -->
         <p v-if="wakeError" class="hint err">{{ wakeError }}</p>
         <p v-else class="hint">{{ t('settings.voice.wakeHint') }}</p>
+        <!-- 唤醒词 = 名字派生(没有独立设置,§8.2「起什么名字就怎么唤醒」):
+             名字喊不了(英文单词)→ 如实提示回落词;名字只有一个音 → 提示可能不灵 -->
+        <p v-if="voiceInfo?.wakeFallback" class="hint warn">
+          {{ t('settings.voice.wakeNameFallback', { name: petName, kw: (voiceInfo?.keywords ?? []).join('、') }) }}
+        </p>
+        <p v-else-if="wakeShortName" class="hint">{{ t('settings.voice.wakeShortName') }}</p>
 
         <p class="section">{{ t('settings.voice.advanced') }}</p>
-        <div class="row">
-          <span class="label">{{ t('settings.voice.keywords') }}</span>
-          <input
-            v-model="keywordsDraft"
-            class="s-input"
-            :class="{ bad: keywordWarn === 'all-bad' }"
-            :placeholder="(voiceInfo?.keywords ?? []).join('、') || t('settings.voice.keywordsPlaceholder')"
-            @blur="saveKeywords"
-            @keyup.enter="saveKeywords"
-          />
-        </div>
-        <!-- 拦输入:非中文当场标出来,不等点「打开」才暴露 -->
-        <p v-if="keywordWarn === 'all-bad'" class="hint err">{{ t('settings.voice.keywordsAllInvalid') }}</p>
-        <p v-else-if="keywordWarn === 'some-bad'" class="hint warn">{{ t('settings.voice.keywordsSomeInvalid') }}</p>
-        <p v-else class="hint">{{ t('settings.voice.keywordsHint') }}</p>
         <div class="row">
           <span class="label">{{ t('settings.voice.sensitivity') }}</span>
           <span class="sens">
@@ -1446,7 +1421,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             <small>{{ t('settings.voice.sensKeen') }}</small>
             <!-- 录音标定挪进灵敏度行当小入口:不想盲拖就录几遍,按真实发音+环境(必要时连触发拼写)定到正好 -->
             <button v-if="calib.running" class="link calib-link" @click="cancelCalib">{{ t('settings.voice.calibCancel') }}</button>
-            <button v-else class="link calib-link" :disabled="keywordWarn === 'all-bad'" @click="startCalib">
+            <button v-else class="link calib-link" @click="startCalib">
               {{ calib.phase === 'done' ? t('settings.voice.calibAgain') : t('settings.voice.calibStart') }}
             </button>
           </span>
@@ -1479,6 +1454,18 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             @input="settings.set('voice.volume', String(($event.target as HTMLInputElement).value))"
           />
         </div>
+        <div class="row">
+          <span class="label">{{ t('settings.voice.echoCancel') }}</span>
+          <span class="seg">
+            <button
+              v-for="v in ['1', '0']"
+              :key="v"
+              :class="{ on: captureSource === (v === '1' ? 'browser' : 'cpal') }"
+              @click="onEchoCancel(v)"
+            >{{ t(v === '1' ? 'settings.audio.on' : 'settings.audio.off') }}</button>
+          </span>
+        </div>
+        <p class="hint">{{ t('settings.voice.echoCancelHint') }}</p>
         <div class="row">
           <span class="label">{{ t('settings.voice.micDevice') }}</span>
           <SkinSelect
@@ -1569,7 +1556,6 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         <p class="hint">{{ t('settings.audio.hint', { name: petName }) }}</p>
 
         <!-- ⚗️ 临时:采集端 AEC spike(层1 第0步),拿到 Windows 真机结论就删 -->
-        <AecSpike />
       </div>
 
       <!-- 远程渠道:手机上跟旺财对话(Telegram/钉钉 bot)。凭证写得进读不回(同供应商 key) -->

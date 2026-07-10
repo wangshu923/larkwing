@@ -76,7 +76,9 @@ pub(crate) fn build_request(recent: &[Message], existing: &[Memory]) -> ChatRequ
     for m in recent {
         let who = match m.role.as_str() {
             "user" => "用户",
-            "assistant" => "7274",
+            // 中立角色标签(§5 底座不嵌具名;提炼模型只需分清谁在说,不需要知道名字,
+            // 也免得跟用户改名后的真名打架——顺手修掉原硬编的旧默认名「7274」)
+            "assistant" => "助手",
             _ => continue, // tool / event 行不进转录
         };
         body.push_str(who);

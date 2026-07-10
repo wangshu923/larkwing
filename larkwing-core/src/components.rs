@@ -1,4 +1,4 @@
-//! 第三方组件(yt-dlp / ffmpeg)**用时下载**:不进安装包(宪法 §10「不打包 Python」
+//! 第三方组件(yt-dlp / ffmpeg / pdfium)**用时下载**:不进安装包(宪法 §10「不打包 Python」
 //! 由此消解 —— 包里没有任何东西,运行时下载到数据目录,性质同浏览器下载文件)。
 //! robot 同款思路(它的 installer.py),收敛成:固定直链 + 镜像列表数据化(国内家庭
 //! 网络拉不动 GitHub,镜像优先、官方兜底)+ 哈希校验(发布方提供 SUMS 才校,见 spec)。
@@ -18,12 +18,16 @@ use crate::bus::Text;
 pub enum Component {
     YtDlp,
     Ffmpeg,
+    /// PDF 渲染动态库(pdf_to_png 栅格化;bblanchon/pdfium-binaries 预编译)。
+    /// 是**库不是可执行**:PATH 兜底自然落空、unix 可执行位无害多余。
+    Pdfium,
 }
 
-/// 压缩形态:None = 裸二进制;Zip = 取出 entry 名以 suffix 结尾的那一个文件。
+/// 压缩形态:None = 裸二进制;Zip / TarGz = 取出 entry 名以 suffix 结尾的那一个文件。
 enum Archive {
     None,
     Zip { entry_suffix: &'static str },
+    TarGz { entry_suffix: &'static str },
 }
 
 struct Spec {
@@ -82,15 +86,40 @@ impl Component {
                 archive: Archive::Zip { entry_suffix: "ffmpeg" },
                 label_key: "task.download.ffmpeg",
             }),
+            // pdfium:官方无 SUMS(只靠 TLS,同 ffmpeg 记录在案);tgz 里 Win 是
+            // bin/pdfium.dll、mac 是 lib/libpdfium.dylib。latest 命名稳定、C API 极稳。
+            (Component::Pdfium, "windows") => Ok(Spec {
+                bin_name: "pdfium.dll",
+                url: "https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-win-x64.tgz",
+                sums_url: None,
+                sums_asset: "",
+                archive: Archive::TarGz { entry_suffix: "bin/pdfium.dll" },
+                label_key: "task.download.pdfium",
+            }),
+            (Component::Pdfium, "macos") => Ok(Spec {
+                bin_name: "libpdfium.dylib",
+                // 开发机按芯片选包(发布目标是 Windows,这里只服务 Mac 开发)
+                url: if std::env::consts::ARCH == "aarch64" {
+                    "https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-mac-arm64.tgz"
+                } else {
+                    "https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-mac-x64.tgz"
+                },
+                sums_url: None,
+                sums_asset: "",
+                archive: Archive::TarGz { entry_suffix: "lib/libpdfium.dylib" },
+                label_key: "task.download.pdfium",
+            }),
             (c, os) => bail!("组件 {c:?} 不支持当前平台 {os}"),
         }
     }
 
     /// PATH 兜底时找的命令名(开发机 brew 装过就直接用,不下载)。
+    /// pdfium 是动态库、PATH 上不会有,which 落空即走下载 —— 语义正确的 no-op。
     fn path_name(self) -> &'static str {
         match self {
             Component::YtDlp => "yt-dlp",
             Component::Ffmpeg => "ffmpeg",
+            Component::Pdfium => "pdfium",
         }
     }
 
@@ -99,6 +128,7 @@ impl Component {
         match s {
             "yt-dlp" => Some(Component::YtDlp),
             "ffmpeg" => Some(Component::Ffmpeg),
+            "pdfium" => Some(Component::Pdfium),
             _ => None,
         }
     }
@@ -121,8 +151,8 @@ pub struct Components {
     dir: PathBuf,
     tasks: Tasks,
     net: crate::net::Client,
-    /// 并发去重:同一组件同时只有一个下载在跑(后到的等同一份结果)。
-    locks: [tokio::sync::Mutex<()>; 2],
+    /// 并发去重:同一组件同时只有一个下载在跑(后到的等同一份结果)。长度随 Component 变体数。
+    locks: [tokio::sync::Mutex<()>; 3],
 }
 
 impl Components {
@@ -198,12 +228,18 @@ impl Components {
             }
         }
 
-        // 3. 解压(zip 包取出目标二进制;裸二进制跳过)
-        if let Archive::Zip { entry_suffix } = spec.archive {
+        // 3. 解压(zip/tgz 包取出目标文件;裸二进制跳过)
+        let extract: Option<(&'static str, fn(&Path, &str, &Path) -> Result<()>)> =
+            match spec.archive {
+                Archive::None => None,
+                Archive::Zip { entry_suffix } => Some((entry_suffix, unzip_entry)),
+                Archive::TarGz { entry_suffix } => Some((entry_suffix, untar_gz_entry)),
+            };
+        if let Some((entry_suffix, extractor)) = extract {
             task.step("step.extract", serde_json::Value::Null);
-            let (zip_path, out_path) = (part.clone(), self.dir.join(format!("{}.bin", spec.bin_name)));
+            let (arc_path, out_path) = (part.clone(), self.dir.join(format!("{}.bin", spec.bin_name)));
             let out = out_path.clone();
-            tokio::task::spawn_blocking(move || unzip_entry(&zip_path, entry_suffix, &out))
+            tokio::task::spawn_blocking(move || extractor(&arc_path, entry_suffix, &out))
                 .await
                 .context("解压任务挂了")??;
             tokio::fs::remove_file(&part).await.ok();
@@ -351,6 +387,28 @@ pub(crate) async fn sha256_file(path: PathBuf) -> Result<String> {
 }
 
 /// 从 zip 里取出第一个以 entry_suffix 结尾的文件写到 dest。
+/// tgz 里取出以 suffix 结尾的那一个文件(pdfium 包形态;entry 用 `/` 分隔,与 tar 一致)。
+fn untar_gz_entry(tgz_path: &Path, entry_suffix: &str, dest: &Path) -> Result<()> {
+    let file = std::fs::File::open(tgz_path)?;
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    for entry in archive.entries().context("tgz 打不开")? {
+        let mut entry = entry?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let matched = entry
+            .path()
+            .map(|p| p.to_string_lossy().replace('\\', "/").ends_with(entry_suffix))
+            .unwrap_or(false);
+        if matched {
+            let mut out = std::fs::File::create(dest)?;
+            std::io::copy(&mut entry, &mut out)?;
+            return Ok(());
+        }
+    }
+    bail!("tgz 里没有 *{entry_suffix}")
+}
+
 fn unzip_entry(zip_path: &Path, entry_suffix: &str, dest: &Path) -> Result<()> {
     let file = std::fs::File::open(zip_path)?;
     let mut archive = zip::ZipArchive::new(file).context("zip 打不开")?;

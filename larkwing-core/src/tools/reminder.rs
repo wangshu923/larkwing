@@ -289,6 +289,7 @@ mod tests {
             conv_id: conv.id,
             media: MediaRuntime::detached(store.clone()),
             store,
+            web: None,
         }
     }
 

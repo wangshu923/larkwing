@@ -368,6 +368,47 @@ impl ChatRepo {
         })
     }
 
+    /// 本会话最近发的图片附件(相对文件名,`attachments/` 下),新的在前:qr_decode
+    /// 「刚发的那几张」缺省用。语义 = 最近的一**批**图——从新往旧走 user 行,进了带图
+    /// 区块后遇到不带图的 user 行即止(手机端一张图一条消息,连发是一批;更早的旧图
+    /// 不掺和)。payload 按 JSON 宽松解析(engine UserMeta 形状,这里只认
+    /// attachments[].kind=="image" 且带 file),坏 payload 跳过不炸。
+    pub fn recent_image_attachments(&self, conv: i64, max: usize) -> Result<Vec<String>> {
+        let msgs = self.recent_messages(conv, 50)?;
+        let mut out: Vec<String> = Vec::new();
+        for m in msgs.iter().rev() {
+            if m.role != "user" {
+                continue;
+            }
+            let images: Vec<String> = m
+                .payload
+                .as_deref()
+                .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+                .and_then(|v| v.get("attachments").and_then(|a| a.as_array()).cloned())
+                .map(|atts| {
+                    atts.iter()
+                        .filter(|a| a.get("kind").and_then(|k| k.as_str()) == Some("image"))
+                        .filter_map(|a| a.get("file").and_then(|f| f.as_str()).map(String::from))
+                        .filter(|f| !f.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if images.is_empty() {
+                if !out.is_empty() {
+                    break; // 一批的边界:带图区块走完了
+                }
+                continue; // 还没进区块(触发那句"认一下"本身不带图)
+            }
+            for f in images {
+                if out.len() >= max {
+                    return Ok(out);
+                }
+                out.push(f);
+            }
+        }
+        Ok(out)
+    }
+
     /// 跨会话按时间区间取用户可见对话(`[from_ms, to_ms)`,升序,封顶 limit):家庭日记蒸馏取料用。
     /// 只收 user/assistant 且内容非空(tool/event 内部行、静默回合不进日记)。
     pub fn messages_between(&self, from_ms: i64, to_ms: i64, limit: i64) -> Result<Vec<Message>> {

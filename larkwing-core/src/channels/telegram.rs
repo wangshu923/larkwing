@@ -22,7 +22,7 @@ use crate::engine::InAttachment;
 use crate::net;
 
 const CHANNEL: &str = "telegram";
-const API: &str = "https://api.telegram.org";
+pub(super) const API: &str = "https://api.telegram.org"; // outbound.rs 发文件共用
 /// Telegram 单条上限 4096;留余量。
 const TG_MAX: usize = 4000;
 /// 富格式路的**源文**分片上限:HTML 转义 + 标签会膨胀,给足余量;切完逐片转 HTML,

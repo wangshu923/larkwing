@@ -30,7 +30,10 @@ tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
 # 一键更新:app 内查清单→签名校验→原地装(Win 装前自动退出 app);走用户代理(check 自带 proxy)。
 tauri-plugin-updater = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+# webrender(隐藏 WebView 窗当 JS 渲染器):实现 core 的 WebRenderer trait 接缝。
+async-trait = "0.1"
+anyhow = "1"
 # 远程渠道监督器:CancellationToken 停旧起新(顶层 spawn 用 tauri runtime,core 不依赖 tauri)。
 tokio-util = "0.7"
 tracing = "0.1"

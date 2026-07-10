@@ -10,7 +10,7 @@
     "farewell": ["我先不打扰了,需要再叫我。"]
   },
   "options": {},
-  "tools": ["now", "weather", "media_search", "media_play", "media_control", "open", "system_volume", "power", "fs_list", "fs_find", "fs_read_text", "fs_move", "fs_copy", "fs_mkdir", "fs_trash", "fs_write_text", "fs_append", "fs_edit", "fs_undo", "reminder_set", "reminder_list", "reminder_cancel", "watch_set", "web_search", "web_fetch", "note_todo", "finish_todo"],
+  "tools": ["now", "weather", "media_search", "media_play", "media_control", "open", "system_volume", "power", "fs_list", "fs_find", "fs_read_text", "fs_move", "fs_copy", "fs_mkdir", "fs_trash", "fs_write_text", "fs_append", "fs_edit", "fs_undo", "reminder_set", "reminder_list", "reminder_cancel", "watch_set", "web_search", "web_fetch", "web_download", "web_render", "qr_decode", "pdf_to_png", "send_file", "note_todo", "finish_todo"],
   "few_shots": [
     { "role": "user", "content": "【示范】记一下,电影都放在 D:\\Movies" },
     {

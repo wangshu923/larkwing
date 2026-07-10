@@ -10,13 +10,17 @@ mod media_control;
 mod media_play;
 mod media_search;
 mod now;
+mod pdf;
+mod qr;
 mod recall;
 mod remember;
 mod reminder;
+mod send_file;
 mod todo;
 mod watch;
 mod weather;
 mod web;
+mod web_render;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -79,6 +83,9 @@ pub struct ToolCtx {
     pub store: Store,
     /// 影音运行时(搜/放/控三工具用;其余工具无视)。
     pub media: crate::media::MediaRuntime,
+    /// 壳层网页渲染器(web_render 专用;None = 壳层没注入〔core 单测/eval/headless〕,
+    /// 工具如实说没有渲染组件,§3.5)。
+    pub web: Option<Arc<dyn crate::webrender::WebRenderer>>,
 }
 
 /// 工具风险分级(预留 slot,PLAN §8):`Safe` = 读/记类;`Mutating` = 会改动用户文件
@@ -145,10 +152,15 @@ impl Tools {
         let weather_client = Arc::new(crate::weather::WeatherClient::new());
         tools.register(Arc::new(weather::WeatherTool::new(weather_client.clone())));
         tools.register(Arc::new(watch::WatchSet::new(weather_client)));
-        // 两个 web 工具共享一个客户端(连接池 + 正文短缓存)
+        // 搜/读两工具共享一个客户端(连接池 + 正文短缓存);下载自持长超时客户端
         let web_client = Arc::new(crate::web::WebClient::new());
         tools.register(Arc::new(web::WebSearch::new(web_client.clone())));
         tools.register(Arc::new(web::WebFetch::new(web_client)));
+        tools.register(Arc::new(web::WebDownload::new()));
+        tools.register(Arc::new(qr::QrDecode::new()));
+        tools.register(Arc::new(pdf::PdfToPng::new()));
+        tools.register(Arc::new(send_file::SendFile::new()));
+        tools.register(Arc::new(web_render::WebRender::new()));
         tools
     }
 

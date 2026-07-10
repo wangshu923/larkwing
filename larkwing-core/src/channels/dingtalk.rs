@@ -387,7 +387,6 @@ pub(super) async fn push(
     text: &str,
 ) -> Result<()> {
     let token = access_token(net, app_key, app_secret).await?;
-    let url = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend";
     // 富格式与回复同判定:像 markdown → sampleMarkdown(title=首行摘要);否则纯文本
     let (msg_key, msg_param) = if render::looks_markdown(text) {
         (
@@ -397,6 +396,19 @@ pub(super) async fn push(
     } else {
         ("sampleText", serde_json::json!({ "content": text }).to_string())
     };
+    batch_send(net, &token, app_key, staff_id, msg_key, &msg_param).await
+}
+
+/// batchSend 裸发(单聊主动推送的共用出口:提醒文字 / outbound 发文件的 sampleFile 都走它)。
+pub(super) async fn batch_send(
+    net: &net::Client,
+    token: &str,
+    app_key: &str,
+    staff_id: &str,
+    msg_key: &str,
+    msg_param: &str,
+) -> Result<()> {
+    let url = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend";
     let body = serde_json::json!({
         "robotCode": app_key,
         "userIds": [staff_id],
@@ -404,7 +416,7 @@ pub(super) async fn push(
         "msgParam": msg_param,
     });
     let resp = net
-        .send(url, |c| c.post(url).header("x-acs-dingtalk-access-token", &token).json(&body))
+        .send(url, |c| c.post(url).header("x-acs-dingtalk-access-token", token).json(&body))
         .await
         .context("钉钉 batchSend 请求失败")?;
     let status = resp.status();
@@ -415,8 +427,8 @@ pub(super) async fn push(
     Ok(())
 }
 
-/// 企业内部应用 access token(v1.0 oauth2;提醒推送每次现取——低频事件,不值得养缓存)。
-async fn access_token(net: &net::Client, app_key: &str, app_secret: &str) -> Result<String> {
+/// 企业内部应用 access token(v1.0 oauth2;低频现取不养缓存)。outbound 发文件共用。
+pub(super) async fn access_token(net: &net::Client, app_key: &str, app_secret: &str) -> Result<String> {
     let url = "https://api.dingtalk.com/v1.0/oauth2/accessToken";
     let body = serde_json::json!({ "appKey": app_key, "appSecret": app_secret });
     let resp =

@@ -83,6 +83,8 @@ pub(super) struct Turn {
     pub tools: Vec<Arc<dyn Tool>>,
     /// 影音运行时(进 ToolCtx)。
     pub media: crate::media::MediaRuntime,
+    /// 壳层网页渲染器(进 ToolCtx;None = 壳层没注入,web_render 工具如实退回)。
+    pub web: Option<Arc<dyn crate::webrender::WebRenderer>>,
     /// 第 1 轮已开的流(建连失败切换发生在 engine;Turn 内不再切换)。
     pub rx: mpsc::Receiver<ChatEvent>,
     /// 插队队列(PLAN §9 B):与 engine.inject 命令共用;回合在轮间/收尾前排空它。
@@ -123,6 +125,7 @@ impl Turn {
             mut request,
             tools,
             media,
+            web,
             mut rx,
             inject,
             mut overheard,
@@ -144,7 +147,7 @@ impl Turn {
         let _inject_guard = InjectGuard(inject.clone());
         let meta = usage::RoundMeta { user_id, conv_id, user_msg_id, provider_id, model };
         let mut round_start = first_round_start;
-        let ctx = ToolCtx { user_id, conv_id, store: store.clone(), media };
+        let ctx = ToolCtx { user_id, conv_id, store: store.clone(), media, web };
         let label_of = |name: &str| -> String {
             tools
                 .iter()

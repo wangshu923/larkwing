@@ -473,7 +473,10 @@ export interface VoiceStatus {
   kwsReady: boolean
   /** 唤醒循环此刻在跑(事实;settings 里的 enabled 只是意向)。 */
   wakeRunning: boolean
+  /** 当前唤醒词(= 名字派生,单源在后端 voice::wake_keywords)。 */
   keywords: string[]
+  /** 起了名但名字语音喊不了(英文单词名)→ 回落默认词;UI 据此如实提示(§3.5)。 */
+  wakeFallback: boolean
   devices: string[]
   /** 音色列表:内置在线音色 + 克隆(含内置 BT 预置);id 克隆为 "clone:<id>"。 */
   speakers: { id: string; name: string; isClone?: boolean; builtin?: boolean }[]
@@ -625,6 +628,9 @@ export const win = {
     await w.show()
     await w.unminimize()
     await w.setFocus()
+    // JS 侧 show 不经壳层 show_window → 自己补可见性信号,否则藏托盘期间被视频唤起时
+    // visible 卡 false、动画不恢复(透明窗 visibilitychange 不报,见 usePageVisible)。
+    void emit('lw:win-visible', true)
   },
   /** 置顶开关:看电影期间开,放完关 —— 别被别的窗口盖住(用户要"置顶")。 */
   setAlwaysOnTop: async (on: boolean) => {
@@ -632,7 +638,12 @@ export const win = {
   },
   /** ✕ = 隐藏到托盘,不退进程(真退出走托盘菜单 quit)。 */
   hideToTray: () => {
-    if (isTauri()) void getCurrentWindow().hide()
+    if (!isTauri()) return
+    void getCurrentWindow().hide()
+    // ✕ 是自绘按钮、直接 hide() —— 不触发壳层 CloseRequested(那条只兜 Alt+F4),得自己发
+    // 「隐藏」信号:不发的话透明窗 RAF 不被节流,藏托盘后动画满帧空跑(§8.1 v0.1.2 坑本路径复活),
+    // 且 visible 卡 true 会在隐藏窗里排下死 rAF id(自启冻死同族)。
+    void emit('lw:win-visible', false)
   },
   /** 监听本窗尺寸 / 全屏变化(图标切换);返回取消订阅。 */
   onResized(cb: () => void): () => void {
@@ -709,6 +720,9 @@ export async function summonWindow(label: string) {
   await w.show()
   await w.unminimize()
   await w.setFocus()
+  // JS 侧 show(悬浮窗唤主窗)不经壳层 show_window → 补可见性信号,否则开机自启后
+  // 经悬浮窗打开主窗,visible 卡 false、会话区动画全冻(§8.1 自启冻死第三轮病灶)。
+  if (label === 'main') void emit('lw:win-visible', true)
 }
 
 /** main 侧按 enabled 显隐悬浮窗(显示不抢焦点 —— 被动呈现)。 */
@@ -930,8 +944,8 @@ export const api = {
     invoke<void>('send_overheard', { convId, text, speaker }),
   /** 浏览器采集推流(层1 AEC 采集端):16k mono i16 LE 帧,raw body 免 JSON(~10Hz)。 */
   voicePushAudio: (pcm: Uint8Array) => invoke<void>('voice_push_audio', pcm),
-  /** 唤醒回合念完 → 开 6s 跟进窗(免唤醒接话)。 */
-  voiceFollowUp: () => invoke<void>('voice_follow_up'),
+  /** 唤醒回合念完 → 开跟进窗(免唤醒接话):常态 6s;媒体在播传 true → 3s 短窗少压音量。 */
+  voiceFollowUp: (mediaPlaying: boolean) => invoke<void>('voice_follow_up', { mediaPlaying }),
   /** 换音色/语速/在线离线档后:唤醒在跑则后台重建应答音(不重启唤醒/麦);没开唤醒则 no-op。 */
   voiceRefreshPrompts: () => invoke<void>('voice_refresh_prompts'),
   /** 唤醒回合失败/取消/被忽略 → 直接回待唤醒。 */

@@ -21,7 +21,7 @@ const LIST_MAX: usize = 200;
 const FIND_MAX_DEPTH: usize = 4;
 const FIND_MAX_RESULTS: usize = 50;
 
-fn human_size(bytes: u64) -> String {
+pub(super) fn human_size(bytes: u64) -> String {
     if bytes >= 1 << 30 {
         format!("{:.1}GB", bytes as f64 / (1u64 << 30) as f64)
     } else if bytes >= 1 << 20 {
@@ -897,7 +897,7 @@ mod tests {
         std::fs::write(dir.join(".hidden"), b"x").unwrap();
         let store = Store::open(&dir.join("t.db")).unwrap();
         let ctx =
-            ToolCtx { user_id: 1, conv_id: 1, media: MediaRuntime::detached(store.clone()), store };
+            ToolCtx { user_id: 1, conv_id: 1, media: MediaRuntime::detached(store.clone()), store, web: None };
         (ctx, dir)
     }
 

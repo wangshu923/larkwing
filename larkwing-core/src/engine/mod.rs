@@ -229,7 +229,7 @@ const APP_SETTING_KEYS: &[&str] = &[
     "llm.thinking",
     "voice.input_device",
     "voice.wake.enabled",
-    "voice.wake.keywords",
+    // (voice.wake.keywords 已退役:唤醒词 = 名字派生,2026-07-10;存量行成死数据无害)
     "voice.wake.sensitivity",
     "voice.asr.model",
     "voice.tts_backend",
@@ -553,6 +553,9 @@ pub struct Engine {
     /// 家庭日记(engine/diary.rs)后台补写的防重入 + 限流(app 级瞬态,丢了 = 下个节拍再试)。
     diary_inflight: Arc<AtomicBool>,
     diary_last_try: AtomicI64,
+    /// 壳层网页渲染器(web_render 工具的机器件,webrender.rs 接缝):壳层 boot 注入;
+    /// 没注入(core 单测/eval/headless)= None,工具如实说没有渲染组件。
+    web_renderer: std::sync::OnceLock<Arc<dyn crate::webrender::WebRenderer>>,
 }
 
 impl Engine {
@@ -587,7 +590,17 @@ impl Engine {
             sessions: Mutex::new(HashMap::new()),
             diary_inflight: Arc::new(AtomicBool::new(false)),
             diary_last_try: AtomicI64::new(0),
+            web_renderer: std::sync::OnceLock::new(),
         })
+    }
+
+    /// 壳层 boot 注入网页渲染器(webrender 接缝;重复注入忽略——boot 只跑一次)。
+    pub fn set_web_renderer(&self, r: Arc<dyn crate::webrender::WebRenderer>) {
+        let _ = self.web_renderer.set(r);
+    }
+
+    fn web_renderer(&self) -> Option<Arc<dyn crate::webrender::WebRenderer>> {
+        self.web_renderer.get().cloned()
     }
 
     /// 解析代理:总开关 `net.proxy_enabled` 关 ⇒ 一律直连(连 env 也不读,与界面开关一致);
@@ -1002,13 +1015,9 @@ impl Engine {
                 self.store.settings.set(None, key, value)?;
                 Ok(())
             }
-            // 唤醒词(app 级,机器属性):写库即可;开着唤醒时前端会调 voice_wake_set
-            // 重启循环让新词生效。voice.wake.enabled 不走这里——开关 = voice_wake_set
+            // 唤醒词无独立设置:= 名字派生(ui.pet_name → voice::wake_keywords,2026-07-10
+            // 「起什么名字就怎么唤醒」)。voice.wake.enabled 也不走这里——开关 = voice_wake_set
             // 一体化入口(写库 + 起停),绕过会出现"库说开着、循环没在跑"的分叉。
-            "voice.wake.keywords" => {
-                self.store.settings.set(None, key, value)?;
-                Ok(())
-            }
             // 唤醒灵敏度(app 级,机器属性):0~100 整数 → wake_threshold 映射成 KWS 阈值。
             // 漏了这条 → 写被白名单拒 → 前端乐观写回滚,滑块"一闪一闪"且从不落库(灵敏度其实没生效)。
             // 开着唤醒时前端 saveSensitivity 会重启循环让新阈值生效。
@@ -2271,6 +2280,7 @@ impl Engine {
                 request,
                 tools: tool_subset,
                 media: self.media.clone(),
+                web: self.web_renderer(),
                 rx: rx_llm,
                 inject: inject.clone(),
                 overheard,

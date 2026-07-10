@@ -6,6 +6,7 @@ mod commands;
 mod fullscreen;
 mod logkeep;
 mod nativelog;
+mod webrender;
 
 use larkwing_core::engine::Engine;
 use larkwing_core::scenes::Scenes;
@@ -182,6 +183,12 @@ pub fn run() {
       // 供应商解析(env key / llm.providers / 单 key 兜底)收口在 engine.reload_providers
       let engine = Engine::with_media(store, scenes, media.clone());
       engine.reload_providers()?;
+      // 网页渲染器注入(webrender 接缝):web_render 工具的机器件 —— 隐藏 WebView 窗
+      // 当 JS 渲染器(app 自己就是浏览器);core 侧没注入时该工具如实说没有渲染组件。
+      engine.set_web_renderer(std::sync::Arc::new(webrender::ShellWebRenderer::new(
+        app.handle().clone(),
+        media.clone(),
+      )));
       tracing::info!(
         data_dir = %data_dir.display(),
         has_key = engine.has_provider(),

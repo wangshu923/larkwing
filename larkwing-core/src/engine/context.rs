@@ -20,7 +20,9 @@ pub(super) const DEFAULT_PERSONA_STYLE: &str = "";
 
 /// 出厂默认助手名:填进 persona 的 `{name}` 占位(用户没在「叫我什么」改过时)。
 /// 与前端 pet.name(locales)、宪法 §4.1 默认名手工同步 —— 改默认名 = 改这三处。
-pub(super) const DEFAULT_NAME: &str = "7274";
+/// 2026-07-10 用户拍板 7274→BT(BT-7274 的小名,配合「起什么名字就怎么唤醒」:
+/// BT 喊得出口〔逼踢〕,默认唤醒词组见 voice::wake::DEFAULT_WAKE_WORDS)。
+pub(super) const DEFAULT_NAME: &str = "BT";
 
 /// 运行时法条(PLAN §9 提示词蓝图):**人格中立底座**的一部分 —— 通用行为纪律,
 /// 与性格无关,住这里不住场景数据;第二个场景出现时自动继承。
@@ -444,9 +446,11 @@ mod tests {
             vec![brief(1, "appliance", "路由器在电视柜"), brief(2, "media", "电影在 NAS")];
         let req = bc(scene, None, None, &[], &briefs, &[], &[]);
 
-        // 法条紧跟 persona(底座纪律,人格中立)
+        // 法条紧跟 persona(底座纪律,人格中立)。对比的是**渲染后**的 persona 长度:
+        // {name}(6 字符)会被实际名字替换,默认名比占位短(BT)→ 拿模板长度比会误判。
+        let rendered_persona = scene.persona.replace("{name}", DEFAULT_NAME);
         let laws_at = req.system.find("## 怎么记事").expect("法条必须进 system");
-        assert!(laws_at > scene.persona.len() - 1, "法条在 persona 之后");
+        assert!(laws_at > rendered_persona.len() - 1, "法条在 persona 之后");
         assert!(req.system.contains("briefing_lookup"), "法条点名常驻基础工具");
 
         // 需知节:固定标题 + repo 给的稳定序原样保持

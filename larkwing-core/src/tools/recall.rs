@@ -85,7 +85,7 @@ mod tests {
         let store = Store::open(&dir.join("t.db")).unwrap();
         // memories FK 到 users → 得先有这个人(briefing 无 FK 才能省这步)
         let me = store.users.ensure_default_user().unwrap();
-        ToolCtx { user_id: me.id, conv_id: 1, media: MediaRuntime::detached(store.clone()), store }
+        ToolCtx { user_id: me.id, conv_id: 1, media: MediaRuntime::detached(store.clone()), store, web: None }
     }
 
     #[tokio::test]

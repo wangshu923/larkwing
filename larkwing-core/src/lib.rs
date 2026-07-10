@@ -22,3 +22,4 @@ pub mod tools;
 pub mod voice;
 pub mod weather;
 pub mod web;
+pub mod webrender;

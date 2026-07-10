@@ -13,8 +13,9 @@ use scraper::{Html, Selector};
 
 /// 同 URL 正文短缓存:防同一回合/相邻回合重复抓(任务 HUD 不掺和,这层全静默)。
 const CACHE_TTL: Duration = Duration::from_secs(600);
-/// 像真浏览器的 UA(裸 reqwest 常被搜索页拒)。
-const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+/// 像真浏览器的 UA(裸 reqwest 常被搜索页拒);web_download 与壳层 webrender 隐藏窗同款
+/// (单源,§4.11——渲染窗与抓取端 UA 一致,免得同一站点见到两副面孔)。
+pub const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                   (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
 #[derive(Debug, Clone)]
@@ -23,6 +24,26 @@ pub struct SearchHit {
     pub url: String,
     pub snippet: String,
 }
+
+/// 页内链接(锚文本 + 绝对地址):web_fetch 靠它让模型从页面里挑出「下载/跳转」
+/// 目标(下载页这类"再点一下"的流程),交给 web_download 落盘。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PageLink {
+    pub text: String,
+    pub url: String,
+}
+
+/// 一次抓取的成品(缓存单元):标题 + 正文 + 页内链接。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Page {
+    pub title: String,
+    pub text: String,
+    #[serde(default)]
+    pub links: Vec<PageLink>,
+}
+
+/// 页内链接收集上限(给模型的预算闸,取文档序前 N 条)。
+const LINKS_MAX: usize = 25;
 
 pub struct WebClient {
     net: crate::net::Client,
@@ -87,21 +108,31 @@ impl WebClient {
 
     /// 抓正文(带短缓存):返回 (标题, 正文)。cap 由调用方按用途裁。
     pub async fn fetch_text(&self, url: &str) -> Result<(String, String)> {
+        let page = self.fetch_page(url).await?;
+        Ok((page.title, page.text))
+    }
+
+    /// 抓整页成品(带短缓存):标题 + 正文 + 页内链接。web_fetch 用它;搜索的正文
+    /// 片段路径走 `fetch_text` 薄壳(链接用不上,但共享同一份缓存)。
+    pub async fn fetch_page(&self, url: &str) -> Result<Page> {
         if let Some(hit) = self.cache_get(url) {
-            let (title, text) = split_cached(&hit);
-            return Ok((title, text));
+            if let Ok(page) = serde_json::from_str::<Page>(&hit) {
+                return Ok(page);
+            }
         }
         let resp = self.net.send(url, |c| c.get(url)).await.context("页面请求失败")?;
         let status = resp.status();
         anyhow::ensure!(status.is_success(), "页面 HTTP {status}");
+        // 重定向后以最终地址为基准解析相对链接(下载类站点常见跳转);bytes() 前先取
+        let final_url = resp.url().to_string();
         // 体积闸:10MB 封顶,防超大页面拖死
         let bytes = resp.bytes().await?;
         anyhow::ensure!(bytes.len() <= 10 * 1024 * 1024, "页面超过 10MB,放弃");
         let html = String::from_utf8_lossy(&bytes);
-        let (title, text) = extract_text(&html);
-        anyhow::ensure!(!text.trim().is_empty(), "页面没有可读正文(可能是纯脚本应用)");
-        self.cache_put(url, &title, &text);
-        Ok((title, text))
+        let page = extract_page(&html, &final_url);
+        anyhow::ensure!(!page.text.trim().is_empty(), "页面没有可读正文(可能是纯脚本应用)");
+        self.cache_put(url, &page);
+        Ok(page)
     }
 
     fn cache_get(&self, url: &str) -> Option<String> {
@@ -110,16 +141,13 @@ impl WebClient {
         cache.get(url).map(|(_, v)| v.clone())
     }
 
-    fn cache_put(&self, url: &str, title: &str, text: &str) {
+    fn cache_put(&self, url: &str, page: &Page) {
+        let json = match serde_json::to_string(page) {
+            Ok(j) => j,
+            Err(_) => return, // 序列化失败只丢缓存,不丢结果
+        };
         let mut cache = self.cache.lock().expect("web cache lock poisoned");
-        cache.insert(url.to_string(), (Instant::now(), format!("{title}\u{0}{text}")));
-    }
-}
-
-fn split_cached(cached: &str) -> (String, String) {
-    match cached.split_once('\u{0}') {
-        Some((t, x)) => (t.to_string(), x.to_string()),
-        None => (String::new(), cached.to_string()),
+        cache.insert(url.to_string(), (Instant::now(), json));
     }
 }
 
@@ -186,7 +214,7 @@ fn decode_uddg(href: &str) -> Option<String> {
     decoded.starts_with("http").then_some(decoded)
 }
 
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -218,10 +246,17 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// 整页抽取(单次解析):正文 + 页内链接。
+fn extract_page(html: &str, base_url: &str) -> Page {
+    let doc = Html::parse_document(html);
+    let (title, text) = extract_text_from(&doc);
+    let links = extract_links(&doc, base_url);
+    Page { title, text, links }
+}
+
 /// 正文抽取(readability 简化版):正文形元素的文本聚合;太少则退化为全文压平。
 /// 不追求完美,目标是"给模型可读的证据",失败兜底永远有东西。
-fn extract_text(html: &str) -> (String, String) {
-    let doc = Html::parse_document(html);
+fn extract_text_from(doc: &Html) -> (String, String) {
     let title = doc
         .select(&sel("title"))
         .next()
@@ -243,6 +278,53 @@ fn extract_text(html: &str) -> (String, String) {
         }
     }
     (title, text)
+}
+
+/// 页内链接:`<a href>` 解析成绝对地址(相对地址按最终 URL 拼),按文档序取前
+/// `LINKS_MAX` 条;js/mailto/纯锚点丢弃、同地址去重。无文字的锚(图片按钮)用链接
+/// 目标文件名顶名字 —— 图标式"下载"按钮常是这种。
+fn extract_links(doc: &Html, base_url: &str) -> Vec<PageLink> {
+    let base = url::Url::parse(base_url).ok();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for a in doc.select(&sel("a[href]")) {
+        let Some(href) = a.value().attr("href").map(str::trim) else { continue };
+        if href.is_empty()
+            || href.starts_with('#')
+            || href.starts_with("javascript:")
+            || href.starts_with("mailto:")
+        {
+            continue;
+        }
+        let abs = match url::Url::parse(href) {
+            Ok(u) => u,
+            Err(_) => match base.as_ref().and_then(|b| b.join(href).ok()) {
+                Some(u) => u,
+                None => continue,
+            },
+        };
+        if !matches!(abs.scheme(), "http" | "https") {
+            continue;
+        }
+        let abs_s = abs.to_string();
+        if !seen.insert(abs_s.clone()) {
+            continue;
+        }
+        let mut text: String =
+            a.text().collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
+        if text.is_empty() {
+            text = abs
+                .path_segments()
+                .and_then(|mut s| s.next_back())
+                .map(percent_decode)
+                .unwrap_or_default();
+        }
+        out.push(PageLink { text: clip(&text, 60), url: abs_s });
+        if out.len() >= LINKS_MAX {
+            break;
+        }
+    }
+    out
 }
 
 /// 按字符数截断(给模型的预算闸)。
@@ -293,7 +375,7 @@ mod tests {
           <h2>小标题在此</h2>
           <li>列表项也足够长才会被收进来哦</li>
           <p>短</p></body></html>"#;
-        let (title, text) = extract_text(page);
+        let Page { title, text, .. } = extract_page(page, "https://x.example.com/");
         assert_eq!(title, "测试页");
         assert!(text.contains("第一段正文"));
         assert!(text.contains("小标题在此"));
@@ -302,8 +384,33 @@ mod tests {
 
         // 没有正文形元素 → 压平兜底
         let bare = "<html><title>裸</title><body><div>只有 div 包着的一行字而已呀</div></body></html>";
-        let (_, fallback) = extract_text(bare);
+        let fallback = extract_page(bare, "https://x.example.com/").text;
         assert!(fallback.contains("只有 div"));
+    }
+
+    #[test]
+    fn extract_links_resolves_dedupes_and_names_blank_anchors() {
+        let html = r##"<html><body>
+          <a href="/dl/fp123.pdf">下载附件</a>
+          <a href="https://other.com/x">外站</a>
+          <a href="/dl/fp123.pdf">重复</a>
+          <a href="#top">锚点</a>
+          <a href="javascript:void(0)">JS</a>
+          <a href="/img/fa%20piao.pdf"><img src="btn.png"></a>
+        </body></html>"##;
+        let page = extract_page(html, "https://inv.example.com/view?id=1");
+        let urls: Vec<&str> = page.links.iter().map(|l| l.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            [
+                "https://inv.example.com/dl/fp123.pdf",
+                "https://other.com/x",
+                "https://inv.example.com/img/fa%20piao.pdf"
+            ],
+            "相对转绝对、去重、js/锚点被滤"
+        );
+        assert_eq!(page.links[0].text, "下载附件");
+        assert_eq!(page.links[2].text, "fa piao.pdf", "无文字锚用目标文件名(百分号解码)");
     }
 
     #[test]

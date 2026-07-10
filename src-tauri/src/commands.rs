@@ -495,10 +495,10 @@ pub async fn voice_wake_set(
     Ok(state.voice.status())
 }
 
-/// 前端编排指令:唤醒回合念完 → 开 6s 跟进窗(免唤醒接话)。
+/// 前端编排指令:唤醒回合念完 → 开跟进窗(免唤醒接话;媒体在播 → 3s 短窗,少压音量)。
 #[tauri::command]
-pub fn voice_follow_up(state: State<'_, AppState>) -> Result<(), AppError> {
-    state.voice.wake_follow_up();
+pub fn voice_follow_up(state: State<'_, AppState>, media_playing: bool) -> Result<(), AppError> {
+    state.voice.wake_follow_up(media_playing);
     Ok(())
 }
 

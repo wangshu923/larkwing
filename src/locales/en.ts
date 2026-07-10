@@ -3,7 +3,7 @@
 // Conversation language follows the user (persona is language-neutral); this dict is UI chrome only.
 export default {
   pet: {
-    name: '7274', // default assistant name (constitution §1); "旺财" is reserved for the warm skin
+    name: 'BT', // default assistant name (constitution §4.1, 7274→BT on 2026-07-10): BT-7274’s nickname, easy to call out; "旺财" is reserved for the warm skin
   },
   status: {
     idle: 'Online and standing by — ping me anytime',
@@ -44,6 +44,11 @@ export default {
     watch_set: 'Keeping an eye on the weather…',
     web_search: 'Searching the web…',
     web_fetch: 'Reading the page…',
+    web_download: 'Downloading the file…',
+    web_render: 'Rendering the page…',
+    qr_decode: 'Reading the QR code…',
+    pdf_to_png: 'Turning the PDF into images…',
+    send_file: 'Sending to the phone…',
     note_todo: 'Noting it to follow up…',
     finish_todo: 'Checking it off…',
     unknown: 'Tinkering…',
@@ -57,9 +62,11 @@ export default {
     relocate: 'Moving data',
     update: 'Downloading update',
     remux: 'Preparing video “{name}”',
+    webrender: 'Browsing for you',
     download: {
       ytdlp: 'Downloading the parser',
       ffmpeg: 'Downloading the playback component',
+      pdfium: 'Downloading the PDF renderer',
       voice_vad: 'Preparing the listening component',
       voice_asr: 'Downloading the speech model',
       voice_kws: 'Preparing the wake-word component',
@@ -74,6 +81,7 @@ export default {
       auth: 'Sign-in needed',
       relocate: 'Move didn’t finish — data is still in place',
       remux: 'Video prep failed — played the normal way instead',
+      render: 'That page step didn’t work — it will try another way or say so',
     },
   },
   step: {
@@ -83,6 +91,10 @@ export default {
     verify: 'Verifying…',
     extract: 'Extracting…',
     resolve: 'Finding the stream…',
+    render_load: 'Opening the page…',
+    render_click: 'Clicking “{t}”…',
+    render_back: 'Going back…',
+    render_snap: 'Reading the page…',
     relocate_copy: 'Copying files…',
     relocate_db: 'Compacting the database…',
     relocate_commit: 'Finalizing…',
@@ -148,6 +160,7 @@ export default {
     condition: 'Weather-triggered',
     empty: 'No reminders yet. Tell me things like “wake me at 8 tomorrow” or “remind Grandma to take her meds every day,” and I’ll keep track for you.',
     repeat: {
+      once: 'Once',
       daily: 'Daily',
       weekdays: 'Weekdays',
       weekly: 'Weekly',
@@ -190,7 +203,13 @@ export default {
     attach: 'Attach image or file',
     attRemove: 'Remove',
     dropHint: 'Drop to hand the file to {name}',
-    trigger: { reminder: 'Reminder' },
+    // "Set a reminder → it fires" presentation: eventDue labels the centered system line (event row);
+    // reminderSaved / memorySaved are receipt chips (reminder set / memory saved, tap → that page)
+    eventDue: 'Time’s up',
+    reminderSaved: 'Noted',
+    reminderSavedHint: 'I’ll call you when it’s time · tap to see all reminders',
+    memorySaved: 'Remembered',
+    memorySavedHint: 'Saved to my notes · tap to see all memories',
     copy: 'Copy',
     queueHint: 'Queued · sends when it’s done',
     queueAtt: '(attachment)',
@@ -404,7 +423,7 @@ export default {
     },
     general: {
       petName: 'Call me',
-      petNamePlaceholder: 'A household nickname works too',
+      petNamePlaceholder: 'A household nickname works too; it’s also what you call out to wake it',
       personaStyle: 'My personality',
       personaStylePlaceholder: 'Sum me up in a line, e.g. cheeky but reliable, with the odd quip',
       personaQuick: 'Quick picks',
@@ -543,15 +562,13 @@ export default {
       wakeBusy: 'Getting ready…',
       wakeListening: 'Listening for “{kw}”', // read-only status, not an input
       wakeIdle: 'Off',
-      wakeHint: 'Once on, it keeps an ear out for its name; what it hears is processed only on this machine, never uploaded. The first time, it’ll prepare a small model.',
-      // friendly fallback when enabling fails (rule §3.5: backend message goes to logs, not to ordinary users). Known
-      // pitfalls like the wake word are caught precisely by the frontend; this only covers the rest (mic / network / model).
+      wakeHint: 'Once on, it keeps an ear out for its name — the one you set in “What to call me”; rename it and the wake word follows. What it hears is processed only on this machine, never uploaded. The first time, it’ll prepare a small model.',
+      // friendly fallback when enabling fails (rule §3.5: backend message goes to logs, not to ordinary users).
+      // The wake word is derived from the name (falls back to the default when underivable); this only covers mic / network / model.
       wakeFailed: 'Couldn’t turn it on — check mic permission and your network, or try again in a bit.',
-      keywords: 'Wake words',
-      keywordsPlaceholder: 'Chinese words, separated by 、 — e.g. 小七、旺财',
-      keywordsHint: 'Want to call it something else? Change it here (Chinese only).', // the only place to change the word
-      keywordsAllInvalid: 'Wake words only work in Chinese — use a Chinese name (like 「小七」) to wake it.',
-      keywordsSomeInvalid: 'Only Chinese words work; ones with letters or digits are ignored.',
+      // the name can’t be called out by voice (English-word names don’t derive) → honest fallback notice (§3.5)
+      wakeNameFallback: '“{name}” can’t be called out by voice (English words aren’t recognized) — say “{kw}” for now, or pick a Chinese name or letter initials (like BT) in “What to call me.”',
+      wakeShortName: 'The name is a single syllable — it may be hard to catch; two or more syllables work better.',
       sensitivity: 'Wake sensitivity',
       sensSteady: 'Steady',
       sensKeen: 'Keen',
@@ -566,7 +583,7 @@ export default {
       calibSayHint: 'When prompted, say 「{kw}」 clearly, a few times; at the end, stay quiet for a short room recording. It’s all processed on this machine.',
       calibVerdict_good: 'All tuned · sensitivity set to {sens}',
       calibVerdict_noisy: 'Tuned, but it’s a bit noisy here · sensitivity {sens}; if it false-wakes often, nudge toward “Steady.”',
-      calibVerdict_hard: 'This word is hard to wake on · set as keen as possible ({sens}); a catchier Chinese name might be easier to call.',
+      calibVerdict_hard: 'This name is hard to wake on · set as keen as possible ({sens}); a catchier name in “What to call me” might be easier to call.',
       calibVerdict_cancelled: 'Canceled',
       calibVerdict_error: 'Recording failed — check mic permission and try again in a bit.',
       winDuckHint: 'On Windows, if other sounds dim after enabling wake: System Settings → Sound → Communications → choose “Do nothing.”',
@@ -596,16 +613,8 @@ export default {
       compReady: 'Ready',
       compMissing: 'Not downloaded · prepared automatically on first use',
       // ⚗️ temporary: capture-side AEC spike (delete with the component once the Windows verdict is in)
-      aec: {
-        title: 'Echo cancellation trial (temporary)',
-        hint: 'Measures how well the browser’s built-in echo cancellation removes “sound this app itself is playing” (movies / its own voice): play something first, then start capture and record once with AEC ON and once OFF to compare levels and playback.',
-        start: 'Start capture',
-        stop: 'Stop',
-        record: 'Record 15s',
-        download: 'Download wav',
-        capture: 'Browser capture',
-        captureHint: 'ON = wake/dictation hear the echo-cancelled mic (system default mic); OFF = raw capture. Takes effect immediately.',
-      },
+      echoCancel: 'Echo cancellation',
+      echoCancelHint: 'Filters out sound it plays itself (movies, music, its own voice) so calling its name misfires less; off = raw microphone audio.',
     },
     remote: {
       enable: 'Enable',

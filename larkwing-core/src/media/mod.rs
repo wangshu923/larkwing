@@ -467,6 +467,24 @@ impl MediaRuntime {
             .context("组件下载任务挂了")?
     }
 
+    /// pdf_to_png(tools/pdf.rs)用:pdfium 动态库就位(用时下载,§6.9;进度上 HUD)。
+    pub async fn ensure_pdfium(&self) -> Result<PathBuf> {
+        self.ensure_component(Component::Pdfium).await
+    }
+
+    /// webrender(壳层渲染窗)回传信箱:确保 relay 在线 → (POST 地址, 一次性接收端)。
+    pub async fn webrender_collect(
+        &self,
+    ) -> Result<(String, tokio::sync::oneshot::Receiver<String>)> {
+        let relay = self.inner.relay.get_or_try_init(relay::Relay::start).await?;
+        Ok(relay.register_collect())
+    }
+
+    /// 进度总线句柄(壳层 webrender 上任务卡用;Tasks 本就是 Clone 的轻句柄)。
+    pub fn tasks(&self) -> Tasks {
+        self.inner.tasks.clone()
+    }
+
     /// 搜索(默认源)。风控错误在此转事件,文字留给工具层喂模型。
     pub async fn search(&self, keyword: &str, limit: usize) -> Result<Vec<MediaHit>, SearchError> {
         let source = self.default_source();

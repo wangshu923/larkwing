@@ -277,7 +277,9 @@ pub fn suite() -> Vec<Scenario> {
             .check(custom("提年检时至多一个问号(不追击;计数不靠判官)", |o| {
                 o.replies.last().is_none_or(|r| {
                     !r.contains("年检")
-                        || r.chars().filter(|c| *c == '?' || *c == '?').count() <= 1
+                        // 全角问号写 unicode 转义(同 judge-diary 句数机测):字面全角会被
+                        // 悄悄归一成半角 → 两个相同表达式(clippy eq_op),且全角漏计
+                        || r.chars().filter(|c| *c == '?' || *c == '\u{FF1F}').count() <= 1
                 })
             }))
             .judge(

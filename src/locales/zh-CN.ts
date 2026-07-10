@@ -2,7 +2,7 @@
 // 豁免:FakeLlm/浏览器预览的假回复(开发态)。
 export default {
   pet: {
-    name: '7274', // 默认助手名(宪法 §1,2026-06):科幻调性;"旺财"留给暖萌皮
+    name: 'BT', // 默认助手名(宪法 §4.1,2026-07-10 由 7274 改 BT):BT-7274 的小名,喊得出口(逼踢);"旺财"留给暖萌皮
   },
   status: {
     idle: '在线待命,随时找我',
@@ -43,6 +43,11 @@ export default {
     watch_set: '盯上天气…',
     web_search: '上网查查…',
     web_fetch: '细读网页中…',
+    web_download: '下载文件中…',
+    web_render: '后台打开网页…',
+    qr_decode: '认认二维码…',
+    pdf_to_png: '把 PDF 转成图…',
+    send_file: '发到手机上…',
     note_todo: '记下这件事…',
     finish_todo: '划掉一件心事…',
     unknown: '鼓捣小玩意儿…',
@@ -56,9 +61,11 @@ export default {
     relocate: '搬家中',
     update: '下载更新',
     remux: '准备视频「{name}」',
+    webrender: '替你看网页',
     download: {
       ytdlp: '下载解析组件',
       ffmpeg: '下载播放组件',
+      pdfium: '下载 PDF 渲染组件',
       voice_vad: '准备听力组件',
       voice_asr: '下载听力模型',
       voice_kws: '准备唤醒组件',
@@ -73,6 +80,7 @@ export default {
       auth: '需要登录',
       relocate: '搬家没成功,数据仍在原处',
       remux: '视频没准备成,已换普通方式播',
+      render: '网页那步没办成,它会换个法子或如实说',
     },
   },
   step: {
@@ -82,6 +90,10 @@ export default {
     verify: '校验中…',
     extract: '解压中…',
     resolve: '找播放地址…',
+    render_load: '打开页面…',
+    render_click: '点一下「{t}」…',
+    render_back: '返回上一页…',
+    render_snap: '读取页面内容…',
     relocate_copy: '复制文件…',
     relocate_db: '整理数据库…',
     relocate_commit: '就位…',
@@ -147,6 +159,7 @@ export default {
     condition: '看天气触发',
     empty: '还没有提醒。跟我说「明早八点叫我起床」「每天提醒奶奶吃药」这类话,我就替你记着。',
     repeat: {
+      once: '一次',
       daily: '每天',
       weekdays: '工作日',
       weekly: '每周',
@@ -189,7 +202,13 @@ export default {
     attach: '加图片或文件',
     attRemove: '移除',
     dropHint: '松手,把文件交给{name}',
-    trigger: { reminder: '提醒' },
+    // 「设提醒 → 到点」链路呈现:eventDue = 到点系统线的标签(event 行,交代"定好的安排
+    // 叫醒了它");reminderSaved / memorySaved = 回执小票(设了提醒/记了记忆,点击去对应页)
+    eventDue: '到点了',
+    reminderSaved: '已记下',
+    reminderSavedHint: '到点我会喊你 · 点开看全部提醒',
+    memorySaved: '记住了',
+    memorySavedHint: '记在小本本上了 · 点开看全部记忆',
     copy: '复制',
     queueHint: '排队中 · 说完一起发',
     queueAtt: '(附件)',
@@ -403,7 +422,7 @@ export default {
     },
     general: {
       petName: '叫我什么',
-      petNamePlaceholder: '给我起个家里人叫的名字也行',
+      petNamePlaceholder: '给我起个家里人叫的名字也行;语音唤醒喊的就是它',
       personaStyle: '我的性格',
       personaStylePlaceholder: '一句话设定我,比如:贫嘴但靠谱,偶尔冒句东北话',
       personaQuick: '快捷选择',
@@ -542,15 +561,13 @@ export default {
       wakeBusy: '准备中…',
       wakeListening: '听「{kw}」', // 只读状态,不是输入框
       wakeIdle: '关着',
-      wakeHint: '打开后它会一直竖着耳朵等你喊名字;听到的声音只在本机处理,不上传。首次打开会准备一个小模型。',
-      // 开启失败的友好兜底(铁律 §3.5:后端 message 进日志,不给普通人看)。唤醒词
-      // 这类已知坑由前端就地拦下并给精确话;这里只兜剩下的(麦克风/网络/模型)。
+      wakeHint: '打开后它会一直竖着耳朵等你喊名字——喊的就是「叫我什么」里起的名字,改名字唤醒词就跟着换。听到的声音只在本机处理,不上传。首次打开会准备一个小模型。',
+      // 开启失败的友好兜底(铁律 §3.5:后端 message 进日志,不给普通人看)。
+      // 唤醒词 = 名字派生(派生不出自动回落默认词),这里只兜麦克风/网络/模型。
       wakeFailed: '没能打开 —— 看看麦克风权限和网络,或者过会儿再试一次。',
-      keywords: '唤醒词',
-      keywordsPlaceholder: '中文词,顿号分隔,比如:小七、旺财',
-      keywordsHint: '想换个名字喊它,就改这里(只认中文)。', // 改词的唯一入口
-      keywordsAllInvalid: '唤醒词只认中文 —— 换成中文名字(比如「小七」)才喊得醒它。',
-      keywordsSomeInvalid: '只有中文词能用,带字母/数字的那些会被忽略。',
+      // 名字语音喊不了(英文单词名派生不出)→ 回落默认词的如实提示(§3.5 不静默)
+      wakeNameFallback: '「{name}」这个名字语音里喊不出来(英文单词认不了)——先喊「{kw}」,或者在「叫我什么」里起个中文名/字母缩写(比如 BT)。',
+      wakeShortName: '名字只有一个音,喊起来可能不太灵;两个字以上更好认。',
       sensitivity: '唤醒灵敏度',
       sensSteady: '稳重',
       sensKeen: '灵敏',
@@ -565,7 +582,7 @@ export default {
       calibSayHint: '听到提示就清楚地念一遍「{kw}」,要录几遍;最后安静一下,录一小段环境音。全程只在本机处理。',
       calibVerdict_good: '调好啦 · 灵敏度已设为 {sens}',
       calibVerdict_noisy: '调好了,但家里有点吵 · 灵敏度 {sens};要是常被误唤醒,再往「稳重」挪一点。',
-      calibVerdict_hard: '这个词不太好唤醒 · 已尽量调灵敏({sens});换个更上口的中文名也许更好叫。',
+      calibVerdict_hard: '这个名字不太好唤醒 · 已尽量调灵敏({sens});在「叫我什么」里换个更上口的名字也许更好叫。',
       calibVerdict_cancelled: '已取消',
       calibVerdict_error: '没录成 —— 看看麦克风权限,过会儿再试一次。',
       winDuckHint: 'Windows 上若开唤醒后其它声音变小:系统设置 → 声音 → 通信 → 选「不执行任何操作」。',
@@ -595,16 +612,8 @@ export default {
       compReady: '已就绪',
       compMissing: '未下载 · 首次使用时自动准备',
       // ⚗️ 临时:采集端 AEC spike(拿到 Windows 真机结论就连组件一起删)
-      aec: {
-        title: '回声消除试验(临时)',
-        hint: '验证浏览器自带回声消除对「自己放的电影/说话声」的消除力度:让它先放点声音,再开采集,AEC 开/关各录一段对比电平和回放。',
-        start: '开始采集',
-        stop: '停止',
-        record: '录 15 秒',
-        download: '下载 wav',
-        capture: '浏览器采集',
-        captureHint: '开 = 唤醒/听写改吃"消完回声"的麦克风(用系统默认麦);关 = 原始采集。切换即生效。',
-      },
+      echoCancel: '回声消除',
+      echoCancelHint: '消掉它自己放的声音(电影、音乐、说话声),喊名字更不容易误触;关掉 = 用麦克风原始声音。',
     },
     remote: {
       enable: '启用',

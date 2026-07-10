@@ -161,6 +161,7 @@ mod tests {
              "fs_read_text", "fs_move", "fs_copy", "fs_mkdir", "fs_trash", "fs_write_text",
              "fs_append", "fs_edit", "fs_undo",
              "reminder_set", "reminder_list", "reminder_cancel", "watch_set", "web_search", "web_fetch",
+             "web_download", "web_render", "qr_decode", "pdf_to_png", "send_file",
              "note_todo", "finish_todo"]
         );
         assert!(!s.few_shots.is_empty(), "companion 必须带 few-shot 示范");

@@ -110,6 +110,10 @@ struct Inner {
     /// `open_capture_auto` 往这儿挂 tap,壳层 `voice_push_audio` 命令喂 16k mono f32 帧。
     /// tap 的管子 drop 了 send 自然失败 → 下次推帧时剪除(与 cpal「pipe drop 即关麦」同语义)。
     push_taps: std::sync::Mutex<Vec<std::sync::mpsc::SyncSender<Vec<f32>>>>,
+    /// 唤醒交互(on_wake / 跟进窗)的「停 / 定稿」信号:`listen_stop` 写、唤醒侧 `collect_utterance` 读。
+    /// 独立于听写会话槽 —— 唤醒录音跑在自己的循环线程、不占 `session` 槽,故此前「在听时点停」没反应;
+    /// 唤醒侧每次开录前武装成 `CTL_RUN`,前端点停 = 定稿(发已听到的)/ 取消(丢弃回待唤醒)。
+    wake_ctl: Arc<AtomicU8>,
 }
 
 #[derive(Clone)]
@@ -139,8 +143,10 @@ pub struct VoiceStatus {
     pub kws_ready: bool,
     /// 唤醒循环此刻在跑(开关的真实状态,settings 只是意向)。
     pub wake_running: bool,
-    /// 当前唤醒词(解析后的列表)。
+    /// 当前唤醒词(解析后的列表;= 名字派生,见 `wake_keywords`)。
     pub keywords: Vec<String>,
+    /// 起了名但名字语音喊不了(英文单词名派生不出)→ 回落默认词。UI 据此如实提示(§3.5)。
+    pub wake_fallback: bool,
     /// 麦克风设备名列表(设置下拉的数据源)。
     pub devices: Vec<String>,
     /// 音色目录(当前语言行;目录 = 数据)。
@@ -174,6 +180,7 @@ impl VoiceRuntime {
                 speaker: tokio::sync::OnceCell::new(),
                 wake: std::sync::Mutex::new(None),
                 push_taps: std::sync::Mutex::new(Vec::new()),
+                wake_ctl: Arc::new(AtomicU8::new(CTL_RUN)),
             }),
         }
     }
@@ -870,27 +877,19 @@ impl VoiceRuntime {
         self.inner.wake.lock().expect("wake lock").is_some()
     }
 
-    /// 当前唤醒词(settings 顿号/逗号/空格分隔)。默认「小七」(2026-06-16 用户拍板定为正式默认;
-    /// 唤醒词 = 用户数据,改设置即生效)。
+    /// 当前唤醒词 = **名字派生**(2026-07-10 用户拍板「起什么名字就怎么唤醒」,原独立设置
+    /// `voice.wake.keywords` 与默认词「小七」退役):主人的 `ui.pet_name` 经
+    /// `wake::derive_wake_word`(中文原样 / 数字转读法 / 字母缩写按字母读音,BT→逼踢);
+    /// 没改名 = 默认名 BT → `wake::DEFAULT_WAKE_WORDS`(逼踢 + 七二七四);英文单词名派生
+    /// 不出同样回落,由 `status().wake_fallback` 让 UI 如实提示(§3.5)。改名即生效
+    /// (前端改完名重启唤醒循环,与旧「改唤醒词」同款)。
     pub fn wake_keywords(&self) -> Vec<String> {
-        let raw = self
-            .inner
-            .store
-            .settings
-            .get(None, "voice.wake.keywords")
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        let words: Vec<String> = raw
-            .split(['、', ',', ',', ' ', ';', ';'])
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if words.is_empty() {
-            vec!["小七".into()]
-        } else {
-            words
-        }
+        self.wake_words_resolved().0
+    }
+
+    /// (词表, 是否「起了名但喊不了」回落默认) —— 后者只在名字派生失败时为 true。
+    fn wake_words_resolved(&self) -> (Vec<String>, bool) {
+        wake::resolve_wake_words(&self.user_setting("ui.pet_name", ""))
     }
 
     /// 标定产出的「拼写覆盖」(voice.wake.spelling,词→整行 token 行)。
@@ -1009,8 +1008,9 @@ impl VoiceRuntime {
     }
 
     /// 前端编排指令:回合念完 → 开跟进窗;回合失败/取消 → 直接回待唤醒。
-    pub fn wake_follow_up(&self) {
-        self.wake_cmd(wake::WakeCmd::FollowUp);
+    /// 回合念完开跟进窗;media_playing = 前端念完那一刻媒体在不在播(在播 → 3s 短窗少压音量)。
+    pub fn wake_follow_up(&self, media_playing: bool) {
+        self.wake_cmd(wake::WakeCmd::FollowUp { media_playing });
     }
     pub fn wake_resume(&self) {
         self.wake_cmd(wake::WakeCmd::Resume);
@@ -1037,12 +1037,14 @@ impl VoiceRuntime {
     }
 
     pub fn status(&self) -> VoiceStatus {
+        let (keywords, wake_fallback) = self.wake_words_resolved();
         VoiceStatus {
             asr_ready: self.inner.models.is_ready(self.asr_model().spec()),
             vad_ready: self.inner.models.is_ready(&models::SILERO_VAD),
             kws_ready: self.inner.models.is_tar_ready(&models::KWS_ZIPFORMER_ZH),
             wake_running: self.wake_running(),
-            keywords: self.wake_keywords(),
+            keywords,
+            wake_fallback,
             devices: list_input_devices(),
             speakers: self.voice_options(),
             default_speaker: tts::DEFAULT_SPEAKER.to_string(),
@@ -1115,11 +1117,25 @@ impl VoiceRuntime {
     }
 
     /// 停止当前听写:accept = 立即定稿(已听到的送识别);false = 取消丢弃。幂等。
+    /// 同一个「停」也喂给唤醒交互:唤醒录音不占 `session` 槽,故两处信号都写(哪个在录哪个响应,
+    /// 二者互斥:听写期唤醒循环挂起、唤醒录音期没有听写会话)。唤醒侧每次开录前会武装成 RUN,
+    /// 故这里在 Watch 态写入的陈旧值不会误触下一轮。
     pub fn listen_stop(&self, accept: bool) {
+        let v = if accept { CTL_ACCEPT } else { CTL_CANCEL };
+        self.inner.wake_ctl.store(v, Ordering::Relaxed);
         let slot = self.inner.session.lock().expect("voice session lock");
         if let Some(s) = slot.as_ref() {
-            s.ctl.store(if accept { CTL_ACCEPT } else { CTL_CANCEL }, Ordering::Relaxed);
+            s.ctl.store(v, Ordering::Relaxed);
         }
+    }
+
+    /// 唤醒交互「停 / 定稿」信号(唤醒循环用):开录前 `arm` 成 RUN,`collect_utterance` 读它响应
+    /// 前端点停。与听写会话槽分家(唤醒录音跑在自己的循环线程,见 `wake_ctl` 字段)。
+    pub(super) fn wake_ctl(&self) -> &AtomicU8 {
+        &self.inner.wake_ctl
+    }
+    pub(super) fn arm_wake_ctl(&self) {
+        self.inner.wake_ctl.store(CTL_RUN, Ordering::Relaxed);
     }
 
     /// 选中的中文 ASR 档(voice.asr.model,app 级;空 / 未知回落默认 SenseVoice)。

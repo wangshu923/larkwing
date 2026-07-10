@@ -10,6 +10,10 @@
 //! channels 是边界适配器、只消费它们的公开 API(voice/media 均不反向依赖本模块)。
 
 mod dingtalk;
+/// 出站文件(send_file 工具的机器件;按人解析目标线程,§7.7)。pub(crate):工具层经
+/// `crate::channels::outbound` 使用——tools 依赖 channels 的单向引用,不构成环(channels
+/// 不认识 tools),也不破 §6.1(channels 仍不反向依赖 engine 之外的上层)。
+pub(crate) mod outbound;
 mod render;
 mod telegram;
 

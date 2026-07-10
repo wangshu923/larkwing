@@ -22,7 +22,7 @@ const state = reactive({
   candidate: false,
   /** 免手唤醒此刻在跑(事实,来自 voiceStatus / lw:wake);悬浮窗待机栏据此显「等你喊…」。 */
   wakeArmed: false,
-  /** 当前唤醒词(显示用;默认「小七」)。 */
+  /** 当前唤醒词(显示用;= 名字派生,单源在后端 voice::wake_keywords)。 */
   wakeKeywords: [] as string[],
   /** 声纹注册进展(家人页录声纹,D 期第二步):驱动对应家人卡的「准备中/第N遍/成功/失败」。
    *  userId=0 → 没有进行中;stage='' | preparing | recording | saved | failed。 */

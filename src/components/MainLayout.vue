@@ -48,29 +48,46 @@ function dayLabel(ts: number): string {
     : `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`
 }
 
-// 消息流布局派生(模板照旧 v-for messages,不改结构):① 跨天在该条前插日期分隔条;
-// ② 相邻同角色打 .cont(收紧间距,读出"一轮里连续几句")。都按 message id 索引。
-const streamLayout = computed(() => {
-  const sep: Record<number, string> = {}
-  const cont = new Set<number>()
+// 消息流分组渲染:相邻的 wang 段合并进**一个气泡**(2026-07-10 用户拍板"合并")。
+// 背景:带工具的一轮里"说话→调工具→再说话"在库里落成多条 assistant 行(工具配对/
+// 逐段轨迹是承重结构,§6.4 动不得),原先逐行一个气泡 → 一轮被切成一串小气泡观感碎。
+// 呈现层合组后段与段只留段落间距,复制/朗读/读数收归组级;逐段的「想了想」/小票仍
+// 跟着各自的段。user 恒单条一组(每条是独立的一次发送),event 是居中系统线。
+// 跨天分隔条落在组前;真跨天的组不并(保日期条,极罕见)。
+interface StreamGroup {
+  /** 首段消息 id(在飞占位是负数,收尾换落库 id → 组重挂,与旧逐泡行为一致)。 */
+  key: number
+  kind: 'user' | 'wang' | 'event'
+  msgs: UiMessage[]
+  /** 组前的日期分隔条文案(跨天才有)。 */
+  sep?: string
+  /** 与上一组同角色(user 连发):收紧间距。 */
+  cont: boolean
+}
+const streamGroups = computed<StreamGroup[]>(() => {
+  const groups: StreamGroup[] = []
   let lastDay = ''
-  let lastRole = ''
+  let lastKind = ''
   for (const m of chat.messages) {
+    let sep: string | undefined
     if (m.at) {
       const day = new Date(m.at).toDateString()
       if (day !== lastDay) {
         // 顶部首条若就是"今天"不立分隔(免得每次打开都顶一条"今天");老会话/真跨天才立
-        if (lastDay !== '' || day !== new Date().toDateString()) {
-          sep[m.id] = dayLabel(m.at)
-          lastRole = '' // 分隔之后第一条不算同角色续接
-        }
+        if (lastDay !== '' || day !== new Date().toDateString()) sep = dayLabel(m.at)
         lastDay = day
       }
     }
-    if (lastRole === m.role) cont.add(m.id)
-    lastRole = m.role
+    const last = groups[groups.length - 1]
+    if (m.role === 'wang' && last && last.kind === 'wang' && !sep) {
+      last.msgs.push(m) // 同一轮的后续段:并进上一组
+      lastKind = 'wang'
+      continue
+    }
+    groups.push({ key: m.id, kind: m.role, msgs: [m], sep, cont: !sep && lastKind === m.role })
+    lastKind = m.role
   }
-  return { sep, cont }
+  return groups
 })
 
 // —— 会话列表右键菜单(桌面右键):重命名(行内改名)/ 钉住 / 删除 ——
@@ -116,7 +133,10 @@ function autoGrow() {
   const el = inputEl.value
   if (!el) return
   el.style.height = 'auto'
-  el.style.height = Math.min(el.scrollHeight, INPUT_MAX_H) + 'px'
+  // border-box:写进 height 的值要装下上下边框,而 scrollHeight 不含边框 —— 不补就恒差
+  // 2px,内容区被压小、永远"溢出"→ 自定义滚动条小块常驻在话筒旁(2026-07-10 真机实锤)
+  const border = el.offsetHeight - el.clientHeight
+  el.style.height = Math.min(el.scrollHeight + border, INPUT_MAX_H) + 'px'
 }
 // 回车键位(纯打字便利,与语音二分无关):Enter 发送、Shift+Enter 换行;
 // 输入法选词中(isComposing / keyCode 229)绝不当发送 —— 否则中文用户每次选词回车都误发。
@@ -321,9 +341,23 @@ function fmtStats(s: TurnStats): string {
   return parts.join(' · ')
 }
 
-// 在飞的那条回复:读数不等 hover,直接常驻跳秒(完成后由 stats 接管,退回 hover 档案)
-function isLiveBubble(m: UiMessage, mi: number): boolean {
-  return chat.usage.liveMs != null && m.role === 'wang' && mi === chat.messages.length - 1
+// 在飞的那组回复:读数不等 hover,直接常驻跳秒(完成后由 stats 接管,退回 hover 档案)
+function isLiveGroup(g: StreamGroup, gi: number): boolean {
+  return chat.usage.liveMs != null && g.kind === 'wang' && gi === streamGroups.value.length - 1
+}
+
+/** 整组文本(段间空行):组级复制/朗读/右键用 —— 合并后"这条回复"= 整组。 */
+function groupText(g: StreamGroup): string {
+  return g.msgs.map((m) => m.text).filter(Boolean).join('\n\n')
+}
+
+/** 组级读数:取组内最后一个有读数的段(端到端读数钉在收尾段;历史回填也在行上)。 */
+function groupStatsLine(g: StreamGroup): string {
+  for (let i = g.msgs.length - 1; i >= 0; i--) {
+    const s = g.msgs[i].stats
+    if (s) return fmtStats(s)
+  }
+  return ''
 }
 const liveLine = computed(() => {
   const ms = chat.usage.liveMs
@@ -333,6 +367,54 @@ const liveLine = computed(() => {
   if (u) parts.push(`↑${fmtTokens(u.input_tokens)} ↓${fmtTokens(u.output_tokens)}`)
   return parts.join(' · ')
 })
+
+// 回执小票(组级,收在气泡末尾):这轮成功设了提醒 / 记了记忆 → 「✓ 已记下 / 记住了」,
+// 点击去对应页看/改/删。数据来自「想了想」轨迹(args/status 由 hydrateTrace 从落库
+// payload 回填;在飞时为空 → 小票在回合收尾后冒出),零后端。
+interface ReceiptChip {
+  kind: 'reminder' | 'memory'
+  text: string
+  hint: string
+  rail: 'reminders' | 'memory'
+}
+function groupChips(g: StreamGroup): ReceiptChip[] {
+  if (g.kind !== 'wang') return []
+  const out: ReceiptChip[] = []
+  for (const m of g.msgs) {
+    for (const s of m.trace?.steps ?? []) {
+      if (s.status !== 'ok' || !s.args) continue
+      try {
+        if (s.ui_key === 'tool.reminder_set') {
+          const a = JSON.parse(s.args) as { first_at?: string; repeat?: string }
+          // "YYYY-MM-DD HH:MM(:SS)" → "MM-DD HH:MM"(展示态,解不出就不显这张小票)
+          const at = /^\d{4}-(\d{2}-\d{2} \d{2}:\d{2})/.exec(a.first_at ?? '')?.[1]
+          if (!at) continue
+          const r = a.repeat && te('reminders.repeat.' + a.repeat) ? a.repeat : 'once'
+          out.push({
+            kind: 'reminder',
+            text: `${t('chat.reminderSaved')} · ${at} · ${t('reminders.repeat.' + r)}`,
+            hint: t('chat.reminderSavedHint'),
+            rail: 'reminders',
+          })
+        } else if (s.ui_key === 'tool.remember') {
+          const fact = ((JSON.parse(s.args) as { fact?: string }).fact ?? '').trim()
+          if (!fact) continue
+          const chars = Array.from(fact) // 按码点截,emoji 不劈半
+          const short = chars.length > 16 ? chars.slice(0, 16).join('') + '…' : fact
+          out.push({
+            kind: 'memory',
+            text: `${t('chat.memorySaved')} · ${short}`,
+            hint: t('chat.memorySavedHint'),
+            rail: 'memory',
+          })
+        }
+      } catch {
+        /* args 不是合法 JSON:不显示小票 */
+      }
+    }
+  }
+  return out
+}
 
 function fmtTime(ts: number): string {
   const diff = Date.now() - ts
@@ -458,12 +540,23 @@ function copyMsg(m: UiMessage) {
   })
 }
 
-// 气泡右键(双方):有选中文本则复制选中片段,否则整条;助手气泡再给「朗读」
-function openBubbleMenu(e: MouseEvent, m: UiMessage) {
+/** 组级复制(wang 合并气泡的 hover 钮):整组文本,✓ 闪在组上。 */
+function copyGroup(g: StreamGroup) {
+  copyText(groupText(g), () => {
+    copiedId.value = g.key
+    setTimeout(() => {
+      if (copiedId.value === g.key) copiedId.value = null
+    }, 1500)
+  })
+}
+
+// 气泡右键(双方):有选中文本则复制选中片段,否则整组;助手气泡再给「朗读」(念整组)
+function openBubbleMenu(e: MouseEvent, g: StreamGroup) {
   const sel = window.getSelection()?.toString().trim() ?? ''
-  const items = [{ label: sel ? t('ctx.copySelection') : t('ctx.copy'), action: () => copyText(sel || m.text) }]
-  if (m.role === 'wang' && m.text && chat.inTauri) {
-    items.push({ label: t('ctx.readAloud'), action: () => replay(m.text) })
+  const whole = groupText(g)
+  const items = [{ label: sel ? t('ctx.copySelection') : t('ctx.copy'), action: () => copyText(sel || whole) }]
+  if (g.kind === 'wang' && whole && chat.inTauri) {
+    items.push({ label: t('ctx.readAloud'), action: () => replay(whole) })
   }
   openMenu(e, items)
 }
@@ -641,81 +734,101 @@ watch(messages, () => nextTick(() => {
       </header>
 
       <div class="stream" ref="streamEl" @click="onStreamClick">
-        <template v-for="(m, mi) in messages" :key="m.id">
-          <div v-if="streamLayout.sep[m.id]" class="day-sep"><span>{{ streamLayout.sep[m.id] }}</span></div>
-          <div class="bubble" :class="[m.role, { cont: streamLayout.cont.has(m.id) }]" @contextmenu="openBubbleMenu($event, m)">
-          <!-- 说话人显性化:user 标非我的说话人名(家人插话 / 声纹 / 渠道归人);wang 标自动触发「⏰ 提醒」。
-               「我」说的 + 旺财主动回的都不标,保持干净——只在需要区分时才冒出标签。 -->
-          <span v-if="m.role === 'user' && m.speakerName" class="spk-tag spk-who">{{ m.speakerName }}</span>
-          <span v-if="m.role === 'wang' && m.trigger" class="spk-tag spk-trig">
+        <template v-for="(g, gi) in streamGroups" :key="g.key">
+          <div v-if="g.sep" class="day-sep"><span>{{ g.sep }}</span></div>
+          <!-- 定时任务到点的系统线(event 行):交代"是定好的安排叫醒了它"——下面的回复
+               就是它自己组织的话,所以回复气泡不再打「提醒」标签(2026-07-10)。 -->
+          <div v-if="g.kind === 'event'" class="evt-line" :title="g.msgs[0].text">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="13" r="7" /><path d="M12 9.5V13l2 1.5" /><path d="M5 4 2.5 6.5" /><path d="M19 4 21.5 6.5" /></svg>
-            {{ t('chat.trigger.' + m.trigger) }}
-          </span>
-          <!-- wang 走富文本(markdown);user 是用户原话,纯文本保留换行、不解析标记 -->
-          <div v-if="m.role === 'wang'" class="md" v-html="renderMarkdown(m.text)"></div>
-          <template v-else>
-            <div v-if="m.attachments?.length" class="atts">
-              <template v-for="(a, ai) in m.attachments" :key="ai">
-                <img v-if="a.kind === 'image' && a.dataUrl" :src="a.dataUrl" class="att-img" alt="" />
-                <span v-else class="att-chip">
-                  <svg v-if="a.kind === 'image'" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2" /><path d="M3 16l5-4 4 3 3-2 6 5" /></svg>
-                  <svg v-else viewBox="0 0 24 24"><path d="M6 2h8l4 4v16H6z" /><path d="M14 2v4h4" /></svg>
-                  {{ a.name }}
-                </span>
-              </template>
+            <b>{{ t('chat.eventDue') }}</b>
+            <span class="evt-text">{{ g.msgs[0].text }}</span>
+          </div>
+          <!-- 气泡:wang 组 = 同一轮的多段(说话→调工具→再说话)合并成**一个**气泡,段间只留
+               段落间距,复制/朗读/读数收归组级;逐段的「想了想」/小票跟着各自的段。user 恒单条。 -->
+          <div v-else class="bubble" :class="[g.kind, { cont: g.cont }]" @contextmenu="openBubbleMenu($event, g)">
+          <!-- 说话人显性化:user 标非我的说话人名(家人插话 / 声纹 / 渠道归人)。
+               「我」说的 + 旺财的回复都不标,保持干净——只在需要区分时才冒出标签。 -->
+          <span v-if="g.kind === 'user' && g.msgs[0].speakerName" class="spk-tag spk-who">{{ g.msgs[0].speakerName }}</span>
+          <template v-for="m in g.msgs" :key="m.id">
+            <!-- wang 走富文本(markdown);user 是用户原话,纯文本保留换行、不解析标记 -->
+            <div v-if="g.kind === 'wang'" class="md" v-html="renderMarkdown(m.text)"></div>
+            <template v-else>
+              <div v-if="m.attachments?.length" class="atts">
+                <template v-for="(a, ai) in m.attachments" :key="ai">
+                  <img v-if="a.kind === 'image' && a.dataUrl" :src="a.dataUrl" class="att-img" alt="" />
+                  <span v-else class="att-chip">
+                    <svg v-if="a.kind === 'image'" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2" /><path d="M3 16l5-4 4 3 3-2 6 5" /></svg>
+                    <svg v-else viewBox="0 0 24 24"><path d="M6 2h8l4 4v16H6z" /><path d="M14 2v4h4" /></svg>
+                    {{ a.name }}
+                  </span>
+                </template>
+              </div>
+              <div v-if="m.text" class="usertext">{{ m.text }}</div>
+            </template>
+            <!-- 「想了想」漏出:逐段的折叠药丸(每段的工具步骤/CoT 挂各自 message_id,合并后仍逐段可查) -->
+            <div v-if="g.kind === 'wang' && m.trace && (m.trace.steps.length || m.trace.reasoning)" class="think">
+              <button class="think-pill" :class="{ open: traceOpen.has(m.id) }" @click="toggleTrace(m.id)">
+                <svg class="think-i" viewBox="0 0 24 24"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-4 10.5c.7.7 1 1.3 1 2.5h6c0-1.2.3-1.8 1-2.5A6 6 0 0 0 12 3z" /></svg>
+                <span>{{ t('trace.title') }}<template v-if="m.trace.steps.length"> · {{ t('trace.steps', { n: m.trace.steps.length }) }}</template></span>
+                <svg class="think-chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" /></svg>
+              </button>
+              <div v-if="traceOpen.has(m.id)" class="think-detail">
+                <div v-for="(s, si) in m.trace.steps" :key="si" class="td-step">
+                  <div class="td-call">
+                    <span class="td-name">{{ s.name }}</span>
+                    <span v-if="s.args && s.args !== '{}'" class="td-args">{{ s.args }}</span>
+                    <span v-if="s.status && s.status !== 'ok'" class="td-bad">{{ s.status }}</span>
+                  </div>
+                  <div v-if="s.result" class="td-result">{{ s.result }}</div>
+                </div>
+                <div v-if="m.trace.reasoning" class="td-cot">
+                  <div class="td-cot-h">{{ t('trace.reasoning') }}</div>
+                  <pre class="td-cot-body">{{ m.trace.reasoning }}</pre>
+                </div>
+              </div>
             </div>
-            <div v-if="m.text" class="usertext">{{ m.text }}</div>
           </template>
+          <!-- 回执小票(组级,收在气泡最后):这轮设了提醒 / 记了记忆 → 「✓ 已记下 / 记住了」,
+               点击去对应页看/改/删(数据来自「想了想」轨迹,零后端) -->
+          <button
+            v-for="(rc, ri) in groupChips(g)"
+            :key="'rc' + ri"
+            class="receipt-chip"
+            :title="rc.hint"
+            @click="activeRail = rc.rail"
+          >
+            <svg v-if="rc.kind === 'reminder'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="13" r="7" /><path d="M12 9.5V13l2 1.5" /><path d="M5 4 2.5 6.5" /><path d="M19 4 21.5 6.5" /></svg>
+            <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 4h10v16l-5-3-5 3z" /></svg>
+            <span class="rc-text">{{ rc.text }}</span>
+          </button>
           <!-- 用户消息 hover:复制 + 时间(右下浮现,与 wang 的读数/重听同款克制) -->
-          <span v-if="m.role === 'user'" class="user-meta">
-            <button class="copy-btn" :class="{ done: copiedId === m.id }" @click="copyMsg(m)" :title="t('chat.copy')">
-              <svg v-if="copiedId === m.id" viewBox="0 0 24 24"><path d="M5 12l4 4 10-10" /></svg>
+          <span v-if="g.kind === 'user'" class="user-meta">
+            <button class="copy-btn" :class="{ done: copiedId === g.msgs[0].id }" @click="copyMsg(g.msgs[0])" :title="t('chat.copy')">
+              <svg v-if="copiedId === g.msgs[0].id" viewBox="0 0 24 24"><path d="M5 12l4 4 10-10" /></svg>
               <svg v-else viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M15 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h3" /></svg>
             </button>
-            <span v-if="m.at" class="u-time">{{ fmtClock(m.at) }}</span>
+            <span v-if="g.msgs[0].at" class="u-time">{{ fmtClock(g.msgs[0].at) }}</span>
           </span>
-          <!-- 「想了想」漏出:折叠药丸(干净默认)+ 展开技术细节(工具名/入参/结果 + CoT 原文) -->
-          <div v-if="m.role === 'wang' && m.trace && (m.trace.steps.length || m.trace.reasoning)" class="think">
-            <button class="think-pill" :class="{ open: traceOpen.has(m.id) }" @click="toggleTrace(m.id)">
-              <svg class="think-i" viewBox="0 0 24 24"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-4 10.5c.7.7 1 1.3 1 2.5h6c0-1.2.3-1.8 1-2.5A6 6 0 0 0 12 3z" /></svg>
-              <span>{{ t('trace.title') }}<template v-if="m.trace.steps.length"> · {{ t('trace.steps', { n: m.trace.steps.length }) }}</template></span>
-              <svg class="think-chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" /></svg>
-            </button>
-            <div v-if="traceOpen.has(m.id)" class="think-detail">
-              <div v-for="(s, si) in m.trace.steps" :key="si" class="td-step">
-                <div class="td-call">
-                  <span class="td-name">{{ s.name }}</span>
-                  <span v-if="s.args && s.args !== '{}'" class="td-args">{{ s.args }}</span>
-                  <span v-if="s.status && s.status !== 'ok'" class="td-bad">{{ s.status }}</span>
-                </div>
-                <div v-if="s.result" class="td-result">{{ s.result }}</div>
-              </div>
-              <div v-if="m.trace.reasoning" class="td-cot">
-                <div class="td-cot-h">{{ t('trace.reasoning') }}</div>
-                <pre class="td-cot-body">{{ m.trace.reasoning }}</pre>
-              </div>
-            </div>
-          </div>
-          <!-- 完成的回复:读数默认隐身,hover 浮现;在飞的回复:跳秒常驻,不用 hover -->
-          <span v-if="m.stats" class="turn-meta">{{ fmtStats(m.stats) }}</span>
-          <span v-else-if="isLiveBubble(m, mi)" class="turn-meta live">{{ liveLine }}</span>
-          <!-- 一键复制这条回复(与 user 气泡同款;右键菜单也有,这给个 hover 直达) -->
+          <!-- 完成的回复:读数默认隐身,hover 浮现(组级,取收尾段);在飞的回复:跳秒常驻,不用 hover -->
+          <span v-if="groupStatsLine(g)" class="turn-meta">{{ groupStatsLine(g) }}</span>
+          <span v-else-if="isLiveGroup(g, gi)" class="turn-meta live">{{ liveLine }}</span>
+          <!-- 一键复制这条回复(= 整组文本;右键菜单也有,这给个 hover 直达) -->
           <button
-            v-if="m.role === 'wang' && m.text"
+            v-if="g.kind === 'wang' && groupText(g)"
             class="copy-btn wang-copy"
-            :class="{ done: copiedId === m.id }"
-            @click="copyMsg(m)"
+            :class="{ done: copiedId === g.key }"
+            @click="copyGroup(g)"
             :title="t('chat.copy')"
           >
-            <svg v-if="copiedId === m.id" viewBox="0 0 24 24"><path d="M5 12l4 4 10-10" /></svg>
+            <svg v-if="copiedId === g.key" viewBox="0 0 24 24"><path d="M5 12l4 4 10-10" /></svg>
             <svg v-else viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M15 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h3" /></svg>
           </button>
-          <!-- 朗读(把这条回复念出来;hover 浮现,缓存命中秒回) -->
+          <!-- 朗读(整条回复念出来;hover 浮现,缓存命中秒回) -->
           <button
-            v-if="m.role === 'wang' && m.text && chat.inTauri"
+            v-if="g.kind === 'wang' && groupText(g) && chat.inTauri"
             class="replay"
             :title="t('chat.replay')"
-            @click="replay(m.text)"
+            @click="replay(groupText(g))"
           >
             <!-- 耳机:朗读 = 把这条念出来(听),与语音输入的话筒区分;默认不念,所以不是「重播」 -->
             <svg viewBox="0 0 24 24"><path d="M4.5 14v-2a7.5 7.5 0 0 1 15 0v2" /><rect x="3" y="13.5" width="3.6" height="6.6" rx="1.8" /><rect x="17.4" y="13.5" width="3.6" height="6.6" rx="1.8" /></svg>
@@ -976,7 +1089,7 @@ watch(messages, () => nextTick(() => {
   transition: transform .18s ease-out;
 }
 .bubble:first-child { margin-top: 0; }
-.bubble.cont { margin-top: 3px; } /* 相邻同角色:收紧,读出"一轮里连续几句" */
+.bubble.cont { margin-top: 3px; } /* 相邻同角色组(实际只剩 user 连发):收紧;wang 同轮已并进一个气泡 */
 /* 回复读数:贴在气泡下沿,默认隐身,hover 浮现(不挤布局,不打扰陪伴感) */
 .turn-meta {
   position: absolute; top: 100%; left: 13px; margin-top: 3px;
@@ -1001,17 +1114,31 @@ watch(messages, () => nextTick(() => {
   align-self: flex-end; background: var(--bubble-me);
   border: 1px solid var(--bubble-me-line); border-bottom-right-radius: 5px; color: var(--bubble-me-text);
 }
-/* 说话人显性化:气泡内顶部小标签,只在需区分时出现(家人插话 / 自动触发)。
-   user 侧(右)右对齐、wang 侧(左)左对齐;语义 token 跟随皮肤。 */
+/* 说话人显性化:气泡内顶部小标签,只在需区分时出现(家人插话)。
+   user 侧(右)右对齐;语义 token 跟随皮肤。 */
 .spk-tag { display: block; font-size: 11px; line-height: 1; margin-bottom: 4px; opacity: 0.85; font-weight: 500; }
 .bubble.user .spk-tag { text-align: right; }
 .spk-who { color: var(--accent); }
-.spk-trig { color: var(--attn); letter-spacing: 0.3px; }
-/* ⏰ 图标走 inline SVG + currentColor,跟随 --attn 换肤(不用彩色 emoji,§6.7) */
-.spk-trig svg { width: 11px; height: 11px; vertical-align: -1.5px; margin-right: 2px; }
+
+/* 定时任务到点的系统线:居中细线(同 day-sep 的克制),⏰/标签用 --attn 提示色、
+   内容淡出单行截断(全文进 title)。SVG 走 currentColor 跟随换肤(§6.7)。 */
+.evt-line { align-self: center; display: flex; align-items: center; gap: 6px; max-width: min(78%, 620px); margin: 8px 0 2px; font-size: 11.5px; color: var(--text-dim); user-select: none; }
+.evt-line svg { width: 12px; height: 12px; flex: none; color: var(--attn); }
+.evt-line b { color: var(--attn); font-weight: 600; letter-spacing: 0.3px; flex: none; }
+.evt-line .evt-text { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+
+/* 回执小票(wang 气泡末尾,组级):设了提醒/记了记忆的确认药丸,--attn 提示色,点击跳对应页;
+   一轮多张(如又设提醒又记事)横排折行 */
+.receipt-chip { display: inline-flex; align-items: center; gap: 5px; margin: 8px 6px 0 0; padding: 3px 10px; border-radius: 999px; border: 1px solid rgba(var(--attn-rgb), 0.35); background: rgba(var(--attn-rgb), 0.08); color: var(--attn); font-size: 11.5px; line-height: 1.4; cursor: pointer; max-width: 100%; }
+.receipt-chip:hover { background: rgba(var(--attn-rgb), 0.16); border-color: rgba(var(--attn-rgb), 0.55); }
+.receipt-chip svg { width: 12px; height: 12px; flex: none; }
+/* 文本不折行:窄气泡被小票撑宽(到气泡上限),真放不下才省略号截 */
+.receipt-chip .rc-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* —— 气泡富文本(markdown):wang 回复用,修掉逐字 span 吞换行的老问题 —— */
 .md { white-space: normal; }
+/* 合并气泡里的后续段:与前一段(文本/想了想/小票)只留段落级间距,读起来是一条消息 */
+.bubble.wang .md:not(:first-child) { margin-top: 9px; }
 .md > :first-child { margin-top: 0; }
 .md > :last-child { margin-bottom: 0; }
 .md p { margin: 0 0 8px; }

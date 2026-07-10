@@ -197,6 +197,9 @@ struct Inner {
     counter: AtomicU64,
     /// 探出来的视频编码器(硬件优先),整进程探一次缓存;转码点复用,免每次试编码。
     hw_encoder: tokio::sync::OnceCell<VideoEncoder>,
+    /// webrender 回传信箱(`POST /collect/{token}`,一次性):壳层隐藏窗里注入的脚本把
+    /// 渲染后页面 POST 回来。token 用完即取走;窗超时收摊后残留项由发起方 drop Receiver 自清。
+    collect: Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>,
 }
 
 #[derive(Clone)]
@@ -219,6 +222,7 @@ impl Relay {
             net: crate::net::Client::new(|b| b.connect_timeout(std::time::Duration::from_secs(10))),
             counter: AtomicU64::new(1),
             hw_encoder: tokio::sync::OnceCell::new(),
+            collect: Mutex::new(HashMap::new()),
         });
         let app = Router::new()
             .route("/s/{token}", get(direct))
@@ -230,6 +234,9 @@ impl Relay {
             .route("/hls/{token}/{seg}", get(hls).options(dash_preflight))
             // 本地自适应(音视频分离,手写 MSE):desc/vinit/v{N}/audio(前端 fetch 跨源 → CORS)。
             .route("/la/{token}/{seg}", get(local_adaptive).options(dash_preflight))
+            // webrender 回传(壳层隐藏窗注入脚本 → 任意外源页面 fetch 过来 → 需 CORS;
+            // 脚本用 text/plain 发 = 简单请求免预检,OPTIONS 只是兜底)。
+            .route("/collect/{token}", axum::routing::post(collect).options(collect_preflight))
             .with_state(inner.clone());
         tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app).await {
@@ -259,6 +266,20 @@ impl Relay {
             .expect("relay streams lock poisoned")
             .insert(token.clone(), Arc::new(entry));
         format!("http://127.0.0.1:{}/{path}/{token}", self.inner.port)
+    }
+
+    /// webrender 回传信箱:一次性 token → (POST 地址, 接收端)。壳层把地址嵌进注入脚本,
+    /// 页面 fetch POST 回来即投递。发起方超时放弃 = drop Receiver;这类死项(页面一直没 POST)
+    /// 在下次 register 时按 `is_closed` 清扫 —— 不随时间堆积。
+    pub fn register_collect(&self) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let token = self.token();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut map = self.inner.collect.lock().expect("relay collect lock poisoned");
+            map.retain(|_, s| !s.is_closed());
+            map.insert(token.clone(), tx);
+        }
+        (format!("http://127.0.0.1:{}/collect/{token}", self.inner.port), rx)
     }
 
     /// 单流直转 URL。
@@ -608,6 +629,39 @@ async fn dash_preflight() -> Response {
         .header("access-control-allow-origin", "*")
         .header("access-control-allow-methods", "GET, OPTIONS")
         .header("access-control-allow-headers", "Range")
+        .header("access-control-max-age", "86400")
+        .body(Body::empty())
+        .unwrap_or_else(|_| bad(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
+/// webrender 回传:一次性 token → 取走信箱、投递页面 JSON。未知/已用 token 一律 404
+/// (页面世界不可信,不给探测面);载荷缓冲上限防恶意页灌爆(注入脚本自身只发 ~10KB)。
+const COLLECT_MAX_BYTES: usize = 512 * 1024;
+
+async fn collect(
+    State(state): State<Arc<Inner>>,
+    AxPath(token): AxPath<String>,
+    body: String,
+) -> Response {
+    if body.len() > COLLECT_MAX_BYTES {
+        return bad(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    let sender = state.collect.lock().expect("relay collect lock poisoned").remove(&token);
+    let Some(tx) = sender else { return bad(StatusCode::NOT_FOUND) };
+    let _ = tx.send(body); // 发起方已放弃(超时收摊)= 静默丢,无人可通知
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header("access-control-allow-origin", "*")
+        .body(Body::empty())
+        .unwrap_or_else(|_| bad(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
+async fn collect_preflight() -> Response {
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header("access-control-allow-origin", "*")
+        .header("access-control-allow-methods", "POST, OPTIONS")
+        .header("access-control-allow-headers", "Content-Type")
         .header("access-control-max-age", "86400")
         .body(Body::empty())
         .unwrap_or_else(|_| bad(StatusCode::INTERNAL_SERVER_ERROR))
@@ -1145,6 +1199,26 @@ fn tokio_stream_from(
 mod tests {
     use super::*;
 
+    /// webrender 回传信箱:注册 → 页面 POST → 接收端拿到原文;token 一次性(二投 404);
+    /// 发起方放弃(drop rx)的死项被下次注册清扫。
+    #[tokio::test]
+    async fn collect_mailbox_roundtrip_once_and_sweeps_dead() {
+        let relay = Relay::start().await.unwrap();
+        let (url, rx) = relay.register_collect();
+        let http = reqwest::Client::new();
+        let resp = http.post(&url).body("{\"title\":\"页\"}").send().await.unwrap();
+        assert!(resp.status().is_success());
+        assert_eq!(rx.await.unwrap(), "{\"title\":\"页\"}");
+        // 同 token 再投 = 404(一次性)
+        let resp = http.post(&url).body("x").send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 404);
+        // 放弃的信箱:drop rx → 下次注册清扫,不堆积
+        let (_url2, rx2) = relay.register_collect();
+        drop(rx2);
+        let _ = relay.register_collect();
+        assert_eq!(relay.inner.collect.lock().unwrap().len(), 1, "死项被清扫,只剩新注册的");
+    }
+
     #[test]
     fn tokens_are_unique_and_urls_local() {
         let inner = Arc::new(Inner {
@@ -1153,6 +1227,7 @@ mod tests {
             net: crate::net::Client::new(|b| b),
             counter: AtomicU64::new(1),
             hw_encoder: tokio::sync::OnceCell::new(),
+            collect: Mutex::new(HashMap::new()),
         });
         let relay = Relay { inner };
         let a = relay.register_direct(UpStream { url: "u1".into(), ..Default::default() });

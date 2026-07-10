@@ -69,8 +69,10 @@ async function cancel(r: Reminder) {
   busy.value = null
 }
 
-/** repeat 徽标:重复类才显(once 单次不挂徽标)。文案全在前端字典(§6)。 */
+/** repeat 徽标:重复类才显,once 单次不挂徽标(显式跳过——字典里 repeat.once 是给
+ *  聊天「已记下」小票用的,不能再靠"键不存在"来压徽标)。文案全在前端字典(§6)。 */
 function repeatLabel(r: Reminder): string {
+  if (r.repeat === 'once') return ''
   const key = `reminders.repeat.${r.repeat}`
   return te(key) ? t(key) : ''
 }

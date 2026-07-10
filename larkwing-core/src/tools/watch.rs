@@ -174,7 +174,7 @@ mod tests {
         let store = Store::open(&dir.join("t.db")).unwrap();
         store.users.ensure_default_user().unwrap();
         let conv = store.chat.create_conversation(1, "companion").unwrap();
-        ToolCtx { user_id: 1, conv_id: conv.id, media: MediaRuntime::detached(store.clone()), store }
+        ToolCtx { user_id: 1, conv_id: conv.id, media: MediaRuntime::detached(store.clone()), store, web: None }
     }
 
     #[tokio::test]
