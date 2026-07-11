@@ -106,9 +106,6 @@ pub(crate) fn resolve_phone(
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     };
-    let setting = |key: &str| {
-        store.settings.get(None, key).ok().flatten().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-    };
     let mut saw_mine = false;
     for t in threads {
         let mine = t.user_id == Some(user_id) || (user_id == owner_id && t.user_id.is_none());
@@ -139,11 +136,18 @@ pub(crate) fn resolve_phone(
             "weixin" => {
                 // 发媒体要回显 context_token(存 push_id);没有 = 用户登录后还没说过话,推不了
                 let Some(context_token) = t.push_id.clone() else { continue };
-                if let Some(token) = secret("remote.weixin.token") {
-                    let base_url = setting("remote.weixin.base_url")
-                        .unwrap_or_else(|| super::weixin::DEFAULT_BASE_URL.to_string());
+                // 多绑定:按线程 ext_id(= 绑定者)选对应账号(1:1 形态,一人一 bot)
+                if let Ok(acc) = super::weixin::account_for(&store.settings, &t.ext_id) {
                     let to_user_id = t.ext_id.clone();
-                    return Ok((t, Target::Weixin { token, base_url, to_user_id, context_token }));
+                    return Ok((
+                        t,
+                        Target::Weixin {
+                            token: acc.token.clone(),
+                            base_url: acc.base().to_string(),
+                            to_user_id,
+                            context_token,
+                        },
+                    ));
                 }
             }
             _ => continue,

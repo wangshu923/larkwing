@@ -958,9 +958,13 @@ export const api = {
   reloadChannels: () => invoke<void>('reload_channels'),
   /** 微信扫码登录起手:拿二维码(SVG + 备用链接 + 轮询 qrcode)。 */
   weixinLoginStart: () => invoke<WeixinQrStart>('weixin_login_start'),
-  /** 微信扫码轮询一次:前端循环调;confirmed 时 core 已把 token/base_url/白名单落库。 */
+  /** 微信扫码轮询一次:前端循环调;confirmed 时 core 已把账号(token/入口/身份)进绑定列表。 */
   weixinLoginPoll: (qrcode: string, baseUrl: string | null, verifyCode: string | null) =>
     invoke<WeixinQrPoll>('weixin_login_poll', { qrcode, baseUrl, verifyCode }),
+  /** 微信绑定列表(多绑定 = 一人一 bot):绑定者 user_id;空串 = 旧版迁移的无身份绑定。不含 token。 */
+  weixinAccounts: () => invoke<string[]>('weixin_accounts'),
+  /** 解绑一个微信账号(空串 = 旧迁移绑定);解绑后调 reloadChannels 生效。 */
+  weixinUnbind: (userId: string) => invoke<void>('weixin_unbind', { userId }),
   /** 开听写:立即返回,进展走 app_event 的 voice 车道(首次会触发模型用时下载)。 */
   voiceListenStart: () => invoke<void>('voice_listen_start'),
   /** 停听写:accept = 立即定稿(已听到的送识别);false = 取消丢弃。幂等。 */

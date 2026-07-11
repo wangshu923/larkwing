@@ -403,6 +403,8 @@ pub fn run() {
       commands::reload_channels,
       commands::weixin_login_start,
       commands::weixin_login_poll,
+      commands::weixin_accounts,
+      commands::weixin_unbind,
       commands::voice_listen_start,
       commands::voice_listen_stop,
       commands::voice_status,

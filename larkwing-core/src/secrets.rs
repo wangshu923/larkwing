@@ -21,7 +21,8 @@ pub const SECRET_KEYS: &[&str] = &[
     "remote.telegram.token",
     "remote.dingtalk.app_key",
     "remote.dingtalk.app_secret",
-    "remote.weixin.token",
+    "remote.weixin.token",    // 旧单绑定(≤v0.2.15);留读做迁移,不再写
+    "remote.weixin.accounts", // 多绑定列表(JSON 数组,含各账号 token → 整块进 keyring)
 ];
 
 pub fn is_secret(key: &str) -> bool {

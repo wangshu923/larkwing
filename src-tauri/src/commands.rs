@@ -945,14 +945,28 @@ pub fn remote_status(state: State<'_, AppState>) -> Result<Vec<RemoteChannelView
             sec("remote.dingtalk.app_key").is_some() && sec("remote.dingtalk.app_secret").is_some(),
             String::new(),
         ),
-        // 微信(腾讯 iLink bot):扫码拿 token → configured;白名单 = allowed_users
+        // 微信(腾讯 iLink bot):扫码进绑定列表 → configured(旧单 token 兼容);
+        // 白名单 = 手动附加名单(绑定者自动放行,不在这里)
         view(
             "weixin",
             "remote.weixin.enabled",
-            sec("remote.weixin.token").is_some(),
+            sec("remote.weixin.accounts").is_some() || sec("remote.weixin.token").is_some(),
             get("remote.weixin.allowed_users").unwrap_or_default(),
         ),
     ])
+}
+
+/// 微信绑定列表(多绑定 = 一人一 bot,§7.7):只回绑定者 user_id,**不含 token**。
+/// 空串项 = 旧版迁移来的无身份绑定。
+#[tauri::command]
+pub fn weixin_accounts(state: State<'_, AppState>) -> Result<Vec<String>, AppError> {
+    Ok(larkwing_core::channels::weixin_accounts(&state.engine))
+}
+
+/// 解绑一个微信账号(user_id 空串 = 解绑旧迁移绑定);前端随后调 reload_channels 生效。
+#[tauri::command]
+pub fn weixin_unbind(state: State<'_, AppState>, user_id: String) -> Result<(), AppError> {
+    larkwing_core::channels::weixin_unbind(&state.engine, &user_id).map_err(AppError::internal)
 }
 
 /// 微信扫码登录起手:拿二维码(SVG + 备用链接 + 轮询 qrcode)。协议/QR 流程在 core channels::weixin。

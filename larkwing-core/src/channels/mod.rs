@@ -27,8 +27,8 @@ pub async fn weixin_qr_start() -> anyhow::Result<QrStart> {
     weixin::qr_start().await
 }
 
-/// 轮询扫码状态;confirmed 时 token/base_url/白名单落库。`base_url` = 前端持有的当前轮询地址
-/// (IDC 重定向后回传;空 = 默认入口)。
+/// 轮询扫码状态;confirmed 时账号(token/入口/身份)进绑定列表。`base_url` = 前端持有的
+/// 当前轮询地址(IDC 重定向后回传;空 = 默认入口)。
 pub async fn weixin_qr_poll(
     engine: &Engine,
     qrcode: &str,
@@ -36,6 +36,17 @@ pub async fn weixin_qr_poll(
     verify_code: Option<&str>,
 ) -> anyhow::Result<QrPoll> {
     weixin::qr_poll_and_store(engine, qrcode, base_url, verify_code).await
+}
+
+/// 绑定列表(设置 UI 用):只给绑定者 user_id,**不含 token**(凭证不过桥 §7.7)。
+/// 空串项 = 旧版迁移来的无身份绑定(UI 显示成「早期绑定」之类)。
+pub fn weixin_accounts(engine: &Engine) -> Vec<String> {
+    weixin::load_accounts(&engine.store().settings).into_iter().map(|a| a.user_id).collect()
+}
+
+/// 解绑一个微信账号(user_id 空串 = 解绑旧迁移绑定);调用方随后 reload_channels 停旧起新。
+pub fn weixin_unbind(engine: &Engine, user_id: &str) -> anyhow::Result<()> {
+    weixin::unbind_account(&engine.store().settings, user_id)
 }
 
 use std::collections::HashMap;
@@ -230,9 +241,9 @@ async fn push_reminder(
                 tracing::info!(conv = conv_id, "微信对话无 context_token,提醒只留桌面");
                 return Ok(());
             };
-            let token = ctx.secret("remote.weixin.token").context("没配微信 token")?;
-            let base = weixin::base_url_of(ctx);
-            weixin::push(net, &base, &token, &thread.ext_id, ctx_token, &text).await
+            // 多绑定:按线程 ext_id(= 绑定者)选对应账号的 token/入口
+            let acc = weixin::account_for(&ctx.engine.store().settings, &thread.ext_id)?;
+            weixin::push(net, acc.base(), &acc.token, &thread.ext_id, ctx_token, &text).await
         }
         other => {
             tracing::warn!(channel = other, "未知渠道,提醒不推");

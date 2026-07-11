@@ -640,6 +640,19 @@ let wxLoginSeq = 0 // 代次:重新扫码 / 切走 tab 时作废旧轮询循环
 async function loadRemote() {
   if (!isTauri()) return
   remoteChannels.value = await api.remoteStatus().catch(() => [])
+  wxAccounts.value = await api.weixinAccounts().catch(() => [])
+}
+// 微信多绑定(一人一 bot):绑定者 user_id 列表;空串 = 旧版迁移的无身份绑定
+const wxAccounts = ref<string[]>([])
+async function unbindWeixin(userId: string) {
+  try {
+    await api.weixinUnbind(userId)
+    await api.reloadChannels()
+    await loadRemote()
+  } catch (e) {
+    console.error('解绑微信失败', e)
+    useToast().error(t('settings.remote.weixin.unbindFailed'))
+  }
 }
 async function toggleRemote(id: string, on: boolean) {
   await api.setSetting(`remote.${id}.enabled`, on ? '1' : '0')
@@ -1744,6 +1757,12 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         </div>
         <p v-if="wxLoginStatus === 'expired'" class="hint">{{ t('settings.remote.weixin.expired') }}</p>
         <p v-if="wxLoginStatus === 'verify_blocked'" class="hint">{{ t('settings.remote.weixin.blocked') }}</p>
+        <!-- 多绑定列表(一人一 bot):每行一个绑定者,可单独解绑 -->
+        <div v-for="a in wxAccounts" :key="a" class="row">
+          <span class="label">{{ t('settings.remote.weixin.bound') }}</span>
+          <span class="s-mono-text">{{ a || t('settings.remote.weixin.legacyBound') }}</span>
+          <button class="link" @click="unbindWeixin(a)">{{ t('settings.remote.weixin.unbind') }}</button>
+        </div>
         <div class="row">
           <span class="label">{{ t('settings.remote.weixin.allowed') }}</span>
           <input
@@ -2060,6 +2079,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .adv-grid { grid-template-columns: 96px minmax(0, 1fr); margin-top: 8px; padding-top: 10px; border-top: 1px dashed var(--line); }
 .adv-grid .adv-hint { grid-column: 1 / -1; margin: 2px 0 0; color: var(--text-dim); font-size: 11.5px; }
 .s-mono-input { font-family: ui-monospace, "SF Mono", monospace; font-size: 12px; }
+/* 微信绑定行:绑定者 id(等宽截断)+ 行尾解绑 */
+.s-mono-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, "SF Mono", monospace; font-size: 12px; color: var(--text-dim); }
 /* 全局应用公钥框:多行 PEM,占满宽、不可拽缩、整段可读(给用户复制到服务控制台) */
 .pubkey-box { display: block; width: 100%; min-width: 0; resize: none; margin-top: 4px; line-height: 1.45; white-space: pre-wrap; word-break: break-all; color: var(--text-dim); }
 .p-foot { display: flex; gap: 16px; margin-top: 11px; }
