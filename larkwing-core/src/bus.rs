@@ -158,6 +158,12 @@ pub enum VoiceEvent {
     /// | no_speech_retry(唤醒首轮没听清,追问后再听)| farewell(两轮没听到,有声告退)
     /// | follow_up_idle(跟进窗口安静结束)| wake_done(回合周期收尾兜底)。
     ListenEnded { reason: String },
+    /// 唤醒常驻的**权威开关广播**(core 起/停时发,boot 自动恢复也发):前端 wakeArmed 与
+    /// mic bridge(browser 采集源的开麦条件)靠它跟随。缘起 2026-07-11 真机实锤「开着但聋」:
+    /// 开机自启 core 的 wake_start(加载模型/短句银行,秒级)比前端首查 voiceStatus 慢 →
+    /// armed 定格 false → browser 源永不开麦,KWS 空转;手动 off→on 靠设置页自发事件才活。
+    /// keywords 随 running=true 带出(前端「听哪个词」跟新);false 时为空。
+    WakeRunning { running: bool, keywords: Vec<String> },
     /// 唤醒录音标定:正在录第 step/total 段(step 从 1 计;total 含末尾 1 段底噪)。
     CalibProgress { step: u8, total: u8 },
     /// 唤醒标定收尾:ok=成功落定;sensitivity=落定灵敏度(滑块应刷新);recall=该档召回(0..1);

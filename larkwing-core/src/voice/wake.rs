@@ -74,6 +74,8 @@ pub(super) struct WakeDeps {
     pub kws_threshold: f32,
     /// 声纹(有家人注册才有;None = 不识别说话人,走会话用户)。
     pub speaker: Option<Arc<SpeakerId>>,
+    /// 启动代次:loop 退出时凭它认领清理(见 `wake_cleanup_gen`)。
+    pub gen: u64,
 }
 
 enum Phase {
@@ -211,7 +213,12 @@ pub(super) fn run_wake_loop(deps: WakeDeps, cmd: Receiver<WakeCmd>) {
         deps.rt.publish(VoiceEvent::ListenEnded { reason: "error".into() });
         deps.rt.publish(VoiceEvent::State { phase: VoicePhase::Idle });
     }
-    deps.rt.wake_cleanup();
+    // 认领式清理:清到自己 = 意外退出(错误/采集挂了),广播「停了」让前端开关/耳朵
+    // 如实归位(§3.5 不静默聋);认领失败 = 被 wake_stop 清过(stop 已广播)或已被
+    // off→on 的新一代顶替(唤醒还活着)——都不该再发 false。
+    if deps.rt.wake_cleanup_gen(deps.gen) {
+        deps.rt.publish(VoiceEvent::WakeRunning { running: false, keywords: Vec::new() });
+    }
     tracing::info!("免手唤醒已停止");
 }
 

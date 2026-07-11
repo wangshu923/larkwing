@@ -74,7 +74,13 @@ struct WakeHandle {
     cmd: std::sync::mpsc::Sender<wake::WakeCmd>,
     /// 与唤醒线程共享的应答音银行;换音色时运行时后台重建后整体替换(问题1-B)。
     prompts: prompts::SharedPromptBank,
+    /// 本次启动的代次:loop 退出清 slot 时凭它认领(off→on 重启的窄竞态:旧线程退出
+    /// 晚于新 start 置位时,朴素置 None 会把**新** loop 的句柄误清 → sender drop 新 loop 也退)。
+    gen: u64,
 }
+
+/// 唤醒启动代次发号器(进程内单调递增;只为 wake_cleanup_gen 的认领判定)。
+static WAKE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 struct Inner {
     store: Store,
@@ -953,12 +959,13 @@ impl VoiceRuntime {
         let prompts: prompts::SharedPromptBank = Arc::new(std::sync::Mutex::new(Arc::new(bank)));
 
         let (tx, rx) = std::sync::mpsc::channel();
+        let gen = WAKE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         {
             let mut slot = self.inner.wake.lock().expect("wake lock");
             if slot.is_some() {
                 return Ok(()); // 并发开关:别人抢先了
             }
-            *slot = Some(WakeHandle { cmd: tx, prompts: prompts.clone() });
+            *slot = Some(WakeHandle { cmd: tx, prompts: prompts.clone(), gen });
         }
         let deps = wake::WakeDeps {
             rt: self.clone(),
@@ -969,6 +976,7 @@ impl VoiceRuntime {
             keywords_buf,
             kws_threshold: self.wake_threshold(),
             speaker,
+            gen,
         };
         if let Err(e) =
             std::thread::Builder::new().name("voice-wake".into()).spawn(move || {
@@ -978,6 +986,10 @@ impl VoiceRuntime {
             self.wake_cleanup();
             return Err(anyhow!(e).context("唤醒线程起不来"));
         }
+        // 权威广播:唤醒起来了(boot 自动恢复也走这——前端 wakeArmed / mic bridge 靠它
+        // 跟随;没有它,开机自启时前端首查赶在 wake_start 完成前 → armed 定格 false →
+        // browser 采集源永不开麦 =「开关显示开、叫不答应」,2026-07-11 真机实锤)。
+        self.publish(VoiceEvent::WakeRunning { running: true, keywords: self.wake_keywords() });
         tracing::info!("免手唤醒已启动");
         Ok(())
     }
@@ -985,6 +997,8 @@ impl VoiceRuntime {
     pub fn wake_stop(&self) {
         self.wake_cmd(wake::WakeCmd::Stop);
         self.wake_cleanup(); // sender 一并丢弃,线程见 Disconnected 也会退
+        // stop 是用户意图点,同步广播「停了」;loop 稍后退出时 slot 已空、认领失败不重发
+        self.publish(VoiceEvent::WakeRunning { running: false, keywords: Vec::new() });
     }
 
     /// 换音色/语速/在线离线档后:若唤醒在跑,后台按新设置重建应答音银行并**热替换**——
@@ -1022,6 +1036,21 @@ impl VoiceRuntime {
 
     pub(super) fn wake_cleanup(&self) {
         *self.inner.wake.lock().expect("wake lock") = None;
+    }
+
+    /// loop 退出路的认领式清理:只有 slot 还是**自己那一代**才清(off→on 重启时旧线程
+    /// 退出可能晚于新 start 置位——朴素置 None 会把新 loop 的句柄误清、连带 drop sender
+    /// 让新 loop 也退)。返回「清的是不是自己」= 要不要广播 running:false
+    /// (被 wake_stop 清过 = stop 已广播;被新一代顶替 = 唤醒还活着,都不该再发 false)。
+    pub(super) fn wake_cleanup_gen(&self, gen: u64) -> bool {
+        let mut slot = self.inner.wake.lock().expect("wake lock");
+        match slot.as_ref() {
+            Some(h) if h.gen == gen => {
+                *slot = None;
+                true
+            }
+            _ => false,
+        }
     }
 
     fn user_setting(&self, key: &str, default: &str) -> String {

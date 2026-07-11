@@ -423,6 +423,10 @@ export type VoiceEvent =
   | { type: 'wake_candidate' }
   // 确认层拒绝(转写无唤醒词 = KWS 幻听):恢复 duck、视觉回 idle,零打扰
   | { type: 'wake_rejected' }
+  // 唤醒常驻的权威开关广播(core 起/停时发,boot 自动恢复也发):wakeArmed 与 mic bridge
+  // 靠它跟随——没有它,开机自启 core 起得比前端首查慢 → armed 定格 false → browser
+  // 采集源永不开麦 =「开着但聋」(2026-07-11 真机实锤)
+  | { type: 'wake_running'; data: { running: boolean; keywords: string[] } }
   // 呼名+续句(「天天暂停」/「看天天向上」):整句交模型仲裁(前端调 sendOverheard)
   | { type: 'overheard'; data: { text: string; speaker_id?: number } }
   // via: mic = 听写(屏幕排版) | wake = 语音会话(必念);speaker_id = 声纹认出的家人

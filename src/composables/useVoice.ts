@@ -176,6 +176,14 @@ function wire() {
         state.candidate = false
         maybeRestoreDuck()
         break
+      case 'wake_running':
+        // core 的权威开关广播(boot 自动恢复/停/意外退出都发):armed 与 mic bridge
+        // (browser 采集源的开麦条件)跟它走。治「开机后开关显示开、叫不答应」——
+        // 启动那次 voiceStatus 兜底查询常赶在 core wake_start(加载模型,秒级)完成前,
+        // armed 定格 false → 永不开麦;现在 core 起来那刻会推这条(2026-07-11 真机实锤)。
+        state.wakeArmed = v.data.running
+        if (v.data.keywords.length) state.wakeKeywords = v.data.keywords
+        break
       case 'overheard':
         // 呼名+续句 → 交模型仲裁;duck 保持,30s 兜底(仲裁挂了也别永远压着电影)
         state.candidate = false
