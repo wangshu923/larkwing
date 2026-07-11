@@ -945,7 +945,39 @@ pub fn remote_status(state: State<'_, AppState>) -> Result<Vec<RemoteChannelView
             sec("remote.dingtalk.app_key").is_some() && sec("remote.dingtalk.app_secret").is_some(),
             String::new(),
         ),
+        // 微信(腾讯 iLink bot):扫码拿 token → configured;白名单 = allowed_users
+        view(
+            "weixin",
+            "remote.weixin.enabled",
+            sec("remote.weixin.token").is_some(),
+            get("remote.weixin.allowed_users").unwrap_or_default(),
+        ),
     ])
+}
+
+/// 微信扫码登录起手:拿二维码(SVG + 备用链接 + 轮询 qrcode)。协议/QR 流程在 core channels::weixin。
+#[tauri::command]
+pub async fn weixin_login_start() -> Result<larkwing_core::channels::QrStart, AppError> {
+    larkwing_core::channels::weixin_qr_start().await.map_err(AppError::internal)
+}
+
+/// 微信扫码轮询一次:前端循环调,confirmed 时 core 已把 token/base_url/白名单落库。
+/// `base_url` = 前端持有的当前轮询地址(redirect 时更新回传);`verify_code` = 手机上的配对码。
+#[tauri::command]
+pub async fn weixin_login_poll(
+    state: State<'_, AppState>,
+    qrcode: String,
+    base_url: Option<String>,
+    verify_code: Option<String>,
+) -> Result<larkwing_core::channels::QrPoll, AppError> {
+    larkwing_core::channels::weixin_qr_poll(
+        &state.engine,
+        &qrcode,
+        base_url.as_deref(),
+        verify_code.as_deref(),
+    )
+    .await
+    .map_err(AppError::internal)
 }
 
 /// 保存远程渠道配置后调:停旧起新(类比 provider 保存即重建)。

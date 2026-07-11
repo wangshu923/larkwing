@@ -372,7 +372,8 @@ export default {
   // Self-drawn window controls on the main window (PLAN §12)
   win: {
     minimize: 'Minimize',
-    maximize: 'Fullscreen / exit fullscreen',
+    maximize: 'Maximize',
+    restore: 'Restore',
     close: 'Hide to tray',
   },
   // System tray menu (injected into the shell via set_tray_menu; §6 text lives in the frontend dict)
@@ -645,6 +646,26 @@ export default {
         appSecretPlaceholder: 'Robot AppSecret (Client Secret)',
         steps: 'On the DingTalk open platform, create a robot app with message mode = Stream, grab AppKey/AppSecret, paste them, and enable.',
         linkPre: 'Go to',
+      },
+      weixin: {
+        title: 'WeChat',
+        hint: 'Scan to connect {name} to your WeChat and chat there. Uses Tencent\'s official iLink bot channel — no public server needed.',
+        login: 'Connection',
+        scan: 'Scan to log in',
+        relogin: 'Scan again',
+        scanHint: 'Scan the QR code above with WeChat on your phone, then confirm on the phone.',
+        scaned: 'Scanned — please confirm on your phone…',
+        code: 'Pairing code',
+        codePlaceholder: 'The number shown on your phone',
+        expired: 'The QR code expired. Tap "Scan again" to retry.',
+        blocked: 'Verification failed too many times. Take a break and retry.',
+        allowed: 'Allowed users',
+        allowedPlaceholder: 'Filled with you after scanning; add a family member\'s user ID (comma-separated) to allow them too',
+        steps: 'Tap "Scan to log in", scan with WeChat and confirm; once connected you\'re on the list — just message in WeChat.',
+        startFailed: 'Couldn\'t get a QR code. Check your network and retry.',
+        risk: 'Note: this uses Tencent\'s official bot channel, but connecting a personal WeChat to automation still carries some platform risk — use at your own discretion.',
+        linkPre: 'Can\'t scan?',
+        linkText: 'Open link',
       },
     },
     system: {

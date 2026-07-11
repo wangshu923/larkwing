@@ -168,6 +168,11 @@ body {
   cursor: default;
 }
 
+/* macOS 主窗用原生标准窗(`decorations:true` 红绿灯)需 `transparent:false`,否则透明窗红绿灯
+   全屏往返后变黑圆(§8.1)。body 默认 transparent(靠窗口透)→ Mac 补不透明底色,免入场缩放 / 首帧
+   露白。仅主窗:float 悬浮窗仍透明、不带 .is-macos。标准窗顶部有独立原生标题栏,不需 rail 避让。 */
+html.is-macos body { background: var(--bg); }
+
 /* 只有真正要输入/编辑的地方可选 */
 input, textarea, [contenteditable="true"] {
   user-select: text;

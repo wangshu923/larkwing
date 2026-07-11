@@ -178,9 +178,11 @@ let stopResize = () => {}
 watch(video, (el) => registerVideoEl(el))
 onMounted(() => {
   window.addEventListener('keydown', onKey)
-  // 与真实窗口态校准:WindowControls 的 F11 / OS 拒绝都会触发 resize,纠回 state.fullscreen
-  //(TasksOverlay 缩 mini、本浮层 .maximized 都依赖它)。
+  // 与真实窗口态校准:只在有视频(show)时纠 state.fullscreen。没视频时若也跟随窗口全屏,会把
+  // 「手动最大化 / 窗口全屏」误写进这个"影院全屏"状态,让 WindowControls 误藏三键 → 卡死出不来
+  // (2026-07-11 根因:两组件对 media.fullscreen 的语义漂移)。没视频时它恒为 false,三键正常显示。
   stopResize = win.onResized(async () => {
+    if (!show.value) return
     state.fullscreen = await win.isFullscreen()
   })
 })

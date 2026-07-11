@@ -44,14 +44,19 @@ impl OpenAiCompatProvider {
                                     json!({ "type": "text", "text": text })
                                 }
                                 // 非视觉模型收到 image_url 直接 400(DeepSeek 真机实锤
-                                // `unknown variant image_url`)→ 降级成占位文本:回合不炸,
-                                // 模型如实说看不了(能力表在 catalog = 数据;未知模型按不支持)。
+                                // `unknown variant image_url`)→ 降级成占位文本:回合不炸。
+                                // ⚠️ 不能只说「看不了」——那会让模型放弃这张图去要文件路径(真机弯路)。
+                                // 关键洞察:认二维码/转 PDF 这类**与视觉无关**(有眼睛也读不出码里的 URL,
+                                // 得算法解码),永远走工具;故占位要引导「用工具处理刚发来的图」,别猜画面。
                                 super::ContentPart::ImageUrl { url } => {
                                     if super::catalog::supports_vision(&self.cfg.model) {
                                         json!({ "type": "image_url", "image_url": { "url": url } })
                                     } else {
                                         json!({ "type": "text", "text":
-                                            "〔用户发来一张图片,但当前模型不支持看图;如实告知看不了即可,绝不要猜图片内容〕" })
+                                            "〔用户发来一张图片。你看不到画面内容,绝不要猜、不要编。但你有工具能直接处理\
+                                             用户刚发来的这张图——认里面的二维码/条码、把图/PDF 转格式、读文档文字等:\
+                                             只要用户意图对得上,直接调对应工具处理「最近发的图」即可,不用让用户再报文件路径。\
+                                             若用户只是要你描述画面本身,才如实说看不了。〕" })
                                     }
                                 }
                             });
@@ -521,7 +526,8 @@ mod tests {
         let c2 = &wire2["messages"][1]["content"];
         assert!(c2.is_array());
         assert_eq!(c2[1]["type"], "text", "非视觉模型图片必须降级成 text 块");
-        assert!(c2[1]["text"].as_str().unwrap().contains("不支持看图"));
+        let ph = c2[1]["text"].as_str().unwrap();
+        assert!(ph.contains("看不到画面") && ph.contains("工具"), "占位要引导用工具处理图,不是放弃图");
         // 纯文本仍是字符串(吃前缀缓存)
         let plain =
             p.to_wire(&ChatRequest { messages: vec![ChatMessage::user("嗨")], ..Default::default() });

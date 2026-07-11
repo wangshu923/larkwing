@@ -37,6 +37,10 @@ const SETTLE_AFTER_LOAD: Duration = Duration::from_millis(1500);
 const SNAPSHOT_WAIT: Duration = Duration::from_secs(6);
 /// 等一次页面 load 完成的上限(导航/返回后)。
 const LOAD_WAIT: Duration = Duration::from_secs(15);
+/// 点击引发导航后的静默期:到点还没触发 page-load-finished,就认定这不是要 load 的 HTML
+/// (Mac WKWebView 把指向 PDF/附件的链接**内联打开**,导航发生但永不 load;SPA 前端路由
+/// 同样不 load)——别干等到 deadline,把这个跳转地址当 post_click_url 交模型接 web_download。
+const NAV_SETTLE: Duration = Duration::from_secs(4);
 
 /// 一个活着的会话窗(引用计数共享给窗口回调闭包)。
 struct SessionEntry {
@@ -181,6 +185,7 @@ async fn browse_step_inner(
     drain_downloads(&entry).await; // 上一步残留的下载信号别混进本步
     let mut download = None;
     let mut post_click_url = None;
+    let mut skip_snapshot = false;
     let did_click = req.click_ref.is_some() || req.click_text.is_some();
     if req.back {
         task.step("step.render_back", serde_json::Value::Null);
@@ -199,20 +204,38 @@ async fn browse_step_inner(
         let js = build_click_script(req.click_ref, req.click_text.as_deref());
         entry.win.eval(js.as_str()).context("点击指令没发出去")?;
         // 等下载/跳转起头(宽限);下载起头等到预算,跳转加载完即收手(普通链接点击别干等)
-        let (dl, navigated) = wait_click_outcome(&entry, click_moment, seq0, deadline).await;
+        let (dl, navigated, loaded) = wait_click_outcome(&entry, click_moment, seq0, deadline).await;
         download = dl;
-        if navigated {
-            // 点出了跳转:确保新页加载完再快照(快照的就是新页,编号重编)
-            wait_for_load(&entry, seq0, deadline).await;
-            if download.is_none() {
-                post_click_url = last_nav_after(&entry.navs, click_moment);
-            }
+        if navigated && download.is_none() {
+            post_click_url = last_nav_after(&entry.navs, click_moment);
+            // 文件内联(PDF/附件:导航了但永不触发 page-load)→ 当前窗已不是可注入脚本的
+            // HTML,快照必空、白等 12s。直接把地址交模型接 web_download,跳过快照。
+            skip_snapshot = !loaded;
+        }
+        // HTML 新页已 load → 给个水合静默期再快照(照刷新后的内容)
+        if navigated && loaded {
+            tokio::time::sleep(
+                SETTLE_AFTER_LOAD.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+            )
+            .await;
         }
     }
 
-    // ---- 4. 编号快照(每步都照一张;失败重注入一次)----
-    task.step("step.render_snap", serde_json::Value::Null);
-    let mut page = take_snapshot(&media, &entry, deadline).await;
+    // ---- 4. 编号快照(每步都照一张;文件内联跳过——注入脚本在 PDF 查看器里跑不了)----
+    let mut page = if skip_snapshot {
+        None
+    } else {
+        task.step("step.render_snap", serde_json::Value::Null);
+        take_snapshot(&media, &entry, deadline).await
+    };
+    tracing::info!(
+        navigated = post_click_url.is_some(),
+        has_download = download.is_some(),
+        has_page = page.is_some(),
+        skip_snapshot,
+        post_click = post_click_url.as_deref().unwrap_or(""),
+        "webrender 步完成"
+    );
     // 点击引发跳转会把页面世界里的 __lwClick 冲掉 → 以「点击后出现导航」补判 clicked
     if did_click && post_click_url.is_some() {
         if let Some(p) = page.as_mut() {
@@ -403,46 +426,53 @@ async fn drain_downloads(entry: &Arc<SessionEntry>) {
 /// - 跳转发生且**新页已加载完**、没有下载起头 → 立即收手(普通链接点击,别干等);
 /// - 跳转在途(nav 到了、load 没完)→ 继续等(重定向链的尽头可能就是附件);
 /// - 宽限内毫无动静 → 收手。
-/// 返回 (下载产物, 点击后是否发生了跳转)。
+/// 返回 (下载产物, 点击后是否导航, 新页是否已 load-finished)。loaded 用来区分「HTML 新页
+/// (要快照)」与「PDF/附件内联(注入脚本跑不了,跳过快照,把地址交 web_download)」——
+/// Mac WKWebView 点指向 PDF 的链接会内联打开、永不 load。
 async fn wait_click_outcome(
     entry: &Arc<SessionEntry>,
     click_moment: Instant,
     seq0: u64,
     deadline: tokio::time::Instant,
-) -> (Option<PathBuf>, bool) {
+) -> (Option<PathBuf>, bool, bool) {
     let grace = tokio::time::Instant::now() + CLICK_DOWNLOAD_GRACE;
+    let mut nav_since: Option<tokio::time::Instant> = None; // 首次检测到导航的时刻(判静默期)
     let mut rx = entry.dl_done.lock().await;
     loop {
         let tick = tokio::time::Instant::now() + Duration::from_millis(400);
+        let loaded = entry.load_seq.load(Ordering::Relaxed) > seq0;
         match tokio::time::timeout_at(tick.min(deadline), rx.recv()).await {
             Ok(Some(true)) => {
                 let path = entry.dl_final.lock().expect("webrender dl slot").clone();
-                return (path, last_nav_after(&entry.navs, click_moment).is_some());
+                return (path, last_nav_after(&entry.navs, click_moment).is_some(), loaded);
             }
             Ok(Some(false)) => {
                 // 下载失败:清掉半截文件,如实两手空空
                 if let Some(p) = entry.dl_final.lock().expect("webrender dl slot").take() {
                     let _ = std::fs::remove_file(p);
                 }
-                return (None, last_nav_after(&entry.navs, click_moment).is_some());
+                return (None, last_nav_after(&entry.navs, click_moment).is_some(), loaded);
             }
-            Ok(None) => return (None, false), // 窗没了
+            Ok(None) => return (None, false, false), // 窗没了
             Err(_) => {
                 let started = entry.dl_final.lock().expect("webrender dl slot").is_some();
                 let navigated = last_nav_after(&entry.navs, click_moment).is_some();
-                let loaded = entry.load_seq.load(Ordering::Relaxed) > seq0;
                 let now = tokio::time::Instant::now();
                 if now >= deadline {
-                    return (None, navigated);
+                    return (None, navigated, loaded);
                 }
                 if started {
-                    continue; // 下载在途:等到预算
+                    continue; // 下载在途:等到预算(大文件慢慢下)
                 }
-                if navigated && loaded {
-                    return (None, true); // 新页已就位、没下载:这就是结果
-                }
-                if !navigated && now >= grace {
-                    return (None, false); // 毫无动静
+                if navigated {
+                    let since = *nav_since.get_or_insert(now);
+                    // HTML 整页导航 load 完 → 就位;或导航后静默期到(PDF/附件内联打开永不 load)
+                    // → 别干等,把跳转地址交 post_click_url(caller 接 web_download)。
+                    if loaded || since.elapsed() >= NAV_SETTLE {
+                        return (None, true, loaded);
+                    }
+                } else if now >= grace {
+                    return (None, false, loaded); // 毫无动静(纯展开菜单/无效点击)
                 }
             }
         }

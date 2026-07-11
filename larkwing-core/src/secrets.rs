@@ -21,6 +21,7 @@ pub const SECRET_KEYS: &[&str] = &[
     "remote.telegram.token",
     "remote.dingtalk.app_key",
     "remote.dingtalk.app_secret",
+    "remote.weixin.token",
 ];
 
 pub fn is_secret(key: &str) -> bool {

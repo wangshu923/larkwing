@@ -16,6 +16,27 @@ mod dingtalk;
 pub(crate) mod outbound;
 mod render;
 mod telegram;
+mod weixin;
+
+/// 微信扫码登录(命令层用):起手拿二维码 + 轮询状态。QR 流程与协议在 `weixin` 模块内,
+/// 这里给 pub 薄包装暴露给壳层(mod weixin 保持私有);storage 归 core(§6.6)。
+pub use weixin::{QrPoll, QrStart};
+
+/// 起手:POST 拿二维码,渲染 SVG 给设置 UI。
+pub async fn weixin_qr_start() -> anyhow::Result<QrStart> {
+    weixin::qr_start().await
+}
+
+/// 轮询扫码状态;confirmed 时 token/base_url/白名单落库。`base_url` = 前端持有的当前轮询地址
+/// (IDC 重定向后回传;空 = 默认入口)。
+pub async fn weixin_qr_poll(
+    engine: &Engine,
+    qrcode: &str,
+    base_url: Option<&str>,
+    verify_code: Option<&str>,
+) -> anyhow::Result<QrPoll> {
+    weixin::qr_poll_and_store(engine, qrcode, base_url, verify_code).await
+}
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -97,6 +118,10 @@ pub async fn run(
     if enabled("remote.dingtalk.enabled") {
         let (ctx, ct) = (ctx.clone(), ct.clone());
         tasks.push(tokio::spawn(async move { dingtalk::run(ctx, ct).await }));
+    }
+    if enabled("remote.weixin.enabled") {
+        let (ctx, ct) = (ctx.clone(), ct.clone());
+        tasks.push(tokio::spawn(async move { weixin::run(ctx, ct).await }));
     }
 
     if tasks.is_empty() {
@@ -198,6 +223,16 @@ async fn push_reminder(
             let app_secret =
                 ctx.secret("remote.dingtalk.app_secret").context("没配钉钉 app_secret")?;
             dingtalk::push(net, &app_key, &app_secret, staff, &text).await
+        }
+        "weixin" => {
+            // 微信主动推送要回显上次的 context_token(存在 push_id 列);没有就推不了(如实跳过)
+            let Some(ctx_token) = thread.push_id.as_deref() else {
+                tracing::info!(conv = conv_id, "微信对话无 context_token,提醒只留桌面");
+                return Ok(());
+            };
+            let token = ctx.secret("remote.weixin.token").context("没配微信 token")?;
+            let base = weixin::base_url_of(ctx);
+            weixin::push(net, &base, &token, &thread.ext_id, ctx_token, &text).await
         }
         other => {
             tracing::warn!(channel = other, "未知渠道,提醒不推");

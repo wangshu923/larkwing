@@ -17,11 +17,14 @@ use crate::store::Store;
 /// 每渠道体积上限(超限如实退回,绝不静默截断/压缩)。
 const TG_FILE_MAX: u64 = 50 * 1024 * 1024;
 const DT_FILE_MAX: u64 = 20 * 1024 * 1024;
+const WX_FILE_MAX: u64 = 50 * 1024 * 1024;
 
 /// 解析好的发送目标(凭证 + 收件地址),一次解析、逐文件复用。
 pub(crate) enum Target {
     Telegram { token: String, chat_id: String },
     Dingtalk { app_key: String, app_secret: String, staff_id: String },
+    /// 微信 iLink bot:发媒体要回显上次 context_token(存 push_id),到 to_user_id(= ext_id)。
+    Weixin { token: String, base_url: String, to_user_id: String, context_token: String },
 }
 
 /// Debug 只露渠道名 —— 变体里揣着 token/secret,绝不随 unwrap/日志外泄。
@@ -37,6 +40,7 @@ impl Target {
         match self {
             Target::Telegram { .. } => "Telegram",
             Target::Dingtalk { .. } => "钉钉",
+            Target::Weixin { .. } => "微信",
         }
     }
 
@@ -44,6 +48,27 @@ impl Target {
         match self {
             Target::Telegram { .. } => TG_FILE_MAX,
             Target::Dingtalk { .. } => DT_FILE_MAX,
+            Target::Weixin { .. } => WX_FILE_MAX,
+        }
+    }
+}
+
+/// 按名字找家人(跨人投递的收件人解析:send_file 的 to / reminder_set 的 for 共用)。
+/// 名字 = 家人页里的称呼(用户数据,非 i18n);找不到 / 重名都给明白话(§3.5),
+/// 错误里带现有名单,让模型自己纠正或如实转告「先去设置·家人里加」。
+pub(crate) fn find_member(store: &Store, name: &str) -> Result<crate::store::User> {
+    let name = name.trim();
+    anyhow::ensure!(!name.is_empty(), "家人名字是空的");
+    let users = store.users.list().unwrap_or_default();
+    let mut hits: Vec<&crate::store::User> = users.iter().filter(|u| u.name == name).collect();
+    if hits.len() > 1 {
+        bail!("有 {} 个家人都叫「{name}」,分不清是谁——先在设置·家人里改成不重名", hits.len());
+    }
+    match hits.pop() {
+        Some(u) => Ok(u.clone()),
+        None => {
+            let known = users.iter().map(|u| u.name.as_str()).collect::<Vec<_>>().join("、");
+            bail!("家里没有叫「{name}」的人(现在有:{known})——名字要跟设置·家人里的一致")
         }
     }
 }
@@ -51,12 +76,24 @@ impl Target {
 /// 「这个人的手机」在哪:绑定线程 + 已配凭证 → 发送目标。找不到给明白话(模型如实转告,
 /// §3.5 不含糊)。钉钉群聊线程(无 push_id)发不了,跳过继续找别的。
 pub(crate) fn resolve_target(store: &Store, user_id: i64) -> Result<Target> {
+    resolve_phone(store, user_id).map(|(_, t)| t)
+}
+
+/// 同 `resolve_target`,但连命中的映射线程一起给(跨人提醒要线程的 conv_id:
+/// 到点回合落在 TA 的手机对话里,推送链才接得上)。
+pub(crate) fn resolve_phone(
+    store: &Store,
+    user_id: i64,
+) -> Result<(crate::store::ChannelThread, Target)> {
     let owner_id = store.users.ensure_default_user().map(|u| u.id).unwrap_or(1);
     let threads = store.channels.list().unwrap_or_default();
     let secret = |key: &str| {
         crate::secrets::get(&store.settings, key)
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
+    };
+    let setting = |key: &str| {
+        store.settings.get(None, key).ok().flatten().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
     };
     let mut saw_mine = false;
     // 新绑定优先(id 大 = 后建 = 更可能是现在在用的那台手机)
@@ -69,7 +106,8 @@ pub(crate) fn resolve_target(store: &Store, user_id: i64) -> Result<Target> {
         match t.channel.as_str() {
             "telegram" => {
                 if let Some(token) = secret("remote.telegram.token") {
-                    return Ok(Target::Telegram { token, chat_id: t.ext_id });
+                    let chat_id = t.ext_id.clone();
+                    return Ok((t, Target::Telegram { token, chat_id }));
                 }
             }
             "dingtalk" => {
@@ -77,7 +115,17 @@ pub(crate) fn resolve_target(store: &Store, user_id: i64) -> Result<Target> {
                 if let (Some(app_key), Some(app_secret)) =
                     (secret("remote.dingtalk.app_key"), secret("remote.dingtalk.app_secret"))
                 {
-                    return Ok(Target::Dingtalk { app_key, app_secret, staff_id });
+                    return Ok((t, Target::Dingtalk { app_key, app_secret, staff_id }));
+                }
+            }
+            "weixin" => {
+                // 发媒体要回显 context_token(存 push_id);没有 = 用户登录后还没说过话,推不了
+                let Some(context_token) = t.push_id.clone() else { continue };
+                if let Some(token) = secret("remote.weixin.token") {
+                    let base_url = setting("remote.weixin.base_url")
+                        .unwrap_or_else(|| super::weixin::DEFAULT_BASE_URL.to_string());
+                    let to_user_id = t.ext_id.clone();
+                    return Ok((t, Target::Weixin { token, base_url, to_user_id, context_token }));
                 }
             }
             _ => continue,
@@ -89,7 +137,9 @@ pub(crate) fn resolve_target(store: &Store, user_id: i64) -> Result<Target> {
     bail!("这个人还没连上手机(没有绑定的 Telegram/钉钉对话)——先在手机上跟我说句话")
 }
 
-/// 发一个文件。体积按渠道上限先检;caption 只 TG 支持(钉钉忽略)。
+/// 发一个文件。体积按渠道上限先检;caption:TG 随文件带,钉钉文件消息不支持附言 →
+/// 文件送达后补推一条文字(跨人捎带说明才有着落);补推失败只 warn 不翻整单
+/// (文件确实到了,翻错会让模型误以为要重发文件)。
 pub(crate) async fn send_file(
     net: &net::Client,
     target: &Target,
@@ -116,7 +166,18 @@ pub(crate) async fn send_file(
             tg_send_document(net, super::telegram::API, token, chat_id, &name, bytes, caption).await
         }
         Target::Dingtalk { app_key, app_secret, staff_id } => {
-            dt_send_file(net, app_key, app_secret, staff_id, &name, bytes).await
+            dt_send_file(net, app_key, app_secret, staff_id, &name, bytes).await?;
+            if let Some(cap) = caption.filter(|s| !s.is_empty()) {
+                if let Err(e) = super::dingtalk::push(net, app_key, app_secret, staff_id, cap).await
+                {
+                    tracing::warn!(err = %format!("{e:#}"), "钉钉文件已送达,附言补推失败");
+                }
+            }
+            Ok(())
+        }
+        Target::Weixin { token, base_url, to_user_id, context_token } => {
+            // 微信上传 CDN(AES 加密)+ 发媒体项;caption 作单独文本项先发(都在 weixin::send_file 内)
+            super::weixin::send_file(net, base_url, token, to_user_id, context_token, path, caption).await
         }
     }
 }
@@ -262,6 +323,32 @@ mod tests {
         // 指认走了之后,主人自己反而没有线程了(NULL 的没了)→ 明白话
         let err = resolve_target(&s, owner.id).unwrap_err();
         assert!(err.to_string().contains("还没连上手机"), "{err:#}");
+    }
+
+    #[test]
+    fn find_member_by_name_honest_on_missing_and_dup() {
+        let s = store("member");
+        s.users.ensure_default_user().unwrap();
+        let mom = s.users.create("妈妈").unwrap();
+
+        assert_eq!(find_member(&s, " 妈妈 ").unwrap().id, mom.id, "名字去空白匹配");
+
+        let err = find_member(&s, "二舅").unwrap_err().to_string();
+        assert!(err.contains("没有叫") && err.contains("妈妈"), "给现有名单让模型纠正: {err}");
+
+        s.users.create("妈妈").unwrap(); // 重名
+        let err = find_member(&s, "妈妈").unwrap_err().to_string();
+        assert!(err.contains("分不清"), "{err}");
+
+        // resolve_phone 带回线程(跨人提醒要 conv_id)
+        let conv = s.chat.create_conversation_full(mom.id, "companion", "telegram").unwrap();
+        s.channels.bind("telegram", "777", conv.id).unwrap();
+        let t = s.channels.thread_for("telegram", "777").unwrap().unwrap();
+        s.channels.bind_user(t.id, Some(mom.id)).unwrap();
+        crate::secrets::set(&s.settings, "remote.telegram.token", "tok").unwrap();
+        let (thread, target) = resolve_phone(&s, mom.id).unwrap();
+        assert_eq!(thread.conv_id, conv.id);
+        assert!(matches!(target, Target::Telegram { .. }));
     }
 
     #[test]

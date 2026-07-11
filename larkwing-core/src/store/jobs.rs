@@ -30,6 +30,10 @@ pub const MIGRATIONS: &[Migration] = &[
         "ALTER TABLE jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'time';
          ALTER TABLE jobs ADD COLUMN condition TEXT;",
     ),
+    // 跨人提醒/捎话(人际路由):created_by = 发起人(NULL = 自己设的,老数据零变化)。
+    // 给家人设的提醒 user_id = 收件的家人(到点归 TA、TA 也看得见撤得掉),发起人凭本列
+    // 在 reminder_list / cancel 里同样看得见、撤得掉(「我给爸爸设的,我要能反悔」)。
+    m("0022_jobs_created_by", "ALTER TABLE jobs ADD COLUMN created_by INTEGER;"),
 ];
 
 /// status 词表:pending(待触发)/ done(一次性完成)/ cancelled / missed(错过太久不补发)。
@@ -48,6 +52,8 @@ pub struct Job {
     pub kind: String,
     /// cond 型的谓词 JSON(scheduler::watch 解析);time 型为 None。
     pub condition: Option<String>,
+    /// 发起人(跨人提醒:给家人设的,user_id = 收件家人、这里记谁设的;None = 自己设的)。
+    pub created_by: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -70,12 +76,25 @@ impl JobRepo {
         due_at: i64,
         repeat: &str,
     ) -> Result<Job> {
+        self.add_for(user_id, None, conv_id, content, due_at, repeat)
+    }
+
+    /// 带发起人的写入(跨人提醒:user_id = 收件家人,created_by = 谁设的;自己设的走 `add`)。
+    pub fn add_for(
+        &self,
+        user_id: i64,
+        created_by: Option<i64>,
+        conv_id: i64,
+        content: &str,
+        due_at: i64,
+        repeat: &str,
+    ) -> Result<Job> {
         self.db.with(|c| {
             let now = now_ms();
             c.execute(
-                "INSERT INTO jobs (user_id, conv_id, content, due_at, repeat, status, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?6)",
-                rusqlite::params![user_id, conv_id, content, due_at, repeat, now],
+                "INSERT INTO jobs (user_id, conv_id, content, due_at, repeat, status, created_by, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?7)",
+                rusqlite::params![user_id, conv_id, content, due_at, repeat, created_by, now],
             )?;
             let id = c.last_insert_rowid();
             Ok(Job {
@@ -88,6 +107,7 @@ impl JobRepo {
                 status: "pending".into(),
                 kind: "time".into(),
                 condition: None,
+                created_by,
                 created_at: now,
                 updated_at: now,
             })
@@ -122,18 +142,34 @@ impl JobRepo {
                 status: "pending".into(),
                 kind: "cond".into(),
                 condition: Some(condition.into()),
+                created_by: None,
                 created_at: now,
                 updated_at: now,
             })
         })
     }
 
-    /// 该用户的待触发清单(reminder_list / 将来 UI 用),按 due_at 升序。
+    /// 该用户的待触发清单(悬浮窗「下个提醒」等自己视角的用途),按 due_at 升序。
     pub fn list_pending(&self, user_id: i64) -> Result<Vec<Job>> {
         self.db.with(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, user_id, conv_id, content, due_at, repeat, status, created_at, updated_at, kind, condition
+                "SELECT id, user_id, conv_id, content, due_at, repeat, status, created_at, updated_at, kind, condition, created_by
                  FROM jobs WHERE user_id = ?1 AND status = 'pending' ORDER BY due_at",
+            )?;
+            let rows = stmt
+                .query_map([user_id], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// 该用户**看得见**的待触发清单(reminder_list 用):自己的 + 自己给家人设的
+    /// (created_by = TA;跨人提醒发起人得看得见自己设了什么、才反悔得了)。
+    pub fn list_visible(&self, user_id: i64) -> Result<Vec<Job>> {
+        self.db.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, user_id, conv_id, content, due_at, repeat, status, created_at, updated_at, kind, condition, created_by
+                 FROM jobs WHERE (user_id = ?1 OR created_by = ?1) AND status = 'pending' ORDER BY due_at",
             )?;
             let rows = stmt
                 .query_map([user_id], map_row)?
@@ -146,7 +182,7 @@ impl JobRepo {
     pub fn due(&self, now: i64) -> Result<Vec<Job>> {
         self.db.with(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, user_id, conv_id, content, due_at, repeat, status, created_at, updated_at, kind, condition
+                "SELECT id, user_id, conv_id, content, due_at, repeat, status, created_at, updated_at, kind, condition, created_by
                  FROM jobs WHERE status = 'pending' AND due_at <= ?1 ORDER BY due_at",
             )?;
             let rows = stmt
@@ -156,7 +192,8 @@ impl JobRepo {
         })
     }
 
-    /// 取消(按 user 限定,防串号);返回是否真取消了。
+    /// 取消(按 user 限定,防串号);收件人与发起人都可撤(跨人提醒:给爸爸设的,
+    /// 设的人和爸爸自己都能取消)。返回是否真取消了。
     pub fn cancel(&self, user_id: i64, id: i64) -> Result<bool> {
         self.set_status_scoped(user_id, id, "cancelled")
     }
@@ -166,7 +203,7 @@ impl JobRepo {
     pub fn list_pending_all(&self) -> Result<Vec<Job>> {
         self.db.with(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, user_id, conv_id, content, due_at, repeat, status, created_at, updated_at, kind, condition
+                "SELECT id, user_id, conv_id, content, due_at, repeat, status, created_at, updated_at, kind, condition, created_by
                  FROM jobs WHERE status = 'pending' ORDER BY due_at",
             )?;
             let jobs = stmt.query_map([], map_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -211,7 +248,7 @@ impl JobRepo {
         self.db.with(|c| {
             let n = c.execute(
                 "UPDATE jobs SET status = ?3, updated_at = ?4
-                 WHERE id = ?1 AND user_id = ?2 AND status = 'pending'",
+                 WHERE id = ?1 AND (user_id = ?2 OR created_by = ?2) AND status = 'pending'",
                 rusqlite::params![id, user_id, status, now_ms()],
             )?;
             Ok(n > 0)
@@ -232,6 +269,7 @@ fn map_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         updated_at: r.get(8)?,
         kind: r.get(9)?,
         condition: r.get(10)?,
+        created_by: r.get(11)?,
     })
 }
 
@@ -261,6 +299,29 @@ mod tests {
         assert!(s.jobs.cancel(u.id, b.id).unwrap());
         assert!(!s.jobs.cancel(u.id, b.id).unwrap(), "重复取消 = false");
         assert_eq!(s.jobs.list_pending(u.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cross_person_visibility_and_cancel() {
+        let s = store("cross");
+        let owner = s.users.ensure_default_user().unwrap();
+        let dad = s.users.create("爸爸").unwrap();
+        // 主人给爸爸设的:收件人 = 爸爸,发起人 = 主人
+        let j = s.jobs.add_for(dad.id, Some(owner.id), 7, "吃降压药", 9000, "once").unwrap();
+        assert_eq!(j.created_by, Some(owner.id));
+
+        // 爸爸自己视角(list_pending)与双方可见视角(list_visible)都看得到
+        assert_eq!(s.jobs.list_pending(dad.id).unwrap().len(), 1);
+        assert!(s.jobs.list_pending(owner.id).unwrap().is_empty(), "悬浮窗视角只看自己收件的");
+        assert_eq!(s.jobs.list_visible(owner.id).unwrap().len(), 1, "发起人看得见自己设的");
+        assert_eq!(s.jobs.list_visible(dad.id).unwrap().len(), 1);
+
+        // 无关第三人撤不了;发起人能撤(反悔);收件人也能撤(另设一条验)
+        let kid = s.users.create("小朋友").unwrap();
+        assert!(!s.jobs.cancel(kid.id, j.id).unwrap(), "无关的人撤不了");
+        assert!(s.jobs.cancel(owner.id, j.id).unwrap(), "发起人可撤");
+        let j2 = s.jobs.add_for(dad.id, Some(owner.id), 7, "复查", 9000, "once").unwrap();
+        assert!(s.jobs.cancel(dad.id, j2.id).unwrap(), "收件人可撤");
     }
 
     #[test]

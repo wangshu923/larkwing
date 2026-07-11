@@ -1,7 +1,8 @@
-//! 能力轴:本机文件 → 说话人的手机(渠道出站文件,机器件在 channels/outbound)。
+//! 能力轴:本机文件 → 家里人的手机(渠道出站文件,机器件在 channels/outbound)。
 //! 正交原语:只管「送过去」——找文件归 fs_find、转格式归 pdf_to_png,模型自己组合
-//! (§7.8 组合链的最后一棒:PDF→PNG→发手机)。目标恒为**说话人**(ToolCtx.user_id =
-//! 渠道归人后的 mem_user):桌面喊「发我手机」= 主人,家人在手机上让它取文件 = TA 自己。
+//! (§7.8 组合链的最后一棒:PDF→PNG→发手机)。目标缺省 = **说话人**(ToolCtx.user_id =
+//! 渠道归人后的 mem_user):桌面喊「发我手机」= 主人,家人在手机上让它取文件 = TA 自己;
+//! `to` 填家人名字 = 发给那位家人(人际路由,2026-07-11 用户拍板放开跨人)。
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -25,10 +26,11 @@ impl SendFile {
         SendFile {
             spec: ToolSpec {
                 name: "send_file",
-                description: "把本机的文件/图片发到说这句话的人的手机上(走已连接的 \
-                              Telegram/钉钉)。用在「发我手机」「传给我」这类请求;发之前文件\
-                              得已经在本机(要下载先 web_download,要转图先 pdf_to_png)。\
-                              没连手机会明说。",
+                description: "把本机的文件/图片发到家里人的手机上(走已连接的 \
+                              Telegram/钉钉)。不填 to = 发给说这句话的人(「发我手机」\
+                              「传给我」);「把XX发给妈妈」这类就把 to 填成那位家人的名字。\
+                              发之前文件得已经在本机(要下载先 web_download,要转图先 \
+                              pdf_to_png)。对方没连手机会明说。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -40,6 +42,10 @@ impl SendFile {
                         "note": {
                             "type": "string",
                             "description": "随文件带一句说明(可选,随第一个文件发)"
+                        },
+                        "to": {
+                            "type": "string",
+                            "description": "发给哪位家人(名字要跟家人页一致);不填 = 说这句话的人自己"
                         }
                     },
                     "required": ["paths"]
@@ -89,8 +95,17 @@ impl Tool for SendFile {
             .map(str::trim)
             .filter(|s| !s.is_empty());
 
-        // 目标 = 说话人的手机(一次解析,逐文件复用);找不到的明白话直接当观察退回
-        let target = outbound::resolve_target(&ctx.store, ctx.user_id)?;
+        // 目标 = 说话人的手机;to 填了 = 那位家人的手机(一次解析,逐文件复用);
+        // 查无此人 / 没连手机的明白话直接当观察退回
+        let recipient = args
+            .get("to")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|name| outbound::find_member(&ctx.store, name))
+            .transpose()?;
+        let target_user = recipient.as_ref().map_or(ctx.user_id, |u| u.id);
+        let target = outbound::resolve_target(&ctx.store, target_user)?;
 
         let mut sent: Vec<String> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
@@ -112,7 +127,13 @@ impl Tool for SendFile {
             target.channel_name(),
             failed.join(";")
         );
-        let mut out = format!("已经 {} 发到手机 {} 个:{}", target.channel_name(), sent.len(), sent.join("、"));
+        let whose = recipient.as_ref().map(|u| format!("{}的", u.name)).unwrap_or_default();
+        let mut out = format!(
+            "已经 {} 发到{whose}手机 {} 个:{}",
+            target.channel_name(),
+            sent.len(),
+            sent.join("、")
+        );
         if !failed.is_empty() {
             out.push_str(&format!("\n没发出去 {} 个:{}", failed.len(), failed.join(";")));
         }
@@ -156,6 +177,25 @@ mod tests {
         // 没绑手机 → 明白话观察(§3.5)
         let err = tool
             .run(serde_json::json!({"paths": ["/tmp/nonexistent-x.png"]}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("还没连上手机"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn to_resolves_family_member_honestly() {
+        let ctx = ctx("to");
+        let tool = SendFile::new();
+        // 查无此人 → 带现有名单的明白话
+        let err = tool
+            .run(serde_json::json!({"paths": ["/tmp/a.png"], "to": "二舅"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("没有叫"), "{err:#}");
+        // 有这个人但没连手机 → 明白话
+        ctx.store.users.create("妈妈").unwrap();
+        let err = tool
+            .run(serde_json::json!({"paths": ["/tmp/a.png"], "to": "妈妈"}), &ctx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("还没连上手机"), "{err:#}");

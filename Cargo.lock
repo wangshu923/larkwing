@@ -3159,7 +3159,7 @@ dependencies = [
 
 [[package]]
 name = "larkwing"
-version = "0.2.13"
+version = "0.2.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3190,8 +3190,9 @@ dependencies = [
 
 [[package]]
 name = "larkwing-core"
-version = "0.2.13"
+version = "0.2.14"
 dependencies = [
+ "aes",
  "anyhow",
  "async-trait",
  "axum",
@@ -3208,8 +3209,10 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "glob",
+ "hex",
  "image",
  "keyring",
+ "md-5",
  "msedge-tts",
  "pdf-extract",
  "pdfium-render",

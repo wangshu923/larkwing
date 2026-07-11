@@ -1,38 +1,55 @@
 <script setup lang="ts">
-// 主窗自绘窗口控件(PLAN §12):无边框 → 右上角三键(最小化 / 全屏⇄退出 / 关闭=缩托盘)。
+// 主窗自绘窗口控件(PLAN §12;2026-07-11 分平台重做,见 AGENT §7.6):
+//   Windows/Linux → 右上角三键:最小化 / 最大化⇄还原 / 关闭=缩托盘(无边框补窗控)。
+//   macOS         → 本组件整个不渲染,改用原生红绿灯(标准窗 decorations:true,见 tauri.macos.conf.json);
+//                   绿灯 = 原生真全屏(进独立 Space),全屏 / 最小化 / 关闭全交 OS、退出口 OS 保证。
 // 拖动 / 双击由各页面顶栏(data-tauri-drag-region)承担,不用全局覆盖层——否则会盖住
 // 顶部的返回/展开等按钮的点击(二轮真机修复)。三键比初版更小、更靠角。
-import { onMounted, onUnmounted, ref } from 'vue'
+//
+// 「方块」= 最大化而非全屏:铺满工作区但三键永在、随时还原,结构上不困人;沉浸全屏只留给看视频
+// (VideoOverlay 影院模式)。⚠️ Windows 无边框窗最大化会盖任务栏(#7103),由 Rust `WM_GETMINMAXINFO`
+// hack 把最大化尺寸钉到工作区修(见 `winmax.rs` / §8.1)——前端照常调 toggleMaximize。
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { win } from '../lib/backend'
+import { isMacOS, win } from '../lib/backend'
 import { useMedia } from '../composables/useMedia'
 
 const { t } = useI18n()
-// 视频全屏时藏三键(影院视图;退出靠 Esc / 浮层 ✕⛶)。只看 media.fullscreen:
-// 手动整窗全屏(无视频)时 media.fullscreen 为 false,三键仍在,用户能点退出。
+// 藏三键的唯一场景 = 视频影院全屏(有浮层 ✕⛶ / Esc 退出);纯窗口最大化/全屏时三键永在,不困人。
+// 判据用 current.kind==='video' && fullscreen 双条件 —— 只认"真的在看视频且全屏",
+// 不再裸看 media.fullscreen(那个会被窗口全屏态污染,是老 bug 的根)。
 const { state: media } = useMedia()
-const fullscreen = ref(false)
+const cinema = computed(() => media.current?.kind === 'video' && media.fullscreen)
+const maximized = ref(false)
 let stop = () => {}
 
 async function sync() {
-  fullscreen.value = await win.isFullscreen()
+  maximized.value = await win.isMaximized()
 }
 onMounted(() => {
+  if (isMacOS) return // Mac 用原生红绿灯,本组件不参与(连 resize 订阅都不挂)
   void sync()
-  stop = win.onResized(sync) // 全屏切换会触发 resize
+  stop = win.onResized(sync) // 最大化 / 还原会触发 resize,同步图标
 })
 onUnmounted(() => stop())
 </script>
 
 <template>
-  <div class="wc" v-show="!media.fullscreen">
+  <div v-if="!isMacOS" class="wc" v-show="!cinema">
     <button class="wcb" :title="t('win.minimize')" @click="win.minimize()">
       <svg viewBox="0 0 12 12"><line x1="2.5" y1="6.5" x2="9.5" y2="6.5" /></svg>
     </button>
-    <button class="wcb" :title="t('win.maximize')" @click="win.toggleFullscreen()">
-      <!-- 已全屏:内收四角(退出);未全屏:外扩四角(进全屏) -->
-      <svg v-if="fullscreen" viewBox="0 0 12 12"><path d="M5 2v3H2M7 2v3h3M5 10V7H2M7 10V7h3" /></svg>
-      <svg v-else viewBox="0 0 12 12"><path d="M2 4.5V2h2.5M10 4.5V2H7.5M2 7.5V10h2.5M10 7.5V10H7.5" /></svg>
+    <button
+      class="wcb"
+      :title="maximized ? t('win.restore') : t('win.maximize')"
+      @click="win.toggleMaximize()"
+    >
+      <!-- 已最大化:双叠方块(还原);未最大化:单方块(最大化) -->
+      <svg v-if="maximized" viewBox="0 0 12 12">
+        <rect x="2.3" y="4" width="5.4" height="5.4" rx="0.6" />
+        <path d="M4.6 4V2.3H9.7V7.4H8" />
+      </svg>
+      <svg v-else viewBox="0 0 12 12"><rect x="2.6" y="2.6" width="6.8" height="6.8" rx="0.6" /></svg>
     </button>
     <button class="wcb close" :title="t('win.close')" @click="win.hideToTray()">
       <svg viewBox="0 0 12 12"><line x1="3" y1="3" x2="9" y2="9" /><line x1="9" y1="3" x2="3" y2="9" /></svg>

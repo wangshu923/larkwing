@@ -210,6 +210,16 @@ impl Tool for WebRender {
                 }
             }
             None if outcome.download.is_some() => {} // 有下载没页面快照:结果已经够用
+            // 快照空 + 点击后跳了页 = 多半点进了文件本身(PDF/附件),当前窗成了文件查看器、
+            // 注入脚本跑不了 → **绝不 bail 把这条线丢掉**:把去向交模型接 web_download。
+            None if outcome.post_click_url.is_some() => {
+                let u = outcome.post_click_url.as_deref().unwrap();
+                out.push_str(&format!(
+                    "点{}后页面跳到了 {u}——这多半就是文件本身(比如 PDF),用 web_download 下它;\
+                     下不动(要登录/一次性链接)就如实告诉用户。",
+                    wanted_click.as_deref().unwrap_or("")
+                ));
+            }
             None => anyhow::bail!(
                 "页面渲染超时没回内容(站点太慢或反爬拦截)——退回 web_fetch,或让用户手动下载后给我文件"
             ),

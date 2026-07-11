@@ -76,14 +76,17 @@ rxing = "0.8"
 flate2 = "1"
 # pdf_to_png(tools/pdf.rs):pdfium 动态绑定(库文件走组件用时下载,不编译期链接)
 pdfium-render = "0.9"
+# 微信渠道(channels/weixin.rs):扫码登录二维码渲染成 SVG 给设置 UI(原 dev-dep,登录用转正)。
+qrcode = "0.14"
+# 微信渠道媒体:CDN 走 AES-128-ECB(PKCS7)——手做 ECB(逐块)+ 手做 PKCS7(不引 ecb/cipher 额外面)。
+aes = "0.8"
+# 微信出站文件:getUploadUrl 要明文 MD5(sha2 不含 MD5);hex = filekey/aeskey/md5 的十六进制编解码。
+md-5 = "0.10"
+hex = "0.4"
 
 # 系统音量(tools/desktop.rs 的 system_volume):Windows 走 Core Audio(IAudioEndpointVolume)。
 # 仅 Windows 编译(Mac 走 osascript、Linux 不支持,都不需要);windows 0.61 与 src-tauri 同版本,
 # 不引入新版本。开「打开」工具不需要 windows crate(走进程 start/open),只音量用它。
-[dev-dependencies]
-# qr_decode 测试:现生成二维码图 → 解码往返(与 image 0.25 对齐的渲染后端)
-qrcode = "0.14"
-
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
   "Win32_Foundation",

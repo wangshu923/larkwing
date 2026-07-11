@@ -157,6 +157,32 @@ pub fn suite() -> Vec<Scenario> {
             .note("「明早提醒我吃药」→ reminder_set(§7.4 提醒三件套)")
             .say("明天早上八点提醒我吃药")
             .check(tool_called("reminder_set")),
+        // 人际路由(§7.4 跨人提醒/捎话,2026-07-11):「跟妈妈说一声…」该走 reminder_set 带
+        // for=妈妈(路由到 TA 的手机对话),而不是设成给自己的提醒、更不能嘴上应下却啥也不做
+        // (它没有别的送话通道 —— 机器侧接线有单测守,这里评模型会不会用 for)。
+        Scenario::turn("family-relay")
+            .note("「跟妈妈说一声…」→ reminder_set 带 for=妈妈(人际路由,§7.4)")
+            .seed(|s, _u| {
+                // 家人「妈妈」+ TA 的手机对话(渠道归人指认)+ 凭证 —— 缺一个工具就会如实退回
+                let mom = s.users.create("妈妈").unwrap();
+                let conv = s
+                    .chat
+                    .create_conversation_full(mom.id, crate::scenes::DEFAULT_SCENE_ID, "telegram")
+                    .unwrap();
+                s.channels.bind("telegram", "9001", conv.id).unwrap();
+                let t = s.channels.thread_for("telegram", "9001").unwrap().unwrap();
+                s.channels.bind_user(t.id, Some(mom.id)).unwrap();
+                let _ = crate::secrets::set(&s.settings, "remote.telegram.token", "eval-tok");
+            })
+            .say("跟妈妈说一声,晚饭在锅里,回家热一下就能吃")
+            .check(tool_called("reminder_set"))
+            .check(custom("带 for=妈妈 且回执确认送到 TA 手机", |o| {
+                o.trace.iter().any(|s| {
+                    s.name == "reminder_set"
+                        && s.args.contains("妈妈")
+                        && s.result.contains("妈妈的手机")
+                })
+            })),
         // 时效性信息该上网查证,不硬编瞎答(§7.4 web 搜索即抓取)。
         Scenario::turn("web-for-fresh-info")
             .note("时效性信息 → web_search,不硬答(§7.4)")

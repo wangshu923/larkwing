@@ -4,6 +4,8 @@ mod commands;
 // 前台全屏检测(悬浮窗让位):仅 Windows 编译,Mac 原生 space 已天然不覆盖别 app 全屏。
 #[cfg(windows)]
 mod fullscreen;
+#[cfg(windows)]
+mod winmax;
 mod logkeep;
 mod nativelog;
 mod webrender;
@@ -271,6 +273,13 @@ pub fn run() {
           let y = mpos.y as f64 + (msz.height as f64 - ph) / 2.0;
           let _ = win.set_position(PhysicalPosition::new(x, y));
         }
+
+        // Windows:无边框窗最大化会盖任务栏 + 任务栏点击失灵(Tauri #7103,上游未修)
+        // → 挂 WM_GETMINMAXINFO subclass 把最大化尺寸钉到工作区(winmax.rs;只能 Windows 真机验 §8.1)。
+        #[cfg(windows)]
+        if let Ok(hwnd) = win.hwnd() {
+          winmax::fix_maximize(hwnd.0 as isize);
+        }
       }
 
       // ---- 系统托盘(PLAN §12 常驻锚点):左键唤主窗;菜单文案由前端 set_tray_menu
@@ -392,6 +401,8 @@ pub fn run() {
       commands::attachment_url,
       commands::remote_status,
       commands::reload_channels,
+      commands::weixin_login_start,
+      commands::weixin_login_poll,
       commands::voice_listen_start,
       commands::voice_listen_stop,
       commands::voice_status,

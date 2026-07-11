@@ -19,6 +19,7 @@ import { useSettings } from './composables/useSettings'
 import { useUpdater } from './composables/useUpdater'
 import {
   api,
+  isMacOS,
   isTauri,
   onFloatUpdate,
   onForegroundFullscreen,
@@ -33,6 +34,9 @@ const { t } = useI18n()
 
 // 窗口分流(PLAN §12):float 标签 = 悬浮窗(独立 WebView),否则主窗全套。
 const isFloat = windowLabel() === 'float'
+// macOS 主窗走原生标准窗(§7.6:decorations:true 红绿灯 + transparent:false)。给 html 打标 is-macos
+// → body 补不透明底色(去透明后免入场/首帧露白)。float 悬浮窗仍透明、不打标。
+if (isMacOS && !isFloat) document.documentElement.classList.add('is-macos')
 
 // 启动编排(仅主窗):phase = 'boot' → 'ready';背景与主界面各自订阅它做入场。
 const { phase, run, skip } = useBoot(1800)

@@ -616,6 +616,17 @@ const tg = computed<RemoteChannelView>(
 const dt = computed<RemoteChannelView>(
   () => remoteChannels.value.find((c) => c.id === 'dingtalk') ?? fallback('dingtalk'),
 )
+const wx = computed<RemoteChannelView>(
+  () => remoteChannels.value.find((c) => c.id === 'weixin') ?? fallback('weixin'),
+)
+// 微信扫码登录状态机(QR-based,区别于 TG/钉钉粘贴 token):起手拿二维码 → 轮询状态 → confirmed 落库。
+const wxQrSvg = ref('') // 二维码 SVG(v-html 直接展示,免前端二维码依赖)
+const wxQrUrl = ref('') // 备用链接(扫不了时点开)
+const wxLoginStatus = ref('') // '' | wait | scaned | need_verifycode | verify_blocked | expired | confirmed | already | error
+const wxVerifyCode = ref('') // 手机上显示的配对码(need_verifycode 时输入,下次轮询自动带上)
+let wxQrcode = '' // 轮询标识(非响应式)
+let wxBaseUrl: string | null = null // IDC 重定向后的轮询地址
+let wxLoginSeq = 0 // 代次:重新扫码 / 切走 tab 时作废旧轮询循环
 async function loadRemote() {
   if (!isTauri()) return
   remoteChannels.value = await api.remoteStatus().catch(() => [])
@@ -648,9 +659,68 @@ function remoteStatusText(c: RemoteChannelView): string {
   if (!c.configured) return t('settings.remote.statusUnconfigured')
   return t('settings.remote.statusStarting')
 }
+
+/** 微信扫码登录起手:拿二维码并展示,开轮询循环。 */
+async function startWeixinLogin() {
+  const seq = ++wxLoginSeq // 作废上一次(重复点/重扫)
+  wxVerifyCode.value = ''
+  wxBaseUrl = null
+  wxLoginStatus.value = 'wait'
+  wxQrSvg.value = ''
+  wxQrUrl.value = ''
+  try {
+    const s = await api.weixinLoginStart()
+    if (seq !== wxLoginSeq) return
+    wxQrcode = s.qrcode
+    wxQrUrl.value = s.qr_url
+    wxQrSvg.value = s.qr_svg
+  } catch {
+    wxLoginStatus.value = 'error'
+    useToast().error(t('settings.remote.weixin.startFailed'))
+    return
+  }
+  void pollWeixinLogin(seq)
+}
+
+/** 轮询扫码状态:每次 poll 命令本身会长挂到服务端事件;小憩防打爆。confirmed 即连(自动开渠道)。 */
+async function pollWeixinLogin(seq: number) {
+  const nap = (ms: number) => new Promise((r) => setTimeout(r, ms))
+  while (seq === wxLoginSeq) {
+    let r
+    try {
+      r = await api.weixinLoginPoll(wxQrcode, wxBaseUrl, wxVerifyCode.value || null)
+    } catch {
+      await nap(1500)
+      continue
+    }
+    if (seq !== wxLoginSeq) return
+    if (r.status === 'redirect') {
+      wxBaseUrl = r.base_url // IDC 重定向:下次轮询换地址
+      continue
+    }
+    wxLoginStatus.value = r.status
+    if (r.status === 'confirmed' || r.status === 'already') {
+      wxQrSvg.value = ''
+      // 扫码即连(§3 强默认):自动开启渠道并刷新状态(token 已由 core 落库)
+      await api.setSetting('remote.weixin.enabled', '1')
+      await api.reloadChannels()
+      await loadRemote()
+      return
+    }
+    if (r.status === 'expired' || r.status === 'verify_blocked') {
+      wxQrSvg.value = '' // 收起过期码,让用户重扫
+      return
+    }
+    await nap(1200) // wait / scaned / need_verifycode:继续
+  }
+}
 // 切到远程/家人 tab 时拉一次(切走不轮询)
 watch(tab, (v) => {
   if (v === 'remote') void loadRemote()
+  else {
+    wxLoginSeq++ // 离开远程 tab:作废在跑的扫码轮询
+    wxQrSvg.value = ''
+  }
   if (v === 'family') void loadFamily()
 })
 
@@ -1635,6 +1705,54 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           {{ t('settings.remote.dingtalk.linkPre') }}
           <button class="link" @click="openExternal('https://open-dev.dingtalk.com/')">open-dev.dingtalk.com</button>
         </p>
+
+        <!-- 微信(腾讯 iLink bot):扫码登录(区别于 TG/钉钉粘贴 token),confirmed 即连 -->
+        <p class="section dt-sec">{{ t('settings.remote.weixin.title') }}</p>
+        <p class="hint">{{ t('settings.remote.weixin.hint', { name: petName }) }}</p>
+        <div class="row">
+          <span class="label">{{ t('settings.remote.enable') }}</span>
+          <span class="chip" :class="{ on: wx.enabled }">{{ wx.enabled ? t('settings.system.on') : t('settings.system.off') }}</span>
+          <button class="link" @click="toggleRemote('weixin', !wx.enabled)">
+            {{ wx.enabled ? t('settings.system.turnOff') : t('settings.system.turnOn') }}
+          </button>
+        </div>
+        <div class="row">
+          <span class="label">{{ t('settings.remote.weixin.login') }}</span>
+          <button class="link" @click="startWeixinLogin">
+            {{ wx.configured ? t('settings.remote.weixin.relogin') : t('settings.remote.weixin.scan') }}
+          </button>
+        </div>
+        <div v-if="wxQrSvg" class="wx-qr">
+          <!-- eslint-disable-next-line vue/no-v-html -- SVG 由 core qrcode crate 生成(非用户内容),可信 -->
+          <div class="wx-qr-img" v-html="wxQrSvg"></div>
+          <p class="hint">{{ t('settings.remote.weixin.scanHint') }}</p>
+          <p v-if="wxLoginStatus === 'scaned'" class="hint">{{ t('settings.remote.weixin.scaned') }}</p>
+          <div v-if="wxLoginStatus === 'need_verifycode'" class="row">
+            <span class="label">{{ t('settings.remote.weixin.code') }}</span>
+            <input v-model="wxVerifyCode" class="s-input" :placeholder="t('settings.remote.weixin.codePlaceholder')" />
+          </div>
+          <p class="hint">
+            {{ t('settings.remote.weixin.linkPre') }}
+            <button class="link" @click="openExternal(wxQrUrl)">{{ t('settings.remote.weixin.linkText') }}</button>
+          </p>
+        </div>
+        <p v-if="wxLoginStatus === 'expired'" class="hint">{{ t('settings.remote.weixin.expired') }}</p>
+        <p v-if="wxLoginStatus === 'verify_blocked'" class="hint">{{ t('settings.remote.weixin.blocked') }}</p>
+        <div class="row">
+          <span class="label">{{ t('settings.remote.weixin.allowed') }}</span>
+          <input
+            class="s-input s-mono-input"
+            :value="wx.allowed_chats"
+            :placeholder="t('settings.remote.weixin.allowedPlaceholder')"
+            @change="saveRemote('remote.weixin.allowed_users', $event)"
+          />
+        </div>
+        <div class="row">
+          <span class="label">{{ t('settings.remote.status') }}</span>
+          <span class="chip" :class="{ on: wx.running, warn: !!wx.last_error }">{{ remoteStatusText(wx) }}</span>
+        </div>
+        <p class="hint">{{ t('settings.remote.weixin.steps') }}</p>
+        <p class="hint wx-risk">{{ t('settings.remote.weixin.risk') }}</p>
       </div>
 
       <!-- 服务/接入:外部数据源与设备接入(天气走和风 JWT;以后智能家居 HA 等同构进驻) -->
@@ -1891,6 +2009,11 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .chip.warn { border-color: rgba(var(--attn-rgb), 0.5); color: var(--attn); }
 .section.dt-sec { margin-top: 20px; }
 .chip.future { opacity: .62; color: var(--text-dim); }
+/* 微信扫码:二维码必须暗码浅底才扫得出(功能要求,故底色写死白、不随皮肤——同 QR 打印惯例) */
+.wx-qr { margin: 10px 0 4px; }
+.wx-qr-img { width: 200px; height: 200px; background: #fff; border-radius: 10px; padding: 8px; box-sizing: border-box; }
+.wx-qr-img :deep(svg) { width: 100%; height: 100%; display: block; }
+.wx-risk { opacity: .7; font-size: 12px; }
 /* 性格:textarea + 紧贴下方的小快捷 chip(复用音色 chip 薄玻璃质感) */
 .persona-row { align-items: flex-start; }
 .persona-field { display: flex; flex-direction: column; gap: 6px; flex: 1 1 340px; max-width: 440px; min-width: 220px; }

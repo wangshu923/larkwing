@@ -534,12 +534,25 @@ export interface ChannelChat {
 
 /** 远程渠道一行(设置页,PLAN 远程渠道);**凭证本身永不过桥**,只报 configured(bool)。 */
 export interface RemoteChannelView {
-  id: string // 'telegram' | 'dingtalk'
+  id: string // 'telegram' | 'dingtalk' | 'weixin'
   enabled: boolean
   configured: boolean
   allowed_chats: string
   running: boolean
   last_error: string | null
+}
+
+/** 微信扫码登录起手:二维码 SVG(v-html 直接展示)+ 备用链接 + 轮询用 qrcode。 */
+export interface WeixinQrStart {
+  qrcode: string
+  qr_url: string
+  qr_svg: string
+}
+
+/** 微信扫码轮询一次:status 驱动 UI;redirect 时 base_url = 新地址(下次回传)。 */
+export interface WeixinQrPoll {
+  status: string // wait | scaned | need_verifycode | verify_blocked | expired | redirect | confirmed | already
+  base_url: string | null
 }
 
 export type AppEvent =
@@ -598,20 +611,27 @@ export function windowLabel(): string {
   }
 }
 
-/** 主窗自绘三键:无边框窗口操作,作用于当前窗口;非 Tauri 预览下 no-op。 */
+/** 平台判定:仅用于窗形分叉 —— macOS 用原生标准窗(`decorations:true`,红绿灯 + 绿灯真全屏),
+ *  Windows/Linux 走无边框自绘三键(§7.6)。UA 足够:WebView2(Win) 不含 Macintosh、WKWebView(Mac) 含;
+ *  非 Tauri 预览按宿主浏览器判(仅影响视觉分叉,无副作用)。 */
+export const isMacOS = /Macintosh|Mac OS X/i.test(navigator.userAgent)
+
+/** 主窗自绘三键(Windows/Linux;macOS 用原生红绿灯):无边框窗口操作,作用于当前窗口;非 Tauri 预览下 no-op。 */
 export const win = {
   minimize: () => {
     if (isTauri()) void getCurrentWindow().minimize()
   },
-  /** 中键:真全屏切换(用户要"全屏的感觉" —— 非 mac zoom 式最大化,那个会留系统菜单栏)。 */
-  toggleFullscreen: async () => {
-    if (!isTauri()) return
-    const w = getCurrentWindow()
-    await w.setFullscreen(!(await w.isFullscreen()))
+  /** 中键(Windows/Linux):最大化⇄还原 —— 铺满工作区但保留三键与任务栏,永不困住用户(区别于全屏)。
+   *  真正的沉浸全屏只留给看视频(VideoOverlay 影院模式,有浮层 ✕⛶ / Esc 退出)。 */
+  toggleMaximize: () => {
+    if (isTauri()) void getCurrentWindow().toggleMaximize()
   },
-  /** 确定性进/退全屏(视频浮层用:自动进 / 关闭强制退,不能用 toggle 读当前态——会竞态)。
+  /** 当前是否最大化(自绘三键的中键图标切换用:最大化⇄还原)。 */
+  isMaximized: (): Promise<boolean> =>
+    isTauri() ? getCurrentWindow().isMaximized() : Promise.resolve(false),
+  /** 确定性进/退全屏(视频影院浮层专用:自动进 / 关闭强制退,不能用 toggle 读当前态——会竞态)。
    *  视频走原生窗口全屏而非 HTML5 requestFullscreen:后者在 WebView2 上与 DWM 合成器打架
-   *  (闪烁/退出穿帮),与本 app 其余全屏路径(toggleFullscreen)对齐才稳。 */
+   *  (闪烁/退出穿帮),故一律走原生窗口全屏才稳。窗口本身的"变大"是 toggleMaximize(不是全屏)。 */
   setFullscreen: async (on: boolean) => {
     if (isTauri()) await getCurrentWindow().setFullscreen(on)
   },
@@ -932,6 +952,11 @@ export const api = {
   remoteStatus: () => invoke<RemoteChannelView[]>('remote_status'),
   /** 保存远程渠道配置后调:停旧起新(类比 provider 保存即重建)。 */
   reloadChannels: () => invoke<void>('reload_channels'),
+  /** 微信扫码登录起手:拿二维码(SVG + 备用链接 + 轮询 qrcode)。 */
+  weixinLoginStart: () => invoke<WeixinQrStart>('weixin_login_start'),
+  /** 微信扫码轮询一次:前端循环调;confirmed 时 core 已把 token/base_url/白名单落库。 */
+  weixinLoginPoll: (qrcode: string, baseUrl: string | null, verifyCode: string | null) =>
+    invoke<WeixinQrPoll>('weixin_login_poll', { qrcode, baseUrl, verifyCode }),
   /** 开听写:立即返回,进展走 app_event 的 voice 车道(首次会触发模型用时下载)。 */
   voiceListenStart: () => invoke<void>('voice_listen_start'),
   /** 停听写:accept = 立即定稿(已听到的送识别);false = 取消丢弃。幂等。 */

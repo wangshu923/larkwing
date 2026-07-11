@@ -371,7 +371,8 @@ export default {
   // 主窗自绘窗口控件(PLAN §12)
   win: {
     minimize: '最小化',
-    maximize: '全屏 / 退出全屏',
+    maximize: '最大化',
+    restore: '还原',
     close: '收起到托盘',
   },
   // 系统托盘菜单(经 set_tray_menu 注入壳层;§6 文案在前端字典)
@@ -645,6 +646,26 @@ export default {
         appSecretPlaceholder: '机器人的 AppSecret(Client Secret)',
         steps: '在钉钉开放平台建应用机器人、消息接收模式选 Stream,拿到 AppKey/AppSecret 填上、开启即可。',
         linkPre: '去',
+      },
+      weixin: {
+        title: '微信',
+        hint: '扫码把{name}接进你的微信,在微信里跟 TA 收发消息。走腾讯官方的 iLink 机器人通道,免公网。',
+        login: '连接',
+        scan: '扫码登录',
+        relogin: '重新扫码',
+        scanHint: '用手机微信扫描上方二维码,并在手机上点确认。',
+        scaned: '已扫描,请在手机上确认…',
+        code: '配对码',
+        codePlaceholder: '手机上显示的数字',
+        expired: '二维码过期了,点「重新扫码」再来一次。',
+        blocked: '验证多次没过,先歇一会儿再试。',
+        allowed: '允许的用户',
+        allowedPlaceholder: '扫码后自动填上你自己;要放行家人,把 TA 的用户 ID 也加进来(逗号分隔)',
+        steps: '点「扫码登录」,用手机微信扫码并确认;连上后你就在名单里了,直接在微信里发消息即可。',
+        startFailed: '拿二维码失败,检查下网络再试。',
+        risk: '说明:走腾讯官方机器人通道,但把个人微信接自动化仍有一定平台风险,自行斟酌。',
+        linkPre: '扫不了?',
+        linkText: '打开链接',
       },
     },
     system: {

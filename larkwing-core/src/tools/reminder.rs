@@ -2,10 +2,15 @@
 //! 永远不暴露 cron/job 概念。执行一律新鲜上下文 —— 所以 content 必须物化自包含
 //! (创建时把指代展开写全),这是描述里教给模型的第一纪律。
 //! mode 只活在创建那一刻:remind → 落当前会话;task → 建专属会话(后续都落它)。
+//! 跨人提醒/捎话(人际路由,2026-07-11):`for` 填家人名字 → 收件人也在创建时刻物化
+//! 成 conv_id(落 TA 的手机对话,到点回合在 TA 的会话里开口、推送链自动送 TA 手机);
+//! 捎话 = first_at 填当前时间的跨人提醒,零新机制。
 
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::TimeZone;
+
+use crate::channels::outbound;
 
 use super::{Tool, ToolCtx, ToolSpec};
 
@@ -65,7 +70,11 @@ impl ReminderSet {
                               (写「提醒吃降压药(饭后、配水)」,不写「提醒吃那个药」)。\
                               mode 选择:remind=捎话提醒,到点的话出现在当前对话(默认);\
                               task=定期干活的任务(如每天总结新闻),会单开一个任务对话存放\
-                              每次的结果。",
+                              每次的结果。给家里其他人提醒/带话:for 填 TA 的名字,到点的话\
+                              出现在 TA 手机的对话里;「跟妈妈说一声X」这类马上要带到的,\
+                              for 照填、first_at 填当前时间即可;给家人的 content 要写明是谁\
+                              托的(「爸爸让我转告:…」)。TA 没连手机会明说(那就别带 for,\
+                              落本对话让在场的人转告)。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -86,6 +95,10 @@ impl ReminderSet {
                             "type": "string",
                             "enum": ["remind", "task"],
                             "description": "remind=捎话进当前对话(默认);task=单开任务对话存放结果"
+                        },
+                        "for": {
+                            "type": "string",
+                            "description": "提醒/带话给哪位家人(名字要跟家人页一致);不填 = 说这句话的人自己。只配 remind 用"
                         }
                     },
                     "required": ["content", "first_at"]
@@ -133,31 +146,63 @@ impl Tool for ReminderSet {
             Some(other) => anyhow::bail!("未知 repeat: {other},可用 once/daily/weekdays/weekly"),
         };
         let task_mode = matches!(args.get("mode").and_then(serde_json::Value::as_str), Some("task"));
+        let for_name = args
+            .get("for")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        anyhow::ensure!(
+            !(task_mode && for_name.is_some()),
+            "for(给家人)只能配 remind 模式;task 任务对话是自己的,别带 for"
+        );
 
         let store = ctx.store.clone();
         let (user_id, here_conv) = (ctx.user_id, ctx.conv_id);
         let content2 = content.clone();
-        let job = tokio::task::spawn_blocking(move || -> anyhow::Result<crate::store::Job> {
-            // mode 只活在此刻:翻译成 conv_id 落库,唤醒管线不认识 mode
-            let conv_id = if task_mode {
-                // 任务模式 = 单独的任务对话(自启兑现) → 系统渠道,列表带系统标
-                let conv = store.chat.create_conversation_full(
-                    user_id,
-                    crate::scenes::DEFAULT_SCENE_ID,
-                    crate::store::chat::CHANNEL_SYSTEM,
-                )?;
-                let title: String = content2.chars().take(TASK_TITLE_MAX_CHARS).collect();
-                store.chat.set_title(conv.id, &title)?;
-                conv.id
-            } else {
-                here_conv
-            };
-            store.jobs.add(user_id, conv_id, &content2, first_at, repeat)
-        })
+        let (job, routed) = tokio::task::spawn_blocking(
+            move || -> anyhow::Result<(crate::store::Job, Option<(String, &'static str)>)> {
+                // 跨人:收件人也在创建时刻物化 —— 落 TA 的手机对话(到点回合在 TA 的会话里
+                // 开口,outbound_loop 顺着会话映射推 TA 手机);没连手机此刻就如实退回
+                // (§3.5,别设一个到点没人收的提醒)。
+                if let Some(name) = for_name {
+                    let member = outbound::find_member(&store, &name)?;
+                    let (thread, target) = outbound::resolve_phone(&store, member.id)?;
+                    let job = store.jobs.add_for(
+                        member.id,
+                        Some(user_id),
+                        thread.conv_id,
+                        &content2,
+                        first_at,
+                        repeat,
+                    )?;
+                    return Ok((job, Some((member.name, target.channel_name()))));
+                }
+                // mode 只活在此刻:翻译成 conv_id 落库,唤醒管线不认识 mode
+                let conv_id = if task_mode {
+                    // 任务模式 = 单独的任务对话(自启兑现) → 系统渠道,列表带系统标
+                    let conv = store.chat.create_conversation_full(
+                        user_id,
+                        crate::scenes::DEFAULT_SCENE_ID,
+                        crate::store::chat::CHANNEL_SYSTEM,
+                    )?;
+                    let title: String = content2.chars().take(TASK_TITLE_MAX_CHARS).collect();
+                    store.chat.set_title(conv.id, &title)?;
+                    conv.id
+                } else {
+                    here_conv
+                };
+                Ok((store.jobs.add(user_id, conv_id, &content2, first_at, repeat)?, None))
+            },
+        )
         .await
         .context("提醒落库任务挂了")??;
 
-        let place = if task_mode { "单独的任务对话里" } else { "这个对话里" };
+        let place = match &routed {
+            Some((name, channel)) => format!("{name}的手机上({channel})"),
+            None if task_mode => "单独的任务对话里".into(),
+            None => "这个对话里".into(),
+        };
         Ok(format!(
             "已设好 #{}:{}({}),到点会出现在{}",
             job.id,
@@ -181,8 +226,9 @@ impl ReminderList {
         ReminderList {
             spec: ToolSpec {
                 name: "reminder_list",
-                description: "看当前定着的提醒/定时任务(全局的,不限本对话)。\
-                              用户问「我定了什么/有什么提醒」时用;取消前先用它拿编号。",
+                description: "看当前定着的提醒/定时任务(全局的,不限本对话;自己的和\
+                              自己给家人设的都在)。用户问「我定了什么/有什么提醒」时用;\
+                              取消前先用它拿编号。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {},
@@ -204,21 +250,40 @@ impl Tool for ReminderList {
     async fn run(&self, _args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
         let store = ctx.store.clone();
         let user_id = ctx.user_id;
-        let jobs = tokio::task::spawn_blocking(move || store.jobs.list_pending(user_id))
-            .await
-            .context("提醒查询任务挂了")??;
+        let (jobs, users) = tokio::task::spawn_blocking(
+            move || -> anyhow::Result<(Vec<crate::store::Job>, Vec<crate::store::User>)> {
+                Ok((store.jobs.list_visible(user_id)?, store.users.list()?))
+            },
+        )
+        .await
+        .context("提醒查询任务挂了")??;
         if jobs.is_empty() {
             return Ok("目前没有定着的提醒".into());
         }
+        let name_of = |id: i64| users.iter().find(|u| u.id == id).map(|u| u.name.clone());
         Ok(jobs
             .iter()
             .map(|j| {
                 let content: String = j.content.chars().take(80).collect();
+                // 跨人标注:自己给家人设的标「给谁的」,家人给自己设的标「谁设的」
+                // (名字查不到 = 家人已删,不标不崩)
+                let who = if j.user_id != user_id {
+                    name_of(j.user_id).map(|n| format!("[给{n}的] ")).unwrap_or_default()
+                } else if let Some(c) = j.created_by.filter(|&c| c != user_id) {
+                    name_of(c).map(|n| format!("[{n}设的] ")).unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 // 条件提醒(kind=cond)的 due_at 是「下次检查时刻」,显示成时间会误导 → 标条件
                 if j.kind == "cond" {
-                    format!("#{} [条件触发] {}", j.id, content)
+                    format!("#{} [条件触发] {who}{content}", j.id)
                 } else {
-                    format!("#{} {}({}){}", j.id, fmt_local(j.due_at), repeat_label(&j.repeat), content)
+                    format!(
+                        "#{} {}({}){who}{content}",
+                        j.id,
+                        fmt_local(j.due_at),
+                        repeat_label(&j.repeat)
+                    )
                 }
             })
             .collect::<Vec<_>>()
@@ -324,6 +389,80 @@ mod tests {
             .await
             .unwrap()
             .contains("没有定着"));
+    }
+
+    #[tokio::test]
+    async fn cross_person_reminder_routes_to_target_phone_conv() {
+        let ctx = ctx("cross");
+        // 家人 + TA 的手机对话(渠道归人指认)+ 凭证
+        let mom = ctx.store.users.create("妈妈").unwrap();
+        let mconv =
+            ctx.store.chat.create_conversation_full(mom.id, "companion", "telegram").unwrap();
+        ctx.store.channels.bind("telegram", "42", mconv.id).unwrap();
+        let t = ctx.store.channels.thread_for("telegram", "42").unwrap().unwrap();
+        ctx.store.channels.bind_user(t.id, Some(mom.id)).unwrap();
+        crate::secrets::set(&ctx.store.settings, "remote.telegram.token", "tok").unwrap();
+
+        let out = ReminderSet::new()
+            .run(
+                serde_json::json!({
+                    "content": "转告:家里人说晚饭在锅里,回来热一下",
+                    "first_at": tomorrow_str(),
+                    "for": "妈妈"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("妈妈的手机"), "{out}");
+
+        let job = &ctx.store.jobs.list_visible(1).unwrap()[0];
+        assert_eq!(job.user_id, mom.id, "收件人 = 妈妈");
+        assert_eq!(job.created_by, Some(1), "发起人 = 说话人");
+        assert_eq!(job.conv_id, mconv.id, "落 TA 的手机对话(到点推送链才接得上)");
+
+        // 发起人视角:看得见(带「给妈妈的」标注)、撤得掉(反悔)
+        let list = ReminderList::new().run(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(list.contains("给妈妈的"), "{list}");
+        assert_eq!(
+            ReminderCancel::new().run(serde_json::json!({"id": job.id}), &ctx).await.unwrap(),
+            "ok"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_person_rejections_are_honest() {
+        let ctx = ctx("crossbad");
+        let tool = ReminderSet::new();
+        // 查无此人 → 带名单的明白话
+        let err = tool
+            .run(
+                serde_json::json!({"content": "x", "first_at": tomorrow_str(), "for": "二舅"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("没有叫"), "{err:#}");
+        // 有这个人但没连手机 → 如实退回,不设「到点没人收」的提醒
+        ctx.store.users.create("妈妈").unwrap();
+        let err = tool
+            .run(
+                serde_json::json!({"content": "x", "first_at": tomorrow_str(), "for": "妈妈"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("还没连上手机"), "{err:#}");
+        assert!(ctx.store.jobs.list_visible(1).unwrap().is_empty(), "退回就不该落库");
+        // task 模式不带 for
+        let err = tool
+            .run(
+                serde_json::json!({"content": "x", "first_at": tomorrow_str(), "for": "妈妈", "mode": "task"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("remind"), "{err:#}");
     }
 
     #[tokio::test]
