@@ -21,7 +21,8 @@ pub(super) const DEFAULT_PERSONA_STYLE: &str = "";
 /// 出厂默认助手名:填进 persona 的 `{name}` 占位(用户没在「叫我什么」改过时)。
 /// 与前端 pet.name(locales)、宪法 §4.1 默认名手工同步 —— 改默认名 = 改这三处。
 /// 2026-07-10 用户拍板 7274→BT(BT-7274 的小名,配合「起什么名字就怎么唤醒」:
-/// BT 喊得出口〔逼踢〕,默认唤醒词组见 voice::wake::DEFAULT_WAKE_WORDS)。
+/// BT 喊得出口〔逼踢〕,默认唤醒词见 voice::wake::DEFAULT_WAKE_WORDS——2026-07-11
+/// 起只有派生的「逼踢」一个,与显式起名同一条路、无特殊处理,「七二七四」退役)。
 pub(super) const DEFAULT_NAME: &str = "BT";
 
 /// 运行时法条(PLAN §9 提示词蓝图):**人格中立底座**的一部分 —— 通用行为纪律,

@@ -448,10 +448,11 @@ pub(super) const LETTER_READINGS: [&str; 26] = [
 pub(super) const DIGIT_READINGS: [&str; 10] =
     ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
 
-/// 没改名(或名字派生不出)时的唤醒词:默认名 BT 的两种叫法 —— 小名「BT(逼踢)」+
-/// 全号读法「七二七四」(2026-07-10 用户拍板:默认名 7274→BT,唤醒词 = 名字派生,
-/// 原独立唤醒词设置与默认词「小七」一并退役)。改了名就纯跟名字,这组附带词作废。
-pub(super) const DEFAULT_WAKE_WORDS: [&str; 2] = ["逼踢", "七二七四"];
+/// 没改名(或名字派生不出)时的唤醒词 = 默认名 BT 的派生读法「逼踢」,**与显式起名
+/// 同一条派生路、无任何特殊处理**(2026-07-11 用户拍板砍掉第二喊法「七二七四」——BT
+/// 就是个英文名,起什么名字就怎么唤醒,默认名不额外附赠全号读法;防回潮断言
+/// `default_words_equal_plain_derivation` 钉着)。「小七」「七二七四」均已退役。
+pub(super) const DEFAULT_WAKE_WORDS: [&str; 1] = ["逼踢"];
 
 /// 名字 → 可唤醒形(§8.2「起什么名字就怎么唤醒」):中文原样、数字转读法、字母缩写按
 /// 字母读音(BT→逼踢);分隔符/标点/表情丢弃。英文单词式名字(≥3 个字母且含小写,如
@@ -616,7 +617,16 @@ fn on_hit(
     ring: &[f32],
 ) -> Result<Phase> {
     d.rt.publish(VoiceEvent::WakeCandidate); // 前端:提前 duck + 轻视觉「在听」
-    super::prompts::play_chirp_async(); // 即时「叮」:第一时间告诉用户听到了(真唤醒/旁听的判定仍在后台跑)
+    // 命中即出声应答(2026-07-11 用户拍板「立刻出声应答、录音不断」,取代 v0.2.13 的「叮」;
+    // 代价照单收下:误命中/旁听也会应一声——派生名〔逼踢〕极少撞,起高频常用名才会吵)。
+    // 应答期间麦照收、**全程不 drain**(录音不断):browser 源(默认)AEC 消自播,应答音
+    // 不进识别;cpal 源应答音可能被录进转写——单音节应答词落在 triage 尾随豁免里,多音节
+    // (「怎么了?」)会把孤立呼名推去旁听仲裁(模型兜),真机嫌吵再议,不做特殊处理。
+    // 应答音银行没就绪(首启预合成中/断网降级)→ 回落「叮」,绝不静默让人喊了没动静(§3.5)。
+    let prompts = d.prompts.lock().expect("prompts lock").clone();
+    if prompts.play_async(PromptKind::Ack).is_none() {
+        super::prompts::play_chirp_async();
+    }
     vad.reset();
     let tail = confirm_tail(pipe, vad)?;
     vad.reset();
@@ -666,7 +676,9 @@ fn on_wake(
     // 取当前应答音银行快照:运行时可能已按新音色热替换,本轮交互用这一份(下轮再取新的)。
     let prompts = d.prompts.lock().expect("prompts lock").clone();
     d.rt.publish(VoiceEvent::WakeTriggered);
-    ack_and_drain(&prompts, pipe, PromptKind::Ack); // 边播应答音边清麦,播完即开录(0 间隙)
+    // 应答已在命中那一刻出声(on_hit;2026-07-11「立刻出声应答、录音不断」)——这里不再
+    // 重复应答、也**不 drain**:命中到此刻的积压帧里可能有用户紧接着说的话,清了就把
+    // 「逼踢(应答)帮我看看…」的后半句丢了。追问/告退仍走 ack_and_drain(要清自听)。
 
     // 武装「停 / 定稿」信号一次(整轮共用):清掉上一轮遗留;之后由 listen_stop 写(在听时前端点
     // ✕ / 定稿键)。**不在循环内重置** —— 追问间隙(「没听清」仍显停控件)用户点停也要认,重置会冲掉它。
@@ -952,6 +964,16 @@ mod tests {
         assert_eq!(derive_wake_word("小Buddy"), None, "带单词段的名字整个判喊不了");
         assert_eq!(derive_wake_word(""), None);
         assert_eq!(derive_wake_word("!!"), None, "全是派生不出的字符");
+    }
+
+    #[test]
+    fn default_words_equal_plain_derivation() {
+        // 「不做任何特殊处理」的守卫(2026-07-11 用户拍板):默认词组必须恒等于
+        // 默认名 BT 走普通派生的结果——谁想再给默认名附赠第二喊法,先来改这条。
+        assert_eq!(
+            DEFAULT_WAKE_WORDS.to_vec(),
+            vec![derive_wake_word("BT").expect("默认名必须派生得出")]
+        );
     }
 
     #[test]

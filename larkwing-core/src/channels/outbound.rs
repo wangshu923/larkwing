@@ -96,7 +96,11 @@ pub(crate) fn resolve_phone(
     channel: Option<&str>,
 ) -> Result<(crate::store::ChannelThread, Target)> {
     let owner_id = store.users.ensure_default_user().map(|u| u.id).unwrap_or(1);
-    let threads = store.channels.list().unwrap_or_default();
+    // 新绑定优先 = 显式按 id 降序,不依赖 list() 的顺序(它按 created_at DESC,毫秒级
+    // 时间戳会平局;此前对它 .rev() 实际反成了**最老优先**——2026-07-11 测试抓包的真 bug,
+    // 「发我微信」没点名时挑了最老的钉钉线程正是它)。
+    let mut threads = store.channels.list().unwrap_or_default();
+    threads.sort_by_key(|t| std::cmp::Reverse(t.id));
     let secret = |key: &str| {
         crate::secrets::get(&store.settings, key)
             .map(|s| s.trim().to_string())
@@ -106,8 +110,7 @@ pub(crate) fn resolve_phone(
         store.settings.get(None, key).ok().flatten().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
     };
     let mut saw_mine = false;
-    // 新绑定优先(id 大 = 后建 = 更可能是现在在用的那台手机)
-    for t in threads.into_iter().rev() {
+    for t in threads {
         let mine = t.user_id == Some(user_id) || (user_id == owner_id && t.user_id.is_none());
         if !mine {
             continue;
