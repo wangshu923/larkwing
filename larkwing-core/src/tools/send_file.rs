@@ -27,8 +27,9 @@ impl SendFile {
             spec: ToolSpec {
                 name: "send_file",
                 description: "把本机的文件/图片发到家里人的手机上(走已连接的 \
-                              Telegram/钉钉)。不填 to = 发给说这句话的人(「发我手机」\
+                              Telegram/钉钉/微信)。不填 to = 发给说这句话的人(「发我手机」\
                               「传给我」);「把XX发给妈妈」这类就把 to 填成那位家人的名字。\
+                              用户点名了渠道(「发我微信」)才填 channel,没点名就不填。\
                               发之前文件得已经在本机(要下载先 web_download,要转图先 \
                               pdf_to_png)。对方没连手机会明说。",
                 parameters: serde_json::json!({
@@ -46,6 +47,11 @@ impl SendFile {
                         "to": {
                             "type": "string",
                             "description": "发给哪位家人(名字要跟家人页一致);不填 = 说这句话的人自己"
+                        },
+                        "channel": {
+                            "type": "string",
+                            "enum": ["telegram", "dingtalk", "weixin"],
+                            "description": "发到哪个渠道;只在用户点名时填(「发我微信」= weixin),不填 = 对方最近在用的那个"
                         }
                     },
                     "required": ["paths"]
@@ -105,7 +111,19 @@ impl Tool for SendFile {
             .map(|name| outbound::find_member(&ctx.store, name))
             .transpose()?;
         let target_user = recipient.as_ref().map_or(ctx.user_id, |u| u.id);
-        let target = outbound::resolve_target(&ctx.store, target_user)?;
+        // 渠道点名(「发我微信」):非法值如实退回带可选清单,别静默当没填
+        let channel = args
+            .get("channel")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(ch) = channel {
+            anyhow::ensure!(
+                matches!(ch, "telegram" | "dingtalk" | "weixin"),
+                "channel 只能是 telegram/dingtalk/weixin,收到「{ch}」"
+            );
+        }
+        let target = outbound::resolve_target(&ctx.store, target_user, channel)?;
 
         let mut sent: Vec<String> = Vec::new();
         let mut failed: Vec<String> = Vec::new();

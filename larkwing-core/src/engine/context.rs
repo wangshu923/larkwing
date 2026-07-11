@@ -326,6 +326,15 @@ pub(super) fn build_context(
                 if let Some(name) = meta.speaker_user.and_then(|id| speakers.get(&id)) {
                     prefix.push_str(&format!("〔{name}说〕"));
                 }
+                // 带图的行加确定性标记:图本体只当轮注入(§9 不回放省钱),之后的轮次模型对
+                // 「刚发过图」零感知 → 吃「最近一批图」缺省的工具(qr_decode 等)路由不过去
+                // (2026-07-11 微信真机实锤:发完码图,下一轮说「下载下来」,模型不知道有图
+                // 可认、反过来找用户要链接)。同〔语音〕:装配现加、不落库,同一消息每轮
+                // 翻译一致 → 历史区字节稳定,前缀缓存零损伤。
+                let imgs = meta.attachments.iter().filter(|a| a.kind == "image").count();
+                if imgs > 0 {
+                    prefix.push_str(&format!("〔附了{imgs}张图〕"));
+                }
                 let content = if prefix.is_empty() {
                     msg.content.clone()
                 } else {
@@ -739,6 +748,29 @@ mod tests {
         assert!(req.system.contains("## 说话守则"));
         let again = bc(scene, None, None, &[], &[], &history, &[]);
         assert_eq!(req.messages, again.messages, "同输入同翻译(前缀稳定 golden)");
+    }
+
+    #[test]
+    fn image_attachment_rows_get_count_prefix() {
+        let scenes = Scenes::builtin();
+        let scene = scenes.default_scene();
+        let history = vec![
+            msg(
+                1,
+                "user",
+                "",
+                Some(r#"{"attachments":[{"kind":"image","name":"a.jpg","file":"x.jpg"},{"kind":"image","name":"b.jpg"},{"kind":"doc","name":"c.pdf"}]}"#),
+            ),
+            msg(2, "assistant", "收到~", None),
+            msg(3, "user", "下载下来转成图", None),
+        ];
+        let req = bc(scene, None, None, &[], &[], &history, &[]);
+        let tail = &req.messages[scene.few_shots.len()..];
+        // 图计数进标记(doc 不算——文档文字已并进 content 本身);无附件行零膨胀
+        assert_eq!(tail[0], ChatMessage::user("〔附了2张图〕"), "带图行交代「这轮有图」");
+        assert_eq!(tail[2], ChatMessage::user("下载下来转成图"));
+        let again = bc(scene, None, None, &[], &[], &history, &[]);
+        assert_eq!(req.messages, again.messages, "同输入同翻译(前缀稳定)");
     }
 
     #[test]

@@ -167,7 +167,7 @@ impl Tool for ReminderSet {
                 // (§3.5,别设一个到点没人收的提醒)。
                 if let Some(name) = for_name {
                     let member = outbound::find_member(&store, &name)?;
-                    let (thread, target) = outbound::resolve_phone(&store, member.id)?;
+                    let (thread, target) = outbound::resolve_phone(&store, member.id, None)?;
                     let job = store.jobs.add_for(
                         member.id,
                         Some(user_id),

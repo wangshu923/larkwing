@@ -125,10 +125,20 @@ const wakeShortName = computed(() => {
 
 // 影响"正在监听的唤醒循环"的设置(阈值/名字→唤醒词/麦克风/耐心)改完 → 自动 off→on 重启,
 // 让新值立即生效,不让用户手动重启(这不是服务器,改一下就重启体验差)。重启很轻
-// (模型已缓存,只重建 spotter/VAD/采集,无声、亚秒级);唤醒没开就只存库,下次开自然用上。
+// (模型已缓存,只重建 spotter/VAD/采集,无声、亚秒级);唤醒没开就只刷状态,下次开自然用上。
+// ⚠️ 唤醒开没开必须现问 core,不吃本页缓存:voiceInfo 是进声音 tab 才懒加载的,改名在
+// 别的 tab 时它还是 null → 旧版在这里静默 return,唤醒词根本没换(2026-07-11 真机实锤
+// 「改名后喊新名字不应」)。
 async function restartWakeIfRunning() {
-  if (!isTauri() || !voiceInfo.value?.wakeRunning) return
+  if (!isTauri()) return
   try {
+    const cur = await api.voiceStatus()
+    if (!cur.wakeRunning) {
+      // 没在听:词已随名字派生落库,刷一下状态让「听哪个词」与悬浮窗跟上即可
+      voiceInfo.value = cur
+      emitWakeChanged(cur.wakeRunning, cur.keywords)
+      return
+    }
     await api.voiceWakeSet(false)
     const s = await api.voiceWakeSet(true)
     voiceInfo.value = s
@@ -799,15 +809,11 @@ async function savePetName() {
   const changed = next !== (settings.get('ui.pet_name') || '')
   await settings.set('ui.pet_name', next)
   petDraft.value = petName.value // 回填:清空后框里也显示回默认名,始终与标题一致
-  // 名字就是唤醒词(派生,§8.2):改名 → 开着唤醒就重启循环换词即时生效;
-  // 没开也刷一下状态,让「听哪个词」跟着新名字走。
+  // 名字就是唤醒词(派生,§8.2):改名 → 开着唤醒就重启循环换词即时生效;没开则
+  // restartWakeIfRunning 内部会刷状态,让「听哪个词」跟着新名字走(它现问 core,
+  // 不吃本页缓存——原先看 voiceInfo 快照,没进过声音 tab 时恒 null → 改名不生效)。
   if (changed && isTauri()) {
-    if (voiceInfo.value?.wakeRunning) {
-      await restartWakeIfRunning()
-    } else {
-      voiceInfo.value = await api.voiceStatus().catch(() => voiceInfo.value)
-      if (voiceInfo.value) emitWakeChanged(voiceInfo.value.wakeRunning, voiceInfo.value.keywords)
-    }
+    await restartWakeIfRunning()
   }
 }
 

@@ -60,9 +60,16 @@ pub(crate) fn find_member(store: &Store, name: &str) -> Result<crate::store::Use
     let name = name.trim();
     anyhow::ensure!(!name.is_empty(), "家人名字是空的");
     let users = store.users.list().unwrap_or_default();
+    // 精确优先;没有再放宽到「家人名包含所填」——家人页的名字常带注释(「蛋蛋(就是妈妈)」),
+    // 模型照口头称呼填「妈妈/蛋蛋」也该路由得到(2026-07-11 真机实锤:精确匹配把三次重试全拒)。
+    // 唯一命中才取;多命中如实报名单,绝不猜。
     let mut hits: Vec<&crate::store::User> = users.iter().filter(|u| u.name == name).collect();
+    if hits.is_empty() {
+        hits = users.iter().filter(|u| u.name.contains(name)).collect();
+    }
     if hits.len() > 1 {
-        bail!("有 {} 个家人都叫「{name}」,分不清是谁——先在设置·家人里改成不重名", hits.len());
+        let names = hits.iter().map(|u| u.name.as_str()).collect::<Vec<_>>().join("、");
+        bail!("「{name}」对得上 {} 个家人({names})——换个更具体的叫法", hits.len());
     }
     match hits.pop() {
         Some(u) => Ok(u.clone()),
@@ -75,15 +82,18 @@ pub(crate) fn find_member(store: &Store, name: &str) -> Result<crate::store::Use
 
 /// 「这个人的手机」在哪:绑定线程 + 已配凭证 → 发送目标。找不到给明白话(模型如实转告,
 /// §3.5 不含糊)。钉钉群聊线程(无 push_id)发不了,跳过继续找别的。
-pub(crate) fn resolve_target(store: &Store, user_id: i64) -> Result<Target> {
-    resolve_phone(store, user_id).map(|(_, t)| t)
+pub(crate) fn resolve_target(store: &Store, user_id: i64, channel: Option<&str>) -> Result<Target> {
+    resolve_phone(store, user_id, channel).map(|(_, t)| t)
 }
 
 /// 同 `resolve_target`,但连命中的映射线程一起给(跨人提醒要线程的 conv_id:
 /// 到点回合落在 TA 的手机对话里,推送链才接得上)。
+/// `channel` = 只考虑这个渠道(用户点名「发我微信」;2026-07-11 真机实锤:一人多渠道时
+/// 默认取最新绑定,点名渠道没有入口 → 文件被发去钉钉、微信要不到)。None = 不限渠道。
 pub(crate) fn resolve_phone(
     store: &Store,
     user_id: i64,
+    channel: Option<&str>,
 ) -> Result<(crate::store::ChannelThread, Target)> {
     let owner_id = store.users.ensure_default_user().map(|u| u.id).unwrap_or(1);
     let threads = store.channels.list().unwrap_or_default();
@@ -101,6 +111,11 @@ pub(crate) fn resolve_phone(
         let mine = t.user_id == Some(user_id) || (user_id == owner_id && t.user_id.is_none());
         if !mine {
             continue;
+        }
+        if let Some(ch) = channel {
+            if t.channel != ch {
+                continue;
+            }
         }
         saw_mine = true;
         match t.channel.as_str() {
@@ -131,10 +146,28 @@ pub(crate) fn resolve_phone(
             _ => continue,
         }
     }
-    if saw_mine {
-        bail!("手机渠道没法发文件(凭证不全,或钉钉那头是群聊)——让用户在设置·远程里检查")
+    if let Some(ch) = channel {
+        let ch_name = match ch {
+            "telegram" => "Telegram",
+            "dingtalk" => "钉钉",
+            "weixin" => "微信",
+            other => other,
+        };
+        if saw_mine {
+            bail!(
+                "{ch_name}那头现在收不了(凭证不全、是群聊,或微信刚绑定还没说过话)\
+                 ——先在{ch_name}上给我发一句,或检查设置·远程"
+            )
+        }
+        bail!("这个人没有绑定的{ch_name}对话——先在{ch_name}上跟我说句话")
     }
-    bail!("这个人还没连上手机(没有绑定的 Telegram/钉钉对话)——先在手机上跟我说句话")
+    if saw_mine {
+        bail!(
+            "手机渠道没法发文件(凭证不全、钉钉那头是群聊,或微信刚绑定还没说过话)\
+             ——让用户在设置·远程里检查"
+        )
+    }
+    bail!("这个人还没连上手机(没有绑定的 Telegram/钉钉/微信对话)——先在手机上跟我说句话")
 }
 
 /// 发一个文件。体积按渠道上限先检;caption:TG 随文件带,钉钉文件消息不支持附言 →
@@ -297,14 +330,14 @@ mod tests {
         let owner = s.users.ensure_default_user().unwrap();
 
         // 没有任何线程 → 「还没连上手机」
-        let err = resolve_target(&s, owner.id).unwrap_err();
+        let err = resolve_target(&s, owner.id, None).unwrap_err();
         assert!(err.to_string().contains("还没连上手机"), "{err:#}");
 
         // 主人的 TG 线程(未指认 NULL = 会话归属者)+ 凭证在 → 命中 Telegram
         let conv = s.chat.create_conversation_full(owner.id, "companion", "telegram").unwrap();
         s.channels.bind("telegram", "8877", conv.id).unwrap();
         crate::secrets::set(&s.settings, "remote.telegram.token", "tok123").unwrap();
-        match resolve_target(&s, owner.id).unwrap() {
+        match resolve_target(&s, owner.id, None).unwrap() {
             Target::Telegram { token, chat_id } => {
                 assert_eq!(token, "tok123");
                 assert_eq!(chat_id, "8877");
@@ -314,14 +347,14 @@ mod tests {
 
         // 家人(指认)只算指认给 TA 的线程;TA 没有 → 明白话
         let kid = s.users.create("小朋友").unwrap();
-        let err = resolve_target(&s, kid.id).unwrap_err();
+        let err = resolve_target(&s, kid.id, None).unwrap_err();
         assert!(err.to_string().contains("还没连上手机"), "{err:#}");
         let t = s.channels.thread_for("telegram", "8877").unwrap().unwrap();
         s.channels.bind_user(t.id, Some(kid.id)).unwrap();
-        assert!(matches!(resolve_target(&s, kid.id).unwrap(), Target::Telegram { .. }));
+        assert!(matches!(resolve_target(&s, kid.id, None).unwrap(), Target::Telegram { .. }));
 
         // 指认走了之后,主人自己反而没有线程了(NULL 的没了)→ 明白话
-        let err = resolve_target(&s, owner.id).unwrap_err();
+        let err = resolve_target(&s, owner.id, None).unwrap_err();
         assert!(err.to_string().contains("还没连上手机"), "{err:#}");
     }
 
@@ -338,7 +371,7 @@ mod tests {
 
         s.users.create("妈妈").unwrap(); // 重名
         let err = find_member(&s, "妈妈").unwrap_err().to_string();
-        assert!(err.contains("分不清"), "{err}");
+        assert!(err.contains("对得上"), "{err}");
 
         // resolve_phone 带回线程(跨人提醒要 conv_id)
         let conv = s.chat.create_conversation_full(mom.id, "companion", "telegram").unwrap();
@@ -346,9 +379,44 @@ mod tests {
         let t = s.channels.thread_for("telegram", "777").unwrap().unwrap();
         s.channels.bind_user(t.id, Some(mom.id)).unwrap();
         crate::secrets::set(&s.settings, "remote.telegram.token", "tok").unwrap();
-        let (thread, target) = resolve_phone(&s, mom.id).unwrap();
+        let (thread, target) = resolve_phone(&s, mom.id, None).unwrap();
         assert_eq!(thread.conv_id, conv.id);
         assert!(matches!(target, Target::Telegram { .. }));
+    }
+
+    #[test]
+    fn find_member_matches_containment_uniquely() {
+        let s = store("member-loose");
+        s.users.ensure_default_user().unwrap();
+        let mom = s.users.create("蛋蛋(就是妈妈)").unwrap();
+        // 口头称呼含于备注名 → 命中(真机实锤:名字带注释时「妈妈/蛋蛋」都该路由得到)
+        assert_eq!(find_member(&s, "妈妈").unwrap().id, mom.id);
+        assert_eq!(find_member(&s, "蛋蛋").unwrap().id, mom.id);
+        // 多人都对得上 → 如实报名单,绝不猜
+        s.users.create("蛋挞").unwrap();
+        let err = find_member(&s, "蛋").unwrap_err().to_string();
+        assert!(err.contains("对得上") && err.contains("蛋挞"), "{err}");
+    }
+
+    #[test]
+    fn resolve_honors_channel_pick() {
+        let s = store("chanpick");
+        let owner = s.users.ensure_default_user().unwrap();
+        let c1 = s.chat.create_conversation_full(owner.id, "companion", "telegram").unwrap();
+        s.channels.bind("telegram", "101", c1.id).unwrap();
+        crate::secrets::set(&s.settings, "remote.telegram.token", "tok").unwrap();
+        let c2 = s.chat.create_conversation_full(owner.id, "companion", "weixin").unwrap();
+        s.channels.bind("weixin", "wxid_1", c2.id).unwrap();
+        s.channels.set_push_id("weixin", "wxid_1", "ctx-token-1").unwrap();
+        crate::secrets::set(&s.settings, "remote.weixin.token", "wtok").unwrap();
+        // 不点名 = 最新绑定(微信);点名 telegram → TG;点名没映射的渠道 → 明白话带渠道名
+        assert!(matches!(resolve_target(&s, owner.id, None).unwrap(), Target::Weixin { .. }));
+        assert!(matches!(
+            resolve_target(&s, owner.id, Some("telegram")).unwrap(),
+            Target::Telegram { .. }
+        ));
+        let err = resolve_target(&s, owner.id, Some("dingtalk")).unwrap_err().to_string();
+        assert!(err.contains("钉钉"), "{err}");
     }
 
     #[test]
@@ -360,11 +428,11 @@ mod tests {
         crate::secrets::set(&s.settings, "remote.dingtalk.app_key", "k").unwrap();
         crate::secrets::set(&s.settings, "remote.dingtalk.app_secret", "s").unwrap();
         // 群聊线程没有 push_id → 发不了,但线程确实是 TA 的 → 「配置不全/群聊」话术
-        let err = resolve_target(&s, owner.id).unwrap_err();
+        let err = resolve_target(&s, owner.id, None).unwrap_err();
         assert!(err.to_string().contains("没法发文件"), "{err:#}");
         // 补上单聊 push_id → 命中钉钉
         s.channels.set_push_id("dingtalk", "cidGROUP", "staff01").unwrap();
-        match resolve_target(&s, owner.id).unwrap() {
+        match resolve_target(&s, owner.id, None).unwrap() {
             Target::Dingtalk { staff_id, .. } => assert_eq!(staff_id, "staff01"),
             _ => panic!("应命中钉钉"),
         }

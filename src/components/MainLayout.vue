@@ -702,6 +702,10 @@ watch(messages, () => nextTick(() => {
               <svg v-else-if="s.channel === 'dingtalk'" class="rc-chan-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="M20 4H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3v4l5-4h8a1 1 0 0 0 1-1V5a1 1 0 0 0-1-1Z" />
               </svg>
+              <svg v-else-if="s.channel === 'weixin'" class="rc-chan-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M10.5 4a6.3 5.6 0 0 0-6.3 5.6c0 1.8.9 3.4 2.2 4.5L5.5 17l2.9-1.3" />
+                <path d="M9.4 12.9a5.4 4.8 0 0 1 10.8.3c0 1.5-.7 2.8-1.8 3.7l.7 2.6-2.7-1.2a6 6 0 0 1-1.6.2 5.4 4.8 0 0 1-5.4-5.6Z" />
+              </svg>
               <span v-else class="rc-chan-dot" />
             </span>
           </div>
