@@ -51,12 +51,63 @@ pub fn weixin_unbind(engine: &Engine, user_id: &str) -> anyhow::Result<()> {
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::{Engine, InAttachment, TurnEvent, UserMeta};
 use crate::net;
+
+/// 攒批提示(§6.6 债:渠道操作性话术,不经模型;三渠道共用)。用户 2026-07-11 选定「极简功能」版。
+/// 时机 = 纯文件消息到达、缓冲从空变满那一刻(防抖:连发多个只第一个提示,后续静默并入)。
+pub(crate) const ATTACH_HINT: &str =
+    "文件收到了。想让我做什么?说一句(可以接着发别的文件),我就连同文件一起处理。";
+/// 攒批过期:攒着的文件超过这么久还没等到文字,下次文字到就不再算进去(隔太久的文件
+/// 不该混进新意图)。宽松取 30min —— 人「发文件→看着发出去→再打字」十几秒很常见,别掐太紧。
+const ATTACH_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// 攒批缓冲一项:等意图的附件 + 首个到达时刻(过期判定)。
+struct PendingAttach {
+    items: Vec<InAttachment>,
+    first_at: Instant,
+}
+
+/// 附件攒批器(per (channel, ext_id)):无文字附件先攒、等文字一起处理。抽成独立结构 =
+/// 可脱 ChannelCtx 单测(防抖 / 攒取 / 过期)。三渠道共用一个实例(ChannelCtx 持有)。
+#[derive(Default)]
+struct AttachBuffer {
+    inner: Mutex<HashMap<(String, String), PendingAttach>>,
+}
+
+impl AttachBuffer {
+    /// 收进缓冲;返回是否「本批第一个」(缓冲空→满)= 调用方要不要发一次提示。
+    fn buffer(&self, channel: &str, ext_id: &str, atts: Vec<InAttachment>) -> bool {
+        let mut m = self.inner.lock().expect("attach_buf poisoned");
+        // 攒新批时顺手清过期僵尸(有人发了文件再没回来打字 → 别让 base64 bytes 长留内存)
+        m.retain(|_, p| p.first_at.elapsed() < ATTACH_TTL);
+        let key = (channel.to_string(), ext_id.to_string());
+        match m.get_mut(&key) {
+            Some(p) => {
+                p.items.extend(atts);
+                false
+            }
+            None => {
+                m.insert(key, PendingAttach { items: atts, first_at: Instant::now() });
+                true
+            }
+        }
+    }
+
+    /// 取走并清空;超 `ATTACH_TTL` 的丢弃当没攒过(隔太久的文件不混进新意图)。
+    fn take(&self, channel: &str, ext_id: &str) -> Vec<InAttachment> {
+        let mut m = self.inner.lock().expect("attach_buf poisoned");
+        match m.remove(&(channel.to_string(), ext_id.to_string())) {
+            Some(p) if p.first_at.elapsed() < ATTACH_TTL => p.items,
+            _ => Vec::new(),
+        }
+    }
+}
 
 /// 渠道连接状态(给设置页状态行;不静默失败 §3.5)。
 #[derive(Clone, Default, serde::Serialize)]
@@ -77,9 +128,30 @@ pub(crate) struct ChannelCtx {
     /// ffmpeg 解码(语音消息 ogg/opus → PCM);同上,只消费公开 API。
     pub media: crate::media::MediaRuntime,
     pub status: ChannelStatus,
+    /// 攒批缓冲(A,2026-07-11):手机发文件不能同时打字(微信铁律、钉钉文件同样),文件先
+    /// 到、意图后到。无文字的附件消息先攒这里、不触发回合;等用户发来文字,连同攒的一起处理
+    /// (§7.7)。带文字的附件(TG caption / 钉钉图文 richText)不进这。
+    attach_buf: AttachBuffer,
 }
 
 impl ChannelCtx {
+    /// 攒批:无文字附件收进缓冲,等后续文字一起处理。返回是否「本批第一个」——true 时调用方
+    /// 发一次 `ATTACH_HINT`;后续并入的返回 false(静默,防抖=连发多个文件只提示一次)。
+    pub(crate) fn buffer_attachments(
+        &self,
+        channel: &str,
+        ext_id: &str,
+        atts: Vec<InAttachment>,
+    ) -> bool {
+        self.attach_buf.buffer(channel, ext_id, atts)
+    }
+
+    /// 取走并清空某人攒着的附件(用户发来文字时调,连同文字一起进回合)。超过 `ATTACH_TTL`
+    /// 的丢弃当没攒过(隔太久的文件不该混进新意图)。没攒过 = 空 Vec(正常纯文本回合)。
+    pub(crate) fn take_attachments(&self, channel: &str, ext_id: &str) -> Vec<InAttachment> {
+        self.attach_buf.take(channel, ext_id)
+    }
+
     pub(crate) fn set_state(&self, channel: &str, running: bool, err: Option<String>) {
         if let Ok(mut m) = self.status.lock() {
             m.insert(channel.into(), ChannelState { running, last_error: err });
@@ -119,7 +191,13 @@ pub async fn run(
 ) {
     let store = engine.store().clone();
     let enabled = |k: &str| store.settings.get(None, k).ok().flatten().as_deref() == Some("1");
-    let ctx = Arc::new(ChannelCtx { engine, voice, media, status });
+    let ctx = Arc::new(ChannelCtx {
+        engine,
+        voice,
+        media,
+        status,
+        attach_buf: AttachBuffer::default(),
+    });
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     if enabled("remote.telegram.enabled") {
@@ -362,6 +440,28 @@ mod tests {
     fn split_keeps_short_intact() {
         assert_eq!(split_message("你好", 100), vec!["你好"]);
         assert!(split_message("   ", 100).is_empty());
+    }
+
+    #[test]
+    fn attach_buffer_debounces_and_merges() {
+        let att = |n: &str| InAttachment { name: n.into(), mime: "application/pdf".into(), data: String::new() };
+        let buf = AttachBuffer::default();
+
+        // 连发 3 个文件:只第一个「本批第一个」= 要提示,后两个静默(防抖:不提示三次)
+        assert!(buf.buffer("weixin", "u1", vec![att("a.pdf")]), "第一个要提示");
+        assert!(!buf.buffer("weixin", "u1", vec![att("b.pdf")]), "第二个静默");
+        assert!(!buf.buffer("weixin", "u1", vec![att("c.pdf")]), "第三个静默");
+
+        // 用户发文字 → 取走全部攒的(连同文字一起进回合),缓冲清空
+        let taken = buf.take("weixin", "u1");
+        assert_eq!(taken.len(), 3, "三个文件一起交出");
+        assert!(buf.take("weixin", "u1").is_empty(), "取过即空");
+
+        // 取空后下一个文件又算「本批第一个」(重新提示);不同人 / 不同渠道各自独立
+        assert!(buf.buffer("weixin", "u1", vec![att("d.pdf")]), "新一批重新提示");
+        assert!(buf.buffer("weixin", "u2", vec![att("x.pdf")]), "另一个人独立成批");
+        assert!(buf.buffer("dingtalk", "u1", vec![att("y.pdf")]), "另一渠道独立成批");
+        assert!(buf.take("telegram", "nobody").is_empty(), "没攒过 = 空");
     }
 
     #[test]

@@ -26,7 +26,7 @@ use md5::{Digest, Md5};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use super::{drive_turn, split_message, ChannelCtx};
+use super::{drive_turn, split_message, ChannelCtx, ATTACH_HINT};
 use crate::engine::InAttachment;
 use crate::net;
 
@@ -376,9 +376,22 @@ async fn handle_message(
     } else {
         None
     };
-    // 图片当轮无文字时给个空串,与桌面同缝(引擎收「空文本 + 图」)
-    if text.is_empty() && !attachments.is_empty() {
-        text = String::new();
+    // 攒批(A,§7.7):微信发文件/图不能同时打字 → 纯附件消息(有附件、没文字)先攒着、
+    // **不触发回合**,等用户发来文字一起处理。防抖靠 buffer_attachments(缓冲空→满才提示,
+    // 连发多个只第一个吭声)。提示用当前这条消息的 context_token 即时回,不碰 thread ——
+    // 会话映射/持久化留给文字那轮的 drive_turn(那时的 context_token 才是要回显的最新值)。
+    if !attachments.is_empty() && text.trim().is_empty() {
+        if ctx.buffer_attachments(CHANNEL, &p.from_user_id, attachments) {
+            let _ = send_text(net, base, token, &p.from_user_id, &p.context_token, ATTACH_HINT).await;
+        }
+        return;
+    }
+    // 有文字(或纯文字):把之前攒着的文件捞出来,连同本次附件一起处理
+    let mut attachments = attachments;
+    let mut pending = ctx.take_attachments(CHANNEL, &p.from_user_id);
+    if !pending.is_empty() {
+        pending.extend(attachments);
+        attachments = pending;
     }
 
     let out = drive_turn(&ctx.engine, CHANNEL, &p.from_user_id, text, p.sender.as_deref(), attachments, input)

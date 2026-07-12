@@ -20,7 +20,7 @@ use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
-use super::{drive_turn, render, ChannelCtx};
+use super::{drive_turn, render, ChannelCtx, ATTACH_HINT};
 use crate::engine::InAttachment;
 use crate::net;
 
@@ -188,6 +188,22 @@ async fn run_reply(
     attachments: Vec<InAttachment>,
     input: Option<&str>,
 ) {
+    // 攒批(A,§7.7):钉钉文件同微信实测——`file` 消息不带文字,文字随后另发一条(隔十几秒)。
+    // 纯附件消息(有附件、没文字:file / 纯图)先攒、不触发回合,等用户发文字一起处理;防抖靠
+    // buffer_attachments(缓冲空→满才提示)。带文字的(richText 图文 caption / 纯文本)直接走。
+    if !attachments.is_empty() && text.trim().is_empty() {
+        if ctx.buffer_attachments(CHANNEL, &m.ext_id, attachments) {
+            let _ = reply_webhook(net, &m.webhook, ATTACH_HINT).await;
+        }
+        return;
+    }
+    // 有文字(或纯文字):把之前攒着的文件捞出来,连同本次一起处理
+    let mut attachments = attachments;
+    let mut pending = ctx.take_attachments(CHANNEL, &m.ext_id);
+    if !pending.is_empty() {
+        pending.extend(attachments);
+        attachments = pending;
+    }
     match drive_turn(&ctx.engine, CHANNEL, &m.ext_id, text, m.sender.as_deref(), attachments, input)
         .await
     {

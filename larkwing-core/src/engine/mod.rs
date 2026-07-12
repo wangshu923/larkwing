@@ -478,6 +478,7 @@ fn save_image_blob(atts_dir: &std::path::Path, bytes: &[u8], mime: &str) -> Opti
 fn process_attachments(
     attachments: &[InAttachment],
     atts_dir: &std::path::Path,
+    inbox_dir: &std::path::Path,
 ) -> (Vec<crate::llm::ContentPart>, String, Vec<AttachmentRef>) {
     use base64::Engine as _;
     let mut image_parts = Vec::new();
@@ -502,22 +503,47 @@ fn process_attachments(
             });
             continue;
         }
-        let extracted = base64::engine::general_purpose::STANDARD
-            .decode(a.data.as_bytes())
-            .ok()
-            .and_then(|bytes| crate::attach::extract_doc_text(&a.name, &a.mime, &bytes));
-        match extracted {
-            Some(t) => doc_text.push_str(&format!("\n\n〔附件:{}〕\n{t}", a.name)),
-            None => doc_text.push_str(&format!("\n\n〔附件:{}(暂时读不出内容)〕", a.name)),
+        // 文档/文件:bytes 先落「收件区」(B,2026-07-11)——给模型一个**可 fs 操作的本地
+        // 绝对路径**,「把发来的文件存到电脑 / 整理」才成立;扫描件抽不出文字也照落(存文件
+        // 不需读内容)。再尝试抽文字(能抽的多轮追问还在,§9)。
+        // ⚠️ doc_text 带的是**运行时**绝对路径,会随内容进 history 落库 —— 数据根搬家后老对话
+        // 里的路径会失效(只影响回看老对话,不影响当下操作),换取模型直接拿到路径能操作。
+        let bytes =
+            base64::engine::general_purpose::STANDARD.decode(a.data.as_bytes()).ok();
+        let saved = bytes.as_ref().and_then(|b| save_inbox_blob(inbox_dir, &a.name, b));
+        let extracted =
+            bytes.as_ref().and_then(|b| crate::attach::extract_doc_text(&a.name, &a.mime, b));
+        let abs = saved.as_ref().map(|p| p.display().to_string());
+        match (&abs, &extracted) {
+            (Some(p), Some(t)) => {
+                doc_text.push_str(&format!("\n\n〔附件:{} 已存到本地:{p}〕\n{t}", a.name))
+            }
+            (Some(p), None) => doc_text.push_str(&format!(
+                "\n\n〔附件:{} 已存到本地:{p}(读不出文字,可能是扫描件;文件已在本地,可移动、整理、发送)〕",
+                a.name
+            )),
+            (None, Some(t)) => doc_text.push_str(&format!("\n\n〔附件:{}〕\n{t}", a.name)),
+            (None, None) => doc_text.push_str(&format!("\n\n〔附件:{}(暂时读不出内容)〕", a.name)),
         }
         refs.push(AttachmentRef {
             kind: "doc".into(),
             name: a.name.clone(),
             mime: a.mime.clone(),
-            file: None,
+            // 相对名(收件区内);随数据根搬家不断链(§6.2 DB 不存绝对路径)
+            file: saved.as_ref().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().into_owned()),
         });
     }
     (image_parts, doc_text, refs)
+}
+
+/// 收到的文档/文件 bytes 落收件区,返回落定的绝对路径(给模型 fs 操作)。文件名清洗 +
+/// 永不覆盖(同名 ` (N)`,§7.2 复用);写失败返回 None(回合照走,只是模型拿不到路径)。
+fn save_inbox_blob(inbox_dir: &std::path::Path, name: &str, bytes: &[u8]) -> Option<std::path::PathBuf> {
+    let clean = crate::files::sanitize_filename(name);
+    let clean = if clean.is_empty() { "file".to_string() } else { clean };
+    std::fs::create_dir_all(inbox_dir).ok()?;
+    let path = crate::files::dedupe_path(&inbox_dir.join(clean));
+    std::fs::write(&path, bytes).ok().map(|_| path)
 }
 
 /// 命令侧构造一条注入的就绪形(处理附件 + 物化 meta + 拼 LLM 文本)。
@@ -526,8 +552,9 @@ fn build_inject_ready(
     meta: Option<UserMeta>,
     attachments: Vec<InAttachment>,
     atts_dir: &std::path::Path,
+    inbox_dir: &std::path::Path,
 ) -> InjectReady {
-    let (parts, doc_text, refs) = process_attachments(&attachments, atts_dir);
+    let (parts, doc_text, refs) = process_attachments(&attachments, atts_dir, inbox_dir);
     let mut eff_meta = meta.unwrap_or_default();
     eff_meta.attachments = refs.clone();
     let payload = (!eff_meta.is_default()).then(|| serde_json::to_string(&eff_meta).ok()).flatten();
@@ -2090,6 +2117,7 @@ impl Engine {
         let store = self.store.clone();
         let conv_user = conversation.user_id;
         let atts_dir = self.media.attachments_dir(); // 图缩略图落盘目录(闭包内写图)
+        let inbox_dir = self.media.inbox_dir(); // 文件收件区(闭包内落文档原件,给模型可操作路径)
         // 标题还空 = 本次 append 会写下截断占位 → 回头后台给它起个正经名(engine/title.rs)
         let needs_title = conversation.title.is_empty();
         let (mut request, user_msg_id, mem_user, title_seed) = tokio::task::spawn_blocking(
@@ -2098,7 +2126,8 @@ impl Engine {
             // 文档**文字**并进落库的 user 消息内容 → 进 history,多轮追问还在、且落可缓存前缀
             // (§9 收窄:仅图当轮,文档持久化)。图 bytes 另落文件、小票记相对名(重开会话回看图);
             // 只把小票(AttachmentRef)落 payload。与插队共用
-            let (image_parts, doc_text, att_refs) = process_attachments(&attachments, &atts_dir);
+            let (image_parts, doc_text, att_refs) =
+                process_attachments(&attachments, &atts_dir, &inbox_dir);
 
             // 语音会话模式(PLAN §11)+ 附件小票:非默认形态物化进 payload(真相在库)
             let mut eff_meta = meta.unwrap_or_default();
@@ -2199,8 +2228,9 @@ impl Engine {
         }
         // 处理附件(阻塞下沉线程池)→ 就绪形。附件目录先取(cheap PathBuf),move 进闭包写图。
         let atts_dir = self.media.attachments_dir();
+        let inbox_dir = self.media.inbox_dir();
         let ready = match tokio::task::spawn_blocking(move || {
-            build_inject_ready(text, meta, attachments, &atts_dir)
+            build_inject_ready(text, meta, attachments, &atts_dir, &inbox_dir)
         })
         .await
         {

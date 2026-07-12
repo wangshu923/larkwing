@@ -374,6 +374,13 @@ impl MediaRuntime {
         self.inner.dir.join("attachments")
     }
 
+    /// 收到的文件/文档「收件区」(`<media>/inbox`;随数据根搬家)。手机发来的文件落这里、
+    /// 把本地路径交给模型,「把发来的文件存到电脑 / 整理」才成立(扫描件读不出文字也能存,
+    /// 存文件不需要读内容,§9)。与缩略图分开:那是给 UI 看的,这是给模型 fs 操作的原件。
+    pub fn inbox_dir(&self) -> PathBuf {
+        self.inner.dir.join("inbox")
+    }
+
     /// 历史图片小票(相对文件名)→ 可显缩略图的 localhost URL(重开会话回看图,§1/§9)。
     /// 文件名兜底防目录穿越:只取末段 file_name,拒绝 `..` / 路径分隔。
     pub async fn attachment_url(&self, file: &str) -> Result<String> {

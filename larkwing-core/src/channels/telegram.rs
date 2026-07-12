@@ -17,7 +17,7 @@ use base64::Engine as _;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use super::{drive_turn, render, split_message, ChannelCtx};
+use super::{drive_turn, render, split_message, ChannelCtx, ATTACH_HINT};
 use crate::engine::InAttachment;
 use crate::net;
 
@@ -160,6 +160,22 @@ async fn reply_turn(
     attachments: Vec<InAttachment>,
     input: Option<&str>,
 ) {
+    // 攒批(A,§7.7):TG 文件/图能带 caption(和文件同一条)→ 那种 text 非空、直接走。
+    // 但「发文件忘了写 caption」= 有附件、没文字 → 先攒、不触发回合,等文字一起处理
+    //(防抖靠 buffer_attachments)。纯附件才进这;带 caption 的照旧即时处理。
+    if !attachments.is_empty() && text.trim().is_empty() {
+        if ctx.buffer_attachments(CHANNEL, chat, attachments) {
+            let _ = send_message(net, token, chat_id, ATTACH_HINT).await;
+        }
+        return;
+    }
+    // 有文字(或纯文字):把之前攒着的文件捞出来,连同本次一起处理
+    let mut attachments = attachments;
+    let mut pending = ctx.take_attachments(CHANNEL, chat);
+    if !pending.is_empty() {
+        pending.extend(attachments);
+        attachments = pending;
+    }
     match drive_turn(&ctx.engine, CHANNEL, chat, text, sender, attachments, input).await {
         Ok(Some(reply)) => {
             if let Err(e) = send_rich(net, token, chat_id, &reply).await {
