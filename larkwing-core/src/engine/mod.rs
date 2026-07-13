@@ -475,9 +475,9 @@ fn save_image_blob(atts_dir: &std::path::Path, bytes: &[u8], mime: &str) -> Opti
     }
 }
 
-/// 入站附件 → (图 image_url parts, 文档抽出的文字, 落库小票)。send_message 与插队共用。
+/// 入站附件 → (图 image_url parts, 文档抽出的文字 + 落盘路径行, 落库小票)。send_message 与插队共用。
 /// `atts_dir` = 图片缩略图落盘目录(`<media>/attachments`);图 bytes 写盘、小票记相对名,
-/// 供重开会话回看(不进 DB、不喂 LLM)。
+/// 供重开会话回看(不进 DB、不喂 LLM)。图另落一份收件区原名件(见分支内注释)。
 fn process_attachments(
     attachments: &[InAttachment],
     atts_dir: &std::path::Path,
@@ -492,12 +492,26 @@ fn process_attachments(
             image_parts.push(crate::llm::ContentPart::ImageUrl {
                 url: format!("data:{};base64,{}", a.mime, a.data),
             });
-            // 落盘缩略图(§1 用户反馈:图转一圈回来只剩名字太糙)——解一次 base64 写文件;
-            // 失败只是没缩略图,回合照走。
-            let file = base64::engine::general_purpose::STANDARD
-                .decode(a.data.as_bytes())
-                .ok()
-                .and_then(|bytes| save_image_blob(atts_dir, &bytes, &a.mime));
+            // 解一次 base64,双落盘共用(失败只是缺那份落盘,回合照走):
+            //   attachments/ = hash 名缩略图源,UI 回看用(§1 用户反馈:图转一圈只剩名字太糙);
+            //   inbox/ = 原名件 + 路径行进上下文(2026-07-13 与文档收件区对称)——「把刚发的图
+            //   存到桌面/发给某某」模型才有路径可操作;路径行随内容落库,后续回合(图 bytes
+            //   不回放)也还找得到这张图。
+            let bytes =
+                base64::engine::general_purpose::STANDARD.decode(a.data.as_bytes()).ok();
+            let file = bytes.as_ref().and_then(|b| save_image_blob(atts_dir, b, &a.mime));
+            // 没扩展名的图(渠道来的名字可能光秃)按 mime 补,落到收件区好认好开。
+            let clean = crate::files::sanitize_filename(&a.name);
+            let named = if clean.contains('.') {
+                clean
+            } else {
+                format!("{clean}.{}", image_ext(&a.mime))
+            };
+            let saved = bytes.as_ref().and_then(|b| save_inbox_blob(inbox_dir, &named, b));
+            if let Some(p) = &saved {
+                let shown = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                doc_text.push_str(&format!("\n\n〔图片:{shown} 已存到本地:{}(可移动、整理、发送)〕", p.display()));
+            }
             refs.push(AttachmentRef {
                 kind: "image".into(),
                 name: a.name.clone(),
@@ -2132,14 +2146,15 @@ impl Engine {
         let store = self.store.clone();
         let conv_user = conversation.user_id;
         let atts_dir = self.media.attachments_dir(); // 图缩略图落盘目录(闭包内写图)
-        let inbox_dir = self.media.inbox_dir(); // 文件收件区(闭包内落文档原件,给模型可操作路径)
+        let inbox_dir = self.media.inbox_dir(); // 收件区(闭包内落文档/图片原名件,给模型可操作路径)
         // 标题还空 = 本次 append 会写下截断占位 → 回头后台给它起个正经名(engine/title.rs)
         let needs_title = conversation.title.is_empty();
         let (mut request, user_msg_id, mem_user, title_seed) = tokio::task::spawn_blocking(
             move || -> anyhow::Result<(crate::llm::ChatRequest, i64, i64, Option<String>)> {
-            // 入站附件(媒体输入 PLAN §9):图 → image_url 当轮注入(不落库,vision 重复计费);
+            // 入站附件(媒体输入 PLAN §9):图 bytes → image_url 当轮注入(不落库,vision 重复计费);
             // 文档**文字**并进落库的 user 消息内容 → 进 history,多轮追问还在、且落可缓存前缀
-            // (§9 收窄:仅图当轮,文档持久化)。图 bytes 另落文件、小票记相对名(重开会话回看图);
+            // (§9 收窄:仅图 bytes 当轮,文档持久化)。图 bytes 另落文件、小票记相对名(重开会话
+            // 回看图);图的收件区**路径行**随 doc_text 进落库内容(2026-07-13「存图到电脑」);
             // 只把小票(AttachmentRef)落 payload。与插队共用
             let (image_parts, doc_text, att_refs) =
                 process_attachments(&attachments, &atts_dir, &inbox_dir);
@@ -2150,7 +2165,7 @@ impl Engine {
             let payload = (!eff_meta.is_default())
                 .then(|| serde_json::to_string(&eff_meta))
                 .transpose()?;
-            // 文档文字并进落库内容(图不并:仍当轮)。doc_text 自带「〔附件:…〕」分隔。
+            // 文档文字 + 图片路径行并进落库内容(图 bytes 不并:仍当轮)。doc_text 自带「〔附件/图片:…〕」分隔。
             let stored_content =
                 if doc_text.is_empty() { text } else { format!("{text}{doc_text}") };
             let user_msg = store.chat.append_message_full(
@@ -2367,11 +2382,11 @@ impl Engine {
                     return Ok(c);
                 }
                 // 自启回合兜底新建 = 系统渠道(原会话被删、用户也无任何会话时才走到)
-                Ok(store.chat.create_conversation_full(
+                store.chat.create_conversation_full(
                     job_user,
                     DEFAULT_SCENE_ID,
                     crate::store::chat::CHANNEL_SYSTEM,
-                )?)
+                )
             },
         )
         .await
@@ -2623,6 +2638,48 @@ mod tests {
         let _ = std::fs::remove_file(dir.join("t.db"));
         let store = Store::open(&dir.join("t.db")).unwrap();
         Engine::new(store, crate::scenes::Scenes::builtin())
+    }
+
+    /// 「存图到电脑」(2026-07-13,与文档收件区对称):图除当轮 image_url 注入外,原名件落
+    /// 收件区、「已存到本地」路径行进 doc_text(随内容落库);UI 缩略图 hash 小票不变;
+    /// 同名 ` (N)` 永不覆盖;渠道来的光秃名按 mime 补扩展。
+    #[test]
+    fn process_attachments_gives_images_a_local_inbox_path() {
+        use base64::Engine as _;
+        let base = std::env::temp_dir().join(format!("lw-img-inbox-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let atts = base.join("atts");
+        let inbox = base.join("inbox");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"fake-image-bytes");
+        let att = |name: &str, mime: &str| InAttachment {
+            name: name.into(),
+            mime: mime.into(),
+            data: b64.clone(),
+        };
+
+        let (parts, doc_text, refs) =
+            process_attachments(&[att("全家福.png", "image/png")], &atts, &inbox);
+        assert_eq!(parts.len(), 1, "当轮视觉注入不变");
+        assert!(inbox.join("全家福.png").is_file(), "原名件落收件区");
+        assert!(
+            doc_text.contains("已存到本地") && doc_text.contains("全家福.png"),
+            "路径行进上下文: {doc_text}"
+        );
+        assert_eq!(refs[0].kind, "image");
+        assert!(
+            refs[0].file.as_deref().unwrap_or_default().ends_with(".png"),
+            "UI 缩略图小票仍是 attachments 的 hash 名"
+        );
+
+        // 同名第二张:永不覆盖(§7.2 规①),路径行报实际落定名
+        let (_, doc2, _) = process_attachments(&[att("全家福.png", "image/png")], &atts, &inbox);
+        assert!(inbox.join("全家福 (2).png").is_file(), "同名去重不覆盖");
+        assert!(doc2.contains("全家福 (2).png"), "路径行报去重后的名字: {doc2}");
+
+        // 渠道来的光秃名(无扩展):按 mime 补,好认好开
+        let (_, doc3, _) = process_attachments(&[att("photo", "image/jpeg")], &atts, &inbox);
+        assert!(inbox.join("photo.jpg").is_file(), "无扩展名按 mime 补");
+        assert!(doc3.contains("photo.jpg"), "{doc3}");
     }
 
     /// 说话人显性化(§):load_conversation 富化 —— 非归属者说话人标名(声纹 / 渠道共用 speaker_user),

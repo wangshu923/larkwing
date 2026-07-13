@@ -60,26 +60,36 @@ pub struct Store {
     pub diary: DiaryRepo,
 }
 
+/// 全部域迁移(Store::open 执行;恢复备份预检拿它判「备份是否来自更新版本」)。
+fn all_migrations() -> Vec<db::Migration> {
+    [
+        users::MIGRATIONS,
+        settings::MIGRATIONS,
+        chat::MIGRATIONS,
+        channels::MIGRATIONS,
+        cloned_voices::MIGRATIONS,
+        memory::MIGRATIONS,
+        usage::MIGRATIONS,
+        briefings::MIGRATIONS,
+        jobs::MIGRATIONS,
+        fsops::MIGRATIONS,
+        voiceprints::MIGRATIONS,
+        media_progress::MIGRATIONS,
+        todos::MIGRATIONS,
+        diary::MIGRATIONS,
+    ]
+    .concat()
+}
+
+/// 本版程序认识的全部迁移 id(供 datadir 恢复预检:备份库里出现不认识的 id = 来自更新版本)。
+pub fn migration_ids() -> Vec<&'static str> {
+    all_migrations().iter().map(|m| m.id).collect()
+}
+
 impl Store {
     pub fn open(path: &std::path::Path) -> anyhow::Result<Store> {
         let db = Db::open(path)?;
-        let all: Vec<db::Migration> = [
-            users::MIGRATIONS,
-            settings::MIGRATIONS,
-            chat::MIGRATIONS,
-            channels::MIGRATIONS,
-            cloned_voices::MIGRATIONS,
-            memory::MIGRATIONS,
-            usage::MIGRATIONS,
-            briefings::MIGRATIONS,
-            jobs::MIGRATIONS,
-            fsops::MIGRATIONS,
-            voiceprints::MIGRATIONS,
-            media_progress::MIGRATIONS,
-            todos::MIGRATIONS,
-            diary::MIGRATIONS,
-        ]
-        .concat();
+        let all = all_migrations();
         db.migrate(&all)?;
         Ok(Store {
             users: UserRepo::new(db.clone()),

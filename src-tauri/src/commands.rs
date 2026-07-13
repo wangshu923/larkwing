@@ -38,6 +38,9 @@ pub struct AppState {
     pub bus: Bus,
     /// boot 时数据位置失效(盘没插/被删)的记录:Some=前端弹恢复弹窗(§3.5 不静默)。
     pub data_missing: Option<PathBuf>,
+    /// boot 时「从备份恢复」落位结果:Some("ok"/"failed") = 本次启动应用过恢复负载,
+    /// 前端 boot 检查据此弹一句结果提示(§3.5 失败绝不静默);None = 无事。
+    pub restore_outcome: Option<&'static str>,
 }
 
 /// 远程渠道的 shell-side 监督器(§6.1:停旧起新的编排在壳层,顶层 spawn 用 tauri runtime;
@@ -1069,6 +1072,8 @@ pub struct DataLocation {
     pub old_root: Option<String>,
     /// 数据位置失效(盘没插/被删)的记录(Some = 前端弹恢复弹窗);正常为 None。
     pub missing: Option<String>,
+    /// 本次启动「从备份恢复」的落位结果("ok"/"failed";None = 无事)→ 前端 boot 弹一句结果。
+    pub restored: Option<String>,
 }
 
 /// 读数据位置(指针每次现读,反映清理后的最新态)。
@@ -1079,6 +1084,7 @@ pub fn data_location(state: State<'_, AppState>) -> DataLocation {
         root: state.data_root.to_string_lossy().into_owned(),
         old_root: ptr.old_root.filter(|s| !s.trim().is_empty()),
         missing: state.data_missing.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        restored: state.restore_outcome.map(str::to_owned),
     }
 }
 
@@ -1113,6 +1119,77 @@ pub async fn backup_data(
         .map_err(AppError::internal)?; // backup_to 错误
     tracing::info!(zip = %zip.display(), "数据备份完成");
     Ok(zip.to_string_lossy().into_owned())
+}
+
+/// 唤起系统原生文件选择器挑备份包(zip)。返回绝对路径;用户取消 = None。
+#[tauri::command]
+pub async fn pick_backup_file(app: tauri::AppHandle) -> Result<Option<String>, AppError> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().add_filter("zip", &["zip"]).pick_file(move |p| {
+        let _ = tx.send(p);
+    });
+    let picked = rx.await.map_err(AppError::internal)?;
+    Ok(picked
+        .and_then(|fp| fp.into_path().ok())
+        .map(|p| p.to_string_lossy().into_owned()))
+}
+
+/// 恢复预检结果(给前端确认弹窗:包概要 + 失败原因 code)。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreCheckOut {
+    pub ok: bool,
+    /// 失败原因(RestoreBlock code → 前端 `settings.system.restoreErr.<reason>`);ok 时 None。
+    pub reason: Option<String>,
+    /// 包内数据库(解压后)字节数;ok 时有值。
+    pub db_bytes: u64,
+    /// 包内克隆音色文件个数。
+    pub clones: u32,
+}
+
+/// 恢复预检(选完备份包、确认前调):zip 结构 + DB 魔数 + 迁移版本前向检查(备份来自
+/// 更新版本 → 拒并明说,老程序开新库会坏)。纯校验不动数据。
+#[tauri::command]
+pub async fn restore_precheck(zip: String) -> Result<RestoreCheckOut, AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let known = larkwing_core::store::migration_ids();
+        match datadir::restore_precheck(Path::new(&zip), &known) {
+            Ok(info) => RestoreCheckOut {
+                ok: true,
+                reason: None,
+                db_bytes: info.db_bytes,
+                clones: info.clones,
+            },
+            Err(b) => RestoreCheckOut { ok: false, reason: Some(b.code().into()), db_bytes: 0, clones: 0 },
+        }
+    })
+    .await
+    .map_err(AppError::internal)
+}
+
+/// 执行「从备份恢复」:重检 → 负载解到 `<root>/restore-pending/` → 立即重启;
+/// 真正落位在下次 boot 开库前(运行中不能覆盖已打开的 DB),现库届时留保险副本
+/// `larkwing.db.pre-restore-<时间戳>`。成功路径不返回(进程重启);失败返回 AppError。
+#[tauri::command]
+pub async fn restore_data(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    zip: String,
+) -> Result<(), AppError> {
+    let root = state.data_root.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // 重检(前端已 precheck,这里防竞态/直接调用)。
+        let known = larkwing_core::store::migration_ids();
+        datadir::restore_precheck(Path::new(&zip), &known)
+            .map_err(|b| anyhow::anyhow!("恢复预检未过: {}", b.code()))?;
+        datadir::stage_restore(&root, Path::new(&zip))
+    })
+    .await
+    .map_err(AppError::internal)? // join 错误
+    .map_err(AppError::internal)?; // stage_restore 错误
+    tracing::info!("恢复负载已就位,重启落位");
+    app.restart(); // -> !,不返回
 }
 
 /// 搬家预检结果(给前端确认弹窗:目标路径 + 体积 + 失败原因 code)。

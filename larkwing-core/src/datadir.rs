@@ -8,6 +8,7 @@
 //!   - `data_root` 指向别处且目录在 → 搬过家,用记的路径;
 //!   - `data_root` 指向别处但目录不在(盘没插 / 被删)→ `Resolution.missing`,壳层友好处理,
 //!     **绝不静默在默认位置重建空数据**(§3.5 不静默失败)。
+//!
 //! 指针文件本身**永不参与搬家**,永远留在锚点。
 //!
 //! 搬家流程(提交点 = 翻指针):拷可重建 / 静态子树 → DB 走 `VACUUM INTO` 出一致快照(放最后)
@@ -362,7 +363,11 @@ pub fn backup_to(data_root: &Path, dest_dir: &Path) -> Result<PathBuf> {
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
     let zip_path = dest_dir.join(format!("larkwing-backup-{stamp}.zip"));
     // VACUUM 出一致快照到系统临时目录(读进 zip 后即删,不在用户所选目录里散落临时文件)。
-    let snap_db = std::env::temp_dir().join(format!("lw-backup-{}-{stamp}.db", std::process::id()));
+    // 名带进程内序号:秒级时间戳在并发调用(测试并行实锤)下会同名互删。
+    static SNAP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SNAP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let snap_db = std::env::temp_dir()
+        .join(format!("lw-backup-{}-{stamp}-{seq}.db", std::process::id()));
     let _ = std::fs::remove_file(&snap_db);
 
     let build = || -> Result<()> {
@@ -401,6 +406,272 @@ pub fn backup_to(data_root: &Path, dest_dir: &Path) -> Result<PathBuf> {
         return Err(e);
     }
     Ok(zip_path)
+}
+
+// ---- 从备份恢复(2026-07-13):backup_to 的另一半 ----
+//
+// 运行中不能覆盖已打开的 DB(Windows 文件锁 + WAL),所以恢复分两拍:
+//   ① 运行中:`restore_precheck` 校验 zip(结构 / SQLite 魔数 / 迁移版本前向检查)→ 用户确认
+//      → `stage_restore` 把负载解到 `<root>/restore-pending/` → 调用方重启;
+//   ② 下次 boot(开库前):`apply_pending_restore` 把现库(连 -wal/-shm)挪成
+//      `larkwing.db.pre-restore-<时间戳>` 保险副本 → 备份库就位 → 克隆音色合并。
+// 翻拍点 = staging 目录 rename 成 `restore-pending`(同卷原子);半截 `.tmp` 是垃圾,boot 清。
+// 失败回滚保老数据权威(§3.5 不静默,结果由壳层带给前端弹提示)。
+
+/// 待恢复负载目录名(在数据根下;boot 开库前查它)。
+pub const RESTORE_PENDING: &str = "restore-pending";
+
+/// 恢复预检失败原因(→ 前端 i18n code,同 MoveBlock 手法)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreBlock {
+    /// 不是备份包(打不开 / 不是 zip / 里面没有数据库)。
+    NotBackup,
+    /// 包里的数据库读不出来(魔数不对 / 打不开 / 没有迁移记账表)。
+    BadDb,
+    /// 备份来自更新版本(库里有本版不认识的迁移 id)——老程序开新库会坏,拒绝。
+    Newer,
+}
+
+impl RestoreBlock {
+    /// 前端字典 key(`settings.system.restoreErr.<code>`)。
+    pub fn code(self) -> &'static str {
+        match self {
+            RestoreBlock::NotBackup => "not_backup",
+            RestoreBlock::BadDb => "bad_db",
+            RestoreBlock::Newer => "newer",
+        }
+    }
+}
+
+/// 预检通过后的备份包概要(给前端确认弹窗)。
+#[derive(Debug, Clone, Copy)]
+pub struct RestoreCheck {
+    /// 包内数据库(解压后)字节数。
+    pub db_bytes: u64,
+    /// 包内克隆音色文件个数。
+    pub clones: u32,
+}
+
+const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+
+fn stamp() -> String {
+    chrono::Local::now().format("%Y%m%d-%H%M%S").to_string()
+}
+
+/// 恢复预检(纯校验,不动数据根):zip 结构 + DB 魔数 + 迁移版本前向检查。
+/// `known` = 本版程序认识的全部迁移 id(`store::migration_ids()`,参数传入保持 datadir 不依赖 store)。
+pub fn restore_precheck(
+    zip_path: &Path,
+    known: &[&str],
+) -> std::result::Result<RestoreCheck, RestoreBlock> {
+    let file = std::fs::File::open(zip_path).map_err(|_| RestoreBlock::NotBackup)?;
+    let mut z = zip::ZipArchive::new(file).map_err(|_| RestoreBlock::NotBackup)?;
+
+    let mut db_bytes = 0u64;
+    let mut has_db = false;
+    let mut clones = 0u32;
+    for i in 0..z.len() {
+        let f = z.by_index(i).map_err(|_| RestoreBlock::NotBackup)?;
+        if f.is_dir() {
+            continue;
+        }
+        match f.enclosed_name() {
+            Some(p) if p == Path::new(DB_FILE) => {
+                has_db = true;
+                db_bytes = f.size();
+            }
+            Some(p) if p.starts_with("voice/clones") => clones += 1,
+            _ => {}
+        }
+    }
+    if !has_db {
+        return Err(RestoreBlock::NotBackup);
+    }
+
+    // DB 内容校验要开 SQLite → 解到系统临时文件,验完即删。
+    // 名带进程内序号:秒级时间戳在并发调用(测试并行)下会同名互删(backup_to 同款)。
+    static CHECK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = CHECK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = std::env::temp_dir().join(format!(
+        "lw-restore-check-{}-{}-{seq}.db",
+        std::process::id(),
+        stamp()
+    ));
+    let _ = std::fs::remove_file(&tmp);
+    let check = (|| -> std::result::Result<(), RestoreBlock> {
+        {
+            let mut entry = z.by_name(DB_FILE).map_err(|_| RestoreBlock::NotBackup)?;
+            let mut out = std::fs::File::create(&tmp).map_err(|_| RestoreBlock::BadDb)?;
+            std::io::copy(&mut entry, &mut out).map_err(|_| RestoreBlock::BadDb)?;
+        }
+        let head = {
+            use std::io::Read;
+            let mut buf = [0u8; 16];
+            let mut f = std::fs::File::open(&tmp).map_err(|_| RestoreBlock::BadDb)?;
+            f.read_exact(&mut buf).map_err(|_| RestoreBlock::BadDb)?;
+            buf
+        };
+        if &head != SQLITE_MAGIC {
+            return Err(RestoreBlock::BadDb);
+        }
+        let conn = rusqlite::Connection::open_with_flags(
+            &tmp,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|_| RestoreBlock::BadDb)?;
+        // 迁移记账表是每个真库都有的(首启即建);读不到 = 不是我们的库。
+        let ids: Vec<String> = conn
+            .prepare("SELECT id FROM schema_migrations")
+            .and_then(|mut s| {
+                s.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(|_| RestoreBlock::BadDb)?;
+        if ids.is_empty() {
+            return Err(RestoreBlock::BadDb);
+        }
+        if ids.iter().any(|id| !known.contains(&id.as_str())) {
+            return Err(RestoreBlock::Newer);
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    check.map(|_| RestoreCheck { db_bytes, clones })
+}
+
+/// 把备份负载解到 `<root>/restore-pending/`(先 `.tmp` 后原子改名 = 落定标记),供下次 boot 落位。
+/// 只认识 DB 与 `voice/clones/`(其余条目跳过 = 老程序对未来备份成员向前兼容);
+/// 条目路径走 `enclosed_name` 防 zip-slip。调用方应先跑过 `restore_precheck`。
+pub fn stage_restore(data_root: &Path, zip_path: &Path) -> Result<()> {
+    let pending = data_root.join(RESTORE_PENDING);
+    let tmp = data_root.join(format!("{RESTORE_PENDING}.tmp"));
+    for d in [&pending, &tmp] {
+        if d.exists() {
+            std::fs::remove_dir_all(d)
+                .with_context(|| format!("清理旧恢复负载失败: {}", d.display()))?;
+        }
+    }
+    std::fs::create_dir_all(&tmp)?;
+
+    let file = std::fs::File::open(zip_path)
+        .with_context(|| format!("打开备份包失败: {}", zip_path.display()))?;
+    let mut z = zip::ZipArchive::new(file).context("读备份包失败")?;
+    let mut got_db = false;
+    for i in 0..z.len() {
+        let mut f = z.by_index(i)?;
+        if f.is_dir() {
+            continue;
+        }
+        // enclosed_name = None 说明条目名带路径穿越,直接跳过(防 zip-slip)。
+        let Some(rel) = f.enclosed_name() else { continue };
+        let dest = if rel == Path::new(DB_FILE) {
+            got_db = true;
+            tmp.join(DB_FILE)
+        } else if rel.starts_with("voice/clones") {
+            let Some(name) = rel.file_name() else { continue };
+            let dir = tmp.join("voice").join("clones");
+            std::fs::create_dir_all(&dir)?;
+            dir.join(name)
+        } else {
+            tracing::debug!(entry = %rel.display(), "备份包里不认识的条目,跳过");
+            continue;
+        };
+        let mut out = std::fs::File::create(&dest)
+            .with_context(|| format!("写恢复负载失败: {}", dest.display()))?;
+        std::io::copy(&mut f, &mut out)?;
+    }
+    if !got_db {
+        bail!("备份包里没有数据库");
+    }
+    std::fs::rename(&tmp, &pending).context("恢复负载落定失败")?;
+    Ok(())
+}
+
+/// boot 最先(开库前)调:有待恢复负载就把它换进来。
+/// - `None` = 没有待恢复负载,无事;
+/// - `Some(Ok(()))` = 恢复成功(原库留保险副本 `larkwing.db.pre-restore-<时间戳>`);
+/// - `Some(Err)` = 失败,已尽力回滚,老数据仍权威(负载已清,下次 boot 不再撞)。
+pub fn apply_pending_restore(data_root: &Path) -> Option<std::result::Result<(), String>> {
+    // rename 落定前崩掉的半截 staging = 垃圾,顺手清。
+    let half = data_root.join(format!("{RESTORE_PENDING}.tmp"));
+    if half.exists() {
+        std::fs::remove_dir_all(&half).ok();
+    }
+    let pending = data_root.join(RESTORE_PENDING);
+    if !pending.is_dir() {
+        return None;
+    }
+    let out = apply_restore_inner(data_root, &pending).map_err(|e| format!("{e:#}"));
+    // 成败都清负载:成功 = 已消费;失败 = 别让每次启动反复撞同一坨坏负载。
+    std::fs::remove_dir_all(&pending).ok();
+    Some(out)
+}
+
+fn apply_restore_inner(data_root: &Path, pending: &Path) -> Result<()> {
+    let staged_db = pending.join(DB_FILE);
+    if !staged_db.is_file() {
+        bail!("待恢复负载缺数据库");
+    }
+    let ts = stamp();
+
+    // 1) 现库连 -wal/-shm 一起挪成保险副本(WAL 里可能有已提交未 checkpoint 的数据,必须跟着走;
+    //    后缀保持 `<副本名>-wal` 配对,保险副本本身仍是可直接打开的库)。挪走也顺带保证
+    //    新库就位后不会被旧 WAL 污染。记下动过的对,失败逆序滚回去。
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let safety = data_root.join(format!("{DB_FILE}.pre-restore-{ts}"));
+    let with_suffix = |base: &Path, suffix: &str| -> PathBuf {
+        let mut s = base.as_os_str().to_os_string();
+        s.push(suffix);
+        PathBuf::from(s)
+    };
+    for (from, to) in [
+        (data_root.join(DB_FILE), safety.clone()),
+        (data_root.join(format!("{DB_FILE}-wal")), with_suffix(&safety, "-wal")),
+        (data_root.join(format!("{DB_FILE}-shm")), with_suffix(&safety, "-shm")),
+    ] {
+        if !from.exists() {
+            continue; // 全新机器上恢复(还没有库)也是合法路
+        }
+        if let Err(e) = std::fs::rename(&from, &to) {
+            for (f, t) in moved.iter().rev() {
+                std::fs::rename(t, f).ok();
+            }
+            return Err(e).with_context(|| format!("挪保险副本失败: {}", from.display()));
+        }
+        moved.push((from, to));
+    }
+
+    // 2) 备份库就位;失败把保险副本滚回来(老数据仍权威)。
+    if let Err(e) = std::fs::rename(&staged_db, data_root.join(DB_FILE)) {
+        for (f, t) in moved.iter().rev() {
+            std::fs::rename(t, f).ok();
+        }
+        return Err(e).context("恢复就位失败");
+    }
+
+    // 3) 克隆音色合并:同名以备份为准(恢复回来的 DB 指向的就是备份里那份),现有多出来的
+    //    留着(孤儿 wav 无害)。库已就位,单个 wav 失败只记日志不翻整单。
+    let src = pending.join("voice").join("clones");
+    if src.is_dir() {
+        let dst_dir = data_root.join("voice").join("clones");
+        std::fs::create_dir_all(&dst_dir).ok();
+        if let Ok(rd) = std::fs::read_dir(&src) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if !p.is_file() {
+                    continue;
+                }
+                let dest = dst_dir.join(e.file_name());
+                if dest.exists() {
+                    std::fs::remove_file(&dest).ok();
+                }
+                if let Err(err) = std::fs::rename(&p, &dest) {
+                    tracing::warn!(file = %dest.display(), err = %err, "恢复克隆音色失败(跳过)");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn dir_size(root: &Path) -> u64 {
@@ -604,5 +875,171 @@ mod tests {
         std::fs::write(other.join(DB_FILE), b"db").unwrap();
         cleanup_old(&other, &anchor).unwrap();
         assert!(!other.exists(), "专属数据文件夹整个删掉");
+    }
+
+    // ---- 从备份恢复 ----
+
+    /// 造一个带迁移记账表的真库(恢复预检要读 schema_migrations)。
+    fn mk_db(path: &Path, marker: i64, migration_ids: &[&str]) {
+        let c = rusqlite::Connection::open(path).unwrap();
+        c.execute_batch(
+            "CREATE TABLE schema_migrations(id TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);
+             CREATE TABLE t(x);",
+        )
+        .unwrap();
+        for id in migration_ids {
+            c.execute("INSERT INTO schema_migrations VALUES(?1, 1)", [id]).unwrap();
+        }
+        c.execute("INSERT INTO t VALUES(?1)", [marker]).unwrap();
+    }
+
+    fn zip_with(dest: &Path, entries: &[(&str, &[u8])]) {
+        use std::io::Write;
+        let f = std::fs::File::create(dest).unwrap();
+        let mut z = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default();
+        for (name, bytes) in entries {
+            z.start_file(*name, opts).unwrap();
+            z.write_all(bytes).unwrap();
+        }
+        z.finish().unwrap();
+    }
+
+    #[test]
+    fn restore_precheck_gates_garbage_bad_db_and_newer() {
+        let base = tmp("restore-precheck");
+        let known = ["0001_test"];
+
+        // 非 zip
+        let junk = base.join("junk.zip");
+        std::fs::write(&junk, b"not a zip at all").unwrap();
+        assert_eq!(restore_precheck(&junk, &known).unwrap_err(), RestoreBlock::NotBackup);
+
+        // zip 里没有数据库
+        let nodb = base.join("nodb.zip");
+        zip_with(&nodb, &[("readme.txt", b"hi")]);
+        assert_eq!(restore_precheck(&nodb, &known).unwrap_err(), RestoreBlock::NotBackup);
+
+        // 数据库魔数不对
+        let baddb = base.join("baddb.zip");
+        zip_with(&baddb, &[(DB_FILE, b"definitely not sqlite")]);
+        assert_eq!(restore_precheck(&baddb, &known).unwrap_err(), RestoreBlock::BadDb);
+
+        // 备份来自更新版本(有本版不认识的迁移 id)
+        let newer_db = base.join("newer.db");
+        mk_db(&newer_db, 1, &["0001_test", "9999_future"]);
+        let newer = base.join("newer.zip");
+        zip_with(&newer, &[(DB_FILE, &std::fs::read(&newer_db).unwrap())]);
+        assert_eq!(restore_precheck(&newer, &known).unwrap_err(), RestoreBlock::Newer);
+
+        // 正常包:概要数出克隆音色
+        let ok_db = base.join("ok.db");
+        mk_db(&ok_db, 1, &["0001_test"]);
+        let okzip = base.join("ok.zip");
+        zip_with(
+            &okzip,
+            &[
+                (DB_FILE, &std::fs::read(&ok_db).unwrap()),
+                ("voice/clones/c1.wav", b"RIFFxxxx"),
+            ],
+        );
+        let info = restore_precheck(&okzip, &known).unwrap();
+        assert!(info.db_bytes > 0);
+        assert_eq!(info.clones, 1);
+    }
+
+    #[test]
+    fn restore_roundtrip_swaps_db_keeps_safety_and_merges_clones() {
+        // A 机:真数据 → backup_to 出包
+        let root_a = tmp("restore-a");
+        mk_db(&root_a.join(DB_FILE), 42, &["0001_test"]);
+        std::fs::create_dir_all(root_a.join("voice/clones")).unwrap();
+        std::fs::write(root_a.join("voice/clones/c1.wav"), b"AAA").unwrap();
+        let dest = tmp("restore-zipdest");
+        let zip = backup_to(&root_a, &dest).unwrap();
+
+        // B 机:另一份现数据(同名克隆内容不同 + 多一个自己的 + 残留 -wal)
+        let root_b = tmp("restore-b");
+        mk_db(&root_b.join(DB_FILE), 7, &["0001_test"]);
+        std::fs::write(root_b.join(format!("{DB_FILE}-wal")), b"stale wal").unwrap();
+        std::fs::create_dir_all(root_b.join("voice/clones")).unwrap();
+        std::fs::write(root_b.join("voice/clones/c1.wav"), b"BBB").unwrap();
+        std::fs::write(root_b.join("voice/clones/c2.wav"), b"CCC").unwrap();
+
+        // 预检 → 暂存 → boot 落位
+        let info = restore_precheck(&zip, &["0001_test"]).unwrap();
+        assert_eq!(info.clones, 1);
+        stage_restore(&root_b, &zip).unwrap();
+        assert!(root_b.join(RESTORE_PENDING).join(DB_FILE).is_file(), "负载落定");
+        let outcome = apply_pending_restore(&root_b).expect("有负载应返回结果");
+        outcome.expect("落位应成功");
+
+        // 库换成了备份的内容
+        let c = rusqlite::Connection::open(root_b.join(DB_FILE)).unwrap();
+        let v: i64 = c.query_row("SELECT x FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 42, "恢复后应是备份里的数据");
+        // 原库(连 -wal)成保险副本;live 旁不再有旧 wal
+        let names: Vec<String> = std::fs::read_dir(&root_b)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.starts_with(&format!("{DB_FILE}.pre-restore-")) && !n.ends_with("-wal")),
+            "应留保险副本: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.starts_with(&format!("{DB_FILE}.pre-restore-")) && n.ends_with("-wal")),
+            "旧 wal 跟着保险副本走: {names:?}"
+        );
+        assert!(!names.iter().any(|n| n == &format!("{DB_FILE}-wal")), "live 旁不残留旧 wal");
+        // 克隆音色:同名以备份为准,多出来的留着;负载目录已收摊
+        assert_eq!(std::fs::read(root_b.join("voice/clones/c1.wav")).unwrap(), b"AAA");
+        assert_eq!(std::fs::read(root_b.join("voice/clones/c2.wav")).unwrap(), b"CCC");
+        assert!(!root_b.join(RESTORE_PENDING).exists(), "负载已消费");
+        // 保险副本本身是能打开的库(带着自己的 wal 配对名)
+        let safety = std::fs::read_dir(&root_b)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                let n = p.file_name().unwrap().to_string_lossy().into_owned();
+                n.starts_with(&format!("{DB_FILE}.pre-restore-")) && !n.ends_with("-wal") && !n.ends_with("-shm")
+            })
+            .unwrap();
+        let c2 = rusqlite::Connection::open(&safety).unwrap();
+        let v2: i64 = c2.query_row("SELECT x FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(v2, 7, "保险副本 = 恢复前的数据");
+    }
+
+    #[test]
+    fn apply_pending_restore_noop_without_payload_and_cleans_half_staging() {
+        let root = tmp("restore-noop");
+        std::fs::create_dir_all(root.join(format!("{RESTORE_PENDING}.tmp"))).unwrap();
+        assert!(apply_pending_restore(&root).is_none(), "无负载 = None");
+        assert!(!root.join(format!("{RESTORE_PENDING}.tmp")).exists(), "半截 staging 清掉");
+    }
+
+    #[test]
+    fn stage_restore_skips_zip_slip_entries() {
+        let base = tmp("restore-slip");
+        let root = base.join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = base.join("ok.db");
+        mk_db(&db, 1, &["0001_test"]);
+        let zip = base.join("slip.zip");
+        zip_with(
+            &zip,
+            &[
+                (DB_FILE, &std::fs::read(&db).unwrap()),
+                ("../evil.wav", b"x"),
+                ("voice/clones/../../evil2.wav", b"y"),
+            ],
+        );
+        stage_restore(&root, &zip).unwrap();
+        assert!(root.join(RESTORE_PENDING).join(DB_FILE).is_file());
+        assert!(!base.join("evil.wav").exists(), "路径穿越条目不落盘");
+        assert!(!root.join("evil2.wav").exists(), "路径穿越条目不落盘");
+        assert!(!root.join(RESTORE_PENDING).join("evil2.wav").exists());
     }
 }

@@ -130,6 +130,21 @@ pub fn run() {
           "数据位置失效(盘没插/被删),已回落默认根;前端将提示恢复(退出去插回磁盘 / 恢复默认)");
       }
 
+      // 「从备份恢复」落位:上次运行 restore_data 暂存的负载在开库前换进来(运行中不能覆盖
+      // 已打开的 DB)。成功 = 现库已挪成 pre-restore 保险副本;失败 = 老数据仍权威。
+      // 结果带给前端 boot 检查弹一句(§3.5 失败绝不静默)。
+      let restore_outcome = match larkwing_core::datadir::apply_pending_restore(&data_dir) {
+        None => None,
+        Some(Ok(())) => {
+          tracing::info!("已从备份恢复数据(原数据留有 *.pre-restore-* 保险副本)");
+          Some("ok")
+        }
+        Some(Err(e)) => {
+          tracing::error!(err = %e, "从备份恢复失败,继续用原数据");
+          Some("failed")
+        }
+      };
+
       let store = Store::open(&data_dir.join("larkwing.db"))?;
       store.users.ensure_default_user()?; // 首启零配置
       // 把 settings 里的 legacy 明文密钥迁到 keyring(§6.3;幂等,keyring 不可用则原地留 settings)
@@ -214,6 +229,7 @@ pub fn run() {
         anchor: anchor.clone(),
         bus: bus.clone(),
         data_missing,
+        restore_outcome,
       });
 
       let forward = app.handle().clone();
@@ -460,6 +476,9 @@ pub fn run() {
       commands::data_reset_to_default,
       commands::reveal_data_dir,
       commands::backup_data,
+      commands::pick_backup_file,
+      commands::restore_precheck,
+      commands::restore_data,
       commands::search_messages,
     ])
     .run(tauri::generate_context!())

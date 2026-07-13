@@ -865,6 +865,8 @@ export interface DataLocation {
   root: string
   oldRoot: string | null
   missing: string | null
+  /** 本次启动「从备份恢复」的落位结果('ok'/'failed';null = 无事)→ boot 弹一句结果。 */
+  restored: string | null
 }
 
 /** 搬家预检结果(给确认弹窗:目标路径 + 体积 + 失败原因 code)。 */
@@ -875,6 +877,15 @@ export interface RelocateCheck {
   newRoot: string | null
   needBytes: number
   freeBytes: number
+}
+
+/** 恢复预检结果(给确认弹窗:包概要 + 失败原因 code)。 */
+export interface RestoreCheck {
+  ok: boolean
+  /** 失败原因 code(→ settings.system.restoreErr.<reason>);ok 时 null。 */
+  reason: string | null
+  dbBytes: number
+  clones: number
 }
 
 export const api = {
@@ -1083,6 +1094,15 @@ export const api = {
   revealDataDir: () => invoke<void>('reveal_data_dir'),
   /** 一键备份:在所选目录导出 larkwing-backup-<时间戳>.zip(DB 快照 + 克隆音色),返回包路径。 */
   backupData: (destDir: string) => invoke<string>('backup_data', { destDir }),
+
+  /** 原生文件选择器挑备份包(zip);取消 = null。 */
+  pickBackupFile: () => invoke<string | null>('pick_backup_file'),
+
+  /** 恢复预检(纯校验):zip 结构 + DB 魔数 + 迁移版本前向检查。 */
+  restorePrecheck: (zip: string) => invoke<RestoreCheck>('restore_precheck', { zip }),
+
+  /** 执行恢复:负载暂存 → 自动重启,下次启动开库前落位(现库留 pre-restore 保险副本)。成功不返回。 */
+  restoreData: (zip: string) => invoke<void>('restore_data', { zip }),
 }
 
 /** 托盘点「显示悬浮窗」→ 壳层 emit,主窗据此重开悬浮窗(置 enabled + show)。 */

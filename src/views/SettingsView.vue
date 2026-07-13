@@ -547,6 +547,46 @@ async function backupNow() {
     backupBusy.value = false
   }
 }
+// 从备份恢复:选 zip → 预检(结构/魔数/迁移版本)→ 内联确认 → 负载暂存 + 自动重启,
+// 下次启动开库前落位(现库留 pre-restore 保险副本)。backup 的另一半。
+const restoreBusy = ref(false)
+const restoreError = ref('')
+const pendingRestore = ref<{ zip: string; dbBytes: number; clones: number } | null>(null)
+const mb = (n: number) => (Math.max(n, 104858) / 1048576).toFixed(1)
+async function restorePick() {
+  if (restoreBusy.value || relocateBusy.value || backupBusy.value || !isTauri()) return
+  restoreError.value = ''
+  pendingRestore.value = null
+  const zip = await api.pickBackupFile()
+  if (!zip) return
+  try {
+    const check = await api.restorePrecheck(zip)
+    if (!check.ok) {
+      restoreError.value = t(`settings.system.restoreErr.${check.reason ?? 'not_backup'}`, { name: petName.value })
+      return
+    }
+    pendingRestore.value = { zip, dbBytes: check.dbBytes, clones: check.clones }
+  } catch (e) {
+    console.error('恢复预检失败', e)
+    restoreError.value = t('settings.system.restoreFailed')
+  }
+}
+async function confirmRestore() {
+  const pr = pendingRestore.value
+  if (!pr) return
+  restoreBusy.value = true
+  try {
+    await api.restoreData(pr.zip) // 成功 = 暂存后自动重启落位,不会走到这下面
+  } catch (e) {
+    restoreBusy.value = false
+    pendingRestore.value = null
+    console.error('恢复失败', e)
+    restoreError.value = t('settings.system.restoreFailed')
+  }
+}
+function cancelRestore() {
+  pendingRestore.value = null
+}
 async function cleanupOld() {
   try {
     await api.cleanupOldData()
@@ -1893,9 +1933,10 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         <div class="row">
           <span class="label">{{ t('settings.system.dataLocation') }}</span>
           <span class="key-state">
-            <button class="link" :disabled="relocateBusy" @click="revealData">{{ t('settings.system.dataReveal') }}</button>
-            <button class="link" :disabled="relocateBusy || backupBusy" @click="backupNow">{{ backupBusy ? t('settings.system.backingUp') : t('settings.system.backup') }}</button>
-            <button class="link" :disabled="relocateBusy || backupBusy" @click="relocate">{{ relocateBusy ? t('settings.system.relocating') : t('settings.system.relocate') }}</button>
+            <button class="link" :disabled="relocateBusy || restoreBusy" @click="revealData">{{ t('settings.system.dataReveal') }}</button>
+            <button class="link" :disabled="relocateBusy || backupBusy || restoreBusy" @click="backupNow">{{ backupBusy ? t('settings.system.backingUp') : t('settings.system.backup') }}</button>
+            <button class="link" :disabled="relocateBusy || backupBusy || restoreBusy" @click="restorePick">{{ restoreBusy ? t('settings.system.restoring') : t('settings.system.restore') }}</button>
+            <button class="link" :disabled="relocateBusy || backupBusy || restoreBusy" @click="relocate">{{ relocateBusy ? t('settings.system.relocating') : t('settings.system.relocate') }}</button>
           </span>
         </div>
         <p class="hint s-mono">{{ dataRoot || '—' }}</p>
@@ -1908,6 +1949,14 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           </span>
         </div>
         <p v-if="relocateError" class="hint data-err">{{ relocateError }}</p>
+        <div v-if="pendingRestore" class="data-confirm">
+          <p>{{ t('settings.system.restoreConfirm', { size: mb(pendingRestore.dbBytes), clones: pendingRestore.clones, name: petName }) }}</p>
+          <span class="key-state">
+            <button class="link strong" :disabled="restoreBusy" @click="confirmRestore">{{ t('settings.system.restoreGo') }}</button>
+            <button class="link" :disabled="restoreBusy" @click="cancelRestore">{{ t('settings.system.restoreCancel') }}</button>
+          </span>
+        </div>
+        <p v-if="restoreError" class="hint data-err">{{ restoreError }}</p>
         <p class="hint">{{ t('settings.system.dataLocationHint') }}</p>
         <div v-if="oldDataRoot" class="row">
           <span class="label">{{ t('settings.system.oldData') }}</span>

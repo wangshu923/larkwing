@@ -16,6 +16,7 @@ import UpdateCard from './components/UpdateCard.vue'
 import { useBoot } from './composables/useBoot'
 import { useChat } from './composables/useChat'
 import { useSettings } from './composables/useSettings'
+import { useToast } from './composables/useToast'
 import { useUpdater } from './composables/useUpdater'
 import {
   api,
@@ -128,6 +129,7 @@ if (!isFloat && isTauri()) {
     else void updater.download()
   })
   // boot 后查一次数据位置:失效 → 恢复弹窗;有旧数据残留 → 清理弹窗(主动来找用户,不用回设置页)。
+  // 本次启动若应用过「从备份恢复」的负载,把结果弹一句(成功给底、失败绝不静默 §3.5)。
   onMounted(async () => {
     try {
       const loc = await api.dataLocation()
@@ -138,6 +140,8 @@ if (!isFloat && isTauri()) {
         dataNotice.value = 'old'
         dataNoticePath.value = loc.oldRoot
       }
+      if (loc.restored === 'ok') useToast().ok(t('toast.restoreOk'))
+      else if (loc.restored === 'failed') useToast().error(t('toast.restoreFailed'))
     } catch (e) {
       console.error('数据位置检查失败', e)
     }
