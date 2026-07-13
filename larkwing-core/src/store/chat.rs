@@ -427,6 +427,32 @@ impl ChatRepo {
         })
     }
 
+    /// 全局最后一条消息时刻(**含 tool/event 内部行** —— 判「系统此刻安不安静」用,
+    /// 家庭日记的空闲窗以此为准:回合进行中 tool 行也在落,都算「正热闹」)。
+    pub fn last_message_at(&self) -> Result<Option<i64>> {
+        self.db.with(|c| {
+            let v = c.query_row("SELECT MAX(created_at) FROM messages", [], |r| {
+                r.get::<_, Option<i64>>(0)
+            })?;
+            Ok(v)
+        })
+    }
+
+    /// `[from_ms, to_ms)` 内家里人说话的条数(user 行、非空,跨全家所有会话)——
+    /// 家庭日记「攒够了就写」的量判据(口径同 `messages_between` 的取料过滤)。
+    pub fn count_user_messages_between(&self, from_ms: i64, to_ms: i64) -> Result<i64> {
+        self.db.with(|c| {
+            let n = c.query_row(
+                "SELECT COUNT(*) FROM messages
+                 WHERE created_at >= ?1 AND created_at < ?2
+                   AND role = 'user' AND content <> ''",
+                rusqlite::params![from_ms, to_ms],
+                |r| r.get(0),
+            )?;
+            Ok(n)
+        })
+    }
+
     /// 跨会话搜索(当前用户):`messages.content` 子串匹配,排除 tool/event 内部行
     /// (`role IN (user, assistant)`)。substring `LIKE` 即可(同 recall 立场,历史量小够用;
     /// 真要语义查找走 §13.9 检索核心)。最近命中在前。

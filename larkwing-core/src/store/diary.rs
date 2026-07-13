@@ -5,10 +5,11 @@
 //! 情感记录**,不是「关于人的稳定事实」(不进前缀、不参与召回、不喂回模型);它是给人看的,
 //! 不是给模型用的。home 一天至多一条(全家一本,不 per-user)。
 //!
-//! **水位线不在这里**:写到哪天由 engine/diary.rs 经 settings `diary.covered_until` 管
+//! **水位线不在这里**:写到哪由 engine/diary.rs 经 settings `diary.covered_until_ms` 管
 //! (小状态不开新域 §6.2);本域只管存取。蒸馏触发/区间语义见 engine 侧。
 
 use anyhow::Result;
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 
 use super::db::{m, now_ms, Db, Migration};
@@ -42,7 +43,7 @@ impl DiaryRepo {
         Self { db }
     }
 
-    /// 记某天的日记;该天已有则不覆盖(蒸馏正常沿水位线只前进、不会重写;用户删过的
+    /// 记某天的日记;该天已有则不覆盖(水位线只前进、不会重跑同区间;用户删过的
     /// 日子区间也不会回去,IGNORE 是安全默认)。返回是否真插入。
     pub fn upsert(&self, date: &str, content: &str) -> Result<bool> {
         self.db.with(|c| {
@@ -51,6 +52,39 @@ impl DiaryRepo {
                 rusqlite::params![date, content, now_ms()],
             )?;
             Ok(n > 0)
+        })
+    }
+
+    /// 某天已有的日记内容(engine 同日第二段触发时喂给模型:「这天此前已记」)。
+    pub fn get_by_date(&self, date: &str) -> Result<Option<String>> {
+        self.db.with(|c| {
+            let v = c
+                .query_row(
+                    "SELECT content FROM diary WHERE date=?1",
+                    rusqlite::params![date],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(v)
+        })
+    }
+
+    /// 融合重写(2026-07-13 用户拍板):同一天被第二次写到,整条换新 —— **engine 只对
+    /// 「已把旧文喂给模型」的日子调它**,其余日子仍走 `upsert` 的 IGNORE 安全默认;
+    /// 该天不在(用户刚删的竞态)则退化为插入。`created_at` 不动(记录首写时刻)。
+    pub fn set(&self, date: &str, content: &str) -> Result<bool> {
+        self.db.with(|c| {
+            let n = c.execute(
+                "UPDATE diary SET content=?2 WHERE date=?1",
+                rusqlite::params![date, content],
+            )?;
+            if n == 0 {
+                c.execute(
+                    "INSERT OR IGNORE INTO diary (date, content, created_at) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![date, content, now_ms()],
+                )?;
+            }
+            Ok(true)
         })
     }
 

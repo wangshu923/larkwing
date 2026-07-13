@@ -493,21 +493,22 @@ where
                 }
             }
             Drive::Diary(transcript) => {
-                // 消息落在「真实今天」;水位线拨到前天、now 拨到明天 → 今天成了待补的
-                // 「昨天」(engine/diary 单测同款时间戏法)。直调 diary::run(pub(crate)),
-                // provider 再 make 一个(scripted FakeLlm 每次 make 都带完整剧本)。
+                // 消息落在「真实此刻」;水位线拨到 25h 前(时长攒够)、now 拨到空闲窗之后
+                // (最近 10 分钟无新消息)→ 触发「攒够 + 空闲」蒸馏(engine/diary 单测同款
+                // 时间戏法)。直调 diary::run(pub(crate)),provider 再 make 一个
+                // (scripted FakeLlm 每次 make 都带完整剧本)。
                 for (role, content) in transcript {
                     let _ = store.chat.append_message(conv.id, role, content);
                 }
-                let today = chrono::Local::now().date_naive();
+                let now = crate::store::now_ms();
                 let _ = store.settings.set(
                     None,
-                    crate::engine::diary::WATERMARK_KEY,
-                    &(today - chrono::Duration::days(1)).to_string(),
+                    crate::engine::diary::WATERMARK_MS_KEY,
+                    &(now - 25 * 3_600_000).to_string(),
                 );
                 let provider = make();
-                let tomorrow = crate::store::now_ms() + 86_400_000;
-                match crate::engine::diary::run(&provider, &store, tomorrow).await {
+                let later = now + crate::engine::diary::IDLE_WINDOW_MS + 60_000;
+                match crate::engine::diary::run(&provider, &store, later).await {
                     Ok(n) => {
                         distilled = n;
                         Outcome::Done

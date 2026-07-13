@@ -1525,14 +1525,26 @@ impl Engine {
         });
     }
 
-    /// 家庭日记「这些日子」后台补写(engine/diary.rs,2026-07-09):scheduler 每个节拍喊一声,
-    /// 这里做便宜闸门 —— care.enabled 显式关 = 不写;每小时最多真试一次(失败也计,水位线没跨日时
-    /// 这就是全部开销);防重入;**匿名 provider(model_id 空)不跑**(spawn_title 同款挡板:
+    /// 家庭日记「这些日子」后台补写(engine/diary.rs,2026-07-09;2026-07-13 触发改版
+    /// 「攒够 + 空闲」):scheduler 每个节拍喊一声,这里做便宜闸门 —— care.enabled 显式关 =
+    /// 不写;**任一回合在飞就让路**(空闲才动笔;§7.4 忙检教训:看 `join.is_finished()`,
+    /// 不看 `inflight.is_some()`;不耗尝试冷却,回合结束后下个节拍就能试);每 5 分钟最多
+    /// 真试一次(攒够/安静窗的库侧判断在 diary::run,只是几个轻查询;10 分钟空闲窗按这个
+    /// 粒度不漏);防重入;**匿名 provider(model_id 空)不跑**(spawn_title 同款挡板:
     /// FakeLlm 剧本队列是共享弹出,后台杂活去弹会偷走测试/eval 的脚本回合)。尽力件,绝不阻塞调用方。
     pub fn spawn_diary(&self, now_ms: i64) {
-        const TRY_INTERVAL_MS: i64 = 3_600_000;
+        const TRY_INTERVAL_MS: i64 = 300_000;
         if self.store.settings.get(None, "care.enabled").ok().flatten().as_deref() == Some("0") {
             return; // 随主动关怀总开关收口(§3 一个开关,不添新概念)
+        }
+        {
+            let sessions = self.sessions.lock().expect("sessions lock poisoned");
+            let busy = sessions
+                .values()
+                .any(|slot| slot.inflight.as_ref().is_some_and(|h| !h.join.is_finished()));
+            if busy {
+                return;
+            }
         }
         let last = self.diary_last_try.load(Ordering::Acquire);
         if now_ms.saturating_sub(last) < TRY_INTERVAL_MS {
