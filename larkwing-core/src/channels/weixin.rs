@@ -328,7 +328,7 @@ async fn handle_message(
 
     // 媒体:下载 + 解密 → 桌面同缝 InAttachment(图当轮注入 / 文档抽文字进 history,§9)
     let mut attachments = Vec::new();
-    let mut text = p.text.clone();
+    let text = p.text.clone();
     if let Some(media) = &p.media {
         match media.kind {
             // 语音:优先服务端转写文字;没有则如实说听不了(SILK 解码后置)
@@ -387,14 +387,14 @@ async fn handle_message(
         return;
     }
     // 有文字(或纯文字):把之前攒着的文件捞出来,连同本次附件一起处理
-    let mut attachments = attachments;
     let mut pending = ctx.take_attachments(CHANNEL, &p.from_user_id);
     if !pending.is_empty() {
         pending.extend(attachments);
         attachments = pending;
     }
 
-    let out = drive_turn(&ctx.engine, CHANNEL, &p.from_user_id, text, p.sender.as_deref(), attachments, input)
+    // iLink bot 恒 1:1 单聊 → 一律吃 12h 会话轮换(single=true)
+    let out = drive_turn(&ctx.engine, CHANNEL, &p.from_user_id, text, p.sender.as_deref(), attachments, input, true)
         .await;
     // context_token 落库(未来提醒/发文件回显要):thread 已由 drive_turn 建好
     persist_context_token(ctx, &p.from_user_id, &p.context_token);

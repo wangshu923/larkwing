@@ -94,6 +94,7 @@ async fn serve(ctx: &ChannelCtx, net: &net::Client, ct: &CancellationToken) -> R
             }
             let Some((chat_id, incoming, sender)) = parse_update(&upd) else { continue };
             let chat = chat_id.to_string();
+            let single = is_private_chat(&upd); // 单聊才吃 12h 轮换,群聊维持永久续接
 
             // 访问控制(非风控 §9):配了白名单就只放行名单内;空白名单 = 谁来都先发 onboarding
             if !allowed.is_empty() {
@@ -111,15 +112,15 @@ async fn serve(ctx: &ChannelCtx, net: &net::Client, ct: &CancellationToken) -> R
 
             match incoming {
                 Incoming::Text(text) => {
-                    reply_turn(ctx, net, &token, chat_id, &chat, text, sender.as_deref(), Vec::new(), None)
+                    reply_turn(ctx, net, &token, chat_id, &chat, single, text, sender.as_deref(), Vec::new(), None)
                         .await;
                 }
                 Incoming::Voice { file_id, duration } => {
-                    handle_voice(ctx, net, &token, chat_id, &chat, sender.as_deref(), &file_id, duration)
+                    handle_voice(ctx, net, &token, chat_id, &chat, single, sender.as_deref(), &file_id, duration)
                         .await;
                 }
                 Incoming::Photo { file_id, caption } => {
-                    handle_photo(ctx, net, &token, chat_id, &chat, sender.as_deref(), &file_id, caption)
+                    handle_photo(ctx, net, &token, chat_id, &chat, single, sender.as_deref(), &file_id, caption)
                         .await;
                 }
                 Incoming::Document { file_id, file_name, mime, size, caption } => {
@@ -129,6 +130,7 @@ async fn serve(ctx: &ChannelCtx, net: &net::Client, ct: &CancellationToken) -> R
                         &token,
                         chat_id,
                         &chat,
+                        single,
                         sender.as_deref(),
                         &file_id,
                         &file_name,
@@ -155,6 +157,7 @@ async fn reply_turn(
     token: &str,
     chat_id: i64,
     chat: &str,
+    single: bool,
     text: String,
     sender: Option<&str>,
     attachments: Vec<InAttachment>,
@@ -176,7 +179,7 @@ async fn reply_turn(
         pending.extend(attachments);
         attachments = pending;
     }
-    match drive_turn(&ctx.engine, CHANNEL, chat, text, sender, attachments, input).await {
+    match drive_turn(&ctx.engine, CHANNEL, chat, text, sender, attachments, input, single).await {
         Ok(Some(reply)) => {
             if let Err(e) = send_rich(net, token, chat_id, &reply).await {
                 tracing::warn!(err = %format!("{e:#}"), "Telegram 发送失败");
@@ -200,6 +203,7 @@ async fn handle_voice(
     token: &str,
     chat_id: i64,
     chat: &str,
+    single: bool,
     sender: Option<&str>,
     file_id: &str,
     duration: i64,
@@ -225,7 +229,8 @@ async fn handle_voice(
         let _ = send_message(net, token, chat_id, VOICE_EMPTY_HINT).await;
         return;
     }
-    reply_turn(ctx, net, token, chat_id, chat, text, sender, Vec::new(), Some("voice_msg")).await;
+    reply_turn(ctx, net, token, chat_id, chat, single, text, sender, Vec::new(), Some("voice_msg"))
+        .await;
 }
 
 /// 语音消息的转写链(错误统一冒泡给上面兜 ERR_HINT)。
@@ -248,6 +253,7 @@ async fn handle_photo(
     token: &str,
     chat_id: i64,
     chat: &str,
+    single: bool,
     sender: Option<&str>,
     file_id: &str,
     caption: String,
@@ -265,7 +271,7 @@ async fn handle_photo(
         mime: "image/jpeg".into(), // Bot API 的 photo 恒为服务端压缩 JPEG
         data: base64::engine::general_purpose::STANDARD.encode(&bytes),
     };
-    reply_turn(ctx, net, token, chat_id, chat, caption, sender, vec![att], None).await;
+    reply_turn(ctx, net, token, chat_id, chat, single, caption, sender, vec![att], None).await;
 }
 
 /// 文档(document):文件方式发来的东西——能抽文字的文档下载后走桌面同缝 `InAttachment`
@@ -278,6 +284,7 @@ async fn handle_document(
     token: &str,
     chat_id: i64,
     chat: &str,
+    single: bool,
     sender: Option<&str>,
     file_id: &str,
     file_name: &str,
@@ -310,7 +317,7 @@ async fn handle_document(
         mime: as_image.unwrap_or_else(|| mime.to_string()),
         data: base64::engine::general_purpose::STANDARD.encode(&bytes),
     };
-    reply_turn(ctx, net, token, chat_id, chat, caption, sender, vec![att], None).await;
+    reply_turn(ctx, net, token, chat_id, chat, single, caption, sender, vec![att], None).await;
 }
 
 /// 启动时取"最后一条积压之后"的 offset(offset=-1 拿最后一条;+1 = 跳过积压)。
@@ -488,6 +495,12 @@ fn parse_update(upd: &Value) -> Option<(i64, Incoming, Option<String>)> {
     Some((chat_id, incoming, sender))
 }
 
+/// 单聊判定(`chat.type == "private"`):12h 会话轮换只对单聊,群聊(group/supergroup)
+/// 维持永久续接(§7.7)。TG 消息恒带 type;万一取不到按群聊处理 = 不轮换,保守。
+fn is_private_chat(upd: &Value) -> bool {
+    upd.pointer("/message/chat/type").and_then(Value::as_str) == Some("private")
+}
+
 /// 白名单(逗号/空格/分号/换行分隔的 chat id);空 = 未配置。
 fn allowed_chats(ctx: &ChannelCtx) -> Vec<String> {
     ctx.setting("remote.telegram.allowed_chats")
@@ -524,6 +537,21 @@ mod tests {
         // 空白文本 → 跳过
         let empty = serde_json::json!({ "message": { "text": "   ", "chat": { "id": 1 } } });
         assert_eq!(parse_update(&empty), None);
+    }
+
+    #[test]
+    fn private_chat_detection_defaults_to_group() {
+        let private = serde_json::json!({ "message": {
+            "text": "hi", "chat": { "id": 1, "type": "private" }
+        }});
+        assert!(is_private_chat(&private));
+        // 群/超级群 → 不轮换;缺 type(理论上不发生)也按群聊保守处理
+        for t in ["group", "supergroup", "channel"] {
+            let upd = serde_json::json!({ "message": { "chat": { "id": -9, "type": t } } });
+            assert!(!is_private_chat(&upd), "{t} 不算单聊");
+        }
+        let missing = serde_json::json!({ "message": { "chat": { "id": 1 } } });
+        assert!(!is_private_chat(&missing), "取不到 type 按群聊保守处理");
     }
 
     #[test]

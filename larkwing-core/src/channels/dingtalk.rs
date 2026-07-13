@@ -145,6 +145,8 @@ struct BotMessage {
     webhook: String,
     sender: Option<String>,
     staff_id: Option<String>,
+    /// 群聊(conversationType=2):12h 会话轮换只对单聊,群聊维持永久续接(§7.7)。
+    group: bool,
 }
 
 /// 异步处理一条 bot 消息:按载荷分派。spawn 出来跑,不阻塞 WS 收循环。
@@ -204,8 +206,17 @@ async fn run_reply(
         pending.extend(attachments);
         attachments = pending;
     }
-    match drive_turn(&ctx.engine, CHANNEL, &m.ext_id, text, m.sender.as_deref(), attachments, input)
-        .await
+    match drive_turn(
+        &ctx.engine,
+        CHANNEL,
+        &m.ext_id,
+        text,
+        m.sender.as_deref(),
+        attachments,
+        input,
+        !m.group,
+    )
+    .await
     {
         Ok(Some(reply)) => {
             if let Err(e) = reply_webhook(net, &m.webhook, &reply).await {
@@ -585,7 +596,7 @@ fn parse_bot_message(frame: &Value) -> Option<BotMessage> {
         .filter(|s| !s.is_empty());
     // 推送地址只记单聊(群聊的提醒主动推是另一套群 API,本批不做 → None = 不推)
     let staff_id = if is_group { None } else { staff };
-    Some(BotMessage { ext_id, payload, webhook, sender, staff_id })
+    Some(BotMessage { ext_id, payload, webhook, sender, staff_id, group: is_group })
 }
 
 /// picture 消息的下载码:钉钉两种字段名都见过(downloadCode / pictureDownloadCode),都认。
@@ -671,6 +682,7 @@ mod tests {
         assert!(m.webhook.contains("oapi.dingtalk.com"));
         assert_eq!(m.sender.as_deref(), Some("妈妈"), "昵称去空白");
         assert_eq!(m.staff_id.as_deref(), Some("staff1"), "单聊记推送地址");
+        assert!(!m.group, "单聊 → 吃 12h 会话轮换");
     }
 
     #[test]
@@ -688,6 +700,7 @@ mod tests {
         assert_eq!(m.payload, Payload::Text("今天天气".into()), "开头 @机器人 被去掉");
         assert_eq!(m.sender, None, "无 senderNick → None");
         assert_eq!(m.staff_id, None, "群聊不记推送地址(群提醒主动推本批不做)");
+        assert!(m.group, "群聊 → 不轮换,维持永久续接");
     }
 
     #[test]

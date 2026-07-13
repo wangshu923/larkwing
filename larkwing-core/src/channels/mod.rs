@@ -330,14 +330,62 @@ async fn push_reminder(
     }
 }
 
+/// 单聊闲置轮换阈值(2026-07-13 用户拍板 12h):同一个人超过这么久没动静,下一条消息
+/// 开新会话(老会话留在桌面当历史)。判据 = 会话 `updated_at`(任意角色的最后一条消息,
+/// 含提醒到点的推送——刚推过提醒会话就还「热」,用户回「收到」要接得上文,不按
+/// 「用户上一条」算);群聊不轮换(支持群聊时再议)。
+const FRESH_CONV_IDLE_MS: i64 = 12 * 60 * 60 * 1000;
+
+/// 会话解析(轮换 + 悬空自愈):返回 (conv_id, 指认的家人)。规则 = **chat 的会话 = 名下
+/// 最近有动静的那个**;单聊全部凉透(> 12h)才开新会话;名下会话被桌面删光 = 自愈重建
+/// (修「删会话后手机永久报错」)。「最近动静的不一定是现行会话」:提醒在轮换走的老会话
+/// 到点 → 用户回话接回老会话(上下文都在那);改绑经 `bind` 落新历史行,老行留档
+/// (`thread_by_conv` 反查:提醒推送/发起人标签不断链),指认/推送地址随行继承。
+/// `fresh` = 建新会话(注入可测);`now` = 毫秒时钟(注入可测,同 memory::maintain)。
+fn resolve_conv(
+    store: &crate::store::Store,
+    channel: &str,
+    ext_id: &str,
+    single: bool,
+    now: i64,
+    fresh: impl FnOnce() -> anyhow::Result<crate::store::Conversation>,
+) -> anyhow::Result<(i64, Option<i64>)> {
+    let Some(t) = store.channels.thread_for(channel, ext_id)? else {
+        // 首次来消息:建专属会话并绑定
+        let conv = fresh()?;
+        store.channels.bind(channel, ext_id, conv.id)?;
+        return Ok((conv.id, None));
+    };
+    let active = store.channels.latest_active_conv(channel, ext_id)?;
+    match active {
+        Some((conv_id, updated_at))
+            if !single || now.saturating_sub(updated_at) <= FRESH_CONV_IDLE_MS =>
+        {
+            if conv_id != t.conv_id {
+                // 动静在老会话(提醒刚到点):接回它,现行指针跟着挪
+                store.channels.bind(channel, ext_id, conv_id)?;
+            }
+            Ok((conv_id, t.user_id))
+        }
+        // 全凉透(单聊 12h 轮换)/ 名下会话全被删(悬空自愈)→ 开新会话
+        _ => {
+            let conv = fresh()?;
+            store.channels.bind(channel, ext_id, conv.id)?; // 新行继承指认/昵称/推送地址
+            Ok((conv.id, t.user_id))
+        }
+    }
+}
+
 /// 把一条入站文本喂进引擎、攒出回复(**渠道无关**,复用 turn loop —— 这是"渠道复用回合循环"的兑现)。
 /// `sender_label` = 平台昵称(有就顺手记进映射,给家人页认脸,不参与逻辑)。
 /// 渠道归人:该 chat 若被指认给某家人(家人页设置),回合带 `speaker_user` —— 记忆/需知/提醒
 /// 归 TA(与桌面声纹同一条 `UserMeta` 缝);未指认 = None,零行为变化。
 /// `attachments` = 手机发来的图(桌面同缝:当轮注入、不落库);`input` = 输入形态
 /// (`Some("voice")` = 语音消息转写,只作 payload 事实记录,不置 speak —— 渠道回复是文字)。
+/// `single` = 单聊(12h 闲置轮换只对单聊;群聊维持永久续接,见 `resolve_conv`)。
 /// 返回 `None` = 已折进在飞回合(inject,沿用桌面前端语义,本条不单独回);
 /// `Some(text)` = 完整回复,调用方按平台限长 `split_message` 后发出。
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn drive_turn(
     engine: &Engine,
     channel: &str,
@@ -346,17 +394,14 @@ pub(crate) async fn drive_turn(
     sender_label: Option<&str>,
     attachments: Vec<InAttachment>,
     input: Option<&str>,
+    single: bool,
 ) -> anyhow::Result<Option<String>> {
     let store = engine.store().clone();
-    // 会话映射:回访续接同一会话(send_message 自带历史回放),首次建专属会话并绑定
-    let (conv_id, speaker) = match store.channels.thread_for(channel, ext_id)? {
-        Some(t) => (t.conv_id, t.user_id),
-        None => {
-            let conv = engine.new_conversation(channel)?;
-            store.channels.bind(channel, ext_id, conv.id)?;
-            (conv.id, None)
-        }
-    };
+    // 会话映射:续接名下最近有动静的会话;单聊闲置 12h 轮换、映射悬空自愈(resolve_conv)
+    let (conv_id, speaker) =
+        resolve_conv(&store, channel, ext_id, single, crate::store::now_ms(), || {
+            Ok(engine.new_conversation(channel)?)
+        })?;
     if let Some(label) = sender_label {
         let _ = store.channels.set_label(channel, ext_id, label); // 尽力件,失败不挡回合
     }
@@ -462,6 +507,61 @@ mod tests {
         assert!(buf.buffer("weixin", "u2", vec![att("x.pdf")]), "另一个人独立成批");
         assert!(buf.buffer("dingtalk", "u1", vec![att("y.pdf")]), "另一渠道独立成批");
         assert!(buf.take("telegram", "nobody").is_empty(), "没攒过 = 空");
+    }
+
+    /// 会话解析全链:首建 → 续接 → 12h 轮换(继承指认)→ 提醒唤醒老会话接回 → 删光自愈 → 群聊不轮换。
+    #[test]
+    fn resolve_conv_rotates_heals_and_keeps_groups() {
+        let p = std::env::temp_dir().join(format!("lw-chan-resolve-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let store = crate::store::Store::open(&p).unwrap();
+        let user = store.users.ensure_default_user().unwrap();
+        let kid = store.users.create("小朋友").unwrap();
+        let fresh =
+            || Ok(store.chat.create_conversation_full(user.id, "companion", "telegram").unwrap());
+        let now = crate::store::now_ms();
+        const H12: i64 = FRESH_CONV_IDLE_MS;
+
+        // 首次来消息:建会话并绑定
+        let (c1, sp) = resolve_conv(&store, "telegram", "42", true, now, fresh).unwrap();
+        assert_eq!(sp, None);
+        assert_eq!(store.channels.conv_for("telegram", "42").unwrap(), Some(c1));
+
+        // 12h 内回访:续接同一会话;指认给家人后说话人跟着带
+        let t = store.channels.thread_for("telegram", "42").unwrap().unwrap();
+        store.channels.bind_user(t.id, Some(kid.id)).unwrap();
+        let (again, sp) = resolve_conv(&store, "telegram", "42", true, now + H12, fresh).unwrap();
+        assert_eq!((again, sp), (c1, Some(kid.id)), "12h 整还没过线,续接");
+
+        // 超 12h 没动静:轮换新会话,指认随历史行继承、说话人不丢
+        let (c2, sp) = resolve_conv(&store, "telegram", "42", true, now + H12 + 60_000, fresh).unwrap();
+        assert_ne!(c2, c1, "闲置超时开新会话");
+        assert_eq!(sp, Some(kid.id));
+        let t = store.channels.thread_for("telegram", "42").unwrap().unwrap();
+        assert_eq!((t.conv_id, t.user_id), (c2, Some(kid.id)), "现行指针挪到新会话,指认继承");
+        assert!(store.channels.thread_by_conv(c1).unwrap().is_some(), "老会话反查不断链");
+
+        // 提醒在老会话到点(updated_at 被叫醒)→ 回话接回老会话,现行指针跟着挪
+        std::thread::sleep(std::time::Duration::from_millis(2)); // 毫秒时间戳拉开平局
+        store.chat.append_message(c1, "event", "提醒用户:三点吃药").unwrap();
+        let (back, _) =
+            resolve_conv(&store, "telegram", "42", true, crate::store::now_ms(), fresh).unwrap();
+        assert_eq!(back, c1, "动静在老会话:接回去(用户回「收到」有上文)");
+        assert_eq!(store.channels.conv_for("telegram", "42").unwrap(), Some(c1));
+
+        // 名下会话全被桌面删光:自愈重建,不再永久报错
+        // (SQLite rowid 会复用刚删的 id,判「新」看存在性不看 id 值)
+        store.chat.delete_conversation(c1).unwrap();
+        store.chat.delete_conversation(c2).unwrap();
+        let (c3, sp) = resolve_conv(&store, "telegram", "42", true, now, fresh).unwrap();
+        assert!(store.chat.get_conversation(c3).unwrap().is_some(), "悬空自愈 = 重建了活会话");
+        assert_eq!(sp, Some(kid.id), "自愈也不丢指认");
+        assert_eq!(store.channels.conv_for("telegram", "42").unwrap(), Some(c3));
+
+        // 群聊(single=false):再久也不轮换
+        let (g, _) =
+            resolve_conv(&store, "telegram", "42", false, now + 400 * 24 * H12, fresh).unwrap();
+        assert_eq!(g, c3, "群聊维持永久续接");
     }
 
     #[test]
