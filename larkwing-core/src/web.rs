@@ -125,9 +125,23 @@ impl WebClient {
         anyhow::ensure!(status.is_success(), "页面 HTTP {status}");
         // 重定向后以最终地址为基准解析相对链接(下载类站点常见跳转);bytes() 前先取
         let final_url = resp.url().to_string();
+        let ctype = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
         // 体积闸:10MB 封顶,防超大页面拖死
         let bytes = resp.bytes().await?;
         anyhow::ensure!(bytes.len() <= 10 * 1024 * 1024, "页面超过 10MB,放弃");
+        // 搜索结果/页内链接常直指 PDF 等文件:当 HTML 解析只会出乱码,如实拦下指路
+        if let Some(hint) = non_page_hint(&ctype, &bytes) {
+            bail!("{hint}");
+        }
         let html = String::from_utf8_lossy(&bytes);
         let page = extract_page(&html, &final_url);
         anyhow::ensure!(!page.text.trim().is_empty(), "页面没有可读正文(可能是纯脚本应用)");
@@ -149,6 +163,28 @@ impl WebClient {
         let mut cache = self.cache.lock().expect("web cache lock poisoned");
         cache.insert(url.to_string(), (Instant::now(), json));
     }
+}
+
+/// 直链不是网页(PDF/压缩包/图片…)→ 给模型一句指路话术(该下载走 web_download,
+/// PDF 下完用 fs_read_text 读),绝不把二进制硬当 HTML 解析出乱码。误拦比漏拦贵——
+/// 只认「明确的二进制 Content-Type / %PDF 魔数」;text/*、html/xml/json、没报
+/// Content-Type 的一律照旧当页面解析。
+fn non_page_hint(ctype: &str, bytes: &[u8]) -> Option<String> {
+    if ctype == "application/pdf" || bytes.starts_with(b"%PDF-") {
+        return Some(
+            "这个链接是 PDF 文件不是网页——用 web_download 下载到本机,再用 fs_read_text 读内容"
+                .into(),
+        );
+    }
+    let page_like = ctype.is_empty()
+        || ctype.starts_with("text/")
+        || ctype.contains("html")
+        || ctype.contains("xml")
+        || ctype.contains("json");
+    if page_like {
+        return None;
+    }
+    Some(format!("这个链接不是网页(内容类型 {ctype})——要保存这个文件的话用 web_download 下载"))
 }
 
 fn sel(s: &str) -> Selector {
@@ -411,6 +447,23 @@ mod tests {
         );
         assert_eq!(page.links[0].text, "下载附件");
         assert_eq!(page.links[2].text, "fa piao.pdf", "无文字锚用目标文件名(百分号解码)");
+    }
+
+    #[test]
+    fn non_page_hint_flags_binary_only() {
+        // PDF:按 Content-Type 或 %PDF 魔数认,话术指向 web_download + fs_read_text
+        let pdf = non_page_hint("application/pdf", b"x").expect("CT 认出 PDF");
+        assert!(pdf.contains("web_download") && pdf.contains("fs_read_text"));
+        assert!(non_page_hint("", b"%PDF-1.4 junk").is_some(), "魔数兜住没报 CT 的");
+        // 其他明确二进制 → 通用指路
+        let zip = non_page_hint("application/zip", b"PK").expect("zip 拦下");
+        assert!(zip.contains("web_download"));
+        assert!(non_page_hint("application/octet-stream", &[0, 1]).is_some());
+        assert!(non_page_hint("image/png", b"\x89PNG").is_some());
+        // 页面类一律放行(text/*、html/xml/json、缺 CT)
+        for ct in ["text/html", "text/plain", "application/xhtml+xml", "application/json", ""] {
+            assert!(non_page_hint(ct, b"<html>hello</html>").is_none(), "{ct} 应放行");
+        }
     }
 
     #[test]

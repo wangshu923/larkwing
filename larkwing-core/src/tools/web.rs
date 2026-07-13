@@ -145,13 +145,19 @@ impl WebFetch {
             spec: ToolSpec {
                 name: "web_fetch",
                 description: "读一个具体网页的正文和页内链接(用户给了链接,或 web_search 的\
-                              正文片段不够、要看某条的全文时)。要从页面里找「下载/查看」\
-                              按钮背后的地址时也用它:结果末尾列出页内链接,挑中的交给 \
-                              web_download 下载。",
+                              正文片段不够、要看某条的全文时)。长文一次给一段,没读完会在\
+                              结果末尾标注「继续读带 offset=N」,带上 offset 再调就接着读。\
+                              要从页面里找「下载/查看」按钮背后的地址时也用它:结果末尾列出\
+                              页内链接,挑中的交给 web_download 下载。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "url": { "type": "string", "description": "http(s) 网页链接" }
+                        "url": { "type": "string", "description": "http(s) 网页链接" },
+                        "offset": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "长文续读:从第几个字开始(上次结果末尾给出的数);默认 0 从头读"
+                        }
                     },
                     "required": ["url"]
                 }),
@@ -176,9 +182,28 @@ impl Tool for WebFetch {
             .map(str::trim)
             .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
             .context("缺少合法的 url 参数(需要 http(s) 链接)")?;
+        let offset = super::arg_u64(&args, "offset", 0) as usize;
         let page = self.web.fetch_page(url).await?;
-        let mut out = format!("《{}》\n{}\n\n{}", page.title, url, clip(&page.text, FETCH_MAX_CHARS));
-        if !page.links.is_empty() {
+        // 全文在 WebClient 的短缓存里(缓存单元就是整页成品):续读命中缓存零重抓,
+        // 这里只换切片起点。字符计数与 clip 同口径(CJK 安全)。
+        let total = page.text.chars().count();
+        anyhow::ensure!(
+            offset == 0 || offset < total,
+            "全文约 {total} 字,offset={offset} 超出末尾——已经读完了"
+        );
+        let slice: String = page.text.chars().skip(offset).take(FETCH_MAX_CHARS).collect();
+        let end = offset + slice.chars().count();
+        let mut out = format!("《{}》\n{}\n", page.title, url);
+        if offset > 0 || end < total {
+            out.push_str(&format!("(全文约 {total} 字,本段第 {offset}–{end} 字)\n"));
+        }
+        out.push('\n');
+        out.push_str(&slice);
+        if end < total {
+            out.push_str(&format!("\n\n…(未完,继续读带 offset={end})"));
+        }
+        // 页内链接整页相同,只随首段给一次(续读段重复列出白吃 token)
+        if offset == 0 && !page.links.is_empty() {
             out.push_str("\n\n【页内链接】(要下载哪个就把链接交给 web_download)\n");
             for l in &page.links {
                 out.push_str(&format!("- {} → {}\n", l.text, l.url));
@@ -457,6 +482,80 @@ mod tests {
             .unwrap();
         assert!(out.contains("【页内链接】"), "{out}");
         assert!(out.contains(&format!("下载附件 → http://127.0.0.1:{port}/dl/fp1.pdf")), "{out}");
+    }
+
+    #[tokio::test]
+    async fn web_fetch_offset_paginates_long_page() {
+        use axum::{routing::get, Router};
+        async fn page() -> axum::response::Html<String> {
+            axum::response::Html(format!(
+                "<html><title>长文</title><body><p>{}</p><a href=\"/att.pdf\">附件</a></body></html>",
+                "甲".repeat(7000)
+            ))
+        }
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/long", get(page))).await.ok();
+        });
+
+        let ctx = ctx("fetch-offset");
+        let tool = WebFetch::new(Arc::new(WebClient::new()));
+        let url = format!("http://127.0.0.1:{port}/long");
+
+        // 首段:范围标注 + 续读指引 + 页内链接只随首段给
+        let p1 = tool.run(serde_json::json!({"url": url}), &ctx).await.unwrap();
+        assert!(p1.contains("(全文约 7000 字,本段第 0–6000 字)"), "范围标注");
+        assert!(p1.contains("…(未完,继续读带 offset=6000)"));
+        assert!(p1.contains("【页内链接】"));
+
+        // 第二段(命中缓存零重抓):读到尾,无「未完」、不重复列链接
+        let p2 = tool.run(serde_json::json!({"url": url, "offset": 6000}), &ctx).await.unwrap();
+        assert!(p2.contains("(全文约 7000 字,本段第 6000–7000 字)"));
+        assert!(!p2.contains("未完") && !p2.contains("【页内链接】"));
+        assert_eq!(p2.chars().filter(|c| *c == '甲').count(), 1_000);
+
+        // 超出末尾 = 明确报错(带总长)
+        let err =
+            tool.run(serde_json::json!({"url": url, "offset": 99_999}), &ctx).await.unwrap_err();
+        assert!(err.to_string().contains("超出末尾"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn web_fetch_rejects_pdf_and_binary_with_guidance() {
+        use axum::{http::header, routing::get, Router};
+        async fn pdf() -> impl axum::response::IntoResponse {
+            ([(header::CONTENT_TYPE, "application/pdf")], &b"%PDF-1.4 fake"[..])
+        }
+        async fn zip() -> impl axum::response::IntoResponse {
+            ([(header::CONTENT_TYPE, "application/zip")], &b"PK\x03\x04junk"[..])
+        }
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/f.pdf", get(pdf)).route("/a.zip", get(zip)),
+            )
+            .await
+            .ok();
+        });
+
+        let ctx = ctx("fetch-binary");
+        let tool = WebFetch::new(Arc::new(WebClient::new()));
+        let err = tool
+            .run(serde_json::json!({"url": format!("http://127.0.0.1:{port}/f.pdf")}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("PDF") && err.to_string().contains("web_download"),
+            "{err:#}"
+        );
+        let err = tool
+            .run(serde_json::json!({"url": format!("http://127.0.0.1:{port}/a.zip")}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("web_download"), "{err:#}");
     }
 
     #[tokio::test]

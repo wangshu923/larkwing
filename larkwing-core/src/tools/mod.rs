@@ -85,6 +85,17 @@ pub(crate) fn arg_bool(args: &serde_json::Value, key: &str, default: bool) -> bo
     }
 }
 
+/// 从工具入参里**宽容**地取一个非负整数(`arg_bool` 的整数版,同一类流式 JSON quirk:
+/// 数字被发成字符串 `"6000"`)。真数字取整;数字形字符串解析;缺省 / null / 认不出 /
+/// 负数 → 回落 `default`。
+pub(crate) fn arg_u64(args: &serde_json::Value, key: &str, default: u64) -> u64 {
+    match args.get(key) {
+        Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(default),
+        Some(serde_json::Value::String(s)) => s.trim().parse::<u64>().unwrap_or(default),
+        _ => default,
+    }
+}
+
 /// 每次执行的现场:多用户与会话归属由此带入,工具自身无状态。
 pub struct ToolCtx {
     pub user_id: i64,
@@ -259,6 +270,20 @@ mod tests {
         assert!(arg_bool(&json!({}), "x", true));
         assert!(arg_bool(&json!({ "x": null }), "x", true));
         assert!(arg_bool(&json!({ "x": "maybe" }), "x", true), "认不出回落默认");
+    }
+
+    #[test]
+    fn arg_u64_tolerates_stringified_numbers() {
+        use serde_json::json;
+        assert_eq!(arg_u64(&json!({ "x": 6000 }), "x", 0), 6000);
+        assert_eq!(arg_u64(&json!({ "x": "6000" }), "x", 0), 6000, "字符串数字(流式 JSON 实锤发法)");
+        assert_eq!(arg_u64(&json!({ "x": " 42 " }), "x", 0), 42);
+        // 负数 / 小数 / 认不出 / 缺省 / null → 回落默认
+        assert_eq!(arg_u64(&json!({ "x": -5 }), "x", 7), 7);
+        assert_eq!(arg_u64(&json!({ "x": 1.5 }), "x", 7), 7);
+        assert_eq!(arg_u64(&json!({ "x": "abc" }), "x", 7), 7);
+        assert_eq!(arg_u64(&json!({}), "x", 7), 7);
+        assert_eq!(arg_u64(&json!({ "x": null }), "x", 7), 7);
     }
 
     #[test]

@@ -357,11 +357,17 @@ impl FsReadText {
                 description: "读一个文件的内容拿来看(总结文档、念清单、看说明书、看账单表之类)。\
                               支持纯文本/源码,以及 Word(.docx)、PowerPoint(.pptx)、\
                               Excel(.xlsx,会转成表格文本)、PDF(文字版;扫描成图的 PDF 读不出字)。\
-                              老格式 .doc/.xls/.ppt、或太大的会被拒或只给前一部分。",
+                              老格式 .doc/.xls/.ppt 读不了;太长会分段,结果末尾标注\
+                              「继续读带 offset=N」,带上 offset 再调就接着读。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "文件绝对路径" }
+                        "path": { "type": "string", "description": "文件绝对路径" },
+                        "offset": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "长文续读:从第几个字开始(上次结果末尾给出的数);默认 0 从头读"
+                        }
                     },
                     "required": ["path"]
                 }),
@@ -380,6 +386,7 @@ impl Tool for FsReadText {
 
     async fn run(&self, args: serde_json::Value, _ctx: &ToolCtx) -> anyhow::Result<String> {
         let path = arg_str(&args, "path")?;
+        let offset = super::arg_u64(&args, "offset", 0) as usize;
         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let p = Path::new(&path);
             anyhow::ensure!(p.is_file(), "{path} 不是文件或不存在");
@@ -398,12 +405,26 @@ impl Tool for FsReadText {
                 std::fs::read_to_string(p)
                     .map_err(|_| anyhow::anyhow!("这看起来不是文本文件,读不了内容"))?
             };
-            let mut out: String = full.chars().take(READ_TEXT_MAX_CHARS).collect();
-            if out.len() < full.len() {
-                out.push_str("\n…(文件较长,只读了前一部分)");
-            }
-            if out.is_empty() {
+            // 续读 = 换切片起点重抽一遍(文件本身就是持久层,不另建抽取缓存);
+            // 字符计数口径与 web_fetch 一致(CJK 安全)。
+            let total = full.chars().count();
+            if total == 0 {
+                anyhow::ensure!(offset == 0, "这是个空文件,没有第 {offset} 字");
                 return Ok("(空文件)".into());
+            }
+            anyhow::ensure!(
+                offset == 0 || offset < total,
+                "全文约 {total} 字,offset={offset} 超出末尾——已经读完了"
+            );
+            let slice: String = full.chars().skip(offset).take(READ_TEXT_MAX_CHARS).collect();
+            let end = offset + slice.chars().count();
+            let mut out = if offset > 0 {
+                format!("(从第 {offset} 字接着读,全文约 {total} 字)\n{slice}")
+            } else {
+                slice
+            };
+            if end < total {
+                out.push_str(&format!("\n…(未完:全文约 {total} 字,读到第 {end} 字;继续读带 offset={end})"));
             }
             Ok(out)
         })
@@ -957,5 +978,43 @@ mod tests {
             .run(serde_json::json!({"root": root, "pattern": "[bad"}), &ctx)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn read_text_paginates_long_files_with_offset() {
+        let (ctx, dir) = ctx_and_dir("read");
+        std::fs::write(dir.join("长文.txt"), "甲".repeat(45_000)).unwrap();
+        std::fs::write(dir.join("短.txt"), "短短的一行").unwrap();
+        std::fs::write(dir.join("空.txt"), "").unwrap();
+        let path = dir.join("长文.txt").to_string_lossy().to_string();
+
+        // 首段:截断在 40k 并给出续读起点
+        let p1 = FsReadText::new().run(serde_json::json!({"path": path}), &ctx).await.unwrap();
+        assert!(p1.contains("继续读带 offset=40000"));
+        // 第二段:接着读到尾,无「未完」;字符串形 offset 也认(quirks 同 arg_bool)
+        let p2 = FsReadText::new()
+            .run(serde_json::json!({"path": path, "offset": "40000"}), &ctx)
+            .await
+            .unwrap();
+        assert!(p2.contains("从第 40000 字接着读,全文约 45000 字"));
+        assert!(!p2.contains("未完"));
+        assert_eq!(p2.chars().filter(|c| *c == '甲').count(), 5_000);
+        // 超出末尾 = 明确报错(带总长,模型能自纠)
+        let err = FsReadText::new()
+            .run(serde_json::json!({"path": path, "offset": 99_999}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("超出末尾"));
+        // 短文件输出与从前逐字节相同;空文件仍是「(空文件)」
+        let s = FsReadText::new()
+            .run(serde_json::json!({"path": dir.join("短.txt").to_string_lossy()}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(s, "短短的一行");
+        let e = FsReadText::new()
+            .run(serde_json::json!({"path": dir.join("空.txt").to_string_lossy()}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(e, "(空文件)");
     }
 }
