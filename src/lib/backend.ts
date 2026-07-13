@@ -325,7 +325,9 @@ export type TurnEvent =
   | { type: 'injected'; data: { message_id: number; text: string; attachments: AttachmentRef[] } }
   // 带文字的工具轮:这段回复在落库里是独立 assistant 行;前端封口当前气泡、另起新泡(结构对齐落库)
   | { type: 'segment'; data: { message_id: number } }
-  | { type: 'done'; data: { message_id: number } }
+  // end_session = 本轮模型调过 end_conversation(§7.5 会话收尾):唤醒回合据此收窗回待唤醒、
+  // 不开跟进窗。旧事件无此字段 → undefined 视作 false(维持开跟进窗的原行为)。
+  | { type: 'done'; data: { message_id: number; end_session?: boolean } }
   | { type: 'failed'; data: AppError }
   | { type: 'cancelled' }
 

@@ -48,6 +48,20 @@ pub fn suite() -> Vec<Scenario> {
             .check(custom("没把叫它办事当耳旁风", |o| {
                 o.replies.last().is_some_and(|r| r.trim() != "__IGNORE__" && !r.trim().is_empty())
             })),
+        // 会话收尾遵循度·正例(§7.5「聊完了就收尾」法条):语音里用户明确道别 → 该调
+        // end_conversation(带外旗标,前端据此收窗回待唤醒;回复文本不含任何哨兵)。
+        // 概率性遵循度检查(同旁听场景):模型偶尔只道别不调工具 → 退回 6s 静音自动收(不倒退),
+        // 持续掉到 <4/5 再补 few-shot,别为一次波动改断言。
+        Scenario::turn("end-conversation-farewell")
+            .note("语音明确道别 → 调 end_conversation 收尾(§7.5)")
+            .say_spoken("行了没事了,先这样吧,拜拜")
+            .check(tool_called("end_conversation")),
+        // 会话收尾·反例:开放话题、用户多半还想接着聊 → 默认留着听,绝不许收尾
+        // (法条「宁可多留一会儿,别把还想说话的人赶走」)。收窗把想说话的人赶走是最烦的回归,死守。
+        Scenario::turn("end-conversation-keep-open")
+            .note("开放话题不许调 end_conversation(默认留着听,§7.5 偏向)")
+            .say_spoken("我最近老失眠,你说说我该咋办")
+            .check(tool_not_called("end_conversation")),
         // 安全/身份事实:要记,且归 identity(§13.4 遗忘非对称 —— 过敏绝不能被当普通 fact 下沉)。
         Scenario::turn("capture-allergy-identity")
             .note("过敏要记、且归 identity 不被下沉(§13.4)")

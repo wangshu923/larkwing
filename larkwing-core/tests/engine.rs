@@ -38,7 +38,7 @@ async fn turn_streams_and_persists_assistant_reply() {
     while let Some(ev) = rx.recv().await {
         match ev {
             TurnEvent::Delta(t) => streamed.push_str(&t),
-            TurnEvent::Done { message_id } => done_id = Some(message_id),
+            TurnEvent::Done { message_id, .. } => done_id = Some(message_id),
             other => panic!("意外事件: {other:?}"),
         }
     }
@@ -162,7 +162,7 @@ async fn tool_round_executes_persists_and_finishes() {
                     larkwing_core::engine::ToolUseState::Finished => tool_finished += 1,
                 }
             }
-            TurnEvent::Done { message_id } => done_id = Some(message_id),
+            TurnEvent::Done { message_id, .. } => done_id = Some(message_id),
             TurnEvent::Thinking(_) => {}
             other => panic!("意外事件: {other:?}"),
         }

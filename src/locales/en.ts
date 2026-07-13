@@ -17,6 +17,7 @@ export default {
   tool: {
     remember: 'Jotting it down…',
     now: 'Glancing at the clock…',
+    end_conversation: 'Wrapping up…',
     weather: 'Checking the weather…',
     media_search: 'Digging through the library…',
     media_play: 'Cueing it up…',

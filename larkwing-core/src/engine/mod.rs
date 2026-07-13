@@ -48,7 +48,10 @@ pub enum TurnEvent {
     /// 另起新泡接后续文字 —— 让在飞气泡结构 = 落库/重启结构(否则 trace 实时挂不上、重启才显)。
     Segment { message_id: i64 },
     /// 带落库 id:前端把流式文本与持久消息对账。
-    Done { message_id: i64 },
+    /// end_session = 本回合模型调过 end_conversation(§7.5 会话收尾):唤醒回合据此走 wakeResume
+    /// 收窗回待唤醒、**不开跟进窗**(免唤醒连续对话的显式结束);打字回合恒 false / 无意义。
+    /// 加字段对前端是增量(tagged 编码,§6.8);旧前端不读它 = 维持开跟进窗的原行为。
+    Done { message_id: i64, end_session: bool },
     Failed { kind: ErrorKind, message: String },
     Cancelled,
     /// 旁听临时回合(send_overheard):模型判「不是叫我」→ 整轮蒸发,什么都没落库

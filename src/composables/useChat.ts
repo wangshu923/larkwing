@@ -635,17 +635,24 @@ function send(
   // 唤醒回合的收尾编排:念完 → 开跟进窗;失败/取消/被忽略 → 直接回待唤醒
   const wakeTurn = source === 'wake'
   let wakeSettled = false
-  const wakeFollowUp = () => {
+  // 唤醒回合念完后的收尾:默认开跟进窗(免唤醒接话);endSession=true(本轮模型调过
+  // end_conversation,§7.5)则改为收窗回待唤醒。两条都必须**等念完(busy 落 false)**再动
+  // ——core 在 AwaitTurn 丢帧不自激,若在告别的「拜拜」还没念完就回 Watch,那句 TTS 会漏进
+  // KWS(cpal 源尤甚)。所以只换出口、时序与跟进窗完全一致。
+  const wakeFollowUp = (endSession = false) => {
     if (!wakeTurn || wakeSettled) return
     wakeSettled = true
-    // 等念完(busy 落 false)再开跟进窗——core 在 AwaitTurn 丢帧,不会自激
     const stop = watch(
       () => speech.state.busy,
       (busy) => {
         if (busy) return
         stop()
-        // 媒体在播 → 3s 短窗(跟进窗全程压着媒体音量,能短就短);状态读在念完这一刻,不在 done 时
-        api.voiceFollowUp(useMedia().state.status === 'playing').catch(() => {})
+        if (endSession) {
+          api.voiceWakeResume().catch(() => {}) // 收尾:念完 → 回待唤醒,不开跟进窗
+        } else {
+          // 媒体在播 → 3s 短窗(跟进窗全程压着媒体音量,能短就短);状态读在念完这一刻,不在 done 时
+          api.voiceFollowUp(useMedia().state.status === 'playing').catch(() => {})
+        }
       },
       { immediate: true },
     )
@@ -699,7 +706,7 @@ function send(
         // 跟进窗;失败/取消 = 闭嘴回待唤醒。非唤醒回合这些全是 no-op。
         if (ev.type === 'done') {
           if (speak) speech.endTurn() // turnActive 落下 busy 才会 false,跟进窗才开得出去
-          wakeFollowUp()
+          wakeFollowUp(!!ev.data.end_session) // 收尾信号 → 念完回待唤醒;否则开跟进窗
         } else if (ev.type === 'failed' || ev.type === 'cancelled') {
           speech.abort()
           wakeResume()
@@ -801,7 +808,8 @@ function send(
             break
           }
           if (speak) speech.endTurn() // 残余缓冲 flush(音频节奏独立于打字机)
-          wakeFollowUp() // 唤醒回合:等念完开跟进窗(非唤醒 = no-op)
+          // 唤醒回合:等念完开跟进窗(非唤醒 = no-op);模型判本轮结束(end_session)则收窗回待唤醒
+          wakeFollowUp(!!ev.data.end_session)
           // 收尾等字放完再生效:状态/读数与画面同步,结尾不"啪"地补一大段
           twEnd(() => {
             wang.id = ev.data.message_id // 流式文本与落库消息对账

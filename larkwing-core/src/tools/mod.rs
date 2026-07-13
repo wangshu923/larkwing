@@ -5,6 +5,7 @@
 
 mod briefing;
 mod desktop;
+mod end_conversation;
 mod fs;
 mod media_control;
 mod media_play;
@@ -31,10 +32,18 @@ use async_trait::async_trait;
 use crate::llm::ToolDef;
 use crate::store::Store;
 
-/// 常驻基础工具(PLAN §9):信息纪律件套,**每个场景自动在场**,白名单无需声明 ——
-/// 运行时法条(engine/context::LAWS)点名了它们,法条全场景生效,工具就得全场景在。
-pub const BASE_TOOLS: &[&str] =
-    &["remember", "recall", "briefing_write", "briefing_lookup", "briefing_remove"];
+/// 常驻基础工具(PLAN §9):信息纪律件套 + 会话收尾原语,**每个场景自动在场**,白名单无需
+/// 声明 —— 运行时法条(engine/context::LAWS)点名了它们,法条全场景生效,工具就得全场景在。
+/// end_conversation = 免唤醒连续对话的显式关闭信号(LAWS「聊完了就收尾」点名),同 remember 一族
+/// 全场景可用。
+pub const BASE_TOOLS: &[&str] = &[
+    "remember",
+    "recall",
+    "briefing_write",
+    "briefing_lookup",
+    "briefing_remove",
+    "end_conversation",
+];
 
 /// 静态规格:给模型看的(name/description/parameters)+ 给运行时的(timeout)
 /// + 给 UI 的(ui_key,i18n 键 —— core 不产用户可见文案,文案在前端字典)。
@@ -121,6 +130,7 @@ impl Tools {
     pub fn builtin() -> Tools {
         let mut tools = Tools::default();
         tools.register(Arc::new(now::Now::new()));
+        tools.register(Arc::new(end_conversation::EndConversation::new()));
         tools.register(Arc::new(remember::Remember::new()));
         tools.register(Arc::new(recall::Recall::new()));
         tools.register(Arc::new(todo::NoteTodo::new()));
@@ -215,7 +225,15 @@ mod tests {
         let names: Vec<&str> = subset.iter().map(|t| t.spec().name).collect();
         assert_eq!(
             names,
-            ["remember", "recall", "briefing_write", "briefing_lookup", "briefing_remove", "now"],
+            [
+                "remember",
+                "recall",
+                "briefing_write",
+                "briefing_lookup",
+                "briefing_remove",
+                "end_conversation",
+                "now"
+            ],
             "base 在前(声明里的 remember 被去重),场景序在后,ghost 被忽略"
         );
     }

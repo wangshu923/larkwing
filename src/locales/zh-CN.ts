@@ -16,6 +16,7 @@ export default {
   tool: {
     remember: '记小本本中…',
     now: '瞄了一眼时钟…',
+    end_conversation: '这就收尾…',
     weather: '查查天气…',
     media_search: '翻翻片库…',
     media_play: '准备开播…',

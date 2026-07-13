@@ -159,6 +159,9 @@ impl Turn {
         let mut round: usize = 0;
         let mut stall: usize = 0; // 连续无进展(全重复 / 全失败)轮数
         let mut seen_calls: HashSet<String> = HashSet::new(); // 本回合已发过的工具调用指纹
+        // 本回合是否调过 end_conversation(§7.5 会话收尾):随收尾的 Done 递给前端 → 唤醒回合
+        // 收窗回待唤醒而非开跟进窗。一调即锁(哪一轮调的都算),纯带外信号、不碰回复文本。
+        let mut end_session = false;
         loop {
             // 旁听未转正 = 静音消费(Delta/Thinking/mood 不外发;蒸发时用户从头到尾无感)
             let muted = overheard.is_some();
@@ -233,7 +236,7 @@ impl Turn {
                     // 真收尾(take_or_finish 内已原子置 finishing,此后 inject 拒绝)
                     match persist_row(&store, conv_id, "assistant", &text, None).await {
                         Some(message_id) => {
-                            let _ = tx.send(TurnEvent::Done { message_id }).await;
+                            let _ = tx.send(TurnEvent::Done { message_id, end_session }).await;
                         }
                         None => {
                             let _ = tx
@@ -263,6 +266,7 @@ impl Turn {
                 round = 0; // 新输入 → 新一轮工具预算
                 stall = 0;
                 seen_calls.clear();
+                end_session = false; // 用户插了话 = 还想继续,撤销本轮早先的收尾意图(别把接着说的人赶走)
                 request.tool_choice = ToolChoice::Auto;
                 round_start = std::time::Instant::now();
                 super::context::cap_messages_tail(&mut request.messages, budget); // 防溢出安全阀(注入后)
@@ -317,6 +321,9 @@ impl Turn {
                 }
             }
             for call in &tool_calls {
+                if call.name == "end_conversation" {
+                    end_session = true; // 收尾信号:锁到回合结束,随 Done 递出
+                }
                 let _ = tx
                     .send(TurnEvent::ToolUse {
                         label: label_of(&call.name),
