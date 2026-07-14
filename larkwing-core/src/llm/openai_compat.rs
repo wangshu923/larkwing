@@ -88,7 +88,10 @@ impl OpenAiCompatProvider {
                     }
                     m
                 }
-                super::ChatMessage::ToolResult { call_id, content } => {
+                // chat-completions 的 role:tool 消息 content 只认文本 —— 塞 image_url 会 400
+                // (vLLM/多家实测坐实)。故工具结果附带的图在此一律降级丢弃(DeepSeek 本就非
+                // 视觉,无损);要让视觉模型看工具图走 Responses / Anthropic / Gemini 方言,不走这条。
+                super::ChatMessage::ToolResult { call_id, content, .. } => {
                     json!({ "role": "tool", "tool_call_id": call_id, "content": content })
                 }
             });
@@ -464,7 +467,7 @@ mod tests {
                     }],
                     reasoning_state: None,
                 },
-                ChatMessage::ToolResult { call_id: "call_1".into(), content: "ok".into() },
+                ChatMessage::tool_result("call_1", "ok"),
             ],
             ..Default::default()
         };
@@ -488,6 +491,29 @@ mod tests {
         });
         assert!(plain["messages"][1].get("tool_calls").is_none());
         assert!(plain["messages"][1].get("reasoning_content").is_none());
+    }
+
+    // 工具结果多媒体:chat-completions 的 role:tool 消息不容图 → 一律降级为纯文本 content
+    // (provider() = DeepSeek 非视觉,无损;图被丢弃,call_id/文本照旧)。
+    #[test]
+    fn to_wire_tool_result_image_degrades_to_text() {
+        let p = provider();
+        let wire = p.to_wire(&ChatRequest {
+            messages: vec![ChatMessage::ToolResult {
+                call_id: "call_1".into(),
+                content: "页面截图".into(),
+                parts: vec![crate::llm::ContentPart::ImageUrl {
+                    url: "data:image/png;base64,BBBB".into(),
+                }],
+            }],
+            ..Default::default()
+        });
+        // messages[0] 是 system(openai_compat 恒前置);工具结果在 [1]
+        let msg = &wire["messages"][1];
+        assert_eq!(msg["role"], "tool");
+        assert_eq!(msg["tool_call_id"], "call_1");
+        // content 仍是纯文本字符串(不是数组、无 image_url)
+        assert_eq!(msg["content"], "页面截图");
     }
 
     // 媒体输入(PLAN §9):带图 user 出向成 content 数组(text 块 + image_url 块);

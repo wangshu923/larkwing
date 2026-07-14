@@ -43,6 +43,8 @@ impl AnthropicCompatProvider {
     /// system 翻成顶层参数,且打 cache_control 标(§7:稳定大前缀吃显式缓存;
     /// 不支持的兼容端点会忽略,无害)。空 system 整个省掉 —— 空文本块会被严格端点 400。
     fn to_wire(&self, req: &ChatRequest) -> Value {
+        // 工具结果携图只对视觉模型有意义(catalog::vision;Claude 全系为真)——非视觉降级为纯文本。
+        let vision = super::catalog::supports_vision(&self.cfg.model);
         let messages: Vec<Value> = req
             .messages
             .iter()
@@ -84,11 +86,27 @@ impl AnthropicCompatProvider {
                         json!({ "role": "assistant", "content": blocks })
                     }
                 }
-                // Anthropic 方言:工具结果是 user 消息里的 tool_result block
-                super::ChatMessage::ToolResult { call_id, content } => json!({
-                    "role": "user",
-                    "content": [{ "type": "tool_result", "tool_use_id": call_id, "content": content }]
-                }),
+                // Anthropic 方言:工具结果是 user 消息里的 tool_result block。带图时 tool_result
+                // 的 content 由字符串升成数组(text block + image block),Anthropic 原生支持
+                // (computer use 同款);无图 / 非视觉则保持字符串(出向字节不变,吃前缀缓存)。
+                super::ChatMessage::ToolResult { call_id, content, parts } => {
+                    let inner = if parts.is_empty() || !vision {
+                        json!(content)
+                    } else {
+                        let mut blocks = Vec::with_capacity(parts.len() + 1);
+                        blocks.push(json!({ "type": "text", "text": content }));
+                        for p in parts {
+                            if let super::ContentPart::ImageUrl { url } = p {
+                                blocks.push(anthropic_image_block(url));
+                            }
+                        }
+                        json!(blocks)
+                    };
+                    json!({
+                        "role": "user",
+                        "content": [{ "type": "tool_result", "tool_use_id": call_id, "content": inner }]
+                    })
+                }
             })
             .collect();
         // 思考档位 → budget(API 硬约束:budget ≥ 1024 且 < max_tokens,开思考时抬高 max_tokens 容下它)
@@ -384,6 +402,35 @@ mod tests {
         assert_eq!(content[1]["source"]["data"], "AAAA");
     }
 
+    // 工具结果多媒体:带图 tool_result 的 content 由字符串升成数组(text + image block)。
+    #[test]
+    fn to_wire_tool_result_with_image_becomes_blocks() {
+        use crate::llm::ContentPart;
+        let p = provider(); // Claude = 视觉
+        let wire = p.to_wire(&ChatRequest {
+            messages: vec![ChatMessage::ToolResult {
+                call_id: "c1".into(),
+                content: "这是页面截图".into(),
+                parts: vec![ContentPart::ImageUrl { url: "data:image/png;base64,BBBB".into() }],
+            }],
+            ..Default::default()
+        });
+        let tr = &wire["messages"][0]["content"][0];
+        assert_eq!(tr["type"], "tool_result");
+        assert_eq!(tr["tool_use_id"], "c1");
+        assert_eq!(tr["content"][0]["type"], "text");
+        assert_eq!(tr["content"][0]["text"], "这是页面截图");
+        assert_eq!(tr["content"][1]["type"], "image");
+        assert_eq!(tr["content"][1]["source"]["media_type"], "image/png");
+        assert_eq!(tr["content"][1]["source"]["data"], "BBBB");
+        // 无图 tool_result:content 仍是字符串(出向字节不变,零缓存回归)
+        let plain = p.to_wire(&ChatRequest {
+            messages: vec![ChatMessage::tool_result("c1", "ok")],
+            ..Default::default()
+        });
+        assert_eq!(plain["messages"][0]["content"][0]["content"], "ok");
+    }
+
     fn chunk(json: &str) -> Value {
         serde_json::from_str(json).unwrap()
     }
@@ -466,7 +513,7 @@ mod tests {
                     }],
                     reasoning_state: None,
                 },
-                ChatMessage::ToolResult { call_id: "call_1".into(), content: "ok".into() },
+                ChatMessage::tool_result("call_1", "ok"),
             ],
             options: ChatOptions::default(),
             ..Default::default()

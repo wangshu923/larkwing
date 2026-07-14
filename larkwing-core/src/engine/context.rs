@@ -372,10 +372,8 @@ pub(super) fn build_context(
                     continue;
                 };
                 if open_calls.remove(&payload.call_id) {
-                    messages.push(ChatMessage::ToolResult {
-                        call_id: payload.call_id,
-                        content: msg.content.clone(),
-                    });
+                    // 历史 tool 行只有落库的文本(图从不落库、不回放 §9)→ parts 恒空。
+                    messages.push(ChatMessage::tool_result(payload.call_id, msg.content.clone()));
                 } else {
                     tracing::warn!(msg = msg.id, call = %payload.call_id, "孤儿 tool 行,跳过(防 400)");
                 }
@@ -626,9 +624,9 @@ mod tests {
                 tool_calls: vec![],
                 reasoning_state: None,
             },
-            ChatMessage::ToolResult { call_id: "c1".into(), content: big.clone() },
+            ChatMessage::tool_result("c1", big.clone()),
             ChatMessage::user("新任务"),
-            ChatMessage::ToolResult { call_id: "c2".into(), content: big },
+            ChatMessage::tool_result("c2", big),
         ];
         cap_messages_tail(&mut m, DEFAULT_TAIL_BUDGET_CHARS);
         // 首条必须是 User(无孤儿 ToolResult);且最后一条 User「新任务」保留。

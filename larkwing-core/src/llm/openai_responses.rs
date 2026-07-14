@@ -85,6 +85,8 @@ impl OpenAiResponsesProvider {
     /// function_call 之前回放,否则推理链断裂(reasoning 保真铁律)。
     fn input_items(&self, messages: &[super::ChatMessage]) -> Vec<Value> {
         use super::ChatMessage;
+        // 工具结果携图只对视觉模型有意义;非视觉降级为纯文本 output 字符串。
+        let vision = super::catalog::supports_vision(&self.cfg.model);
         let mut items: Vec<Value> = Vec::new();
         for msg in messages {
             match msg {
@@ -112,11 +114,25 @@ impl OpenAiResponsesProvider {
                         items.push(json!({ "role": "assistant", "content": content }));
                     }
                 }
-                ChatMessage::ToolResult { call_id, content } => {
+                // 带图时 function_call_output.output 由字符串升成内容数组(input_text + input_image),
+                // Responses API 原生支持图作工具输出;无图 / 非视觉保持字符串(字节不变,吃缓存)。
+                ChatMessage::ToolResult { call_id, content, parts } => {
+                    let output = if parts.is_empty() || !vision {
+                        json!(content)
+                    } else {
+                        let mut arr = Vec::with_capacity(parts.len() + 1);
+                        arr.push(json!({ "type": "input_text", "text": content }));
+                        for p in parts {
+                            if let super::ContentPart::ImageUrl { url } = p {
+                                arr.push(json!({ "type": "input_image", "image_url": url }));
+                            }
+                        }
+                        json!(arr)
+                    };
                     items.push(json!({
                         "type": "function_call_output",
                         "call_id": call_id,
-                        "output": content,
+                        "output": output,
                     }));
                 }
             }
@@ -368,7 +384,7 @@ mod tests {
         let wire = p.to_wire(&req(vec![
             ChatMessage::user("几点"),
             assistant,
-            ChatMessage::ToolResult { call_id: "fc_1".into(), content: "12:00".into() },
+            ChatMessage::tool_result("fc_1", "12:00"),
         ]));
         let input = wire["input"].as_array().unwrap();
         // user, reasoning(逐字), function_call, function_call_output
@@ -382,6 +398,27 @@ mod tests {
         );
         assert_eq!(input[3]["type"], "function_call_output");
         assert_eq!(input[3]["output"], "12:00");
+    }
+
+    // 工具结果多媒体:带图 tool_result → function_call_output.output 升成数组(input_text + input_image)
+    #[test]
+    fn to_wire_tool_result_with_image_becomes_output_array() {
+        let p = OpenAiResponsesProvider::new(cfg()); // gpt-5 = 视觉
+        let wire = p.to_wire(&req(vec![ChatMessage::ToolResult {
+            call_id: "fc_1".into(),
+            content: "页面截图".into(),
+            parts: vec![crate::llm::ContentPart::ImageUrl {
+                url: "data:image/png;base64,BBBB".into(),
+            }],
+        }]));
+        let out = &wire["input"][0]["output"];
+        assert_eq!(out[0]["type"], "input_text");
+        assert_eq!(out[0]["text"], "页面截图");
+        assert_eq!(out[1]["type"], "input_image");
+        assert_eq!(out[1]["image_url"], "data:image/png;base64,BBBB");
+        // 无图:output 仍是字符串(零回归)
+        let plain = p.to_wire(&req(vec![ChatMessage::tool_result("fc_1", "ok")]));
+        assert_eq!(plain["input"][0]["output"], "ok");
     }
 
     #[tokio::test]

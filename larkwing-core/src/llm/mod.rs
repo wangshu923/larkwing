@@ -117,6 +117,10 @@ pub enum ChatMessage {
     ToolResult {
         call_id: String,
         content: String,
+        /// 工具产出的附带图片(工具结果多媒体);空 = 纯文本退化形,出向仍是字符串
+        /// (吃前缀缓存,与 User.parts 同款)。只有视觉模型真收到,非视觉各方言降级。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        parts: Vec<ContentPart>,
     },
 }
 
@@ -136,6 +140,15 @@ impl ChatMessage {
             reasoning: None,
             tool_calls: Vec::new(),
             reasoning_state: None,
+        }
+    }
+
+    /// 纯文本工具结果(常态)。带图走直接构造 `ToolResult { .., parts }`。
+    pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        ChatMessage::ToolResult {
+            call_id: call_id.into(),
+            content: content.into(),
+            parts: Vec::new(),
         }
     }
 }
@@ -421,7 +434,7 @@ mod tests {
             serde_json::from_str(r#"{"role":"tool","call_id":"fs_1","content":"ok"}"#).unwrap();
         assert_eq!(
             result,
-            ChatMessage::ToolResult { call_id: "fs_1".into(), content: "ok".into() }
+            ChatMessage::tool_result("fs_1", "ok")
         );
 
         // 普通 assistant 出向不带空 tool_calls/reasoning 字段:序列化干净、不挤前缀

@@ -117,6 +117,41 @@ pub enum ToolRisk {
     Mutating,
 }
 
+/// 工具产出:文本主体 + 可选附带图片(工具结果多媒体)。绝大多数工具只产文本 ——
+/// `run` 返回的 `String` 经 `From` 自动包成 `ToolOutput { text, images: [] }`,零改动。
+/// 要回图的工具(如网页渲染截图 / 单据转图预览)覆写 `run_output`,把图当 data: URL 塞
+/// `images`;turn loop 据此组装带 parts 的 `ToolResult`,**只有视觉模型真收到图,非视觉降级**
+/// (§6.3;各供应商方言在 `llm::*_compat` 里分别处理:Anthropic tool_result 内嵌 image block、
+/// Gemini functionResponse 旁挂 inlineData、OpenAI Responses function_call_output 带 input_image、
+/// OpenAI chat-completions 协议不容 tool 消息带图 → 只发文本)。落库始终只落 `text`(图不回放,
+/// 与用户发图「当轮不落库」同源 §9)。
+#[derive(Debug, Clone, Default)]
+pub struct ToolOutput {
+    /// 回填给模型 + 落库的文本主体。
+    pub text: String,
+    /// 附带图片,data: URL(`data:image/png;base64,…`);空 = 纯文本(常态)。
+    pub images: Vec<String>,
+}
+
+impl ToolOutput {
+    /// 纯文本产出(等价于 `From<String>`,给显式构造用)。
+    pub fn text(t: impl Into<String>) -> ToolOutput {
+        ToolOutput { text: t.into(), images: Vec::new() }
+    }
+}
+
+impl From<String> for ToolOutput {
+    fn from(text: String) -> ToolOutput {
+        ToolOutput { text, images: Vec::new() }
+    }
+}
+
+impl From<&str> for ToolOutput {
+    fn from(text: &str) -> ToolOutput {
+        ToolOutput { text: text.to_string(), images: Vec::new() }
+    }
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> &ToolSpec;
@@ -129,6 +164,17 @@ pub trait Tool: Send + Sync {
     /// 错误也是观察:Err 会被 engine 变成错误 ToolResult 喂回模型(模型自行换路),
     /// 不打断回合。取消语义:future 可能被 drop(回合取消),实现必须 drop-safe。
     async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String>;
+
+    /// turn loop 的实际调用入口:文本 + 可选图片。**默认 = `run` 的纯文本**(所有现有工具
+    /// 不动即得此行为)。要回图的工具覆写这个(内部自产文本 + 图,不必再走 `run`;`run` 作为
+    /// 无图的文本降级路仍需实现)。加它零行为变化 —— 只是给「工具结果多媒体」开的口子。
+    async fn run_output(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> anyhow::Result<ToolOutput> {
+        Ok(ToolOutput::from(self.run(args, ctx).await?))
+    }
 }
 
 /// 静态注册表(Scenes 同款)。注册表本身无依赖 —— 工具执行所需的一切经 ToolCtx 按次传入。
@@ -270,6 +316,17 @@ mod tests {
         assert!(arg_bool(&json!({}), "x", true));
         assert!(arg_bool(&json!({ "x": null }), "x", true));
         assert!(arg_bool(&json!({ "x": "maybe" }), "x", true), "认不出回落默认");
+    }
+
+    #[test]
+    fn tool_output_from_string_is_text_only() {
+        // 现有工具返回 String → run_output 默认包成纯文本 ToolOutput(零改动、零图)
+        let out: ToolOutput = "结果".to_string().into();
+        assert_eq!(out.text, "结果");
+        assert!(out.images.is_empty());
+        let out2 = ToolOutput::text("x");
+        assert_eq!(out2.text, "x");
+        assert!(out2.images.is_empty());
     }
 
     #[test]

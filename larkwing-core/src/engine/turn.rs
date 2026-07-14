@@ -9,10 +9,12 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::llm::{ChatEvent, ChatMessage, ChatRequest, LlmProvider, ToolCall, ToolChoice, Usage};
+use crate::llm::{
+    ChatEvent, ChatMessage, ChatRequest, ContentPart, LlmProvider, ToolCall, ToolChoice, Usage,
+};
 use crate::bus::{AppEvent, Mood};
 use crate::store::Store;
-use crate::tools::{Tool, ToolCtx};
+use crate::tools::{Tool, ToolCtx, ToolOutput};
 
 use super::{usage, AppError, AssistantPayload, ErrorKind, ToolRowPayload, ToolUseState, TurnEvent};
 
@@ -357,18 +359,26 @@ impl Turn {
                 tool_calls: tool_calls.clone(),
                 reasoning_state,
             });
-            for (call, status, content) in &results {
+            for (call, status, out) in &results {
                 let p = tool_payload(call, status);
-                persist_row(&store, conv_id, "tool", content, p.as_deref()).await;
+                // 落库只落文本:图不进 DB、不回放(与用户发图「当轮不落库」同源 §9)。
+                persist_row(&store, conv_id, "tool", &out.text, p.as_deref()).await;
                 let _ = tx
                     .send(TurnEvent::ToolUse {
                         label: label_of(&call.name),
                         state: ToolUseState::Finished,
                     })
                     .await;
+                // 图当轮注入:随本回合后续开流喂给模型(视觉模型真收、非视觉降级),不落 DB。
+                let parts: Vec<ContentPart> = out
+                    .images
+                    .iter()
+                    .map(|url| ContentPart::ImageUrl { url: url.clone() })
+                    .collect();
                 request.messages.push(ChatMessage::ToolResult {
                     call_id: call.id.clone(),
-                    content: content.clone(),
+                    content: out.text.clone(),
+                    parts,
                 });
             }
 
@@ -646,28 +656,38 @@ async fn drain(
 }
 
 /// 并发执行一轮 tool_calls。错误也是观察:超时/报错/未知名都变成喂回模型的结果文本,
-/// 模型自行换路(兜底逻辑通用化,不打断回合)。返回 (call, status, content)。
+/// 模型自行换路(兜底逻辑通用化,不打断回合)。返回 (call, status, ToolOutput)——
+/// out.text 落库 + 回填,out.images 组装成 ToolResult 的 parts(工具结果多媒体)。
+/// 走 `run_output`(默认 = run 的纯文本;要回图的工具覆写它)。
 async fn run_tools(
     tools: &[Arc<dyn Tool>],
     calls: &[ToolCall],
     ctx: &ToolCtx,
-) -> Vec<(ToolCall, String, String)> {
+) -> Vec<(ToolCall, String, ToolOutput)> {
     let futs = calls.iter().map(|call| async move {
         if call.is_incomplete {
             // 规范 #6:截断的参数拒绝执行(robot 实战伤痕:半截文件编辑参数差点拿去干活)
             return (
                 call.clone(),
                 "error".to_string(),
-                "参数不完整(可能被长度上限截断),没有执行。请换种方式或缩短参数重试。".to_string(),
+                ToolOutput::text(
+                    "参数不完整(可能被长度上限截断),没有执行。请换种方式或缩短参数重试。",
+                ),
             );
         }
         let Some(tool) = tools.iter().find(|t| t.spec().name == call.name) else {
-            return (call.clone(), "error".to_string(), format!("没有叫 {} 的工具", call.name));
+            return (
+                call.clone(),
+                "error".to_string(),
+                ToolOutput::text(format!("没有叫 {} 的工具", call.name)),
+            );
         };
-        match tokio::time::timeout(tool.spec().timeout, tool.run(call.args.clone(), ctx)).await {
+        match tokio::time::timeout(tool.spec().timeout, tool.run_output(call.args.clone(), ctx))
+            .await
+        {
             Err(_) => {
                 tracing::warn!(tool = %call.name, "工具执行超时,没有拿到结果");
-                (call.clone(), "timeout".to_string(), "工具执行超时,没有拿到结果".to_string())
+                (call.clone(), "timeout".to_string(), ToolOutput::text("工具执行超时,没有拿到结果"))
             }
             Ok(Err(e)) => {
                 // 观测:工具失败原因进日志(之前只回喂模型,控制台看不见 → 用户"看不出问题")。
@@ -675,7 +695,7 @@ async fn run_tools(
                 let full = format!("{e:#}");
                 tracing::warn!(tool = %call.name, "工具执行出错: {full}");
                 let msg: String = full.chars().take(500).collect();
-                (call.clone(), "error".to_string(), msg)
+                (call.clone(), "error".to_string(), ToolOutput::text(msg))
             }
             Ok(Ok(out)) => (call.clone(), "ok".to_string(), out),
         }

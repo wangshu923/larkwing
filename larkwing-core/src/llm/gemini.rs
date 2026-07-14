@@ -97,6 +97,8 @@ impl GeminiProvider {
     /// 连续 ToolResult 合并进同一条 user content;Assistant 的签名按 call id 回贴到 functionCall part。
     fn contents(&self, messages: &[super::ChatMessage]) -> Vec<Value> {
         use super::ChatMessage;
+        // 工具结果携图只对视觉模型有意义(Gemini 全系为真);非视觉降级为纯文本。
+        let vision = super::catalog::supports_vision(&self.cfg.model);
         let mut out: Vec<Value> = Vec::new();
         let mut name_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let mut pending_tool: Vec<Value> = Vec::new(); // 攒连续 functionResponse
@@ -156,11 +158,22 @@ impl GeminiProvider {
                         out.push(json!({ "role": "model", "parts": p }));
                     }
                 }
-                ChatMessage::ToolResult { call_id, content } => {
+                ChatMessage::ToolResult { call_id, content, parts } => {
                     let name = name_of.get(call_id).cloned().unwrap_or_default();
                     pending_tool.push(json!({
                         "functionResponse": { "name": name, "response": { "result": content } }
                     }));
+                    // functionResponse.response 只装结构化 JSON、放不下图 → 图作为同一条 user
+                    // content 的旁挂 inlineData part(与 flush 合并进一条),视觉模型才收。
+                    if vision {
+                        for p in parts {
+                            if let super::ContentPart::ImageUrl { url } = p {
+                                if let Some(inline) = data_url_to_inline(url) {
+                                    pending_tool.push(inline);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -466,7 +479,7 @@ mod tests {
             vec![
                 ChatMessage::user("几点"),
                 assistant,
-                ChatMessage::ToolResult { call_id: "gm_0".into(), content: "12:00".into() },
+                ChatMessage::tool_result("gm_0", "12:00"),
             ],
             vec![],
         ));
@@ -480,6 +493,26 @@ mod tests {
         assert_eq!(tool_turn["role"], "user");
         assert_eq!(tool_turn["parts"][0]["functionResponse"]["name"], "now");
         assert_eq!(tool_turn["parts"][0]["functionResponse"]["response"]["result"], "12:00");
+    }
+
+    // 工具结果多媒体:带图 tool_result → functionResponse 旁挂 inlineData part(同条 user content)
+    #[test]
+    fn to_wire_tool_result_with_image_appends_inline_data() {
+        let p = GeminiProvider::new(cfg()); // gemini 全系视觉
+        let wire = p.to_wire(&req(
+            vec![ChatMessage::ToolResult {
+                call_id: "gm_0".into(),
+                content: "页面截图".into(),
+                parts: vec![crate::llm::ContentPart::ImageUrl {
+                    url: "data:image/png;base64,BBBB".into(),
+                }],
+            }],
+            vec![],
+        ));
+        let parts = &wire["contents"][0]["parts"];
+        assert_eq!(parts[0]["functionResponse"]["response"]["result"], "页面截图");
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(parts[1]["inlineData"]["data"], "BBBB");
     }
 
     #[tokio::test]

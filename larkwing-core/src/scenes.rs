@@ -209,7 +209,7 @@ mod tests {
                 }],
                 reasoning_state: None,
             },
-            ChatMessage::ToolResult { call_id: "fs_y".into(), content: "ok".into() },
+            ChatMessage::tool_result("fs_y", "ok"),
         ];
         assert!(s.validate(&registry).is_err(), "白名单外工具必须被拒");
 
@@ -226,7 +226,7 @@ mod tests {
                 }],
                 reasoning_state: None,
             },
-            ChatMessage::ToolResult { call_id: "call_1".into(), content: "ok".into() },
+            ChatMessage::tool_result("call_1", "ok"),
         ];
         assert!(s.validate(&registry).is_err(), "示例 id 必须 fs_ 前缀");
     }
