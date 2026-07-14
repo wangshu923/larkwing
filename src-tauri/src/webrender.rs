@@ -298,8 +298,11 @@ async fn browse_step_inner(
             let _ = entry.win.set_title(&t);
         }
     }
+    // 截图(模型自行决定要不要;没打开窗就没得截 —— 到这步窗必在,截不到只因平台/组件不支持)。
+    // 工具结果多媒体第一个消费者:图随 ToolOutput 图片 part 回给模型,非视觉模型出向层降级。
+    let screenshot = if req.screenshot { capture_screenshot(&entry.win).await } else { None };
     entry.touch();
-    Ok(RenderOutcome { page, download, post_click_url, session: Some(sid) })
+    Ok(RenderOutcome { page, download, post_click_url, session: Some(sid), screenshot })
 }
 
 /// 新建会话窗(超上限先挤掉最旧的)。
@@ -738,6 +741,168 @@ fn build_scroll_script(dir: &str) -> String {
     format!(
         r#"(function() {{ try {{ var se = document.scrollingElement || document.documentElement; window.scrollBy(0, {sign}(se.clientHeight || 600) * 0.9); }} catch (e) {{}} }})();"#
     )
+}
+
+/// 截当前渲染窗为 PNG,转 `data:image/png;base64,…`(工具结果多媒体第一个消费者)。
+/// 平台原生 FFI(wry/tauri 无官方截图 API):Mac `WKWebView.takeSnapshot` / Win WebView2
+/// `CapturePreview`。截不到(平台不支持 / 组件缺 / 失败 / 超时)→ None,工具如实说、不塞空图(§3.5)。
+/// **只截当前可视视口**(两端 API 皆如此),不含滚动到屏外的内容;渲染窗是可见缩略窗故截得到。
+async fn capture_screenshot(win: &tauri::WebviewWindow) -> Option<String> {
+    let png = capture_png(win).await?;
+    Some(to_data_url(&png))
+}
+
+/// PNG bytes → data URL。
+fn to_data_url(png: &[u8]) -> String {
+    use base64::Engine;
+    format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png))
+}
+
+/// 截图上限:窗不可见时 WebView2 completion 可能不触发(#579),靠它兜成 None、绝不挂死。
+const SHOT_TIMEOUT: Duration = Duration::from_secs(8);
+
+// ───────────────────────── macOS:WKWebView.takeSnapshot ─────────────────────────
+#[cfg(target_os = "macos")]
+async fn capture_png(win: &tauri::WebviewWindow) -> Option<Vec<u8>> {
+    use block2::RcBlock;
+    use objc2_app_kit::NSImage;
+    use objc2_foundation::NSError;
+    use objc2_web_kit::WKWebView;
+    use std::cell::RefCell;
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<Option<Vec<u8>>>();
+    // with_webview 闭包在**主线程**跑、且阻塞调用线程到闭包返回 → 闭包只**发起**截图立刻返回,
+    // completion 稍后在主线程 runloop 触发(绝不在闭包内同步等 completion,那要主线程 = 死锁)。
+    let dispatched = win.with_webview(move |pw| {
+        let ptr = pw.inner() as *const WKWebView; // inner() = *mut c_void = WKWebView
+        if ptr.is_null() {
+            let _ = tx.send(None);
+            return;
+        }
+        let webview: &WKWebView = unsafe { &*ptr };
+        // completion 是 dyn Fn(可多次调),oneshot 只发一次 → RefCell<Option<Sender>> take;只主线程用,无需 Send。
+        let slot = RefCell::new(Some(tx));
+        let completion = RcBlock::new(move |image: *mut NSImage, _err: *mut NSError| {
+            let bytes = ns_image_to_png(image);
+            if let Some(tx) = slot.borrow_mut().take() {
+                let _ = tx.send(bytes);
+            }
+        });
+        // 第一个参数 None ⇒ 默认配置 = 截当前可视 bounds。
+        unsafe { webview.takeSnapshotWithConfiguration_completionHandler(None, &completion) };
+    });
+    if dispatched.is_err() {
+        return None;
+    }
+    // 只在异步上下文 await(绝不在主线程阻塞);发起失败时 tx 已 drop → rx 立刻 Err → None。
+    match tokio::time::timeout(SHOT_TIMEOUT, rx).await {
+        Ok(Ok(bytes)) => bytes,
+        _ => None,
+    }
+}
+
+/// NSImage → PNG(TIFF → NSBitmapImageRep → PNG;保留真实像素,Retina 屏为逻辑像素 2×)。
+#[cfg(target_os = "macos")]
+fn ns_image_to_png(image: *mut objc2_app_kit::NSImage) -> Option<Vec<u8>> {
+    use objc2::AnyThread; // 提供 NSBitmapImageRep::alloc()
+    use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep};
+    use objc2_foundation::NSDictionary;
+
+    if image.is_null() {
+        return None;
+    }
+    let image: &objc2_app_kit::NSImage = unsafe { &*image };
+    let tiff = image.TIFFRepresentation()?;
+    let rep = NSBitmapImageRep::initWithData(NSBitmapImageRep::alloc(), &tiff)?;
+    let props = NSDictionary::new();
+    let png = unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &props) }?;
+    Some(png.to_vec())
+}
+
+// ───────────────────────── Windows:WebView2.CapturePreview ─────────────────────────
+#[cfg(target_os = "windows")]
+async fn capture_png(win: &tauri::WebviewWindow) -> Option<Vec<u8>> {
+    use webview2_com::CapturePreviewCompletedHandler;
+    use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG;
+    use windows::core::HRESULT;
+    use windows::Win32::UI::Shell::SHCreateMemStream;
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<Option<Vec<u8>>>();
+    let dispatched = win.with_webview(move |pw| {
+        let controller = pw.controller();
+        let webview = match unsafe { controller.CoreWebView2() } {
+            Ok(w) => w,
+            Err(_) => {
+                let _ = tx.send(None);
+                return;
+            }
+        };
+        let stream = match unsafe { SHCreateMemStream(None) } {
+            Some(s) => s,
+            None => {
+                let _ = tx.send(None);
+                return;
+            }
+        };
+        let stream_for_read = stream.clone(); // 引用计数 +1,供 completion 里读
+        // create 收 FnOnce(HRESULT) -> Result<()>:直接 move 走 tx / stream(仅主线程用)。
+        let handler = CapturePreviewCompletedHandler::create(Box::new(
+            move |hr: HRESULT| -> windows::core::Result<()> {
+                let bytes = if hr.is_ok() {
+                    unsafe { read_stream_all(&stream_for_read) }.ok()
+                } else {
+                    None
+                };
+                let _ = tx.send(bytes);
+                Ok(())
+            },
+        ));
+        // 发起后立即返回;completion 稍后在主线程 message loop 触发。发起 Err ⇒ handler 连 tx 一起
+        // drop ⇒ rx.await 立刻 Err ⇒ None。
+        let _ = unsafe {
+            webview.CapturePreview(COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG, &stream, &handler)
+        };
+    });
+    if dispatched.is_err() {
+        return None;
+    }
+    match tokio::time::timeout(SHOT_TIMEOUT, rx).await {
+        Ok(Ok(bytes)) => bytes,
+        _ => None,
+    }
+}
+
+/// 从 IStream 读全部字节(seek 到尾求长度 → 回 0 → 循环读;Read 返回 HRESULT 用 `.ok()`)。
+#[cfg(target_os = "windows")]
+unsafe fn read_stream_all(
+    stream: &windows::Win32::System::Com::IStream,
+) -> windows::core::Result<Vec<u8>> {
+    use windows::Win32::System::Com::{STREAM_SEEK_END, STREAM_SEEK_SET};
+
+    let mut size: u64 = 0;
+    stream.Seek(0, STREAM_SEEK_END, Some(&mut size))?;
+    stream.Seek(0, STREAM_SEEK_SET, None)?;
+    let mut buf = vec![0u8; size as usize];
+    let mut total = 0usize;
+    while total < buf.len() {
+        let mut read: u32 = 0;
+        let remaining = (buf.len() - total) as u32;
+        stream
+            .Read(buf[total..].as_mut_ptr() as *mut core::ffi::c_void, remaining, Some(&mut read))
+            .ok()?;
+        if read == 0 {
+            break;
+        }
+        total += read as usize;
+    }
+    buf.truncate(total);
+    Ok(buf)
+}
+
+// ───────────────── 其它平台(Linux 开发)兜底 ─────────────────
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+async fn capture_png(_win: &tauri::WebviewWindow) -> Option<Vec<u8>> {
+    None
 }
 
 /// 快照脚本:给可见交互元素(可点 + 可填 + 可选 + 勾选)打 `data-lw-ref` 编号,抽

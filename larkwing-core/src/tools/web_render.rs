@@ -14,7 +14,7 @@ use async_trait::async_trait;
 
 use crate::webrender::{FillField, PageElement, RenderRequest};
 
-use super::{Tool, ToolCtx, ToolRisk, ToolSpec};
+use super::{Tool, ToolCtx, ToolOutput, ToolRisk, ToolSpec};
 
 /// 从工具入参取可选字符串(trim + 空即无)。
 fn str_arg(args: &serde_json::Value, key: &str) -> Option<String> {
@@ -183,6 +183,10 @@ impl WebRender {
                             "type": "string",
                             "description": "动作后等这段文字出现再读页(动态内容慢慢加载时用);等不到也照常返回"
                         },
+                        "screenshot": {
+                            "type": "boolean",
+                            "description": "顺便截当前页一张图(想看画面长啥样时用;文字快照说不清版式/图形时才需要,多数情况不用)。得先有打开的页面(配 url 或 session)"
+                        },
                         "dir": {
                             "type": "string",
                             "description": "点出的下载存到哪个文件夹(绝对路径);省略 = 系统「下载」文件夹"
@@ -206,7 +210,29 @@ impl Tool for WebRender {
         ToolRisk::Mutating // 可能落盘下载文件
     }
 
+    // run 只取文本(无图降级路,给不看图的场景);turn loop 实际走 run_output,把截图当图片
+    // part 带回 —— web_render 是「工具结果多媒体」(ToolResult.parts)的第一个真消费者。
     async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
+        Ok(self.browse(args, ctx).await?.0)
+    }
+
+    async fn run_output(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> anyhow::Result<ToolOutput> {
+        let (text, shot) = self.browse(args, ctx).await?;
+        Ok(ToolOutput { text, images: shot.into_iter().collect() })
+    }
+}
+
+impl WebRender {
+    /// 浏览一步 + 渲染结果文本 +(可选)截图 data-URL。run/run_output 共享此核心。
+    async fn browse(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> anyhow::Result<(String, Option<String>)> {
         let url = args
             .get("url")
             .and_then(serde_json::Value::as_str)
@@ -255,6 +281,7 @@ impl Tool for WebRender {
         let press_key = str_arg(&args, "press_key");
         let scroll = str_arg(&args, "scroll");
         let wait_text = str_arg(&args, "wait_text");
+        let want_shot = super::arg_bool(&args, "screenshot", false);
         let download_dir = match args.get("dir").and_then(serde_json::Value::as_str).map(str::trim)
         {
             Some(d) if !d.is_empty() => {
@@ -293,6 +320,7 @@ impl Tool for WebRender {
                 press_key,
                 scroll,
                 wait_text,
+                screenshot: want_shot,
                 download_dir,
                 timeout: RENDER_TIMEOUT,
             })
@@ -376,12 +404,19 @@ impl Tool for WebRender {
                 "页面渲染超时没回内容(站点太慢或反爬拦截)——退回 web_fetch,或让用户手动下载后给我文件"
             ),
         }
+        // 截图(工具结果多媒体第一个消费者):截到就随 ToolOutput 图片 part 回给模型,文本注一句;
+        // 想截没截到如实说(没打开窗 / 平台组件不支持——不塞空图,§3.5 不静默)。
+        if outcome.screenshot.is_some() {
+            out.push_str("\n(已附上当前页面截图)");
+        } else if want_shot {
+            out.push_str("\n(想截图但没截到——得先有打开的页面,或这台机器不支持截图)");
+        }
         if let Some(sid) = &outcome.session {
             out.push_str(&format!(
                 "\n\n会话 {sid}(3 分钟内可继续:带 session 再调,click_ref 点编号 / back 返回 / url 跳新页)"
             ));
         }
-        Ok(out.trim_end().to_string())
+        Ok((out.trim_end().to_string(), outcome.screenshot))
     }
 }
 
@@ -428,6 +463,7 @@ mod tests {
                 download: self.0.download.clone(),
                 post_click_url: self.0.post_click_url.clone(),
                 session: self.0.session.clone(),
+                screenshot: self.0.screenshot.clone(),
             })
         }
     }
@@ -698,5 +734,46 @@ mod tests {
         assert!(out.contains("[3] 下拉「城市」= 「北京」") && out.contains("可选:北京 / 上海"), "{out}");
         assert!(out.contains("[4] ☑ 勾选「同意」"), "{out}");
         assert!(out.contains("下面约 2 屏"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn screenshot_flows_as_image_part_via_run_output() {
+        let mut ctx = base_ctx("shot");
+        let shot = "data:image/png;base64,SHOTBYTES";
+        let fake = Arc::new(FakeRender::new(RenderOutcome {
+            page: Some(RenderedPage { title: "页".into(), text: "正文".into(), ..Default::default() }),
+            session: Some("s".into()),
+            screenshot: Some(shot.into()),
+            ..Default::default()
+        }));
+        ctx.web = Some(fake.clone());
+        // run_output:截图当图片 part 带回,文本注一句;screenshot 请求透传给壳层
+        let out = WebRender::new()
+            .run_output(serde_json::json!({"session": "s", "screenshot": true}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.images, vec![shot.to_string()]);
+        assert!(out.text.contains("已附上当前页面截图"), "{}", out.text);
+        assert!(fake.1.lock().unwrap().clone().unwrap().screenshot);
+        // run(纯文本降级路):不带图,文本仍在
+        let text = WebRender::new()
+            .run(serde_json::json!({"session": "s", "screenshot": true}), &ctx)
+            .await
+            .unwrap();
+        assert!(text.contains("已附上当前页面截图"), "{text}");
+
+        // 想截没截到(outcome.screenshot=None)→ 如实说、不塞空图
+        let fake2 = Arc::new(FakeRender::new(RenderOutcome {
+            page: Some(RenderedPage { title: "页".into(), text: "正文".into(), ..Default::default() }),
+            session: Some("s".into()),
+            ..Default::default()
+        }));
+        ctx.web = Some(fake2);
+        let out2 = WebRender::new()
+            .run_output(serde_json::json!({"session": "s", "screenshot": true}), &ctx)
+            .await
+            .unwrap();
+        assert!(out2.images.is_empty());
+        assert!(out2.text.contains("没截到"), "{}", out2.text);
     }
 }

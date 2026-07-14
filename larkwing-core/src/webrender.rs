@@ -98,6 +98,9 @@ pub struct RenderRequest {
     pub scroll: Option<String>,
     /// 动作后等这段文字出现再快照(SPA 异步内容的显式等待;超时也照常快照,不算错)。
     pub wait_text: Option<String>,
+    /// 顺便截当前渲染窗一张图(模型自行决定要不要看画面;只对能看图的模型有用,非视觉出向降级)。
+    /// **没有活跃渲染窗 = 截不了**(截图依附浏览窗,不凭空截);平台/组件不支持也如实回 None。
+    pub screenshot: bool,
     /// 点击若触发下载,成品落这个目录(壳层负责唯一名,复用 `files::dedupe_path` 口径)。
     pub download_dir: PathBuf,
     /// 单步预算(壳层超时即收手回快照;会话窗本身由 TTL 管生死)。
@@ -122,6 +125,9 @@ pub struct RenderOutcome {
     pub post_click_url: Option<String>,
     /// 会话窗 id(TTL 内可继续:带 session + click_ref/back 再调)。
     pub session: Option<String>,
+    /// 页面截图(data: URL,`data:image/png;base64,…`):仅 `screenshot=true` 且截到才有。
+    /// 工具把它当图片 part 回给模型(工具结果多媒体第一个消费者;非视觉模型出向降级成占位)。
+    pub screenshot: Option<String>,
 }
 
 #[async_trait::async_trait]

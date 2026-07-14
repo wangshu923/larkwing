@@ -48,9 +48,13 @@ rustls = { version = "0.23", features = ["aws_lc_rs"] }
 ctrlc = "3"
 # 原生 stderr 落盘(src/nativelog.rs):unix dup2 / Windows UCRT _dup2(libc 两端都带正确 link_name)。
 libc = "0.2"
+# webrender 截图(工具结果多媒体第一个消费者):抓到的 PNG bytes → data URL。lock 里已有
+# (larkwing-core 依赖 base64 0.22),这里补声明才能在壳层用。
+base64 = "0.22"
 
-# 前台全屏检测(悬浮窗让位,见 src/fullscreen.rs):仅 Windows 需要;复用 Tauri 已拉的
-# windows 0.61,不引入新版本。Mac 原生 space 已天然不覆盖别 app 全屏,无此依赖。
+# 前台全屏检测(悬浮窗让位,见 src/fullscreen.rs)+ webrender 截图(WebView2 CapturePreview,
+# 见 src/webrender.rs):仅 Windows;复用 Tauri 已拉的 windows 0.61 + webview2-com 0.38
+# (版本必须与 tauri 拉入的一致,否则 controller() 类型对不上)。Mac 走 objc2(下方独立块)。
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
   "Win32_Foundation",
@@ -58,4 +62,15 @@ windows = { version = "0.61", features = [
   "Win32_System_Threading",
   "Win32_UI_WindowsAndMessaging",
   "Win32_UI_Shell",
+  "Win32_System_Com",         # webrender 截图:IStream / STREAM_SEEK_* / ISequentialStream::Read
 ] }
+webview2-com = "0.38"         # webrender 截图:ICoreWebView2::CapturePreview + 完成回调
+
+# webrender 截图(WKWebView.takeSnapshot,见 src/webrender.rs):仅 macOS;objc2 全家 + block2,
+# 版本与 lock 里 tauri/wry 已解析的一致(objc2 0.6 / objc2-* 0.3 / block2 0.6),不引入新副本。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSData", "NSDictionary", "NSString", "NSError"] }
+objc2-app-kit = { version = "0.3", features = ["NSImage", "NSImageRep", "NSBitmapImageRep"] }
+objc2-web-kit = { version = "0.3", features = ["WKWebView", "WKSnapshotConfiguration", "block2"] }
+block2 = "0.6"
