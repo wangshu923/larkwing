@@ -181,17 +181,49 @@ async fn browse_step_inner(
         wait_for_load(&entry, 0, deadline).await;
     }
 
-    // ---- 3. 动作:back > click_ref > click_text ----
+    // ---- 3. 动作:back > 输入(type/fill/select/press)> click > scroll ----
     drain_downloads(&entry).await; // 上一步残留的下载信号别混进本步
     let mut download = None;
     let mut post_click_url = None;
     let mut skip_snapshot = false;
     let did_click = req.click_ref.is_some() || req.click_text.is_some();
+    let did_input = req.type_ref.is_some()
+        || !req.fill.is_empty()
+        || req.select_ref.is_some()
+        || req.press_key.is_some();
     if req.back {
         task.step("step.render_back", serde_json::Value::Null);
         let seq0 = entry.load_seq.load(Ordering::Relaxed);
         let _ = entry.win.eval("try{history.back()}catch(e){}");
         wait_for_load(&entry, seq0, deadline).await;
+    } else if did_input {
+        task.step("step.render_input", serde_json::Value::Null);
+        let act_moment = Instant::now();
+        let seq0 = entry.load_seq.load(Ordering::Relaxed);
+        let js = build_input_script(&req);
+        entry.win.eval(js.as_str()).context("输入指令没发出去")?;
+        // submit / 回车可能引发导航或下载 → 走点击同款结局等待;否则给短静默让框架状态落定。
+        let may_navigate = req.submit || req.press_key.as_deref() == Some("Enter");
+        if may_navigate {
+            let (dl, navigated, loaded) = wait_click_outcome(&entry, act_moment, seq0, deadline).await;
+            download = dl;
+            if navigated && download.is_none() {
+                post_click_url = last_nav_after(&entry.navs, act_moment);
+                skip_snapshot = !loaded;
+            }
+            if navigated && loaded {
+                tokio::time::sleep(
+                    SETTLE_AFTER_LOAD
+                        .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                )
+                .await;
+            }
+        } else {
+            tokio::time::sleep(
+                SETTLE_AFTER_LOAD.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+            )
+            .await;
+        }
     } else if did_click {
         let desc = req
             .click_ref
@@ -219,6 +251,20 @@ async fn browse_step_inner(
             )
             .await;
         }
+    } else if let Some(dir) = req.scroll.as_deref() {
+        task.step("step.render_scroll", serde_json::Value::Null);
+        let _ = entry.win.eval(build_scroll_script(dir).as_str());
+        tokio::time::sleep(
+            Duration::from_millis(500)
+                .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+        )
+        .await;
+    }
+    // wait_text:动作后等这段文字出现(SPA 异步内容),再快照;超时也照常快照(不算错)。
+    if let Some(needle) = req.wait_text.as_deref() {
+        if !skip_snapshot {
+            wait_for_text(&media, &entry, needle, deadline).await;
+        }
     }
 
     // ---- 4. 编号快照(每步都照一张;文件内联跳过——注入脚本在 PDF 查看器里跑不了)----
@@ -236,12 +282,12 @@ async fn browse_step_inner(
         post_click = post_click_url.as_deref().unwrap_or(""),
         "webrender 步完成"
     );
-    // 点击引发跳转会把页面世界里的 __lwClick 冲掉 → 以「点击后出现导航」补判 clicked
-    if did_click && post_click_url.is_some() {
+    // 点击/提交引发跳转会把页面世界里的 __lwClick 冲掉 → 以「动作后出现导航」补判 acted
+    if (did_click || did_input) && post_click_url.is_some() {
         if let Some(p) = page.as_mut() {
             if !p.clicked {
                 p.clicked = true;
-                p.clicked_desc = "(点击后页面跳转)".into();
+                p.clicked_desc = "(动作后页面跳转)".into();
             }
         }
     }
@@ -414,6 +460,37 @@ async fn wait_for_load(entry: &Arc<SessionEntry>, seq0: u64, deadline: tokio::ti
     tokio::time::sleep(SETTLE_AFTER_LOAD).await;
 }
 
+/// 动作后等某段文字出现再快照(SPA 异步内容的显式等待)。复用一次性 collect 信箱:注入轮询
+/// 脚本,页面文本含目标 / 或轮询到顶就 POST 回来;超时也返回(照常快照,不算错)。
+async fn wait_for_text(
+    media: &larkwing_core::media::MediaRuntime,
+    entry: &Arc<SessionEntry>,
+    needle: &str,
+    deadline: tokio::time::Instant,
+) {
+    let (post_url, rx) = match media.webrender_collect().await {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let needle_js = serde_json::to_string(needle).unwrap_or_else(|_| "\"\"".into());
+    let post_js = serde_json::to_string(&post_url).unwrap_or_else(|_| "\"\"".into());
+    let js = format!(
+        r#"(function() {{
+  var NEEDLE = {needle_js}, POST = {post_js}, tries = 0;
+  function done() {{ try {{ fetch(POST, {{ method: 'POST', headers: {{ 'Content-Type': 'text/plain' }}, body: '1' }}); }} catch (e) {{}} }}
+  function check() {{
+    var body = document.body ? document.body.innerText : '';
+    if (body.indexOf(NEEDLE) >= 0 || tries++ > 50) done();
+    else setTimeout(check, 200);
+  }}
+  check();
+}})();"#
+    );
+    let _ = entry.win.eval(js.as_str());
+    let until = (tokio::time::Instant::now() + LOAD_WAIT).min(deadline);
+    let _ = tokio::time::timeout_at(until, rx).await;
+}
+
 /// 清空残留下载信号 + 上一步的落点记录(每步动作只认自己触发的下载)。
 async fn drain_downloads(entry: &Arc<SessionEntry>) {
     let mut rx = entry.dl_done.lock().await;
@@ -426,6 +503,7 @@ async fn drain_downloads(entry: &Arc<SessionEntry>) {
 /// - 跳转发生且**新页已加载完**、没有下载起头 → 立即收手(普通链接点击,别干等);
 /// - 跳转在途(nav 到了、load 没完)→ 继续等(重定向链的尽头可能就是附件);
 /// - 宽限内毫无动静 → 收手。
+///
 /// 返回 (下载产物, 点击后是否导航, 新页是否已 load-finished)。loaded 用来区分「HTML 新页
 /// (要快照)」与「PDF/附件内联(注入脚本跑不了,跳过快照,把地址交 web_download)」——
 /// Mac WKWebView 点指向 PDF 的链接会内联打开、永不 load。
@@ -587,19 +665,119 @@ fn build_click_script(click_ref: Option<u32>, click_text: Option<&str>) -> Strin
     )
 }
 
-/// 快照脚本:给可见交互元素打 `data-lw-ref` 编号(下一步 click_ref 引用),抽
-/// 「标题/正文/链接/编号元素」+ 上一步点击报告(__lwClick,读完即清)POST 回 loopback。
+/// 输入类动作脚本(完全操作第一批):按编号 type 填字 / fill 批量 / select 选下拉 /
+/// press 按键,可选 submit 提交表单。React/Vue 受控组件走「原生 value setter + input 事件」
+/// (直接改 `.value` 不触发框架状态更新,业界事实标准);填后 blur 触发 on-blur 校验;下张
+/// 快照回读 value = 天然「填对没」校验。合成键盘事件 isTrusted=false **不触发原生提交** →
+/// 提交走 `requestSubmit()`。结果写 window.__lwClick(clicked=acted/desc/stale;编号失效 stale),
+/// 下张快照带回(与点击同一回传口,壳层/工具复用 clicked/stale 呈现)。
+fn build_input_script(req: &RenderRequest) -> String {
+    let ref_js = req.type_ref.map(|n| n.to_string()).unwrap_or_else(|| "null".into());
+    let txt_js =
+        serde_json::to_string(req.type_text.as_deref().unwrap_or("")).unwrap_or_else(|_| "\"\"".into());
+    let fill_js = serde_json::to_string(
+        &req.fill
+            .iter()
+            .map(|f| serde_json::json!({ "ref": f.ref_no, "value": f.value }))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|_| "[]".into());
+    let sel_js = req.select_ref.map(|n| n.to_string()).unwrap_or_else(|| "null".into());
+    let opt_js = serde_json::to_string(req.select_option.as_deref().unwrap_or(""))
+        .unwrap_or_else(|_| "\"\"".into());
+    let key_js =
+        serde_json::to_string(req.press_key.as_deref().unwrap_or("")).unwrap_or_else(|_| "\"\"".into());
+    let submit = req.submit;
+    format!(
+        r#"(function() {{
+  var REF = {ref_js}; var TXT = {txt_js}; var FILL = {fill_js};
+  var SEL = {sel_js}; var OPT = {opt_js}; var KEY = {key_js}; var SUBMIT = {submit};
+  var stale = false, acted = false, desc = '', last = null;
+  function byRef(n) {{ var el = document.querySelector('[data-lw-ref="' + n + '"]'); if (!el) stale = true; return el; }}
+  function setVal(el, v) {{
+    try {{ el.focus(); }} catch (e) {{}}
+    if (el.isContentEditable) {{
+      try {{ document.execCommand('selectAll', false, null); document.execCommand('insertText', false, v); }}
+      catch (e) {{ el.textContent = v; el.dispatchEvent(new Event('input', {{ bubbles: true }})); }}
+      return;
+    }}
+    var proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    try {{ Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, v); }} catch (e) {{ el.value = v; }}
+    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+    try {{ el.blur(); }} catch (e) {{}}
+  }}
+  if (REF !== null) {{ var e0 = byRef(REF); if (e0) {{ setVal(e0, TXT); acted = true; last = e0; desc = '填入[' + REF + ']'; }} }}
+  else if (FILL && FILL.length) {{ for (var i = 0; i < FILL.length; i++) {{ var ei = byRef(FILL[i].ref); if (ei) {{ setVal(ei, FILL[i].value); acted = true; last = ei; }} }} desc = '批量填 ' + FILL.length + ' 项'; }}
+  else if (SEL !== null) {{
+    var s = byRef(SEL);
+    if (s && s.tagName === 'SELECT') {{
+      var hit = -1, o = s.options;
+      for (var j = 0; j < o.length; j++) {{ if ((o[j].text || '').trim() === OPT || o[j].value === OPT) {{ hit = j; break; }} }}
+      if (hit < 0) for (var k = 0; k < o.length; k++) {{ if ((o[k].text || '').indexOf(OPT) >= 0) {{ hit = k; break; }} }}
+      if (hit >= 0) {{ s.selectedIndex = hit; s.dispatchEvent(new Event('input', {{ bubbles: true }})); s.dispatchEvent(new Event('change', {{ bubbles: true }})); acted = true; last = s; desc = '选中[' + SEL + ']→' + (o[hit].text || '').trim().slice(0, 20); }}
+    }}
+  }}
+  else if (KEY) {{
+    var t = document.activeElement || document.body;
+    ['keydown', 'keypress', 'keyup'].forEach(function(ty) {{ try {{ t.dispatchEvent(new KeyboardEvent(ty, {{ key: KEY, bubbles: true }})); }} catch (e) {{}} }});
+    acted = true; desc = '按键 ' + KEY;
+  }}
+  if (SUBMIT) {{
+    var f = (last && last.form) || (document.activeElement && document.activeElement.form) || document.querySelector('form');
+    if (f) {{ setTimeout(function() {{ try {{ f.requestSubmit(); }} catch (e) {{ try {{ f.submit(); }} catch (e2) {{}} }} }}, 60); desc += ' + 提交'; acted = true; }}
+  }}
+  window.__lwClick = {{ clicked: acted, desc: desc, stale: stale }};
+}})();"#
+    )
+}
+
+/// 滚动翻页脚本:按视口高度上/下滚约一屏(够屏外内容;配合快照的 scroll_hint)。
+fn build_scroll_script(dir: &str) -> String {
+    let sign = if dir.eq_ignore_ascii_case("up") { "-" } else { "" };
+    format!(
+        r#"(function() {{ try {{ var se = document.scrollingElement || document.documentElement; window.scrollBy(0, {sign}(se.clientHeight || 600) * 0.9); }} catch (e) {{}} }})();"#
+    )
+}
+
+/// 快照脚本:给可见交互元素(可点 + 可填 + 可选 + 勾选)打 `data-lw-ref` 编号,抽
+/// 「标题/正文/链接/编号元素(带 label/值/勾选态/选项)/滚动位置」+ 上一步动作报告
+/// (__lwClick,读完即清)POST 回 loopback。文本版 Set-of-Marks:同一编号既能 click_ref
+/// 点、也能 type_ref 填 / select_ref 选(壳层动作脚本按编号 querySelector 定位)。
 fn build_snapshot_script(collect_url: &str) -> String {
     let post = serde_json::to_string(collect_url).unwrap_or_else(|_| "\"\"".into());
     format!(
         r#"(function() {{
   var POST = {post};
-  function txt(el) {{ return ((el.innerText || el.value || '') + '').replace(/\s+/g, ' ').trim().slice(0, 40); }}
-  function role(el) {{
-    var t = el.tagName;
-    if (t === 'BUTTON' || t === 'INPUT') return 'button';
-    if (t === 'A') return el.getAttribute('href') ? 'link' : 'click';
-    return 'click';
+  function txt(el) {{ return ((el.innerText || '') + '').replace(/\s+/g, ' ').trim().slice(0, 40); }}
+  function labelOf(el) {{
+    try {{ if (el.id) {{ var l = document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(el.id) : el.id) + '"]'); if (l) return txt(l); }} }} catch (e) {{}}
+    var p = el.closest ? el.closest('label') : null; if (p) return txt(p);
+    var a = el.getAttribute('aria-label'); if (a) return a.trim().slice(0, 40);
+    var ph = el.getAttribute('placeholder'); if (ph) return ph.trim().slice(0, 40);
+    var nm = el.getAttribute('name'); if (nm) return nm.trim().slice(0, 40);
+    return '';
+  }}
+  // 交互元素的类别 + 展示名 + 当前值 + 勾选态 + 选项。null = 不编号(跳过)。
+  function describe(el) {{
+    var tag = el.tagName;
+    var type = (el.getAttribute('type') || '').toLowerCase();
+    if (tag === 'BUTTON' || (tag === 'INPUT' && (type === 'button' || type === 'submit' || type === 'reset' || type === 'image'))) {{
+      var bt = txt(el) || el.value || labelOf(el); return bt ? {{ role: 'button', text: bt }} : null;
+    }}
+    if (tag === 'A') {{ var at = txt(el); return at ? {{ role: el.getAttribute('href') ? 'link' : 'click', text: at }} : null; }}
+    if (tag === 'INPUT' && (type === 'checkbox' || type === 'radio')) {{ return {{ role: type, text: labelOf(el) || type, checked: !!el.checked }}; }}
+    if (tag === 'INPUT' && type === 'hidden') return null;
+    if (tag === 'INPUT') {{ var sec = (type === 'password'); return {{ role: 'input', text: labelOf(el) || '输入框', value: sec ? '' : (el.value || '').slice(0, 80), secret: sec }}; }}
+    if (tag === 'TEXTAREA') {{ return {{ role: 'textarea', text: labelOf(el) || '文本域', value: (el.value || '').slice(0, 80) }}; }}
+    if (tag === 'SELECT') {{
+      var opts = []; for (var i = 0; i < el.options.length && opts.length < 30; i++) opts.push((el.options[i].text || '').trim().slice(0, 40));
+      var cur = el.selectedIndex >= 0 ? (el.options[el.selectedIndex].text || '').trim().slice(0, 40) : '';
+      return {{ role: 'select', text: labelOf(el) || '下拉', value: cur, options: opts }};
+    }}
+    if (el.isContentEditable) {{ var et = txt(el); return {{ role: 'editable', text: labelOf(el) || '可编辑区', value: et.slice(0, 80) }}; }}
+    if (el.getAttribute('role') === 'button' || el.hasAttribute('onclick')) {{ var ct = txt(el); return ct ? {{ role: 'click', text: ct }} : null; }}
+    return null;
   }}
   var links = []; var seen = {{}};
   var anchors = document.querySelectorAll('a[href]');
@@ -609,18 +787,26 @@ fn build_snapshot_script(collect_url: &str) -> String {
     links.push({{ text: txt(anchors[i]) || h.split('/').pop().slice(0, 40), url: h }});
   }}
   var elements = [];
-  var cands = document.querySelectorAll('button,a,[role="button"],[onclick],input[type="button"],input[type="submit"]');
+  var cands = document.querySelectorAll('button,a,[role="button"],[onclick],input,textarea,select,[contenteditable]');
   var no = 1;
-  for (var j = 0; j < cands.length && elements.length < 40; j++) {{
+  for (var j = 0; j < cands.length && elements.length < 60; j++) {{
     var el = cands[j];
     if (el.offsetParent === null) continue; // display:none 等不可见的不编号
-    var t = txt(el);
-    if (!t) continue;
+    var d = describe(el);
+    if (!d) continue;
     el.setAttribute('data-lw-ref', String(no));
     var h = (el.tagName === 'A' && el.href && /^https?:/.test(el.href)) ? el.href : null;
-    elements.push({{ ref: no, role: role(el), text: t, href: h }});
+    elements.push({{ ref: no, role: d.role, text: d.text, href: h, value: d.value || '', checked: (d.checked === undefined ? null : d.checked), options: d.options || [], secret: !!d.secret }});
     no++;
   }}
+  var scroll_hint = '';
+  try {{
+    var se = document.scrollingElement || document.documentElement;
+    var vh = se.clientHeight || 1;
+    var above = Math.round(se.scrollTop / vh);
+    var below = Math.round((se.scrollHeight - se.scrollTop - vh) / vh);
+    if (above > 0 || below > 0) scroll_hint = '上面约 ' + above + ' 屏 / 下面约 ' + below + ' 屏';
+  }} catch (e) {{}}
   var click = window.__lwClick || {{}};
   try {{ delete window.__lwClick; }} catch (e) {{}}
   var payload = {{
@@ -628,6 +814,7 @@ fn build_snapshot_script(collect_url: &str) -> String {
     text: (document.body ? document.body.innerText : '').slice(0, 8000),
     links: links,
     elements: elements,
+    scroll_hint: scroll_hint,
     clicked: !!click.clicked,
     clicked_desc: click.desc || '',
     click_ref_stale: !!click.stale

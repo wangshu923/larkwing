@@ -26,29 +26,48 @@ pub struct RenderedPage {
     /// 实际点中的元素描述(如 `BUTTON「下载」`):多个候选时模型能核对点没点对。
     pub clicked_desc: String,
     /// **编号交互元素**(文本版 Set-of-Marks,L2 会话式浏览的 grounding):快照时给页面
-    /// 元素打 `data-lw-ref` 编号,下一步 `click_ref` 按编号点——同文字多按钮不再靠猜。
-    /// 编号只在同一页面内有效(跳转即作废,快照会重新编)。
+    /// 元素打 `data-lw-ref` 编号——可点的(按钮/链接)按编号 `click_ref` 点,可填的
+    /// (输入框/文本域/可编辑区)按编号 `type_ref` 填、可选的(下拉)按编号 `select_ref` 选、
+    /// 勾选框按编号点。同文字多元素不再靠猜。编号只在同一页面内有效(跳转即作废、重新编)。
     pub elements: Vec<PageElement>,
-    /// 按编号点击但编号已失效(页面变了/元素没了):模型按新快照的编号重试。
+    /// 按编号操作但编号已失效(页面变了/元素没了):模型按新快照的编号重试。
     pub click_ref_stale: bool,
+    /// 滚动位置提示(如「上面还有约 1 屏 / 下面还有约 3 屏」):模型据此决定要不要 scroll
+    /// 去够屏外内容。空 = 一屏装得下 / 探不到。
+    pub scroll_hint: String,
 }
 
-/// 一个编号交互元素。role:button / link / input / click(泛 onclick 类)。
+/// 一个编号交互元素。role:button / link / click(泛 onclick)/ input(文本框)/
+/// textarea / select(下拉)/ checkbox / radio / editable(contenteditable)。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct PageElement {
     #[serde(rename = "ref")]
     pub ref_no: u32,
     pub role: String,
+    /// 展示名:按钮/链接的文字,或输入类的 label(label/placeholder/aria-label/name 择一)。
     pub text: String,
     /// 链接类元素的目标(有 = 也可以直接交给 web_download)。
     pub href: Option<String>,
+    /// 输入类当前值(input/textarea/select 选中项/contenteditable 文本);填后下张快照回读 =
+    /// 天然的「填对没」校验。password 类不回读(见 `secret`)。
+    pub value: String,
+    /// checkbox / radio 的勾选态(其余类型为 None)。
+    pub checked: Option<bool>,
+    /// select 的可选项文本(供模型给 `select_option` 对上)。
+    pub options: Vec<String>,
+    /// 敏感字段(type=password):标出让模型知道它在,但**不回读 value、也不该往里填**
+    /// (凭证交用户在可见小窗自己输;第一批不做闸,靠工具描述引导)。
+    pub secret: bool,
 }
 
-/// 一次渲染/浏览请求(工具 → 壳层)。L2 会话式浏览(2026-07-10 用户拍板解锁):
-/// 窗口跨调用存活,看 → 点(编号)→ 返回 → 再看连续走;**动作空间只有这三样,
-/// 输入/填表仍不做**(等 Tool::risk 确认闸门,§7.8)。
-#[derive(Debug, Clone)]
+/// 一次渲染/浏览请求(工具 → 壳层)。L2 会话式浏览(2026-07-10 解锁)+ **完全操作
+/// 第一批(2026-07-14):看 / 点 / 返回 / 填字 / 批量填表 / 选下拉 / 按键 / 滚动**。
+/// 窗口跨调用存活,连续走。一次调用做**一个主动作**(壳层按优先级择一:back > 输入类
+/// (type/fill/select/press)> click > scroll);`submit`(表单提交)是 type/fill 的修饰,
+/// `wait_text`(动作后等文字出现再快照)对任何动作通用。**文件上传 / 凭证代填 / CDP 可信
+/// 输入仍不做**(§7.8)。
+#[derive(Debug, Clone, Default)]
 pub struct RenderRequest {
     /// 打开的地址。带 session 续用时可空(空 = 不导航,只在当前页上动作/观察)。
     pub url: String,
@@ -59,12 +78,37 @@ pub struct RenderRequest {
     pub click_ref: Option<u32>,
     /// 按文字点第一个包含该文字的可点元素(没有编号时的退路;命中排序见壳层)。
     pub click_text: Option<String>,
-    /// 返回上一页(优先于点击)。
+    /// 返回上一页(优先于一切动作)。
     pub back: bool,
+    /// 往编号输入框/文本域/可编辑区填字(配 `type_text`)。
+    pub type_ref: Option<u32>,
+    /// 配 `type_ref` 的文本内容。
+    pub type_text: Option<String>,
+    /// 批量填表:一次填多个编号字段(比逐个 type 省轮次)。
+    pub fill: Vec<FillField>,
+    /// type / fill 之后提交所在表单(`form.requestSubmit()`;合成回车不触发提交,故走这条)。
+    pub submit: bool,
+    /// 原生下拉按选项文本/值选(配 `select_option`)。
+    pub select_ref: Option<u32>,
+    /// 配 `select_ref` 的目标选项(文本或 value,壳层两边试匹配)。
+    pub select_option: Option<String>,
+    /// 按键:Enter / Escape / Tab / ArrowDown 等(喂 SPA 的按键监听 / 触发下拉)。
+    pub press_key: Option<String>,
+    /// 滚动翻页:"up" / "down"(够屏外内容)。
+    pub scroll: Option<String>,
+    /// 动作后等这段文字出现再快照(SPA 异步内容的显式等待;超时也照常快照,不算错)。
+    pub wait_text: Option<String>,
     /// 点击若触发下载,成品落这个目录(壳层负责唯一名,复用 `files::dedupe_path` 口径)。
     pub download_dir: PathBuf,
     /// 单步预算(壳层超时即收手回快照;会话窗本身由 TTL 管生死)。
     pub timeout: Duration,
+}
+
+/// 批量填表的一个字段(`fill` 数组元素)。
+#[derive(Debug, Clone, Default)]
+pub struct FillField {
+    pub ref_no: u32,
+    pub value: String,
 }
 
 /// 渲染结局:页面快照(None = 一直没回传)+ 下载产物(点击触发才有)+ 点击后跳转

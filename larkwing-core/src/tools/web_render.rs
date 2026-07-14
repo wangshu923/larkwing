@@ -12,9 +12,86 @@ use std::time::Duration;
 use anyhow::Context;
 use async_trait::async_trait;
 
-use crate::webrender::RenderRequest;
+use crate::webrender::{FillField, PageElement, RenderRequest};
 
 use super::{Tool, ToolCtx, ToolRisk, ToolSpec};
+
+/// 从工具入参取可选字符串(trim + 空即无)。
+fn str_arg(args: &serde_json::Value, key: &str) -> Option<String> {
+    args.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+/// 从工具入参取可选编号(宽容:真数字 / 数字形字符串都认,同 `arg_u64` quirk)。
+fn opt_ref(args: &serde_json::Value, key: &str) -> Option<u32> {
+    match args.get(key) {
+        Some(serde_json::Value::Number(n)) => n.as_u64().map(|v| v as u32),
+        Some(serde_json::Value::String(s)) => s.trim().parse::<u32>().ok(),
+        _ => None,
+    }
+}
+
+/// 这次「想干的动作」的人话描述(用于「没找到/已操作」措辞;实际命中以 clicked_desc 为准)。
+fn wanted_action(
+    click_ref: Option<u32>,
+    click_text: Option<&str>,
+    type_ref: Option<u32>,
+    fill: &[FillField],
+    select_ref: Option<u32>,
+    press_key: Option<&str>,
+) -> Option<String> {
+    if let Some(n) = click_ref {
+        return Some(format!("[{n}]"));
+    }
+    if let Some(t) = click_text {
+        return Some(format!("「{t}」"));
+    }
+    if let Some(n) = type_ref {
+        return Some(format!("填入[{n}]"));
+    }
+    if !fill.is_empty() {
+        return Some("批量填表".into());
+    }
+    if let Some(n) = select_ref {
+        return Some(format!("选[{n}]"));
+    }
+    if let Some(k) = press_key {
+        return Some(format!("按键 {k}"));
+    }
+    None
+}
+
+/// 一个交互元素渲染成给模型看的一行(按类别带值/选项/勾选态)。
+fn render_element(e: &PageElement) -> String {
+    let n = e.ref_no;
+    let val = |v: &str| if v.is_empty() { "空".to_string() } else { format!("「{v}」") };
+    match e.role.as_str() {
+        "button" => format!("[{n}] 按钮「{}」\n", e.text),
+        "link" => format!("[{n}] 链接「{}」\n", e.text),
+        "input" if e.secret => {
+            format!("[{n}] 密码框「{}」(敏感,别代填——请用户在小窗里自己输)\n", e.text)
+        }
+        "input" => format!("[{n}] 输入框「{}」= {}\n", e.text, val(&e.value)),
+        "textarea" => format!("[{n}] 文本域「{}」= {}\n", e.text, val(&e.value)),
+        "select" => {
+            let opts = if e.options.is_empty() {
+                String::new()
+            } else {
+                format!(";可选:{}", e.options.join(" / "))
+            };
+            format!("[{n}] 下拉「{}」= {}{}\n", e.text, val(&e.value), opts)
+        }
+        "checkbox" | "radio" => {
+            let mark = if e.checked == Some(true) { "☑" } else { "☐" };
+            format!("[{n}] {mark} 勾选「{}」(click_ref 点它切换)\n", e.text)
+        }
+        "editable" => format!("[{n}] 可编辑区「{}」= {}\n", e.text, val(&e.value)),
+        _ => format!("[{n}] 可点「{}」\n", e.text),
+    }
+}
 
 /// 单次渲染预算(开窗→回传→可能的下载全含;壳层超时自己收摊关窗)。
 const RENDER_TIMEOUT: Duration = Duration::from_secs(40);
@@ -29,14 +106,17 @@ impl WebRender {
             spec: ToolSpec {
                 name: "web_render",
                 description: "用真浏览器打开并操作网页(要跑 JS 才显示内容的页面:web_fetch \
-                              抓回来是空壳、说「动态加载」时用这个)。每次返回渲染后的正文和\
-                              带编号的可点元素(如 [3] 按钮「下载」),并给一个 session 号——\
-                              窗口保持 3 分钟,可以连续操作:带 session + click_ref 点编号元素、\
-                              back 返回上一页、再带 url 则跳新地址。点出的下载自动存到本机并\
-                              返回路径。浏览窗在屏幕右下角对用户可见:遇到要登录/扫码/验证码的\
-                              页面,直接请用户在那个小窗里操作,完成后你再带 session 继续。\
-                              你自己只能看/点/返回,不能填表输入。比 web_fetch 慢得多,\
-                              先试 web_fetch 不行再用它。",
+                              抓回来是空壳、说「动态加载」时用这个)。每次返回渲染后的正文 + 带\
+                              编号的交互元素(可点 [3] 按钮「下载」/ 可填 [5] 输入框「邮箱」/ \
+                              可选 [7] 下拉「城市」/ 勾选框),并给一个 session 号——窗口保持 3 \
+                              分钟,可连续操作:带 session 加 click_ref 点编号、type_ref+text 往\
+                              编号输入框填字、fill 批量填表、select_ref+option 选下拉、勾选框用 \
+                              click_ref 点、press_key 按键(Enter/Escape…)、submit 提交表单、\
+                              scroll 上/下翻页、back 返回、再带 url 跳新地址。填完下张快照会回读\
+                              各框当前值,自己核对填对没。点出的下载自动存到本机并返回路径。\
+                              浏览窗在屏幕右下角对用户可见:遇到要登录/扫码/验证码,或要填密码/\
+                              银行卡这类敏感信息,别自己填——请用户在那个小窗里操作,完成后你带 \
+                              session 继续。比 web_fetch 慢得多,先试 web_fetch 不行再用它。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -58,7 +138,50 @@ impl WebRender {
                         },
                         "back": {
                             "type": "boolean",
-                            "description": "返回上一页(优先于点击)"
+                            "description": "返回上一页(优先于其它动作)"
+                        },
+                        "type_ref": {
+                            "type": "integer",
+                            "description": "往这个编号的输入框/文本域/可编辑区填字(配 text);编号只在同一页有效"
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "配 type_ref:要填进去的文字(会替换原有内容)"
+                        },
+                        "fill": {
+                            "type": "array",
+                            "description": "批量填表:一次填多个字段,比逐个 type 省事",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "ref": { "type": "integer", "description": "字段编号" },
+                                    "value": { "type": "string", "description": "填入的值" }
+                                }
+                            }
+                        },
+                        "select_ref": {
+                            "type": "integer",
+                            "description": "选这个编号的原生下拉(配 option)"
+                        },
+                        "option": {
+                            "type": "string",
+                            "description": "配 select_ref:要选的选项(选项文字或值)"
+                        },
+                        "submit": {
+                            "type": "boolean",
+                            "description": "填完(type/fill)后提交所在表单;按回车提交请用它,合成回车不触发提交"
+                        },
+                        "press_key": {
+                            "type": "string",
+                            "description": "按一个键:Enter / Escape / Tab / ArrowDown 等(喂搜索框/下拉的按键监听)"
+                        },
+                        "scroll": {
+                            "type": "string",
+                            "description": "翻页看屏外内容:up / down"
+                        },
+                        "wait_text": {
+                            "type": "string",
+                            "description": "动作后等这段文字出现再读页(动态内容慢慢加载时用);等不到也照常返回"
                         },
                         "dir": {
                             "type": "string",
@@ -106,14 +229,32 @@ impl Tool for WebRender {
             url.is_some() || session.is_some(),
             "缺参数:开新页面给 url,继续上次的窗给 session"
         );
-        let click_ref = args.get("click_ref").and_then(serde_json::Value::as_u64).map(|n| n as u32);
-        let click_text = args
-            .get("click_text")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from);
+        let click_ref = opt_ref(&args, "click_ref");
+        let click_text = str_arg(&args, "click_text");
         let back = super::arg_bool(&args, "back", false);
+        // 输入类动作(完全操作第一批)
+        let type_ref = opt_ref(&args, "type_ref");
+        let type_text = str_arg(&args, "text");
+        let fill: Vec<FillField> = args
+            .get("fill")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|it| {
+                        Some(FillField {
+                            ref_no: opt_ref(it, "ref")?,
+                            value: str_arg(it, "value").unwrap_or_default(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let select_ref = opt_ref(&args, "select_ref");
+        let select_option = str_arg(&args, "option");
+        let submit = super::arg_bool(&args, "submit", false);
+        let press_key = str_arg(&args, "press_key");
+        let scroll = str_arg(&args, "scroll");
+        let wait_text = str_arg(&args, "wait_text");
         let download_dir = match args.get("dir").and_then(serde_json::Value::as_str).map(str::trim)
         {
             Some(d) if !d.is_empty() => {
@@ -128,9 +269,14 @@ impl Tool for WebRender {
             .clone()
             .context("这台机器没有接网页渲染组件(桌面壳层才有)——退回 web_fetch,或让用户手动打开页面下载后给我文件")?;
 
-        let wanted_click = click_ref
-            .map(|n| format!("[{n}]"))
-            .or_else(|| click_text.clone().map(|t| format!("「{t}」")));
+        let wanted = wanted_action(
+            click_ref,
+            click_text.as_deref(),
+            type_ref,
+            &fill,
+            select_ref,
+            press_key.as_deref(),
+        );
         let outcome = renderer
             .render(RenderRequest {
                 url: url.clone().unwrap_or_default(),
@@ -138,6 +284,15 @@ impl Tool for WebRender {
                 click_ref,
                 click_text,
                 back,
+                type_ref,
+                type_text,
+                fill,
+                submit,
+                select_ref,
+                select_option,
+                press_key,
+                scroll,
+                wait_text,
                 download_dir,
                 timeout: RENDER_TIMEOUT,
             })
@@ -145,11 +300,7 @@ impl Tool for WebRender {
 
         let mut out = String::new();
         if let Some(path) = &outcome.download {
-            out.push_str(&format!(
-                "点击{}触发了下载,已存到 {}\n",
-                wanted_click.as_deref().unwrap_or("?"),
-                path.display()
-            ));
+            out.push_str(&format!("触发了下载,已存到 {}\n", path.display()));
         }
         match &outcome.page {
             Some(page) => {
@@ -160,15 +311,17 @@ impl Tool for WebRender {
                 ));
                 if !page.elements.is_empty() {
                     out.push_str(
-                        "\n\n【可点元素】(点哪个就带 session + click_ref=编号 再调;编号只在本页有效)\n",
+                        "\n\n【交互元素】(带 session 用编号:click_ref 点 / type_ref+text 填 / \
+                         select_ref+option 选;编号只在本页有效)\n",
                     );
                     for e in &page.elements {
-                        let role = match e.role.as_str() {
-                            "button" => "按钮",
-                            "link" => "链接",
-                            _ => "可点",
-                        };
-                        out.push_str(&format!("[{}] {role}「{}」\n", e.ref_no, e.text));
+                        out.push_str(&render_element(e));
+                    }
+                    if !page.scroll_hint.is_empty() {
+                        out.push_str(&format!(
+                            "(滚动位置:{};要看屏外内容用 scroll=up/down)\n",
+                            page.scroll_hint
+                        ));
                     }
                 } else if !page.clickables.is_empty() {
                     // 旧形状兜底(壳层还没升级时)
@@ -184,25 +337,25 @@ impl Tool for WebRender {
                     }
                 }
                 if page.click_ref_stale {
-                    out.push_str("\n(那个编号已经失效——页面变过了,按上面新快照的编号再点)");
+                    out.push_str("\n(那个编号已经失效——页面变过了,按上面新快照的编号再操作)");
                 }
-                match (&wanted_click, page.clicked, &outcome.download) {
+                match (&wanted, page.clicked, &outcome.download) {
                     (Some(t), false, _) if !page.click_ref_stale => out.push_str(&format!(
-                        "\n(没找到{t}对应的可点元素——从上面的清单里换一个再试)"
+                        "\n(没找到{t}对应的元素——从上面的清单里换一个再试)"
                     )),
-                    (Some(t), true, None) => {
-                        let hit = if page.clicked_desc.is_empty() {
-                            String::new()
+                    (_, true, None) => {
+                        let did = if page.clicked_desc.is_empty() {
+                            "已操作".to_string()
                         } else {
-                            format!(",命中 {}", page.clicked_desc)
+                            page.clicked_desc.clone()
                         };
                         match &outcome.post_click_url {
                             Some(u) => out.push_str(&format!(
-                                "\n(点了{t}{hit},页面跳到了 {u} 但没直接下载——上面就是新页的快照;\
+                                "\n({did},页面跳到了 {u} 但没直接下载——上面是新页快照;\
                                  像文件直链也可以交给 web_download 试)"
                             )),
                             None => out.push_str(&format!(
-                                "\n(点了{t}{hit},没触发下载——上面是点击后的页面状态,自己判断下一步)"
+                                "\n({did}——上面是操作后的页面状态;填过的框看回读值核对,自己判断下一步)"
                             )),
                         }
                     }
@@ -215,9 +368,8 @@ impl Tool for WebRender {
             None if outcome.post_click_url.is_some() => {
                 let u = outcome.post_click_url.as_deref().unwrap();
                 out.push_str(&format!(
-                    "点{}后页面跳到了 {u}——这多半就是文件本身(比如 PDF),用 web_download 下它;\
-                     下不动(要登录/一次性链接)就如实告诉用户。",
-                    wanted_click.as_deref().unwrap_or("")
+                    "操作后页面跳到了 {u}——这多半就是文件本身(比如 PDF),用 web_download 下它;\
+                     下不动(要登录/一次性链接)就如实告诉用户。"
                 ));
             }
             None => anyhow::bail!(
@@ -310,12 +462,14 @@ mod tests {
                         role: "button".into(),
                         text: "下载电子票".into(),
                         href: None,
+                        ..Default::default()
                     },
                     crate::webrender::PageElement {
                         ref_no: 2,
                         role: "link".into(),
                         text: "查看清单".into(),
                         href: Some("https://x.example.com/list".into()),
+                        ..Default::default()
                     },
                 ],
                 ..Default::default()
@@ -330,7 +484,7 @@ mod tests {
             .unwrap();
         assert!(out.contains("渲染后的正文"), "{out}");
         assert!(out.contains("[1] 按钮「下载电子票」") && out.contains("[2] 链接「查看清单」"), "{out}");
-        assert!(out.contains("没找到「导出」对应的可点元素"), "{out}");
+        assert!(out.contains("没找到「导出」对应的元素"), "{out}");
         assert!(out.contains("会话 lw-render-1"), "{out}");
     }
 
@@ -354,7 +508,7 @@ mod tests {
             .run(serde_json::json!({"session": "lw-render-9", "click_ref": 3}), &ctx)
             .await
             .unwrap();
-        assert!(out.contains("点了[3]") && out.contains("命中 BUTTON「下载电子票据」"), "{out}");
+        assert!(out.contains("BUTTON「下载电子票据」"), "{out}");
         let req = fake.1.lock().unwrap().clone().unwrap();
         assert_eq!(req.session.as_deref(), Some("lw-render-9"));
         assert_eq!(req.click_ref, Some(3));
@@ -407,7 +561,7 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("页面跳到了 https://x.example.com/f/abc.pdf"), "{out}");
-        assert!(out.contains("命中 BUTTON「下载」"), "{out}");
+        assert!(out.contains("BUTTON「下载」"), "{out}");
     }
 
     #[tokio::test]
@@ -426,5 +580,123 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("触发了下载") && out.contains("单据.pdf"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn input_actions_pass_through() {
+        let mut ctx = base_ctx("input");
+        let fake = Arc::new(FakeRender::new(RenderOutcome {
+            page: Some(RenderedPage {
+                title: "表单".into(),
+                text: "正文".into(),
+                clicked: true,
+                clicked_desc: "填入[2]".into(),
+                ..Default::default()
+            }),
+            session: Some("s".into()),
+            ..Default::default()
+        }));
+        ctx.web = Some(fake.clone());
+        // type_ref + text + submit
+        let _ = WebRender::new()
+            .run(
+                serde_json::json!({"session": "s", "type_ref": 2, "text": "a@b.com", "submit": true}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let req = fake.1.lock().unwrap().clone().unwrap();
+        assert_eq!(req.type_ref, Some(2));
+        assert_eq!(req.type_text.as_deref(), Some("a@b.com"));
+        assert!(req.submit);
+
+        // fill 批量(含字符串编号,宽容解析)
+        let _ = WebRender::new()
+            .run(
+                serde_json::json!({"session": "s", "fill": [{"ref": 1, "value": "张三"}, {"ref": "3", "value": "李四"}]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let req = fake.1.lock().unwrap().clone().unwrap();
+        assert_eq!(req.fill.len(), 2);
+        assert_eq!((req.fill[0].ref_no, req.fill[0].value.as_str()), (1, "张三"));
+        assert_eq!((req.fill[1].ref_no, req.fill[1].value.as_str()), (3, "李四"));
+
+        // select + option / press_key + scroll + wait_text
+        let _ = WebRender::new()
+            .run(serde_json::json!({"session": "s", "select_ref": 5, "option": "北京"}), &ctx)
+            .await
+            .unwrap();
+        let req = fake.1.lock().unwrap().clone().unwrap();
+        assert_eq!(req.select_ref, Some(5));
+        assert_eq!(req.select_option.as_deref(), Some("北京"));
+        let _ = WebRender::new()
+            .run(
+                serde_json::json!({"session": "s", "press_key": "Enter", "scroll": "down", "wait_text": "结果"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let req = fake.1.lock().unwrap().clone().unwrap();
+        assert_eq!(req.press_key.as_deref(), Some("Enter"));
+        assert_eq!(req.scroll.as_deref(), Some("down"));
+        assert_eq!(req.wait_text.as_deref(), Some("结果"));
+    }
+
+    #[tokio::test]
+    async fn renders_form_elements_with_value_options_checked() {
+        let mut ctx = base_ctx("form");
+        let fake = Arc::new(FakeRender::new(RenderOutcome {
+            page: Some(RenderedPage {
+                title: "表单".into(),
+                text: "正文".into(),
+                elements: vec![
+                    crate::webrender::PageElement {
+                        ref_no: 1,
+                        role: "input".into(),
+                        text: "邮箱".into(),
+                        value: "a@b.com".into(),
+                        ..Default::default()
+                    },
+                    crate::webrender::PageElement {
+                        ref_no: 2,
+                        role: "input".into(),
+                        text: "密码".into(),
+                        secret: true,
+                        ..Default::default()
+                    },
+                    crate::webrender::PageElement {
+                        ref_no: 3,
+                        role: "select".into(),
+                        text: "城市".into(),
+                        value: "北京".into(),
+                        options: vec!["北京".into(), "上海".into()],
+                        ..Default::default()
+                    },
+                    crate::webrender::PageElement {
+                        ref_no: 4,
+                        role: "checkbox".into(),
+                        text: "同意".into(),
+                        checked: Some(true),
+                        ..Default::default()
+                    },
+                ],
+                scroll_hint: "下面约 2 屏".into(),
+                ..Default::default()
+            }),
+            session: Some("s".into()),
+            ..Default::default()
+        }));
+        ctx.web = Some(fake.clone());
+        let out = WebRender::new()
+            .run(serde_json::json!({"url": "https://x.example.com"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("[1] 输入框「邮箱」= 「a@b.com」"), "{out}");
+        assert!(out.contains("[2] 密码框「密码」") && out.contains("别代填"), "{out}");
+        assert!(out.contains("[3] 下拉「城市」= 「北京」") && out.contains("可选:北京 / 上海"), "{out}");
+        assert!(out.contains("[4] ☑ 勾选「同意」"), "{out}");
+        assert!(out.contains("下面约 2 屏"), "{out}");
     }
 }
