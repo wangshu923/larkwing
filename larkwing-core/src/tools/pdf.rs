@@ -35,7 +35,8 @@ impl PdfToPng {
                 description: "把 PDF 转成逐页 PNG 图片(用户要「能直接看的图」、要发到手机上看、\
                               或要认 PDF 里的二维码时用)。首次使用会自动准备渲染组件。\
                               产物存在 PDF 旁边(或指定文件夹),同名不覆盖;转完把图片路径\
-                              告诉用户。",
+                              告诉用户。你自己要看 PDF 页面内容(且你能看图)时,转完接 \
+                              read_image 看转出的图。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {

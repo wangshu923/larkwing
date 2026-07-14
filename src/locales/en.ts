@@ -49,6 +49,7 @@ export default {
     web_render: 'Rendering the page…',
     qr_decode: 'Reading the QR code…',
     pdf_to_png: 'Turning the PDF into images…',
+    read_image: 'Taking a look at the picture…',
     send_file: 'Sending to the phone…',
     note_todo: 'Noting it to follow up…',
     finish_todo: 'Checking it off…',

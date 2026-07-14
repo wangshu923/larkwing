@@ -88,10 +88,11 @@ impl AnthropicCompatProvider {
                 }
                 // Anthropic 方言:工具结果是 user 消息里的 tool_result block。带图时 tool_result
                 // 的 content 由字符串升成数组(text block + image block),Anthropic 原生支持
-                // (computer use 同款);无图 / 非视觉则保持字符串(出向字节不变,吃前缀缓存)。
+                // (computer use 同款);无图 / 非视觉则保持字符串(出向字节不变,吃前缀缓存;
+                // 非视觉丢图由 tool_result_text 如实留话)。
                 super::ChatMessage::ToolResult { call_id, content, parts } => {
                     let inner = if parts.is_empty() || !vision {
-                        json!(content)
+                        json!(super::tool_result_text(content, parts, vision))
                     } else {
                         let mut blocks = Vec::with_capacity(parts.len() + 1);
                         blocks.push(json!({ "type": "text", "text": content }));
@@ -429,6 +430,21 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(plain["messages"][0]["content"][0]["content"], "ok");
+        // 非视觉模型(目录未知按 false):图不嵌、content 回字符串,但丢图必留话
+        let mut cfg = LlmConfig::anthropic("sk-ant-test".into());
+        cfg.model = "unknown-text-model".into();
+        let nv = AnthropicCompatProvider::new(cfg);
+        let wire = nv.to_wire(&ChatRequest {
+            messages: vec![ChatMessage::ToolResult {
+                call_id: "c1".into(),
+                content: "这是页面截图".into(),
+                parts: vec![ContentPart::ImageUrl { url: "data:image/png;base64,BBBB".into() }],
+            }],
+            ..Default::default()
+        });
+        let inner = wire["messages"][0]["content"][0]["content"].as_str().unwrap();
+        assert!(inner.starts_with("这是页面截图"), "{inner}");
+        assert!(inner.contains("没能传给当前模型"), "{inner}");
     }
 
     fn chunk(json: &str) -> Value {

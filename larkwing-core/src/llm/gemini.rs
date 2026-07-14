@@ -160,8 +160,10 @@ impl GeminiProvider {
                 }
                 ChatMessage::ToolResult { call_id, content, parts } => {
                     let name = name_of.get(call_id).cloned().unwrap_or_default();
+                    // 非视觉模型收不到下面旁挂的图 → result 文本里如实留话(tool_result_text)
                     pending_tool.push(json!({
-                        "functionResponse": { "name": name, "response": { "result": content } }
+                        "functionResponse": { "name": name, "response": {
+                            "result": super::tool_result_text(content, parts, vision) } }
                     }));
                     // functionResponse.response 只装结构化 JSON、放不下图 → 图作为同一条 user
                     // content 的旁挂 inlineData part(与 flush 合并进一条),视觉模型才收。
@@ -513,6 +515,25 @@ mod tests {
         assert_eq!(parts[0]["functionResponse"]["response"]["result"], "页面截图");
         assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
         assert_eq!(parts[1]["inlineData"]["data"], "BBBB");
+        // 非视觉模型(目录未知按 false):不旁挂 inlineData,result 文本里丢图留话
+        let mut c = cfg();
+        c.model = "unknown-text-model".into();
+        let nv = GeminiProvider::new(c);
+        let wire = nv.to_wire(&req(
+            vec![ChatMessage::ToolResult {
+                call_id: "gm_0".into(),
+                content: "页面截图".into(),
+                parts: vec![crate::llm::ContentPart::ImageUrl {
+                    url: "data:image/png;base64,BBBB".into(),
+                }],
+            }],
+            vec![],
+        ));
+        let parts = &wire["contents"][0]["parts"];
+        assert_eq!(parts.as_array().unwrap().len(), 1, "非视觉不旁挂图");
+        let result = parts[0]["functionResponse"]["response"]["result"].as_str().unwrap();
+        assert!(result.starts_with("页面截图"), "{result}");
+        assert!(result.contains("没能传给当前模型"), "{result}");
     }
 
     #[tokio::test]

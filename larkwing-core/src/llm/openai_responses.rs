@@ -115,10 +115,11 @@ impl OpenAiResponsesProvider {
                     }
                 }
                 // 带图时 function_call_output.output 由字符串升成内容数组(input_text + input_image),
-                // Responses API 原生支持图作工具输出;无图 / 非视觉保持字符串(字节不变,吃缓存)。
+                // Responses API 原生支持图作工具输出;无图 / 非视觉保持字符串(字节不变,吃缓存;
+                // 非视觉丢图由 tool_result_text 如实留话)。
                 ChatMessage::ToolResult { call_id, content, parts } => {
                     let output = if parts.is_empty() || !vision {
-                        json!(content)
+                        json!(super::tool_result_text(content, parts, vision))
                     } else {
                         let mut arr = Vec::with_capacity(parts.len() + 1);
                         arr.push(json!({ "type": "input_text", "text": content }));
@@ -419,6 +420,20 @@ mod tests {
         // 无图:output 仍是字符串(零回归)
         let plain = p.to_wire(&req(vec![ChatMessage::tool_result("fc_1", "ok")]));
         assert_eq!(plain["input"][0]["output"], "ok");
+        // 非视觉模型(目录未知按 false):output 回字符串,丢图留话
+        let mut c = cfg();
+        c.model = "unknown-text-model".into();
+        let nv = OpenAiResponsesProvider::new(c);
+        let wire = nv.to_wire(&req(vec![ChatMessage::ToolResult {
+            call_id: "fc_1".into(),
+            content: "页面截图".into(),
+            parts: vec![crate::llm::ContentPart::ImageUrl {
+                url: "data:image/png;base64,BBBB".into(),
+            }],
+        }]));
+        let out = wire["input"][0]["output"].as_str().unwrap();
+        assert!(out.starts_with("页面截图"), "{out}");
+        assert!(out.contains("没能传给当前模型"), "{out}");
     }
 
     #[tokio::test]

@@ -153,6 +153,25 @@ impl ChatMessage {
     }
 }
 
+/// 出向统一纪律:工具结果附带的图片若没能随消息送达(非视觉模型,或 chat-completions 这类
+/// 协议不容 tool 消息带图),**必须在文本里如实补一句,绝不无声丢图**——工具文本可能宣称
+/// 「已附上截图」,图被悄悄丢掉就成了假前提,模型会顺着装作看过画面。四方言的丢图路共用
+/// 这一处措辞(单源);无图 / 已送达时原样返回(字节不变,前缀缓存零损伤)。
+pub(crate) fn tool_result_text(content: &str, parts: &[ContentPart], delivered: bool) -> String {
+    let dropped = if delivered {
+        0
+    } else {
+        parts.iter().filter(|p| matches!(p, ContentPart::ImageUrl { .. })).count()
+    };
+    if dropped == 0 {
+        return content.to_string();
+    }
+    format!(
+        "{content}\n〔附带的 {dropped} 张图片没能传给当前模型:你看不到画面,别按看过描述;\
+         需要画面信息就如实说明〕"
+    )
+}
+
 /// 思考档位(中立词表,用户侧叫"反应模式":最快/轻度/中度/重度)。
 /// 各方言自行翻译:DeepSeek 只有开关(非 Off 都算开);Anthropic 按档位配 budget;
 /// 支持 reasoning_effort 的 OpenAI 系端点翻成 low/medium/high(见 Quirks::effort_field)。
@@ -440,5 +459,16 @@ mod tests {
         // 普通 assistant 出向不带空 tool_calls/reasoning 字段:序列化干净、不挤前缀
         let plain = serde_json::to_value(ChatMessage::assistant("汪!")).unwrap();
         assert_eq!(plain, serde_json::json!({ "role": "assistant", "content": "汪!" }));
+    }
+
+    // 丢图留话单源(四方言共用):无图 / 已送达原样返回(字节不变),丢图追加带张数的如实说明
+    #[test]
+    fn tool_result_text_notes_dropped_images_only() {
+        let img = ContentPart::ImageUrl { url: "data:image/png;base64,AA".into() };
+        assert_eq!(tool_result_text("ok", &[], false), "ok");
+        assert_eq!(tool_result_text("ok", std::slice::from_ref(&img), true), "ok");
+        let noted = tool_result_text("已附上截图", &[img.clone(), img], false);
+        assert!(noted.starts_with("已附上截图\n"), "{noted}");
+        assert!(noted.contains("2 张图片没能传给当前模型"), "{noted}");
     }
 }

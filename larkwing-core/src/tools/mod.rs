@@ -13,6 +13,7 @@ mod media_search;
 mod now;
 mod pdf;
 mod qr;
+mod read_image;
 mod recall;
 mod remember;
 mod reminder;
@@ -226,6 +227,7 @@ impl Tools {
         tools.register(Arc::new(web::WebDownload::new()));
         tools.register(Arc::new(qr::QrDecode::new()));
         tools.register(Arc::new(pdf::PdfToPng::new()));
+        tools.register(Arc::new(read_image::ReadImage::new()));
         tools.register(Arc::new(send_file::SendFile::new()));
         tools.register(Arc::new(web_render::WebRender::new()));
         tools

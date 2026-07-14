@@ -89,10 +89,12 @@ impl OpenAiCompatProvider {
                     m
                 }
                 // chat-completions 的 role:tool 消息 content 只认文本 —— 塞 image_url 会 400
-                // (vLLM/多家实测坐实)。故工具结果附带的图在此一律降级丢弃(DeepSeek 本就非
-                // 视觉,无损);要让视觉模型看工具图走 Responses / Anthropic / Gemini 方言,不走这条。
-                super::ChatMessage::ToolResult { call_id, content, .. } => {
-                    json!({ "role": "tool", "tool_call_id": call_id, "content": content })
+                // (vLLM/多家实测坐实)。故工具结果附带的图在此一律降级丢弃;要让视觉模型看
+                // 工具图走 Responses / Anthropic / Gemini 方言,不走这条。丢图必须留话
+                // (tool_result_text):工具文本可能宣称「已附上截图」,悄悄丢图 = 喂假前提。
+                super::ChatMessage::ToolResult { call_id, content, parts } => {
+                    json!({ "role": "tool", "tool_call_id": call_id,
+                            "content": super::tool_result_text(content, parts, false) })
                 }
             });
         }
@@ -493,10 +495,10 @@ mod tests {
         assert!(plain["messages"][1].get("reasoning_content").is_none());
     }
 
-    // 工具结果多媒体:chat-completions 的 role:tool 消息不容图 → 一律降级为纯文本 content
-    // (provider() = DeepSeek 非视觉,无损;图被丢弃,call_id/文本照旧)。
+    // 工具结果多媒体:chat-completions 的 role:tool 消息不容图 → 一律降级为纯文本 content,
+    // 且丢图必须留话(tool_result_text):原文本仍在,追加「没能传给当前模型」如实说明。
     #[test]
-    fn to_wire_tool_result_image_degrades_to_text() {
+    fn to_wire_tool_result_image_degrades_to_text_with_note() {
         let p = provider();
         let wire = p.to_wire(&ChatRequest {
             messages: vec![ChatMessage::ToolResult {
@@ -512,8 +514,16 @@ mod tests {
         let msg = &wire["messages"][1];
         assert_eq!(msg["role"], "tool");
         assert_eq!(msg["tool_call_id"], "call_1");
-        // content 仍是纯文本字符串(不是数组、无 image_url)
-        assert_eq!(msg["content"], "页面截图");
+        // content 仍是纯文本字符串(不是数组、无 image_url),且如实说明图没送到
+        let text = msg["content"].as_str().unwrap();
+        assert!(text.starts_with("页面截图"), "{text}");
+        assert!(text.contains("1 张图片没能传给当前模型"), "{text}");
+        // 无图工具结果:字节不变(前缀缓存零回归)
+        let plain = p.to_wire(&ChatRequest {
+            messages: vec![ChatMessage::tool_result("call_1", "ok")],
+            ..Default::default()
+        });
+        assert_eq!(plain["messages"][1]["content"], "ok");
     }
 
     // 媒体输入(PLAN §9):带图 user 出向成 content 数组(text 块 + image_url 块);

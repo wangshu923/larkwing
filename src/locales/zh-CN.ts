@@ -48,6 +48,7 @@ export default {
     web_render: '后台打开网页…',
     qr_decode: '认认二维码…',
     pdf_to_png: '把 PDF 转成图…',
+    read_image: '看看图片…',
     send_file: '发到手机上…',
     note_todo: '记下这件事…',
     finish_todo: '划掉一件心事…',
