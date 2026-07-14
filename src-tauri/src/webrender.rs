@@ -824,7 +824,6 @@ fn ns_image_to_png(image: *mut objc2_app_kit::NSImage) -> Option<Vec<u8>> {
 async fn capture_png(win: &tauri::WebviewWindow) -> Option<Vec<u8>> {
     use webview2_com::CapturePreviewCompletedHandler;
     use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG;
-    use windows::core::HRESULT;
     use windows::Win32::UI::Shell::SHCreateMemStream;
 
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<Vec<u8>>>();
@@ -845,10 +844,11 @@ async fn capture_png(win: &tauri::WebviewWindow) -> Option<Vec<u8>> {
             }
         };
         let stream_for_read = stream.clone(); // 引用计数 +1,供 completion 里读
-        // create 收 FnOnce(HRESULT) -> Result<()>:直接 move 走 tx / stream(仅主线程用)。
+        // create 收 FnOnce(windows::core::Result<()>) -> Result<()>:webview2-com 已把原生
+        // Invoke(errorcode: HRESULT) 包成 Result(Ok=截图成功)。直接 move 走 tx / stream(仅主线程用)。
         let handler = CapturePreviewCompletedHandler::create(Box::new(
-            move |hr: HRESULT| -> windows::core::Result<()> {
-                let bytes = if hr.is_ok() {
+            move |result: windows::core::Result<()>| -> windows::core::Result<()> {
+                let bytes = if result.is_ok() {
                     unsafe { read_stream_all(&stream_for_read) }.ok()
                 } else {
                     None
