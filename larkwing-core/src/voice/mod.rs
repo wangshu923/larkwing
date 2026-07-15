@@ -120,6 +120,9 @@ struct Inner {
     /// 独立于听写会话槽 —— 唤醒录音跑在自己的循环线程、不占 `session` 槽,故此前「在听时点停」没反应;
     /// 唤醒侧每次开录前武装成 `CTL_RUN`,前端点停 = 定稿(发已听到的)/ 取消(丢弃回待唤醒)。
     wake_ctl: Arc<AtomicU8>,
+    /// 动作确认中枢(§7.8 口头确认):壳层 boot 注入 engine 的那一份(set_web_renderer 同款
+    /// 接缝——voice 不碰 engine §6.1,只依赖平级 confirm 模块)。没注入 = 口头确认整个不开。
+    confirmer: std::sync::OnceLock<Arc<crate::confirm::Confirmer>>,
 }
 
 #[derive(Clone)]
@@ -187,8 +190,34 @@ impl VoiceRuntime {
                 wake: std::sync::Mutex::new(None),
                 push_taps: std::sync::Mutex::new(Vec::new()),
                 wake_ctl: Arc::new(AtomicU8::new(CTL_RUN)),
+                confirmer: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    /// 壳层 boot 注入确认中枢(engine 的同一份实例;重复注入忽略)。
+    pub fn set_confirmer(&self, c: Arc<crate::confirm::Confirmer>) {
+        let _ = self.inner.confirmer.set(c);
+    }
+
+    pub(super) fn confirmer(&self) -> Option<Arc<crate::confirm::Confirmer>> {
+        self.inner.confirmer.get().cloned()
+    }
+
+    /// 口头确认(§7.8):对着麦克风听一段应答(「确认/可以」= 允许,「不要/算了」= 拒,
+    /// 听不清不算数——卡片继续等)。前端判定「这张卡属于当前语音回合」后调用。
+    /// 返回 false = 没开听(cpal 采集源关了回声消除,TTS 问句会进麦自答风险大,只走卡片;
+    /// 或唤醒循环没在跑/没注入 confirmer),前端不用等语音结果。
+    pub fn confirm_listen(&self, id: u64) -> bool {
+        if self.capture_source() != "browser" {
+            tracing::info!("口头确认不开:采集源非 browser(无 AEC,防 TTS 问句自答)");
+            return false;
+        }
+        if self.confirmer().is_none() || !self.wake_running() {
+            return false;
+        }
+        self.wake_cmd(wake::WakeCmd::ConfirmListen { id });
+        true
     }
 
     /// 句级 TTS 进缓存,返回音频文件路径(命中秒回);音色/语速取用户设置。

@@ -5,6 +5,7 @@ pub mod attach;
 pub mod bus;
 pub mod channels;
 pub mod components;
+pub mod confirm;
 pub mod crypto;
 pub mod datadir;
 pub mod engine;

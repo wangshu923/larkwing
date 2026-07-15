@@ -10,6 +10,12 @@
 //! 输入脚本组装 File + DataTransfer 赋给 `input.files` + 派发 change(Playwright 同思路
 //! 的纯 JS 版;凭证代填 / CDP 可信输入仍不做)。纪律:不给远程页任何 IPC 桥(注入脚本
 //! 只 POST loopback 一次性 token);会话窗生死归 TTL/清扫,绝不无限存活。
+//! **动作确认闸(2026-07-15,§7.8)**:点击两段式——resolve 脚本(选目标 + 打
+//! `data-lw-armed` 标记 + 回**活 DOM 文本**)→ Rust 核高危词表(单源 `larkwing_core::confirm`,
+//! 壳层零第二实现)∪ 模型自报 → 命中且未 confirmed 就**不执行**、回 `needs_confirm` 交
+//! 工具层问用户;confirmed 重发核对 `expect_text` 没变才按标记真点(变了按 stale 收——
+//! 顺手治「快照后按钮被换字」)。submit 同理:执行前探所在表单提交按钮文本。press_key
+//! 无目标文本核不了(软路,自报仍拦);判定在**动作执行点**,不吃陈旧快照。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -18,7 +24,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use larkwing_core::webrender::{RenderOutcome, RenderRequest, RenderedPage, WebRenderer};
+use larkwing_core::webrender::{
+    PendingConfirm, RenderOutcome, RenderRequest, RenderedPage, WebRenderer,
+};
 
 /// 会话窗空闲多久收摊(模型隔几步回来续用足够;不无限占内存/进程)。
 const SESSION_TTL: Duration = Duration::from_secs(180);
@@ -201,39 +209,68 @@ async fn browse_step_inner(
         let _ = entry.win.eval("try{history.back()}catch(e){}");
         wait_for_load(&entry, seq0, deadline).await;
     } else if did_input {
-        task.step(
-            if did_upload { "step.render_upload" } else { "step.render_input" },
-            serde_json::Value::Null,
-        );
-        // 上传先把文件字节暂存进页面世界(分片 eval),输入脚本再组装成 File 赋给上传框
-        if did_upload {
-            stage_upload_files(&entry, &req.upload_paths).await?;
-        }
-        let act_moment = Instant::now();
-        let seq0 = entry.load_seq.load(Ordering::Relaxed);
-        let js = build_input_script(&req);
-        entry.win.eval(js.as_str()).context("输入指令没发出去")?;
-        // submit / 回车可能引发导航或下载 → 走点击同款结局等待;否则给短静默让框架状态落定。
-        let may_navigate = req.submit || req.press_key.as_deref() == Some("Enter");
-        if may_navigate {
-            let (dl, navigated, loaded) = wait_click_outcome(&entry, act_moment, seq0, deadline).await;
-            download = dl;
-            if navigated && download.is_none() {
-                post_click_url = last_nav_after(&entry.navs, act_moment);
-                skip_snapshot = !loaded;
+        // ── 确认闸·提交半边(§7.8):submit 会把表单落地 → 执行前探所在表单提交按钮的
+        // **活 DOM 文本**核高危词表(∪ 模型自报);命中且未 confirmed = 整步不执行(填也不填,
+        // confirmed 重发时填是替换式、幂等)。press_key 无目标文本核不了(软路),自报仍拦。
+        let mut do_input = true;
+        if req.submit {
+            // target_text = 提交按钮原文(可能空:无按钮的表单——词表核不了,自报仍拦,
+            // 消费端按 kind=submit + 空文本组「提交这个表单」话术)
+            let btn = probe_submit_button(&media, &entry, &req, deadline).await;
+            if !req.confirmed {
+                if req.force_confirm || larkwing_core::confirm::risky_hit(&btn).is_some() {
+                    task.step("step.render_confirm", serde_json::Value::Null);
+                    entry.touch();
+                    return Ok(pending_outcome(&sid, "submit", btn, page_host(&entry)));
+                }
+            } else if req.expect_text.as_deref().is_some_and(|e| e != btn) {
+                // 用户点头的是另一个按钮文本(页面动了):按 stale 收,不执行
+                let _ = entry.win.eval("window.__lwClick = { clicked: false, desc: '', stale: true };");
+                do_input = false;
             }
-            if navigated && loaded {
+        } else if !req.confirmed && req.force_confirm && req.press_key.is_some() {
+            let key = req.press_key.clone().unwrap_or_default();
+            task.step("step.render_confirm", serde_json::Value::Null);
+            entry.touch();
+            return Ok(pending_outcome(&sid, "press", key, page_host(&entry)));
+        }
+        if do_input {
+            task.step(
+                if did_upload { "step.render_upload" } else { "step.render_input" },
+                serde_json::Value::Null,
+            );
+            // 上传先把文件字节暂存进页面世界(分片 eval),输入脚本再组装成 File 赋给上传框
+            if did_upload {
+                stage_upload_files(&entry, &req.upload_paths).await?;
+            }
+            let act_moment = Instant::now();
+            let seq0 = entry.load_seq.load(Ordering::Relaxed);
+            let js = build_input_script(&req);
+            entry.win.eval(js.as_str()).context("输入指令没发出去")?;
+            // submit / 回车可能引发导航或下载 → 走点击同款结局等待;否则给短静默让框架状态落定。
+            let may_navigate = req.submit || req.press_key.as_deref() == Some("Enter");
+            if may_navigate {
+                let (dl, navigated, loaded) =
+                    wait_click_outcome(&entry, act_moment, seq0, deadline).await;
+                download = dl;
+                if navigated && download.is_none() {
+                    post_click_url = last_nav_after(&entry.navs, act_moment);
+                    skip_snapshot = !loaded;
+                }
+                if navigated && loaded {
+                    tokio::time::sleep(
+                        SETTLE_AFTER_LOAD
+                            .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                    )
+                    .await;
+                }
+            } else {
                 tokio::time::sleep(
                     SETTLE_AFTER_LOAD
                         .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
                 )
                 .await;
             }
-        } else {
-            tokio::time::sleep(
-                SETTLE_AFTER_LOAD.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
-            )
-            .await;
         }
     } else if did_click {
         let desc = req
@@ -242,25 +279,55 @@ async fn browse_step_inner(
             .or_else(|| req.click_text.clone())
             .unwrap_or_default();
         task.step("step.render_click", serde_json::json!({ "t": desc }));
-        let click_moment = Instant::now();
-        let seq0 = entry.load_seq.load(Ordering::Relaxed);
-        let js = build_click_script(req.click_ref, req.click_text.as_deref());
-        entry.win.eval(js.as_str()).context("点击指令没发出去")?;
-        // 等下载/跳转起头(宽限);下载起头等到预算,跳转加载完即收手(普通链接点击别干等)
-        let (dl, navigated, loaded) = wait_click_outcome(&entry, click_moment, seq0, deadline).await;
-        download = dl;
-        if navigated && download.is_none() {
-            post_click_url = last_nav_after(&entry.navs, click_moment);
-            // 文件内联(PDF/附件:导航了但永不触发 page-load)→ 当前窗已不是可注入脚本的
-            // HTML,快照必空、白等 12s。直接把地址交模型接 web_download,跳过快照。
-            skip_snapshot = !loaded;
+        // ── 两段式点击(§7.8 确认闸):resolve(同一套选目标规则 PICK_TARGET_JS,打
+        // data-lw-armed 标记、回活 DOM 文本)→ Rust 核词表/自报/expect_text → 按标记真点。
+        // 判定发生在动作执行点,不吃陈旧快照;词表匹配 = core 纯函数,壳层零第二实现。
+        let r =
+            resolve_click_target(&media, &entry, req.click_ref, req.click_text.as_deref(), deadline)
+                .await;
+        let mut do_click = r.found;
+        if r.found {
+            if !req.confirmed
+                && (req.force_confirm || larkwing_core::confirm::risky_hit(&r.text).is_some())
+            {
+                task.step("step.render_confirm", serde_json::Value::Null);
+                entry.touch();
+                return Ok(pending_outcome(&sid, "click", r.text, page_host(&entry)));
+            }
+            if req.confirmed && req.expect_text.as_deref().is_some_and(|e| e != r.text) {
+                // 用户点头时看到的文本已不在(页面动了):绝不点,按 stale 收
+                let _ = entry.win.eval("window.__lwClick = { clicked: false, desc: '', stale: true };");
+                do_click = false;
+            }
+        } else {
+            // 没找到/编号失效:resolve 不点,如实进快照(与旧一体式脚本同语义)
+            let _ = entry.win.eval(
+                format!("window.__lwClick = {{ clicked: false, desc: '', stale: {} }};", r.stale)
+                    .as_str(),
+            );
         }
-        // HTML 新页已 load → 给个水合静默期再快照(照刷新后的内容)
-        if navigated && loaded {
-            tokio::time::sleep(
-                SETTLE_AFTER_LOAD.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
-            )
-            .await;
+        if do_click {
+            let click_moment = Instant::now();
+            let seq0 = entry.load_seq.load(Ordering::Relaxed);
+            entry.win.eval(CLICK_ARMED_JS).context("点击指令没发出去")?;
+            // 等下载/跳转起头(宽限);下载起头等到预算,跳转加载完即收手(普通链接点击别干等)
+            let (dl, navigated, loaded) =
+                wait_click_outcome(&entry, click_moment, seq0, deadline).await;
+            download = dl;
+            if navigated && download.is_none() {
+                post_click_url = last_nav_after(&entry.navs, click_moment);
+                // 文件内联(PDF/附件:导航了但永不触发 page-load)→ 当前窗已不是可注入脚本的
+                // HTML,快照必空、白等 12s。直接把地址交模型接 web_download,跳过快照。
+                skip_snapshot = !loaded;
+            }
+            // HTML 新页已 load → 给个水合静默期再快照(照刷新后的内容)
+            if navigated && loaded {
+                tokio::time::sleep(
+                    SETTLE_AFTER_LOAD
+                        .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                )
+                .await;
+            }
         }
     } else if let Some(dir) = req.scroll.as_deref() {
         task.step("step.render_scroll", serde_json::Value::Null);
@@ -313,7 +380,32 @@ async fn browse_step_inner(
     // 工具结果多媒体第一个消费者:图随 ToolOutput 图片 part 回给模型,非视觉模型出向层降级。
     let screenshot = if req.screenshot { capture_screenshot(&entry.win).await } else { None };
     entry.touch();
-    Ok(RenderOutcome { page, download, post_click_url, session: Some(sid), screenshot })
+    Ok(RenderOutcome {
+        page,
+        download,
+        post_click_url,
+        session: Some(sid),
+        screenshot,
+        needs_confirm: None,
+    })
+}
+
+/// 动作撞确认闸的结局:没执行、没快照(页面没变,模型上一张快照仍有效),
+/// 带 session(窗留着,允许后 confirmed 重发/拒绝后继续别的操作)。
+fn pending_outcome(sid: &str, kind: &str, target_text: String, host: String) -> RenderOutcome {
+    RenderOutcome {
+        page: None,
+        download: None,
+        post_click_url: None,
+        session: Some(sid.to_string()),
+        screenshot: None,
+        needs_confirm: Some(PendingConfirm { target_text, kind: kind.into(), host }),
+    }
+}
+
+/// 当前页 host(确认卡「在哪个站」;取不到给空,卡上只显动作)。
+fn page_host(entry: &Arc<SessionEntry>) -> String {
+    entry.win.url().ok().and_then(|u| u.host_str().map(String::from)).unwrap_or_default()
 }
 
 /// 新建会话窗(超上限先挤掉最旧的)。
@@ -634,49 +726,157 @@ const POPUP_TAME_JS: &str = r#"(function() {
   } catch (e) {}
 })();"#;
 
-/// 点击脚本:按编号(data-lw-ref,上次快照打的)或按文字(精确>包含、最内层优先、
-/// button/a/input 优先、文字更短更 specific——治「点到展开菜单的容器」)。
-/// 结果存 window.__lwClick,下一张快照带回(点击引发跳转时 stash 会被冲掉——
-/// rust 侧以「点击后出现导航」补判 clicked)。
-fn build_click_script(click_ref: Option<u32>, click_text: Option<&str>) -> String {
+/// 目标选择逻辑(JS 片段,resolve 脚本嵌入):按编号(data-lw-ref,上次快照打的)或按
+/// 文字(精确>包含、最内层优先、button/a/input 优先、文字更短更 specific——治「点到展开
+/// 菜单的容器」)。独立成片段 = 选择规则只有一份;真点由 CLICK_ARMED_JS 按标记执行。
+const PICK_TARGET_JS: &str = r#"
+  function txt(el) { return ((el.innerText || el.value || '') + '').replace(/\s+/g, ' ').trim().slice(0, 40); }
+  function pickTarget(REF, CLICK) {
+    var target = null, stale = false;
+    if (REF !== null) {
+      target = document.querySelector('[data-lw-ref="' + REF + '"]');
+      if (!target) stale = true; // 编号失效(页面变了):如实报,别瞎点
+    } else if (CLICK) {
+      var pri = { BUTTON: 0, A: 1, INPUT: 2 };
+      var all = document.querySelectorAll('button,a,[role="button"],[onclick],input[type="button"],input[type="submit"]');
+      var hits = [];
+      for (var k = 0; k < all.length && hits.length < 200; k++) {
+        if (txt(all[k]).indexOf(CLICK) >= 0) hits.push(all[k]);
+      }
+      var best = null, bs = null;
+      for (var m = 0; m < hits.length; m++) {
+        var el = hits[m], inner = false;
+        for (var n = 0; n < hits.length; n++) {
+          if (n !== m && el !== hits[n] && el.contains(hits[n])) { inner = true; break; }
+        }
+        if (inner) continue; // 有更内层的命中:让给它(容器 vs 真按钮)
+        var t = txt(el);
+        var score = (t === CLICK ? 0 : 1) * 1000000 + (pri[el.tagName] !== undefined ? pri[el.tagName] : 3) * 10000 + Math.min(t.length, 9999);
+        if (best === null || score < bs) { best = el; bs = score; }
+      }
+      target = best;
+    }
+    return { target: target, stale: stale };
+  }
+"#;
+
+/// resolve 脚本(两段式点击的前段,§7.8 确认闸):选目标 → 打 `data-lw-armed` 标记
+/// (清旧标记)→ 把**活 DOM 文本**POST 回 Rust 核词表;**不点**。
+fn build_resolve_script(click_ref: Option<u32>, click_text: Option<&str>, post_url: &str) -> String {
     let ref_js = click_ref.map(|n| n.to_string()).unwrap_or_else(|| "null".into());
     let text_js = serde_json::to_string(click_text.unwrap_or("")).unwrap_or_else(|_| "\"\"".into());
+    let post = serde_json::to_string(post_url).unwrap_or_else(|_| "\"\"".into());
     format!(
         r#"(function() {{
-  var REF = {ref_js}; var CLICK = {text_js};
-  function txt(el) {{ return ((el.innerText || el.value || '') + '').replace(/\s+/g, ' ').trim().slice(0, 40); }}
-  var target = null; var stale = false;
-  if (REF !== null) {{
-    target = document.querySelector('[data-lw-ref="' + REF + '"]');
-    if (!target) stale = true; // 编号失效(页面变了):如实报,别瞎点
-  }} else if (CLICK) {{
-    var pri = {{ BUTTON: 0, A: 1, INPUT: 2 }};
-    var all = document.querySelectorAll('button,a,[role="button"],[onclick],input[type="button"],input[type="submit"]');
-    var hits = [];
-    for (var k = 0; k < all.length && hits.length < 200; k++) {{
-      if (txt(all[k]).indexOf(CLICK) >= 0) hits.push(all[k]);
-    }}
-    var best = null, bs = null;
-    for (var m = 0; m < hits.length; m++) {{
-      var el = hits[m], inner = false;
-      for (var n = 0; n < hits.length; n++) {{
-        if (n !== m && el !== hits[n] && el.contains(hits[n])) {{ inner = true; break; }}
-      }}
-      if (inner) continue; // 有更内层的命中:让给它(容器 vs 真按钮)
-      var t = txt(el);
-      var score = (t === CLICK ? 0 : 1) * 1000000 + (pri[el.tagName] !== undefined ? pri[el.tagName] : 3) * 10000 + Math.min(t.length, 9999);
-      if (best === null || score < bs) {{ best = el; bs = score; }}
-    }}
-    target = best;
-  }}
-  window.__lwClick = {{
-    clicked: !!target,
-    desc: target ? (target.tagName + '「' + txt(target) + '」') : '',
-    stale: stale
-  }};
-  if (target) setTimeout(function() {{ try {{ target.click(); }} catch (e) {{}} }}, 50);
+  var REF = {ref_js}; var CLICK = {text_js}; var POST = {post};
+{PICK_TARGET_JS}
+  var old = document.querySelectorAll('[data-lw-armed]');
+  for (var i = 0; i < old.length; i++) old[i].removeAttribute('data-lw-armed');
+  var r = pickTarget(REF, CLICK);
+  if (r.target) r.target.setAttribute('data-lw-armed', '1');
+  var payload = {{ found: !!r.target, stale: r.stale, text: r.target ? txt(r.target) : '' }};
+  try {{ fetch(POST, {{ method: 'POST', headers: {{ 'Content-Type': 'text/plain' }}, body: JSON.stringify(payload) }}); }} catch (e) {{}}
 }})();"#
     )
+}
+
+/// 真点脚本(两段式后段):按 resolve 打的标记点(不重跑选择——两次选择可能分叉);
+/// 标记没了(页面在毫秒窗内重渲染)= stale,如实进快照。结果存 window.__lwClick,
+/// 下一张快照带回(点击引发跳转时 stash 会被冲掉——rust 侧以「点击后出现导航」补判)。
+const CLICK_ARMED_JS: &str = r#"(function() {
+  function txt(el) { return ((el.innerText || el.value || '') + '').replace(/\s+/g, ' ').trim().slice(0, 40); }
+  var target = document.querySelector('[data-lw-armed]');
+  if (target) target.removeAttribute('data-lw-armed');
+  window.__lwClick = {
+    clicked: !!target,
+    desc: target ? (target.tagName + '「' + txt(target) + '」') : '',
+    stale: !target
+  };
+  if (target) setTimeout(function() { try { target.click(); } catch (e) {} }, 50);
+})();"#;
+
+/// resolve 的回传形。
+struct ResolvedTarget {
+    found: bool,
+    stale: bool,
+    text: String,
+}
+
+/// 两段式点击的前段(Rust 侧):注入 resolve 脚本,等目标文本回传。回传失败/超时按
+/// 「没找到」收(闸的 fail 方向 = 核不了文本就不点,模型按新快照重试;能回传快照的页
+/// 这条同信道必通,无额外损耗面)。
+async fn resolve_click_target(
+    media: &larkwing_core::media::MediaRuntime,
+    entry: &Arc<SessionEntry>,
+    click_ref: Option<u32>,
+    click_text: Option<&str>,
+    deadline: tokio::time::Instant,
+) -> ResolvedTarget {
+    let none = |stale: bool| ResolvedTarget { found: false, stale, text: String::new() };
+    let (post_url, rx) = match media.webrender_collect().await {
+        Ok(v) => v,
+        Err(_) => return none(false),
+    };
+    let js = build_resolve_script(click_ref, click_text, &post_url);
+    if entry.win.eval(js.as_str()).is_err() {
+        return none(false);
+    }
+    let until = (tokio::time::Instant::now() + SNAPSHOT_WAIT).min(deadline);
+    match tokio::time::timeout_at(until, rx).await {
+        Ok(Ok(json)) => match serde_json::from_str::<serde_json::Value>(&json) {
+            Ok(v) => ResolvedTarget {
+                found: v["found"].as_bool().unwrap_or(false),
+                stale: v["stale"].as_bool().unwrap_or(false),
+                text: v["text"].as_str().unwrap_or("").to_string(),
+            },
+            Err(_) => none(false),
+        },
+        _ => none(false),
+    }
+}
+
+/// submit 前探「所在表单的提交按钮」活文本(确认闸的提交半边)。表单定位与输入脚本同规:
+/// 锚定字段(type_ref/fill 首项/upload_ref/select_ref)的 form → activeElement.form →
+/// 第一个 form。探不到/无按钮回空串(词表核不了 = 软路;自报仍拦,占位「提交表单」)。
+async fn probe_submit_button(
+    media: &larkwing_core::media::MediaRuntime,
+    entry: &Arc<SessionEntry>,
+    req: &RenderRequest,
+    deadline: tokio::time::Instant,
+) -> String {
+    let anchor = req
+        .type_ref
+        .or_else(|| req.fill.first().map(|f| f.ref_no))
+        .or(req.upload_ref)
+        .or(req.select_ref);
+    let (post_url, rx) = match media.webrender_collect().await {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    let ref_js = anchor.map(|n| n.to_string()).unwrap_or_else(|| "null".into());
+    let post = serde_json::to_string(&post_url).unwrap_or_else(|_| "\"\"".into());
+    let js = format!(
+        r#"(function() {{
+  var REF = {ref_js}; var POST = {post};
+  function txt(el) {{ return ((el.innerText || el.value || '') + '').replace(/\s+/g, ' ').trim().slice(0, 40); }}
+  var el = REF !== null ? document.querySelector('[data-lw-ref="' + REF + '"]') : null;
+  var f = (el && el.form) || (document.activeElement && document.activeElement.form) || document.querySelector('form');
+  var btn = f ? f.querySelector('input[type="submit"],button[type="submit"],button:not([type])') : null;
+  var payload = {{ text: btn ? txt(btn) : '' }};
+  try {{ fetch(POST, {{ method: 'POST', headers: {{ 'Content-Type': 'text/plain' }}, body: JSON.stringify(payload) }}); }} catch (e) {{}}
+}})();"#
+    );
+    if entry.win.eval(js.as_str()).is_err() {
+        return String::new();
+    }
+    let until = (tokio::time::Instant::now() + SNAPSHOT_WAIT).min(deadline);
+    match tokio::time::timeout_at(until, rx).await {
+        Ok(Ok(json)) => serde_json::from_str::<serde_json::Value>(&json)
+            .ok()
+            .and_then(|v| v["text"].as_str().map(String::from))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
 }
 
 /// 上传暂存:把本机文件读进来,base64 **分片** eval 进页面世界的 `window.__lwUpStage`
@@ -1142,5 +1342,24 @@ mod tests {
         assert!(snap.contains("type === 'file'"), "{snap}");
         assert!(snap.contains("click_note"), "{snap}");
         println!("__SCRIPT_SNAP__\n{snap}\n__END__");
+    }
+
+    /// 确认闸脚本(两段式点击 + submit 探针)的形状守卫;`--nocapture` 倒出成品脚本
+    /// 供浏览器冒烟(format! 括号转义错只有真跑 JS 才抓得到)。
+    #[test]
+    fn confirm_gate_scripts_shape() {
+        let js = build_resolve_script(Some(5), None, "http://127.0.0.1:1/collect/x");
+        assert!(js.contains("var REF = 5") && js.contains("data-lw-armed"), "{js}");
+        assert!(js.contains("pickTarget") && js.contains("removeAttribute"), "{js}");
+        println!("__SCRIPT_RESOLVE_REF__\n{js}");
+        let js2 = build_resolve_script(None, Some("确认支付"), "http://127.0.0.1:1/collect/x");
+        assert!(js2.contains("确认支付"), "{js2}");
+        println!("__SCRIPT_RESOLVE_TEXT__\n{js2}");
+        assert!(CLICK_ARMED_JS.contains("data-lw-armed"));
+        println!("__SCRIPT_CLICK_ARMED__\n{CLICK_ARMED_JS}");
+        // 词表判定用的是 core 单源纯函数(壳层零第二实现)——这里锚一个代表词防意外脱钩
+        assert!(larkwing_core::confirm::risky_hit("确认支付 ¥128").is_some());
+        assert!(larkwing_core::confirm::risky_hit("下一页").is_none());
+        println!("__END__");
     }
 }

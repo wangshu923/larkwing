@@ -602,6 +602,9 @@ pub struct Engine {
     /// 壳层网页渲染器(web_render 工具的机器件,webrender.rs 接缝):壳层 boot 注入;
     /// 没注入(core 单测/eval/headless)= None,工具如实说没有渲染组件。
     web_renderer: std::sync::OnceLock<Arc<dyn crate::webrender::WebRenderer>>,
+    /// 动作确认中枢(§7.8 确认闸):经 ToolCtx 给工具;前端命令 / 渠道回话 / 语音听音
+    /// 都汇到它的 resolve,先到先得。
+    confirmer: Arc<crate::confirm::Confirmer>,
 }
 
 impl Engine {
@@ -626,6 +629,7 @@ impl Engine {
         // store/llm,故解析(读设置 + ${ENV} + env 回落)的合流放在 engine——唯一合流点。
         crate::net::set_proxy(Self::resolve_proxy(&store));
         let bus = media.bus().clone();
+        let confirmer = crate::confirm::Confirmer::new(bus.clone(), store.clone());
         Arc::new(Engine {
             store,
             llm: RwLock::new(Vec::new()),
@@ -637,6 +641,7 @@ impl Engine {
             diary_inflight: Arc::new(AtomicBool::new(false)),
             diary_last_try: AtomicI64::new(0),
             web_renderer: std::sync::OnceLock::new(),
+            confirmer,
         })
     }
 
@@ -686,6 +691,11 @@ impl Engine {
     /// 全局事件车道(测试/调度器观测用)。
     pub fn bus(&self) -> &crate::bus::Bus {
         &self.bus
+    }
+
+    /// 动作确认中枢(壳层 confirm_action 命令 / 渠道回话 / 语音听音的应答入口)。
+    pub fn confirmer(&self) -> &Arc<crate::confirm::Confirmer> {
+        &self.confirmer
     }
 
     pub fn store(&self) -> &Store {
@@ -2344,6 +2354,7 @@ impl Engine {
                 tools: tool_subset,
                 media: self.media.clone(),
                 web: self.web_renderer(),
+                confirm: Some(self.confirmer.clone()),
                 rx: rx_llm,
                 inject: inject.clone(),
                 overheard,

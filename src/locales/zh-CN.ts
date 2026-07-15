@@ -85,6 +85,28 @@ export default {
       render: '网页那步没办成,它会换个法子或如实说',
     },
   },
+  // 动作确认卡(§7.8 确认闸):网页上点「付款/发布/删除」级按钮前先问你一声
+  confirm: {
+    title: '等你确认',
+    floatBar: '有一步等你确认',
+    atHost: '在 {host}',
+    allow: '继续',
+    deny: '先不要',
+    done: {
+      allowed: '继续了',
+      denied: '没执行',
+      expired: '过时了,没执行',
+    },
+    // 动作短语(kind + 页面按钮原文;动词在这儿组,core 只过桥数据 §6.6)
+    act: {
+      click: '点「{text}」',
+      submit: '提交「{text}」',
+      submitBare: '提交这个表单',
+      press: '按 {text} 键',
+    },
+    // 语音回合撞确认时念的问句(刻意避开口头否定词「不要/别/算了」,防自播漏网自答)
+    speak: '要{action},可以吗?',
+  },
   step: {
     connect: '连接 {host}…',
     download: '下载中 {done}/{total} MB',
@@ -97,6 +119,7 @@ export default {
     render_back: '返回上一页…',
     render_input: '填写表单…',
     render_upload: '上传文件…',
+    render_confirm: '等你确认…',
     render_scroll: '翻页…',
     render_snap: '读取页面内容…',
     relocate_copy: '复制文件…',
@@ -150,6 +173,21 @@ export default {
       append: '往文件添了内容',
       edit: '改了一个文件',
       unknown: '动了 {n} 个',
+    },
+    // 「确认过的操作」分组(§7.8 确认闸的审计半边):一次确认一行,只看不改
+    confirm: {
+      title: '确认过的操作 · {n} 条',
+      allowed: '继续了',
+      denied: '没执行',
+      via: {
+        desktop: '在电脑上点的',
+        float: '在悬浮窗点的',
+        voice: '口头说的',
+        channel: '在手机上回的',
+        timeout: '等过时了',
+        no_ui: '没有确认通道',
+        unreachable: '没送到手机',
+      },
     },
   },
   // 提醒页(jobs 域):看 7274 替你记下的定时提醒,可一键取消(用户口头设、模型翻成时刻)

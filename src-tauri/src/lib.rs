@@ -206,6 +206,9 @@ pub fn run() {
         app.handle().clone(),
         media.clone(),
       )));
+      // 确认中枢注入 voice(§7.8 口头确认):同一份实例,语音听音的 resolve 与桌面卡/
+      // 渠道回话先到先得(voice 不碰 engine,只吃这个平级 confirm 件——set_web_renderer 同款接缝)。
+      voice.set_confirmer(engine.confirmer().clone());
       tracing::info!(
         data_dir = %data_dir.display(),
         has_key = engine.has_provider(),
@@ -428,6 +431,7 @@ pub fn run() {
       commands::voice_follow_up,
       commands::voice_refresh_prompts,
       commands::voice_wake_resume,
+      commands::voice_confirm_listen,
       commands::voice_wake_suspend,
       commands::voice_push_audio,
       commands::voice_calibrate_wake,
@@ -462,6 +466,8 @@ pub fn run() {
       commands::list_fsops,
       commands::fsops_undo,
       commands::fsops_redo,
+      commands::confirm_action,
+      commands::list_confirms,
       commands::autostart_enabled,
       commands::set_autostart,
       commands::set_tray_menu,

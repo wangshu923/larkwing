@@ -379,6 +379,21 @@ pub fn fsops_redo(state: State<'_, AppState>, id: i64) -> Result<(), AppError> {
     state.engine.fsops_redo(id)
 }
 
+/// 确认卡应答(§7.8 确认闸):HUD 卡 / 悬浮窗按钮直连。via 记谁点的(desktop/float),
+/// 审计随 resolve 落库。返回 false = 这张卡已收尾(过期/别处先点了),前端据此收卡。
+#[tauri::command]
+pub fn confirm_action(state: State<'_, AppState>, id: u64, allow: bool, via: String) -> bool {
+    state.engine.confirmer().resolve(id, allow, &via)
+}
+
+/// 操作记录页「确认过的操作」分组:最近的确认流水(全家的都列,主人管理面同提醒页)。
+#[tauri::command]
+pub fn list_confirms(
+    state: State<'_, AppState>,
+) -> Result<Vec<larkwing_core::store::ConfirmRow>, AppError> {
+    state.engine.store().confirms.list_recent(200).map_err(AppError::internal)
+}
+
 /// 灯带初值:今日 token/费用累计(此后的增量走 TurnEvent::Usage)。
 #[tauri::command]
 pub fn usage_today(state: State<'_, AppState>) -> Result<DayUsage, AppError> {
@@ -518,6 +533,14 @@ pub async fn voice_refresh_prompts(state: State<'_, AppState>) -> Result<(), App
 pub fn voice_wake_resume(state: State<'_, AppState>) -> Result<(), AppError> {
     state.voice.wake_resume();
     Ok(())
+}
+
+/// 口头确认(§7.8):前端判定确认卡属于当前语音回合后调——core 开一段听音
+/// (「确认/可以」允许、「不要/算了」拒、听不清不算数回落等卡)。返回 false = 没开听
+/// (cpal 源无 AEC / 唤醒没在跑),前端只靠卡片。
+#[tauri::command]
+pub fn voice_confirm_listen(state: State<'_, AppState>, id: u64) -> bool {
+    state.voice.confirm_listen(id)
 }
 
 /// 自激防护:TTS 在念(含重听)时唤醒循环丢帧。

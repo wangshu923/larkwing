@@ -177,6 +177,7 @@ mod tests {
             media: MediaRuntime::detached(store.clone()),
             store,
             web: None,
+            confirm: None,
         }
     }
 

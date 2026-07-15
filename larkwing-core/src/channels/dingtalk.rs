@@ -159,6 +159,12 @@ async fn handle_message(
 ) {
     match &m.payload {
         Payload::Text(text) => {
+            // 确认闸回话拦截(§7.8):该 chat 挂着确认时,这条先做应答判定
+            // (肯定 = 回执即回、不进回合;其他 = 拒 + 照常进回合让模型接)
+            if let Some(receipt) = ctx.confirm_reply(CHANNEL, &m.ext_id, text) {
+                let _ = reply_webhook(net, &m.webhook, receipt).await;
+                return;
+            }
             let text = text.clone();
             run_reply(ctx, net, &m, text, Vec::new(), None).await;
         }

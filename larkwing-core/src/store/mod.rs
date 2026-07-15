@@ -7,6 +7,7 @@ pub mod briefings;
 pub mod channels;
 pub mod chat;
 pub mod cloned_voices;
+pub mod confirms;
 pub mod diary;
 pub mod fsops;
 pub mod jobs;
@@ -22,6 +23,7 @@ pub use briefings::{Briefing, BriefingRepo};
 pub use channels::{ChannelRepo, ChannelThread};
 pub use chat::{ChatRepo, Conversation, Message, SearchHit};
 pub use cloned_voices::{ClonedVoice, ClonedVoiceRepo};
+pub use confirms::{ConfirmRepo, ConfirmRow};
 pub use db::Db;
 pub use diary::{DiaryEntry, DiaryRepo};
 pub(crate) use db::now_ms; // 给 engine/consolidate 跑维护轮时取 now(db 模块本身私有)
@@ -58,6 +60,7 @@ pub struct Store {
     pub media_progress: MediaProgressRepo,
     pub todos: TodoRepo,
     pub diary: DiaryRepo,
+    pub confirms: ConfirmRepo,
 }
 
 /// 全部域迁移(Store::open 执行;恢复备份预检拿它判「备份是否来自更新版本」)。
@@ -77,6 +80,7 @@ fn all_migrations() -> Vec<db::Migration> {
         media_progress::MIGRATIONS,
         todos::MIGRATIONS,
         diary::MIGRATIONS,
+        confirms::MIGRATIONS,
     ]
     .concat()
 }
@@ -105,7 +109,8 @@ impl Store {
             voiceprints: VoiceprintRepo::new(db.clone()),
             media_progress: MediaProgressRepo::new(db.clone()),
             todos: TodoRepo::new(db.clone()),
-            diary: DiaryRepo::new(db),
+            diary: DiaryRepo::new(db.clone()),
+            confirms: ConfirmRepo::new(db),
         })
     }
 }

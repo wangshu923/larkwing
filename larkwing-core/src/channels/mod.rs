@@ -120,6 +120,25 @@ pub struct ChannelState {
 /// 共享状态表:各渠道写,`remote_status` 命令读(channel → 状态)。
 pub type ChannelStatus = Arc<Mutex<HashMap<String, ChannelState>>>;
 
+// ⚠️ core 侧静态话术(§6.6 债,同 ONBOARD_HINT):确认闸的渠道回话三句,不经模型。
+/// 确认请求推到手机的提示({action} = 按 kind 组的动作短语,见 `confirm_action_phrase`)。
+pub(crate) const CONFIRM_PROMPT_SITE: &str = "要在 {host} {action},回「确认」就继续;回别的或不理,这步就不做。";
+pub(crate) const CONFIRM_PROMPT_BARE: &str = "要{action},回「确认」就继续;回别的或不理,这步就不做。";
+
+/// 确认卡的动作短语(kind + 目标原文 → 人话;桌面卡走前端字典组同款,这里是渠道静态话术半边)。
+fn confirm_action_phrase(kind: &str, action: &str) -> String {
+    match (kind, action.is_empty()) {
+        ("submit", true) => "提交这个表单".to_string(),
+        ("submit", false) => format!("提交『{action}』"),
+        ("press", _) => format!("按 {action} 键"),
+        _ => format!("点『{action}』"),
+    }
+}
+/// 肯定回话的即时回执(用户回「确认」到模型接着说话之间有工具执行的空窗,别让人对着空气等)。
+const CONFIRM_ACK: &str = "好,继续。";
+/// 回「确认」时那张卡已收尾(超时/别处先点了):如实说,这句不进回合。
+const CONFIRM_EXPIRED: &str = "这个确认已经过期了,那一步没有执行——还要继续的话再说一声。";
+
 /// 渠道适配器运行上下文(引擎 + 语音/媒体运行时 + 状态回写)。pub(crate):仅 channels 内部构造。
 pub(crate) struct ChannelCtx {
     pub engine: Arc<Engine>,
@@ -132,6 +151,10 @@ pub(crate) struct ChannelCtx {
     /// 到、意图后到。无文字的附件消息先攒这里、不触发回合;等用户发来文字,连同攒的一起处理
     /// (§7.7)。带文字的附件(TG caption / 钉钉图文 richText)不进这。
     attach_buf: AttachBuffer,
+    /// 确认闸的渠道等待表(§7.8):chat → 挂着的确认 id。outbound_loop 推确认提示时登记;
+    /// 回话应答 / 卡片终态(超时/别处先点)时清。判定是**代码层严格词表**(`confirm::
+    /// channel_reply_allows`),不交模型仲裁——页面注入玩不到这里。
+    confirm_waits: Mutex<HashMap<(String, String), u64>>,
 }
 
 impl ChannelCtx {
@@ -150,6 +173,45 @@ impl ChannelCtx {
     /// 的丢弃当没攒过(隔太久的文件不该混进新意图)。没攒过 = 空 Vec(正常纯文本回合)。
     pub(crate) fn take_attachments(&self, channel: &str, ext_id: &str) -> Vec<InAttachment> {
         self.attach_buf.take(channel, ext_id)
+    }
+
+    /// 确认等待登记(outbound_loop 推完提示调)。同 chat 只挂一单(新单顶旧单——旧单会
+    /// 因超时/取消自己收尾,这里不额外处理)。
+    fn confirm_wait_set(&self, channel: &str, ext_id: &str, id: u64) {
+        self.confirm_waits
+            .lock()
+            .expect("confirm_waits poisoned")
+            .insert((channel.to_string(), ext_id.to_string()), id);
+    }
+
+    /// 卡片终态(超时/桌面先点了):按 id 把等待摘掉(不知道 chat,按值扫)。
+    fn confirm_wait_clear(&self, id: u64) {
+        self.confirm_waits.lock().expect("confirm_waits poisoned").retain(|_, v| *v != id);
+    }
+
+    /// 渠道回话先过确认闸(§7.8):该 chat 挂着确认时,这条**纯文本**回话先做应答判定。
+    /// 返回 Some(回执) = 消息被确认流程消费(回执直接发,不进回合);None = 没挂确认,
+    /// 或已按「拒」处理(拒的那句照常进回合——用户说「先别,改成 X」,在飞回合正等着它)。
+    pub(crate) fn confirm_reply(
+        &self,
+        channel: &str,
+        ext_id: &str,
+        text: &str,
+    ) -> Option<&'static str> {
+        let key = (channel.to_string(), ext_id.to_string());
+        let id = *self.confirm_waits.lock().expect("confirm_waits poisoned").get(&key)?;
+        self.confirm_waits.lock().expect("confirm_waits poisoned").remove(&key);
+        if crate::confirm::channel_reply_allows(text) {
+            if self.engine.confirmer().resolve(id, true, "channel") {
+                Some(CONFIRM_ACK)
+            } else {
+                Some(CONFIRM_EXPIRED) // 已超时/别处先答:这句只是「确认」,不值得进回合
+            }
+        } else {
+            // 其他任何回复 = 拒;resolve 失败(已收尾)也无妨——消息照常进回合
+            let _ = self.engine.confirmer().resolve(id, false, "channel");
+            None
+        }
     }
 
     pub(crate) fn set_state(&self, channel: &str, running: bool, err: Option<String>) {
@@ -197,6 +259,7 @@ pub async fn run(
         media,
         status,
         attach_buf: AttachBuffer::default(),
+        confirm_waits: Mutex::new(HashMap::new()),
     });
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
@@ -243,14 +306,59 @@ async fn outbound_loop(ctx: Arc<ChannelCtx>, ct: CancellationToken) {
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             },
         };
-        let crate::bus::AppEvent::Conversation(act) = ev else { continue };
-        // 只管自启回合(提醒/盯天气);渠道入站回合(kind="channel")已在 drive_turn 内回过了
-        if act.kind != "reminder" {
-            continue;
+        match ev {
+            crate::bus::AppEvent::Conversation(act) => {
+                // 只管自启回合(提醒/盯天气);渠道入站回合(kind="channel")drive_turn 内回过了
+                if act.kind != "reminder" {
+                    continue;
+                }
+                if let Err(e) = push_reminder(&ctx, &net, act.conv_id, act.outcome).await {
+                    tracing::warn!(err = %format!("{e:#}"), conv = act.conv_id, "提醒推回渠道失败");
+                }
+            }
+            // 确认闸(§7.8):渠道来源的确认请求推回发起的那个 chat 等回话;
+            // 终态卡(超时/桌面先点)清等待表。桌面来源的卡归前端,这里不管。
+            crate::bus::AppEvent::Confirm(card) => handle_confirm_card(&ctx, &net, card).await,
+            _ => continue,
         }
-        if let Err(e) = push_reminder(&ctx, &net, act.conv_id, act.outcome).await {
-            tracing::warn!(err = %format!("{e:#}"), conv = act.conv_id, "提醒推回渠道失败");
-        }
+    }
+}
+
+/// 确认卡的渠道半边:pending → 反查映射、把「要点『X』,回『确认』继续」推到发起 chat、
+/// 登记等待;推不出去(渠道断/没收件地址)→ **立即按「送达失败」拒**,别让工具白等 120s
+/// (via="unreachable",工具层据此如实说「没送到」而不是「用户拒了」)。终态卡 → 清等待。
+async fn handle_confirm_card(ctx: &Arc<ChannelCtx>, net: &net::Client, card: crate::confirm::ConfirmCard) {
+    if !matches!(card.origin.as_str(), "telegram" | "dingtalk" | "weixin") {
+        return; // 桌面来源(ui/system)归前端卡
+    }
+    if card.state != "pending" {
+        ctx.confirm_wait_clear(card.id);
+        return;
+    }
+    let store = ctx.engine.store().clone();
+    let conv_id = card.conv_id;
+    let thread = tokio::task::spawn_blocking(move || store.channels.thread_by_conv(conv_id))
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .flatten();
+    let Some(thread) = thread else {
+        tracing::warn!(conv = conv_id, "确认请求反查不到渠道映射,按送达失败收");
+        let _ = ctx.engine.confirmer().resolve(card.id, false, "unreachable");
+        return;
+    };
+    let phrase = confirm_action_phrase(&card.kind, &card.action);
+    let prompt = if card.host.is_empty() {
+        CONFIRM_PROMPT_BARE.replace("{action}", &phrase)
+    } else {
+        CONFIRM_PROMPT_SITE.replace("{host}", &card.host).replace("{action}", &phrase)
+    };
+    // 先登记再推(推到与用户回话之间没有空窗);推失败立刻摘掉
+    ctx.confirm_wait_set(&thread.channel, &thread.ext_id, card.id);
+    if let Err(e) = push_text_to_thread(ctx, net, &thread, &prompt).await {
+        tracing::warn!(err = %format!("{e:#}"), conv = conv_id, "确认请求推不到手机,按送达失败收");
+        ctx.confirm_wait_clear(card.id);
+        let _ = ctx.engine.confirmer().resolve(card.id, false, "unreachable");
     }
 }
 
@@ -291,42 +399,46 @@ async fn push_reminder(
         tokio::task::spawn_blocking(move || reminder_push_payload(&store, conv_id, outcome))
             .await??;
     let Some((thread, Some(text))) = looked else { return Ok(()) };
+    push_text_to_thread(ctx, net, &thread, &text).await
+}
+
+/// 往一条渠道映射主动推一段文字(提醒推送与确认请求共用的出口):渠道未启用 / 缺凭证 /
+/// 无收件地址 → Err(调用方按语义处理:提醒静静跳过 warn、确认按送达失败收)。
+async fn push_text_to_thread(
+    ctx: &ChannelCtx,
+    net: &net::Client,
+    thread: &crate::store::ChannelThread,
+    text: &str,
+) -> anyhow::Result<()> {
     let enabled = ctx.setting(&format!("remote.{}.enabled", thread.channel)).as_deref() == Some("1");
-    if !enabled {
-        return Ok(());
-    }
+    anyhow::ensure!(enabled, "渠道 {} 未启用", thread.channel);
 
     match thread.channel.as_str() {
         "telegram" => {
             let token = ctx.secret("remote.telegram.token").context("没配 Telegram token")?;
             let chat_id: i64 = thread.ext_id.parse().context("Telegram ext_id 非 chat_id")?;
-            telegram::push(net, &token, chat_id, &text).await
+            telegram::push(net, &token, chat_id, text).await
         }
         "dingtalk" => {
-            // 单聊入站时存了 senderStaffId;没有(群聊/老映射)= 推不了,如实跳过并留日志
-            let Some(staff) = thread.push_id.as_deref() else {
-                tracing::info!(conv = conv_id, "钉钉对话无推送地址(群聊/旧映射),提醒只留桌面");
-                return Ok(());
-            };
+            // 单聊入站时存了 senderStaffId;没有(群聊/老映射)= 推不了
+            let staff = thread
+                .push_id
+                .as_deref()
+                .context("钉钉对话无推送地址(群聊/旧映射)")?;
             let app_key = ctx.secret("remote.dingtalk.app_key").context("没配钉钉 app_key")?;
             let app_secret =
                 ctx.secret("remote.dingtalk.app_secret").context("没配钉钉 app_secret")?;
-            dingtalk::push(net, &app_key, &app_secret, staff, &text).await
+            dingtalk::push(net, &app_key, &app_secret, staff, text).await
         }
         "weixin" => {
-            // 微信主动推送要回显上次的 context_token(存在 push_id 列);没有就推不了(如实跳过)
-            let Some(ctx_token) = thread.push_id.as_deref() else {
-                tracing::info!(conv = conv_id, "微信对话无 context_token,提醒只留桌面");
-                return Ok(());
-            };
+            // 微信主动推送要回显上次的 context_token(存在 push_id 列);没有就推不了
+            let ctx_token =
+                thread.push_id.as_deref().context("微信对话无 context_token")?;
             // 多绑定:按线程 ext_id(= 绑定者)选对应账号的 token/入口
             let acc = weixin::account_for(&ctx.engine.store().settings, &thread.ext_id)?;
-            weixin::push(net, acc.base(), &acc.token, &thread.ext_id, ctx_token, &text).await
+            weixin::push(net, acc.base(), &acc.token, &thread.ext_id, ctx_token, text).await
         }
-        other => {
-            tracing::warn!(channel = other, "未知渠道,提醒不推");
-            Ok(())
-        }
+        other => anyhow::bail!("未知渠道 {other},推不了"),
     }
 }
 
@@ -485,6 +597,110 @@ mod tests {
     fn split_keeps_short_intact() {
         assert_eq!(split_message("你好", 100), vec!["你好"]);
         assert!(split_message("   ", 100).is_empty());
+    }
+
+    fn test_ctx(tag: &str) -> (Arc<ChannelCtx>, Arc<Engine>) {
+        let dir = std::env::temp_dir().join(format!("lw-chconfirm-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(dir.join("t.db"));
+        let store = crate::store::Store::open(&dir.join("t.db")).unwrap();
+        store.users.ensure_default_user().unwrap();
+        let engine = Engine::new(store.clone(), crate::scenes::Scenes::builtin());
+        let ctx = Arc::new(ChannelCtx {
+            engine: engine.clone(),
+            voice: crate::voice::VoiceRuntime::new(
+                dir,
+                store.clone(),
+                crate::bus::Bus::new(),
+                crate::scenes::Scenes::builtin(),
+            ),
+            media: crate::media::MediaRuntime::detached(store),
+            status: ChannelStatus::default(),
+            attach_buf: AttachBuffer::default(),
+            confirm_waits: Mutex::new(HashMap::new()),
+        });
+        (ctx, engine)
+    }
+
+    fn channel_ask(conv_id: i64) -> crate::confirm::ConfirmAsk {
+        crate::confirm::ConfirmAsk {
+            user_id: 1,
+            conv_id,
+            origin: "weixin".into(),
+            host: "x.example.com".into(),
+            action: "确认支付 ¥128.00".into(),
+            kind: "click".into(),
+        }
+    }
+
+    #[test]
+    fn confirm_action_phrase_by_kind() {
+        assert_eq!(confirm_action_phrase("click", "确认支付"), "点『确认支付』");
+        assert_eq!(confirm_action_phrase("submit", "立即购买"), "提交『立即购买』");
+        assert_eq!(confirm_action_phrase("submit", ""), "提交这个表单");
+        assert_eq!(confirm_action_phrase("press", "Enter"), "按 Enter 键");
+    }
+
+    /// 渠道回话拦截:挂着确认时,非肯定回话 = 拒 + 照常进回合;别的 chat 不受影响;
+    /// 应答后等待表即清。
+    #[tokio::test]
+    async fn confirm_reply_deny_falls_through_to_turn() {
+        let (ctx, engine) = test_ctx("deny");
+        // 没挂确认:不拦(照常进回合)
+        assert!(ctx.confirm_reply("weixin", "u1", "确认").is_none());
+
+        let _sub = engine.bus().subscribe(); // 有订阅者 ask 才不走 NoUi
+        let confirmer = engine.confirmer().clone();
+        let c2 = confirmer.clone();
+        let task = tokio::spawn(async move {
+            c2.ask(channel_ask(7), std::time::Duration::from_secs(10)).await
+        });
+        while confirmer.pending_for_conv(7).is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let id = confirmer.pending_for_conv(7).unwrap().id;
+        ctx.confirm_wait_set("weixin", "u1", id);
+
+        // 别的 chat / 别的渠道:不拦
+        assert!(ctx.confirm_reply("weixin", "u2", "确认").is_none());
+        assert!(ctx.confirm_reply("telegram", "u1", "确认").is_none());
+        // 非肯定回话 = 拒(resolve deny)+ None(这句照常进回合让模型接)
+        assert!(ctx.confirm_reply("weixin", "u1", "先别,改成到店自提").is_none());
+        assert_eq!(
+            task.await.unwrap(),
+            crate::confirm::ConfirmDecision::Denied { via: "channel".into() }
+        );
+        // 等待表已清:同 chat 再说「确认」不再拦
+        assert!(ctx.confirm_reply("weixin", "u1", "确认").is_none());
+    }
+
+    /// 肯定回话 = 回执即回、不进回合;卡已收尾时回「确认」= 如实说过期。
+    #[tokio::test]
+    async fn confirm_reply_allow_receipt_and_expired_honesty() {
+        let (ctx, engine) = test_ctx("allow");
+        let _sub = engine.bus().subscribe();
+        let confirmer = engine.confirmer().clone();
+        let c2 = confirmer.clone();
+        let task = tokio::spawn(async move {
+            c2.ask(channel_ask(9), std::time::Duration::from_secs(10)).await
+        });
+        while confirmer.pending_for_conv(9).is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let id = confirmer.pending_for_conv(9).unwrap().id;
+        ctx.confirm_wait_set("weixin", "u1", id);
+        assert_eq!(ctx.confirm_reply("weixin", "u1", "确认"), Some(CONFIRM_ACK));
+        assert_eq!(
+            task.await.unwrap(),
+            crate::confirm::ConfirmDecision::Allowed { via: "channel".into() }
+        );
+        // 挂一个已经收尾的 id(超时/桌面先点):回「确认」如实说过期,不进回合
+        ctx.confirm_wait_set("weixin", "u1", id);
+        assert_eq!(ctx.confirm_reply("weixin", "u1", "确认"), Some(CONFIRM_EXPIRED));
+        // 终态清扫入口:按 id 摘(outbound_loop 终态卡路径)
+        ctx.confirm_wait_set("weixin", "u3", 424242);
+        ctx.confirm_wait_clear(424242);
+        assert!(ctx.confirm_reply("weixin", "u3", "确认").is_none());
     }
 
     #[test]

@@ -99,6 +99,9 @@ const state = reactive({
 let localId = -1 // 本地占位 id 用负数,与落库的正数 id 永不冲突
 let turnSeq = 0 // 回合序号:流中再发会开新回合,旧回合的迟到事件按此作废,不串台(并发发送防竞态)
 let turnInFlight = false // 回合是否在飞:打字发送遇它=进排队区(Phase A:整轮结束自动合并发)
+// 在飞的**语音(唤醒)回合**目标会话;null = 当前没有。确认闸(§7.8)据此判「这张确认卡
+// 属于当前语音回合」→ 念出来问 + 开口头确认听音(人可能不在屏幕前);打字/mic 回合只卡片。
+let voiceTurnConv: number | null = null
 // 插队(PLAN §9 B):已 inject 出去、等 Injected 事件落地成气泡的展示态(带缩略图)。FIFO 与事件序对齐。
 let pendingInjects: { text: string; attachments: UiAttachment[] }[] = []
 let bootStarted = false
@@ -559,6 +562,7 @@ async function refreshConversations() {
 /** 回合任一出口收尾:解除"在飞" + 把排队区攒的消息合并成下一轮发出(Phase A:整轮结束自动发)。 */
 function settleInFlight() {
   turnInFlight = false
+  voiceTurnConv = null
   flushQueue()
 }
 /** 把排队区攒的消息合并成一条作为下一轮发出(文本换行拼接,附件并起来);在飞或空则不动。 */
@@ -686,6 +690,7 @@ function send(
   startLiveClock()
   twStart(wang)
   turnInFlight = true // 占住"在飞":后续打字发送进排队区,直到本轮收尾
+  voiceTurnConv = wakeTurn ? state.convId : null // 确认闸的语音路由判据(§7.8)
 
   if (!state.inTauri) {
     fakeStream(wang, `(浏览器预览)滴——收到「${content}」!进 Tauri 壳里我就接上真模型咯!`, speak)
@@ -888,6 +893,7 @@ async function selectConversation(convId: number) {
   twFlush() // 旧会话还在放字:立刻收尾,别让打字机写进看不见的孤儿气泡
   state.queue.splice(0) // 换话题:排队区清空(它属于旧会话的在飞流程)
   turnInFlight = false
+  voiceTurnConv = null
   state.convId = convId
   delete state.convBadges[convId] // 进入会话即清「有动静」标
   loadConvUsage(convId) // 灯带"话题"段跟着切
@@ -910,6 +916,7 @@ async function newConversation(channel?: string) {
   twFlush()
   state.queue.splice(0) // 新话题:排队区清空
   turnInFlight = false
+  voiceTurnConv = null
   state.usage.conv = null // 新话题还没花过,熄灯
   if (!state.inTauri) {
     state.messages = []
@@ -1131,5 +1138,5 @@ function fakeStream(msg: UiMessage, full: string, speak = false) {
 export function useChat() {
   void boot()
   wireVoiceActivity()
-  return { state, send, cancel, selectConversation, newConversation, ensureVoiceConv, overheardTargetConv, saveApiKey, dequeue, inject, renameConversation, togglePinConversation, deleteConversation }
+  return { state, send, cancel, selectConversation, newConversation, ensureVoiceConv, overheardTargetConv, saveApiKey, dequeue, inject, renameConversation, togglePinConversation, deleteConversation, voiceConfirmTarget: () => voiceTurnConv }
 }

@@ -220,6 +220,9 @@ pub enum AppEvent {
     Voice(VoiceEvent),
     /// 回合 mood(悬浮窗显示「正在想 / 正在说」;主窗不消费,用自己的 per-turn mood)。
     Mood(Mood),
+    /// 动作确认卡(§7.8 确认闸):HUD 任务区 + 悬浮窗显卡可点;渠道回合由 outbound_loop
+    /// 消费推回发起 chat。全量快照语义(state 翻终态 = 收卡)。
+    Confirm(crate::confirm::ConfirmCard),
 }
 
 /// 广播总线:壳层订阅一次、转发成 Tauri 全局事件;core 各处只管 publish。
@@ -247,6 +250,12 @@ impl Bus {
 
     pub fn publish(&self, ev: AppEvent) {
         let _ = self.tx.send(ev); // 无人听 = 丢弃,不是错误
+    }
+
+    /// 当前订阅者数。确认闸用它判「有没有任何确认通道可达」(0 = headless/单测,
+    /// 立即拒不白等);正式 app 里壳层恒订阅(转发 Tauri 事件),恒 ≥1。
+    pub fn receiver_count(&self) -> usize {
+        self.tx.receiver_count()
     }
 }
 

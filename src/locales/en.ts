@@ -86,6 +86,26 @@ export default {
       render: 'That page step didn’t work — it will try another way or say so',
     },
   },
+  // Action confirmation card (§7.8): asks you before clicking pay/publish/delete-grade buttons on the web
+  confirm: {
+    title: 'Waiting for you',
+    floatBar: 'A step needs your OK',
+    atHost: 'On {host}',
+    allow: 'Go ahead',
+    deny: 'Not now',
+    done: {
+      allowed: 'Went ahead',
+      denied: 'Skipped',
+      expired: 'Timed out — skipped',
+    },
+    act: {
+      click: 'Click “{text}”',
+      submit: 'Submit “{text}”',
+      submitBare: 'Submit this form',
+      press: 'Press {text}',
+    },
+    speak: 'It wants to {action} — is that OK?',
+  },
   step: {
     connect: 'Connecting to {host}…',
     download: 'Downloading {done}/{total} MB',
@@ -98,6 +118,7 @@ export default {
     render_back: 'Going back…',
     render_input: 'Filling the form…',
     render_upload: 'Uploading files…',
+    render_confirm: 'Waiting for your OK…',
     render_scroll: 'Scrolling…',
     render_snap: 'Reading the page…',
     relocate_copy: 'Copying files…',
@@ -151,6 +172,21 @@ export default {
       append: 'Appended to a file',
       edit: 'Edited a file',
       unknown: 'Touched {n}',
+    },
+    // "Confirmed actions" group (§7.8 audit half of the confirmation gate): one row per ask, read-only
+    confirm: {
+      title: 'Confirmed actions · {n}',
+      allowed: 'Went ahead',
+      denied: 'Skipped',
+      via: {
+        desktop: 'confirmed on desktop',
+        float: 'confirmed on the widget',
+        voice: 'confirmed by voice',
+        channel: 'confirmed on the phone',
+        timeout: 'no answer in time',
+        no_ui: 'no way to ask',
+        unreachable: 'couldn’t reach the phone',
+      },
     },
   },
   // Reminders page (jobs domain): timed reminders 7274 keeps for you, one-tap cancel (you say it aloud, the model turns it into a time)

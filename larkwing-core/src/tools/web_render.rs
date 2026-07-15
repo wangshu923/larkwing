@@ -6,7 +6,11 @@
 //! 返回 → 再看连续走。完全操作第一批(2026-07-14)开了填字/批量填表/选下拉/按键/提交/
 //! 滚动 + 截图可选第二只眼;**文件上传(2026-07-15)**:upload_ref+upload_paths 把本机
 //! 文件传给页面的上传框(壳层 DataTransfer 注入)。**凭证代填 / CDP 可信输入仍不做**,
-//! 敏感字段标出交用户在可见小窗自己输(§7.8;确认闸门另案)。
+//! 敏感字段标出交用户在可见小窗自己输(§7.8)。
+//! **动作确认闸(2026-07-15,§7.8)**:点击/提交撞高危词表(壳层在动作执行点拿活 DOM
+//! 文本核,单源 `crate::confirm`)或模型自报 `confirm=true` → 壳层不执行、回 needs_confirm
+//! → 本工具在 run 内阻塞请用户点头(桌面卡/渠道回话/语音,先到先得)→ 允许则带
+//! `confirmed + expect_text` 重发这一步(目标文本变了按 stale 收);拒/超时 = 观察不是错。
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -138,7 +142,10 @@ impl WebRender {
                               返回路径。\
                               浏览窗在屏幕右下角对用户可见:遇到要登录/扫码/验证码,或要填密码/\
                               银行卡这类敏感信息,别自己填——请用户在那个小窗里操作,完成后你带 \
-                              session 继续。比 web_fetch 慢得多,先试 web_fetch 不行再用它。",
+                              session 继续。点「付款/发布/删除」这类有实际后果的按钮会自动先请\
+                              用户点头(结果里会告诉你同意了没);你自己判断某一步有对外后果时\
+                              也主动带 confirm=true。用户没点头就别换路硬做,如实说需要确认。\
+                              比 web_fetch 慢得多,先试 web_fetch 不行再用它。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -214,6 +221,10 @@ impl WebRender {
                             "type": "string",
                             "description": "动作后等这段文字出现再读页(动态内容慢慢加载时用);等不到也照常返回"
                         },
+                        "confirm": {
+                            "type": "boolean",
+                            "description": "这次点击/提交会产生付款、发送、发布、删除等对外后果时带 true:先请用户点头再执行(等结果即可,同意与否会写在结果里)。高危按钮不带也会自动请示,带上是你替用户多把一道关"
+                        },
                         "screenshot": {
                             "type": "boolean",
                             "description": "顺便截当前页一张图(想看画面长啥样时用;文字快照说不清版式/图形时才需要,多数情况不用)。得先有打开的页面(配 url 或 session)"
@@ -224,7 +235,9 @@ impl WebRender {
                         }
                     }
                 }),
-                timeout: Duration::from_secs(90),
+                // 210s:两次单步渲染(40×2)+ 确认等待(桌面 60 / 渠道 120)+ 余量。
+                // 确认等待吃工具预算(turn loop 的 timeout 包住整个 run_output),故须容纳。
+                timeout: Duration::from_secs(210),
                 ui_key: "tool.web_render",
             },
         }
@@ -375,29 +388,145 @@ impl WebRender {
             press_key.as_deref(),
             upload_ref,
         );
-        let outcome = renderer
-            .render(RenderRequest {
-                url: url.clone().unwrap_or_default(),
-                session,
-                click_ref,
-                click_text,
-                back,
-                type_ref,
-                type_text,
-                fill,
-                submit,
-                upload_ref,
-                upload_paths,
-                select_ref,
-                select_option,
-                press_key,
-                scroll,
-                wait_text,
-                screenshot: want_shot,
-                download_dir,
-                timeout: RENDER_TIMEOUT,
-            })
-            .await?;
+        // 模型自报(§7.8 确认闸的自报半边):只对真有「落地动作」的调用生效(点击/提交);
+        // 纯看页/填字带 confirm 没有可确认的动作,忽略。单向阀:词表命中自报压不掉。
+        let self_report = super::arg_bool(&args, "confirm", false);
+        let force_confirm = self_report && (click_ref.is_some() || click_text.is_some() || submit);
+        let mut req = RenderRequest {
+            url: url.clone().unwrap_or_default(),
+            session,
+            click_ref,
+            click_text,
+            back,
+            type_ref,
+            type_text,
+            fill,
+            submit,
+            upload_ref,
+            upload_paths,
+            select_ref,
+            select_option,
+            press_key,
+            scroll,
+            wait_text,
+            force_confirm,
+            confirmed: false,
+            expect_text: None,
+            screenshot: want_shot,
+            download_dir,
+            timeout: RENDER_TIMEOUT,
+        };
+        let mut outcome = renderer.render(req.clone()).await?;
+
+        // 动作撞确认闸(高危词表命中 / 模型自报):壳层没执行,在这儿阻塞请用户点头。
+        // 拒/超时是**观察不是错**(Ok 文本喂回模型,让它如实收尾);允许 → 带 confirmed +
+        // expect_text 重发这一步(`confirmed` 是内部字段不进 schema,页面注入教不动它)。
+        if let Some(pc) = outcome.needs_confirm.take() {
+            // 给模型看的动作描述(工具结果文本);用户可见的动词组装在前端字典(§6.6),
+            // 卡片/审计只过桥 kind + 原文。
+            let action_desc = match (pc.kind.as_str(), pc.target_text.is_empty()) {
+                ("submit", true) => "提交表单".to_string(),
+                ("submit", false) => format!("提交『{}』", pc.target_text),
+                ("press", _) => format!("按 {} 键", pc.target_text),
+                _ => format!("点『{}』", pc.target_text),
+            };
+            let session_note = outcome
+                .session
+                .as_deref()
+                .map(|s| format!("\n(会话 {s} 还开着,带 session 可以继续看页面/做别的操作)"))
+                .unwrap_or_default();
+            let confirmer = ctx.confirm.as_ref().with_context(|| {
+                format!(
+                    "在 {} {action_desc}有实际后果,需要用户确认,但这里没有确认通道——这步没执行,如实告诉用户",
+                    pc.host
+                )
+            })?;
+            // 确认路由到回合来源:桌面会话(ui/system)= 卡片(+语音回合口头应答);
+            // 渠道会话 = outbound 推回发起的那个 chat 等回话(人在手机上,超时放宽)。
+            let origin = ctx
+                .store
+                .chat
+                .get_conversation(ctx.conv_id)
+                .ok()
+                .flatten()
+                .map(|c| c.channel)
+                .unwrap_or_else(|| "ui".into());
+            let timeout = if matches!(origin.as_str(), "ui" | "system") {
+                crate::confirm::DESKTOP_TIMEOUT
+            } else {
+                crate::confirm::CHANNEL_TIMEOUT
+            };
+            let decision = confirmer
+                .ask(
+                    crate::confirm::ConfirmAsk {
+                        user_id: ctx.user_id,
+                        conv_id: ctx.conv_id,
+                        origin,
+                        host: pc.host.clone(),
+                        action: pc.target_text.clone(),
+                        kind: pc.kind.clone(),
+                    },
+                    timeout,
+                )
+                .await;
+            use crate::confirm::ConfirmDecision::*;
+            match decision {
+                Allowed { .. } => {
+                    req.confirmed = true;
+                    req.expect_text = Some(pc.target_text.clone());
+                    req.force_confirm = false;
+                    // 续用同一个窗:首步可能是「url + click」一步式(带 url、无 session),
+                    // 重发若原样带 url 会另开新窗重导航——改带回壳层给的 session、清 url。
+                    if let Some(sid) = outcome.session.clone() {
+                        req.session = Some(sid);
+                        req.url = String::new();
+                    }
+                    outcome = renderer.render(req).await?;
+                }
+                // 渠道推送失败(手机够不着):不是用户拒了,如实区分(§3.5)
+                Denied { via } if via == "unreachable" => {
+                    return Ok((
+                        format!(
+                            "在 {} {action_desc}需要用户确认,但确认请求没能送到用户那\
+                             (渠道断线/没有收件地址)——这步没执行,如实说明;\
+                             用户可以在电脑上让我继续。{session_note}",
+                            pc.host
+                        ),
+                        None,
+                    ));
+                }
+                Denied { .. } => {
+                    return Ok((
+                        format!(
+                            "用户看过了,选择先不执行——在 {} {action_desc}没有进行。\
+                             别自己重试或换路硬做;问问用户想怎么调整。{session_note}",
+                            pc.host
+                        ),
+                        None,
+                    ));
+                }
+                TimedOut => {
+                    return Ok((
+                        format!(
+                            "在 {} {action_desc}需要用户点头,等了一会儿没等到回应——这步没执行。\
+                             如实告诉用户:这一步有实际后果,TA 方便时说一声再继续。{session_note}",
+                            pc.host
+                        ),
+                        None,
+                    ));
+                }
+                NoUi => {
+                    return Ok((
+                        format!(
+                            "在 {} {action_desc}有实际后果,需要用户确认,但这台机器上没有可用的\
+                             确认通道——这步没执行,如实告诉用户。{session_note}",
+                            pc.host
+                        ),
+                        None,
+                    ));
+                }
+            }
+        }
 
         let mut out = String::new();
         if let Some(path) = &outcome.download {
@@ -519,6 +648,7 @@ mod tests {
             media: MediaRuntime::detached(store.clone()),
             store,
             web: None,
+            confirm: None,
         }
     }
 
@@ -533,6 +663,8 @@ mod tests {
     #[async_trait]
     impl WebRenderer for FakeRender {
         async fn render(&self, req: RenderRequest) -> anyhow::Result<RenderOutcome> {
+            // 镜像真壳层契约:confirmed 重发不再回闸(用户已点头,动作执行)。
+            let confirmed = req.confirmed;
             *self.1.lock().unwrap() = Some(req);
             Ok(RenderOutcome {
                 page: self.0.page.clone(),
@@ -540,8 +672,128 @@ mod tests {
                 post_click_url: self.0.post_click_url.clone(),
                 session: self.0.session.clone(),
                 screenshot: self.0.screenshot.clone(),
+                needs_confirm: if confirmed { None } else { self.0.needs_confirm.clone() },
             })
         }
+    }
+
+    /// 确认闸测试件:真 Confirmer + 自动应答订阅者(pending 卡一到就点头/摇头)。
+    fn confirmer_with_responder(
+        store: &Store,
+        allow: bool,
+    ) -> std::sync::Arc<crate::confirm::Confirmer> {
+        let bus = crate::bus::Bus::new();
+        let confirmer = crate::confirm::Confirmer::new(bus.clone(), store.clone());
+        let mut rx = bus.subscribe();
+        let c2 = confirmer.clone();
+        tokio::spawn(async move {
+            while let Ok(ev) = rx.recv().await {
+                if let crate::bus::AppEvent::Confirm(card) = ev {
+                    if card.state == "pending" {
+                        c2.resolve(card.id, allow, "desktop");
+                    }
+                }
+            }
+        });
+        confirmer
+    }
+
+    fn risky_outcome() -> RenderOutcome {
+        RenderOutcome {
+            page: Some(RenderedPage {
+                title: "订单页".into(),
+                text: "操作后的正文".into(),
+                clicked: true,
+                clicked_desc: "BUTTON「确认支付 ¥128.00」".into(),
+                ..Default::default()
+            }),
+            session: Some("lw-render-3".into()),
+            needs_confirm: Some(crate::webrender::PendingConfirm {
+                target_text: "确认支付 ¥128.00".into(),
+                kind: "click".into(),
+                host: "x.example.com".into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn risky_click_denied_is_honest_observation() {
+        let mut ctx = base_ctx("deny");
+        let fake = Arc::new(FakeRender::new(risky_outcome()));
+        ctx.web = Some(fake.clone());
+        ctx.confirm = Some(confirmer_with_responder(&ctx.store, false));
+        let out = WebRender::new()
+            .run(serde_json::json!({"session": "lw-render-3", "click_ref": 5}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("选择先不执行") && out.contains("点『确认支付 ¥128.00』"), "{out}");
+        assert!(out.contains("x.example.com"), "{out}");
+        assert!(out.contains("会话 lw-render-3 还开着"), "{out}");
+        // 只渲染了一次(没有 confirmed 重发)
+        let req = fake.1.lock().unwrap().clone().unwrap();
+        assert!(!req.confirmed);
+        // 审计落了 denied 一行(action = 目标原文,动词由消费端组 §6.6)
+        let log = ctx.store.confirms.list_recent(5).unwrap();
+        assert_eq!(log[0].decision, "denied");
+        assert_eq!((log[0].action.as_str(), log[0].kind.as_str()), ("确认支付 ¥128.00", "click"));
+    }
+
+    #[tokio::test]
+    async fn risky_click_allowed_resends_confirmed_with_expect_text() {
+        let mut ctx = base_ctx("allow");
+        let fake = Arc::new(FakeRender::new(risky_outcome()));
+        ctx.web = Some(fake.clone());
+        ctx.confirm = Some(confirmer_with_responder(&ctx.store, true));
+        // 「url + click_text」一步式:撞闸重发必须续用壳层给的 session、清 url(别另开新窗)
+        let out = WebRender::new()
+            .run(
+                serde_json::json!({"url": "https://x.example.com/pay", "click_text": "确认支付"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        // 允许后 = 正常操作结果(第二次渲染的页面)
+        assert!(out.contains("BUTTON「确认支付 ¥128.00」"), "{out}");
+        assert!(!out.contains("选择先不执行"), "{out}");
+        let req = fake.1.lock().unwrap().clone().unwrap();
+        assert!(req.confirmed, "重发必须带 confirmed(内部字段)");
+        assert_eq!(req.expect_text.as_deref(), Some("确认支付 ¥128.00"));
+        assert!(!req.force_confirm);
+        assert_eq!(req.session.as_deref(), Some("lw-render-3"), "重发续用同一个窗");
+        assert!(req.url.is_empty(), "重发不再带 url(否则另开新窗重导航)");
+        let log = ctx.store.confirms.list_recent(5).unwrap();
+        assert_eq!((log[0].decision.as_str(), log[0].via.as_str()), ("allowed", "desktop"));
+    }
+
+    #[tokio::test]
+    async fn self_report_sets_force_confirm_and_no_confirmer_is_honest() {
+        let mut ctx = base_ctx("selfreport");
+        let fake = Arc::new(FakeRender::new(risky_outcome()));
+        ctx.web = Some(fake.clone());
+        // 自报 + 没有确认通道(ctx.confirm=None):明白话退回、动作没执行
+        let err = WebRender::new()
+            .run(
+                serde_json::json!({"session": "s", "click_text": "领取", "confirm": true}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("没有确认通道"), "{err:#}");
+        let req = fake.1.lock().unwrap().clone().unwrap();
+        assert!(req.force_confirm, "自报要置 force_confirm 透传壳层");
+        // 自报但没有落地动作(纯看页):忽略,不置 force_confirm
+        let fake2 = Arc::new(FakeRender::new(RenderOutcome {
+            page: Some(RenderedPage { title: "页".into(), text: "正文".into(), ..Default::default() }),
+            session: Some("s".into()),
+            ..Default::default()
+        }));
+        ctx.web = Some(fake2.clone());
+        let _ = WebRender::new()
+            .run(serde_json::json!({"url": "https://x.example.com", "confirm": true}), &ctx)
+            .await
+            .unwrap();
+        assert!(!fake2.1.lock().unwrap().clone().unwrap().force_confirm);
     }
 
     #[tokio::test]

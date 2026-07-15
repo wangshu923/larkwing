@@ -565,6 +565,35 @@ export interface WeixinQrPoll {
   base_url: string | null
 }
 
+/** 动作确认卡(§7.8 确认闸):全量快照语义(state 翻终态 = 收卡)。action = 动作原文
+ *  (「点『确认支付 ¥128』」,页面数据非产文案);deadline_ms 画倒计时。 */
+export interface ConfirmCard {
+  id: number
+  user_id: number
+  conv_id: number
+  origin: string // 'ui' | 'system' | 渠道名(渠道来源的卡桌面也显示、也可点——先到先得)
+  host: string
+  action: string
+  kind: string // 'click' | 'submit'
+  state: 'pending' | 'allowed' | 'denied' | 'expired'
+  deadline_ms: number
+  via?: string
+}
+
+/** 确认流水一行(操作记录页「确认过的操作」分组)。 */
+export interface ConfirmLog {
+  id: number
+  user_id: number
+  conv_id: number
+  origin: string
+  host: string
+  action: string
+  kind: string
+  decision: 'allowed' | 'denied'
+  via: string // desktop | float | voice | channel | timeout | no_ui | unreachable
+  created_at: number
+}
+
 export type AppEvent =
   | { type: 'task'; data: TaskView }
   | { type: 'media'; data: MediaEvent }
@@ -576,6 +605,8 @@ export type AppEvent =
   | { type: 'voice'; data: VoiceEvent }
   // 回合 mood(PLAN §12 修订):悬浮窗显「正在想/正在说」;主窗用自己的 per-turn mood,忽略这条
   | { type: 'mood'; data: 'idle' | 'thinking' | 'speaking' }
+  // 动作确认卡(§7.8):HUD 任务区 + 悬浮窗显卡可点;终态卡 = 收卡信号
+  | { type: 'confirm'; data: ConfirmCard }
 
 /** 订阅全局事件车道;未知 type 忽略(与 TurnEvent 同一增量演化约定)。 */
 export function onAppEvent(cb: (ev: AppEvent) => void): void {
@@ -1070,6 +1101,13 @@ export const api = {
   listFsops: () => invoke<FsOp[]>('list_fsops'),
   fsopsUndo: (id: number) => invoke<void>('fsops_undo', { id }),
   fsopsRedo: (id: number) => invoke<void>('fsops_redo', { id }),
+  /** 确认卡应答(§7.8):HUD 卡/悬浮窗按钮直连;false = 卡已收尾(过期/别处先点)。 */
+  confirmAction: (id: number, allow: boolean, via: string) =>
+    invoke<boolean>('confirm_action', { id, allow, via }),
+  /** 操作记录页「确认过的操作」分组:最近确认流水(全家,主人管理面)。 */
+  listConfirms: () => invoke<ConfirmLog[]>('list_confirms'),
+  /** 口头确认(§7.8):卡属于当前语音回合时开一段听音;false = 没开听(cpal 源/唤醒没跑)。 */
+  voiceConfirmListen: (id: number) => invoke<boolean>('voice_confirm_listen', { id }),
   /** 开机自启(PLAN §12):OS 是真相源,不进 DB。 */
   autostartEnabled: () => invoke<boolean>('autostart_enabled'),
   setAutostart: (on: boolean) => invoke<void>('set_autostart', { on }),

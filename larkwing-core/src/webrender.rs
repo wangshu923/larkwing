@@ -116,6 +116,16 @@ pub struct RenderRequest {
     pub scroll: Option<String>,
     /// 动作后等这段文字出现再快照(SPA 异步内容的显式等待;超时也照常快照,不算错)。
     pub wait_text: Option<String>,
+    /// 模型自报「这一步有对外后果」(工具 `confirm` 参数,§7.8 确认闸的自报半边):
+    /// 壳层解析动作目标后**必回 needs_confirm 不执行**(拿真实按钮文本/host 给确认卡),
+    /// 与词表命中同路。只对 click/submit 有意义(工具层置位)。
+    pub force_confirm: bool,
+    /// **内部字段,绝不进工具 schema**:用户已点头,跳过高危词表/自报检查执行动作。
+    /// 页面注入教模型传什么参数都够不到这里(工具入参解析不读它)。
+    pub confirmed: bool,
+    /// confirmed 重发时核对动作目标文本未变(变了 = 页面动了,按 stale 处理不执行——
+    /// 顺手治「快照后按钮被 JS 换字」的正确性问题)。
+    pub expect_text: Option<String>,
     /// 顺便截当前渲染窗一张图(模型自行决定要不要看画面;只对能看图的模型有用,非视觉出向降级)。
     /// **没有活跃渲染窗 = 截不了**(截图依附浏览窗,不凭空截);平台/组件不支持也如实回 None。
     pub screenshot: bool,
@@ -132,6 +142,19 @@ pub struct FillField {
     pub value: String,
 }
 
+/// 动作撞了确认闸(§7.8):壳层解析到目标、**没执行**,把现场信息交回工具层去问用户。
+/// 用户允许 → 工具带 `confirmed + expect_text` 原样重发这一步。
+#[derive(Debug, Clone, Default)]
+pub struct PendingConfirm {
+    /// 动作目标的现场文本(按钮文字 / 表单提交按钮文字;自报无按钮时为动作占位描述)——
+    /// 确认卡原文 + 重发时的 `expect_text`。页面数据,非 core 文案。
+    pub target_text: String,
+    /// click | submit
+    pub kind: String,
+    /// 当前页 host(壳层从渲染窗现取,确认卡「在哪个站」)。
+    pub host: String,
+}
+
 /// 渲染结局:页面快照(None = 一直没回传)+ 下载产物(点击触发才有)+ 点击后跳转
 /// + 会话号(窗还活着,可继续)。
 #[derive(Debug, Default)]
@@ -146,6 +169,8 @@ pub struct RenderOutcome {
     /// 页面截图(data: URL,`data:image/png;base64,…`):仅 `screenshot=true` 且截到才有。
     /// 工具把它当图片 part 回给模型(工具结果多媒体第一个消费者;非视觉模型出向降级成占位)。
     pub screenshot: Option<String>,
+    /// 动作撞确认闸没执行(高危词表命中 / 模型自报):工具层据此问用户、允许后重发。
+    pub needs_confirm: Option<PendingConfirm>,
 }
 
 #[async_trait::async_trait]

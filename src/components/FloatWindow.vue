@@ -7,6 +7,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useAgentMood } from '../composables/useAgentMood'
+import { confirmActionPhrase, useConfirm } from '../composables/useConfirm'
 import { useFloat } from '../composables/useFloat'
 import { useFloatIdle } from '../composables/useFloatIdle'
 import { useSettings } from '../composables/useSettings'
@@ -20,6 +21,9 @@ const settings = useSettings()
 const { state, running, nowPlaying, mediaPlaying, mediaToggle, mediaStop, listening, level, wakeArmed, dismissNotice, openMain } = useFloat()
 const mood = useAgentMood()
 const idle = useFloatIdle()
+// 确认卡(§7.8):悬浮窗也收 bus 卡——主窗藏托盘时这里是唯一可点的确认入口(展开面板直接
+// 允许/拒绝,confirm_action 是 core 命令、悬浮窗直连不转发;via=float 记进审计)。
+const confirm = useConfirm()
 
 const avatars: Record<string, string> = { titan: titanIdle, dog: dogIdle, cat: catIdle }
 const avatar = computed(() => avatars[settings.get('ui.character')] ?? titanIdle)
@@ -51,6 +55,14 @@ type Bar = {
   count?: number
 }
 const bar = computed<Bar>(() => {
+  // ⓪ 等你确认(§7.8):有动作等人点头,比一切都急(点开面板允许/拒绝)
+  if (confirm.pending.value.length) {
+    return {
+      text: t('confirm.floatBar'),
+      tone: 'hot',
+      count: confirm.pending.value.length > 1 ? confirm.pending.value.length : undefined,
+    }
+  }
   // ① 语音 / 回合进行中(你正在跟它互动,最该知道)
   if (listening.value) return { text: t('float.listening'), tone: 'hot', wave: true }
   if (mood.state.mood === 'thinking') return { text: t('float.thinking'), tone: 'hot' }
@@ -218,6 +230,16 @@ onUnmounted(() => stopMoved())
 
       <!-- 展开内容:两区 —— 正在进行(钉住) / 最近消息(新→旧);全显示,不取舍 -->
       <div v-if="state.expanded" class="body">
+        <!-- 等你确认(§7.8):置顶,面板里直接点头/摇头(主窗藏托盘时的唯一确认入口) -->
+        <template v-if="confirm.pending.value.length">
+          <div class="ptag">{{ t('confirm.title') }}</div>
+          <div v-for="c in confirm.pending.value" :key="'cfm-' + c.id" class="cfm">
+            <span class="n-text">{{ confirmActionPhrase(c) }}<em v-if="c.host" class="cfm-host">{{ c.host }}</em></span>
+            <button class="cfm-go" @click.stop="confirm.resolve(c.id, true, 'float')">{{ t('confirm.allow') }}</button>
+            <button class="n-x" :title="t('confirm.deny')" @click.stop="confirm.resolve(c.id, false, 'float')">✕</button>
+          </div>
+        </template>
+
         <template v-if="listening || nowPlaying || running.length">
           <div class="ptag">{{ t('float.zoneNow') }}</div>
           <div v-if="listening" class="status">
@@ -451,6 +473,24 @@ onUnmounted(() => stopMoved())
   transition: border-color 0.15s, background 0.15s;
 }
 .notice:hover { border-color: var(--f-cy); background: rgba(var(--accent-rgb), 0.12); }
+/* 确认条(§7.8):同 .notice 观感,琥珀描边示急;「继续」小钮 + ✕ = 先不要 */
+.cfm {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 8px;
+  border-radius: 9px;
+  background: rgba(var(--warn-rgb), 0.08);
+  border: 1px solid rgba(var(--warn-rgb), 0.45);
+}
+.cfm-host { display: block; font-size: 10px; font-style: normal; color: var(--f-txt2); }
+.cfm-go {
+  flex: 0 0 auto; cursor: pointer; line-height: 1;
+  font-size: 11px; padding: 4px 8px; border-radius: 7px;
+  color: var(--accent); background: rgba(var(--accent-rgb), 0.12);
+  border: 1px solid rgba(var(--accent-rgb), 0.4);
+}
+.cfm-go:hover { background: rgba(var(--accent-rgb), 0.22); border-color: var(--accent); }
 .n-text {
   flex: 1;
   font-size: 12.5px;

@@ -6,6 +6,7 @@ import { useSettings } from '../composables/useSettings'
 import { onOverheard, onTranscribed, useVoice } from '../composables/useVoice'
 import { useMicBridge } from '../composables/useMicBridge'
 import { useSpeech } from '../composables/useSpeech'
+import { useConfirm, confirmActionPhrase } from '../composables/useConfirm'
 import { useContextMenu } from '../composables/useContextMenu'
 import { useCharacter } from '../composables/useCharacter'
 import { useMedia } from '../composables/useMedia'
@@ -33,7 +34,7 @@ const petName = computed(() => settings.get('ui.pet_name') || t('pet.name'))
 const textScale = computed(() => (settings.get('ui.text_scale') === 'large' ? '16.5px' : '14px'))
 const activeRail = ref<'chat' | 'reminders' | 'memory' | 'ops' | 'settings'>('chat')
 
-const { state: chat, send: chatSend, cancel, selectConversation, newConversation, ensureVoiceConv, overheardTargetConv, saveApiKey, dequeue, inject, renameConversation, togglePinConversation, deleteConversation } = useChat()
+const { state: chat, send: chatSend, cancel, selectConversation, newConversation, ensureVoiceConv, overheardTargetConv, saveApiKey, dequeue, inject, renameConversation, togglePinConversation, deleteConversation, voiceConfirmTarget: chatVoiceConfirmTarget } = useChat()
 const messages = computed(() => chat.messages)
 
 // 日期分隔条文案:今天 / 昨天 / 月-日(跨年带年份)。core 不产文案,这里走 i18n。
@@ -256,6 +257,16 @@ function micToggle() {
 function replay(text: string) {
   speech.speakText(text)
 }
+
+// —— 确认闸的语音半边(§7.8,仅主窗):当前**语音回合**撞确认 → 念出来问 + 开口头确认听音
+// (双通道,与屏幕卡先到先得;人可能不在屏幕前)。pushDelta 走回合的同一条念话管线
+// (唤醒回合已 beginTurn;绝不用 speakText——它会 endTurn 把在飞回合的后续语音掐哑)。
+// 话术刻意避开语音否定词(不要/别/算了):browser 源 AEC 消自播,但别赌漏网的一句自答。
+useConfirm().onPending((card) => {
+  if (chatVoiceConfirmTarget() !== card.conv_id) return
+  speech.pushDelta(t('confirm.speak', { action: confirmActionPhrase(card) }))
+  void api.voiceConfirmListen(card.id)
+})
 
 // 气泡里 markdown 链接:WebView 直接导航会把整个 app 顶走,一律拦下(preventDefault 保命);
 // http(s) 链接交系统浏览器(openExternal:Tauri 走 opener 插件,只放行 http(s))

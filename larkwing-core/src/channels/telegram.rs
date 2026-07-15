@@ -52,7 +52,8 @@ const VOICE_EMPTY_HINT: &str = "这条语音没听清,再说一遍试试?";
 
 /// 渠道入口:建长超时 net client,跑服务循环;出错退避重连(不静默失败 §3.5)。
 pub(super) async fn run(ctx: Arc<ChannelCtx>, ct: CancellationToken) {
-    let net = net::Client::new(|b| b.timeout(Duration::from_secs(POLL_TIMEOUT_S + 20)));
+    // Arc:回合 spawn 出去跑(见 serve),net 随 clone 共享(Client 自身不可 Clone)
+    let net = Arc::new(net::Client::new(|b| b.timeout(Duration::from_secs(POLL_TIMEOUT_S + 20))));
     while !ct.is_cancelled() {
         ctx.set_state(CHANNEL, true, None);
         match serve(&ctx, &net, &ct).await {
@@ -72,7 +73,7 @@ pub(super) async fn run(ctx: Arc<ChannelCtx>, ct: CancellationToken) {
     tracing::info!("Telegram 渠道已停");
 }
 
-async fn serve(ctx: &ChannelCtx, net: &net::Client, ct: &CancellationToken) -> Result<()> {
+async fn serve(ctx: &Arc<ChannelCtx>, net: &Arc<net::Client>, ct: &CancellationToken) -> Result<()> {
     let token = ctx.secret("remote.telegram.token").context("没配 Telegram token")?;
     let allowed = allowed_chats(ctx);
     // 启动丢弃积压(等价 drop_pending_updates):从最后一条之后开始
@@ -110,35 +111,91 @@ async fn serve(ctx: &ChannelCtx, net: &net::Client, ct: &CancellationToken) -> R
                 continue;
             }
 
+            // 回合 **spawn** 出去跑、不阻塞收循环(对齐钉钉,2026-07-15 确认闸的前提):
+            // 确认等待期间(工具阻塞在请示里)这条循环必须还能收到用户的「确认」回话;
+            // 顺手治了「一人长任务冻住全家回复」。同会话时序仍由 inject-or-send 收口。
             match incoming {
                 Incoming::Text(text) => {
-                    reply_turn(ctx, net, &token, chat_id, &chat, single, text, sender.as_deref(), Vec::new(), None)
+                    // 确认闸回话拦截(§7.8):该 chat 挂着确认时,这条先做应答判定
+                    // (肯定 = 回执即回、不进回合;其他 = 拒 + 照常进回合让模型接)
+                    if let Some(receipt) = ctx.confirm_reply(CHANNEL, &chat, &text) {
+                        let _ = send_message(net, &token, chat_id, receipt).await;
+                        continue;
+                    }
+                    let (ctx, net, token, chat) =
+                        (ctx.clone(), net.clone(), token.clone(), chat.clone());
+                    tokio::spawn(async move {
+                        reply_turn(
+                            &ctx,
+                            &net,
+                            &token,
+                            chat_id,
+                            &chat,
+                            single,
+                            text,
+                            sender.as_deref(),
+                            Vec::new(),
+                            None,
+                        )
                         .await;
+                    });
                 }
                 Incoming::Voice { file_id, duration } => {
-                    handle_voice(ctx, net, &token, chat_id, &chat, single, sender.as_deref(), &file_id, duration)
+                    let (ctx, net, token, chat) =
+                        (ctx.clone(), net.clone(), token.clone(), chat.clone());
+                    tokio::spawn(async move {
+                        handle_voice(
+                            &ctx,
+                            &net,
+                            &token,
+                            chat_id,
+                            &chat,
+                            single,
+                            sender.as_deref(),
+                            &file_id,
+                            duration,
+                        )
                         .await;
+                    });
                 }
                 Incoming::Photo { file_id, caption } => {
-                    handle_photo(ctx, net, &token, chat_id, &chat, single, sender.as_deref(), &file_id, caption)
+                    let (ctx, net, token, chat) =
+                        (ctx.clone(), net.clone(), token.clone(), chat.clone());
+                    tokio::spawn(async move {
+                        handle_photo(
+                            &ctx,
+                            &net,
+                            &token,
+                            chat_id,
+                            &chat,
+                            single,
+                            sender.as_deref(),
+                            &file_id,
+                            caption,
+                        )
                         .await;
+                    });
                 }
                 Incoming::Document { file_id, file_name, mime, size, caption } => {
-                    handle_document(
-                        ctx,
-                        net,
-                        &token,
-                        chat_id,
-                        &chat,
-                        single,
-                        sender.as_deref(),
-                        &file_id,
-                        &file_name,
-                        &mime,
-                        size,
-                        caption,
-                    )
-                    .await;
+                    let (ctx, net, token, chat) =
+                        (ctx.clone(), net.clone(), token.clone(), chat.clone());
+                    tokio::spawn(async move {
+                        handle_document(
+                            &ctx,
+                            &net,
+                            &token,
+                            chat_id,
+                            &chat,
+                            single,
+                            sender.as_deref(),
+                            &file_id,
+                            &file_name,
+                            &mime,
+                            size,
+                            caption,
+                        )
+                        .await;
+                    });
                 }
                 // 已读必回(§3.5 不静默):看不了的类型如实说,别让家人对着空气等
                 Incoming::Unsupported => {

@@ -1,15 +1,25 @@
 <script setup lang="ts">
 // 任务 HUD:窗口右缘垂直堆叠的进度卡(标题 + 当前步骤 + 进度条)。
 // 超过 4 条折叠成汇总胶囊;视频全屏时缩成右上角迷你胶囊,不挡画面。
+// 确认卡(§7.8 确认闸)与任务卡同族同区:置顶、不随折叠收起(它在等人点头,必须可见)。
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useTasks } from '../composables/useTasks'
 import { useMedia } from '../composables/useMedia'
-import { api, type TaskView, type TextRef } from '../lib/backend'
+import { confirmActionPhrase, useConfirm } from '../composables/useConfirm'
+import { api, type ConfirmCard, type TaskView, type TextRef } from '../lib/backend'
 
 const { t, te } = useI18n()
 const { state, dismiss } = useTasks()
 const { state: media } = useMedia()
+const confirm = useConfirm()
+
+// 确认卡终态一行(短暂停留后淡出)
+function confirmOutcome(c: ConfirmCard): string {
+  if (c.state === 'allowed') return t('confirm.done.allowed')
+  if (c.state === 'denied') return t('confirm.done.denied')
+  return t('confirm.done.expired')
+}
 
 const COLLAPSE_AT = 4
 
@@ -41,14 +51,31 @@ function txt(ref?: TextRef, fallback = 'task.unknown'): string {
 </script>
 
 <template>
-  <div class="tasks" :class="{ mini: media.fullscreen }" v-if="state.tasks.length">
+  <div class="tasks" :class="{ mini: media.fullscreen }" v-if="state.tasks.length || confirm.state.cards.length">
+    <!-- 确认卡(§7.8):等人点头的动作,置顶、永不折叠;终态短暂停留后自动淡出 -->
+    <TransitionGroup name="card" tag="div" class="stack" v-if="confirm.state.cards.length">
+      <div v-for="c in confirm.state.cards" :key="'cfm-' + c.id" class="card confirm" :class="c.state">
+        <div class="row">
+          <span class="label c-title">{{ t('confirm.title') }}</span>
+          <span v-if="c.state === 'pending'" class="count">{{ confirm.remaining(c) }}s</span>
+          <span v-else class="c-final" :class="c.state">{{ confirmOutcome(c) }}</span>
+        </div>
+        <div class="c-action">{{ confirmActionPhrase(c) }}</div>
+        <div v-if="c.host" class="step">{{ t('confirm.atHost', { host: c.host }) }}</div>
+        <div v-if="c.state === 'pending'" class="c-btns">
+          <button class="c-go" @click="confirm.resolve(c.id, true, confirm.via)">{{ t('confirm.allow') }}</button>
+          <button class="c-no" @click="confirm.resolve(c.id, false, confirm.via)">{{ t('confirm.deny') }}</button>
+        </div>
+      </div>
+    </TransitionGroup>
+
     <!-- 折叠胶囊:N 项进行中(点开展开) -->
-    <button v-if="collapsed" class="pill" @click="state.expanded = true">
+    <button v-if="collapsed && state.tasks.length" class="pill" @click="state.expanded = true">
       <span class="spin" v-if="running"></span>
       {{ t('task.progress', { n: state.tasks.length }) }}
     </button>
 
-    <TransitionGroup v-else name="card" tag="div" class="stack">
+    <TransitionGroup v-if="!collapsed" name="card" tag="div" class="stack">
       <div v-for="task in state.tasks" :key="task.task_id" class="card" :class="task.state">
         <div class="row">
           <span class="label">{{ txt(task.label) }}</span>
@@ -100,6 +127,37 @@ function txt(ref?: TextRef, fallback = 'task.unknown'): string {
 }
 .card.failed { border-color: rgba(var(--attn-rgb), 0.5); }
 .card.done { border-color: rgba(var(--ok-rgb), 0.5); }
+
+/* —— 确认卡(§7.8):同族观感,琥珀描边示意「等你一下」 —— */
+.stack + .stack, .stack + .pill { margin-top: 8px; }
+.card.confirm { border-color: rgba(var(--warn-rgb), 0.55); }
+.card.confirm.allowed { border-color: rgba(var(--ok-rgb), 0.5); }
+.card.confirm.denied, .card.confirm.expired { border-color: var(--line); }
+.c-title { color: var(--warn); }
+.count {
+  font: 10.5px/1 ui-monospace, "SF Mono", monospace;
+  color: var(--warn); letter-spacing: .4px;
+}
+.c-final { font-size: 10.5px; color: var(--text-dim); }
+.c-final.allowed { color: var(--ok); }
+.c-action {
+  margin-top: 4px; font-size: 12px; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.c-btns { display: flex; gap: 8px; margin-top: 8px; }
+.c-go, .c-no {
+  flex: 1; cursor: pointer; line-height: 1; padding: 5px 0;
+  font-size: 11px; letter-spacing: .6px; border-radius: 7px;
+}
+.c-go {
+  color: var(--accent); background: rgba(var(--accent-rgb), 0.12);
+  border: 1px solid rgba(var(--accent-rgb), 0.4);
+}
+.c-go:hover { background: rgba(var(--accent-rgb), 0.22); border-color: var(--accent); }
+.c-no {
+  color: var(--text-dim); background: none; border: 1px solid var(--line);
+}
+.c-no:hover { color: var(--text); border-color: var(--text-dim); }
 
 .row { display: flex; align-items: center; gap: 8px; }
 .label { flex: 1; font-size: 12px; color: var(--text); letter-spacing: .5px; }

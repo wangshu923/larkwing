@@ -225,7 +225,8 @@ pub(super) async fn run(ctx: Arc<ChannelCtx>, ct: CancellationToken) {
 /// 状态行粒度是渠道级:某路出错时 running 保持 true(别的路还活着),错误串进状态行
 /// ——真机排「谁掉线了」看日志的 who 字段。
 async fn run_account(ctx: Arc<ChannelCtx>, acc: Account, ct: CancellationToken) {
-    let net = net::Client::new(|b| b.timeout(Duration::from_secs(POLL_CLIENT_TIMEOUT_S)));
+    // Arc:回合 spawn 出去跑(见 serve),net 随 clone 共享(Client 自身不可 Clone)
+    let net = Arc::new(net::Client::new(|b| b.timeout(Duration::from_secs(POLL_CLIENT_TIMEOUT_S))));
     let who = if acc.user_id.is_empty() { "(旧迁移绑定)" } else { acc.user_id.as_str() };
     while !ct.is_cancelled() {
         match serve(&ctx, &net, &acc, &ct).await {
@@ -244,8 +245,8 @@ async fn run_account(ctx: Arc<ChannelCtx>, acc: Account, ct: CancellationToken) 
 }
 
 async fn serve(
-    ctx: &ChannelCtx,
-    net: &net::Client,
+    ctx: &Arc<ChannelCtx>,
+    net: &Arc<net::Client>,
     acc: &Account,
     ct: &CancellationToken,
 ) -> Result<()> {
@@ -300,7 +301,13 @@ async fn serve(
         let msgs = resp.get("msgs").and_then(Value::as_array).cloned().unwrap_or_default();
         for m in &msgs {
             if let Some(parsed) = parse_message(m) {
-                handle_message(ctx, net, &base, &token, &allowed, parsed).await;
+                // 回合 spawn 出去跑、不阻塞长轮询(对齐钉钉,2026-07-15 确认闸的前提):
+                // 确认等待期间这条循环必须还能收到用户的「确认」回话。
+                let (ctx, net) = (ctx.clone(), net.clone());
+                let (base, token, allowed) = (base.clone(), token.clone(), allowed.clone());
+                tokio::spawn(async move {
+                    handle_message(&ctx, &net, &base, &token, &allowed, parsed).await;
+                });
             }
         }
     }
@@ -326,6 +333,15 @@ async fn handle_message(
         return;
     }
 
+    // 确认闸回话拦截(§7.8):该 chat 挂着确认时,纯文本回话先做应答判定
+    // (肯定 = 回执即回、不进回合;其他 = 拒 + 照常进回合让模型接)
+    if p.media.is_none() && !p.text.trim().is_empty() {
+        if let Some(receipt) = ctx.confirm_reply(CHANNEL, &p.from_user_id, &p.text) {
+            let _ = send_text(net, base, token, &p.from_user_id, &p.context_token, receipt).await;
+            persist_context_token(ctx, &p.from_user_id, &p.context_token);
+            return;
+        }
+    }
     // 媒体:下载 + 解密 → 桌面同缝 InAttachment(图当轮注入 / 文档抽文字进 history,§9)
     let mut attachments = Vec::new();
     let text = p.text.clone();

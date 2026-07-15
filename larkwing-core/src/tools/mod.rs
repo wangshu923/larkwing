@@ -107,6 +107,9 @@ pub struct ToolCtx {
     /// 壳层网页渲染器(web_render 专用;None = 壳层没注入〔core 单测/eval/headless〕,
     /// 工具如实说没有渲染组件,§3.5)。
     pub web: Option<Arc<dyn crate::webrender::WebRenderer>>,
+    /// 动作确认中枢(§7.8 确认闸,通用件):动作后果「出圈且收不回」的工具执行前经它
+    /// 请用户点头。None(单测)= 没有确认通道,当拒处理。现状唯一消费者 = web_render。
+    pub confirm: Option<Arc<crate::confirm::Confirmer>>,
 }
 
 /// 工具风险分级(预留 slot,PLAN §8):`Safe` = 读/记类;`Mutating` = 会改动用户文件

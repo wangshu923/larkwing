@@ -231,7 +231,7 @@ mod tests {
         let store = Store::open(&dir.join("t.db")).unwrap();
         let me = store.users.ensure_default_user().unwrap();
         let media = MediaRuntime::new(dir.clone(), store.clone(), crate::bus::Bus::new());
-        (ToolCtx { user_id: me.id, conv_id: 1, media, store, web: None }, dir)
+        (ToolCtx { user_id: me.id, conv_id: 1, media, store, web: None, confirm: None }, dir)
     }
 
     #[tokio::test]

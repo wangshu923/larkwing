@@ -918,7 +918,7 @@ mod tests {
         std::fs::write(dir.join(".hidden"), b"x").unwrap();
         let store = Store::open(&dir.join("t.db")).unwrap();
         let ctx =
-            ToolCtx { user_id: 1, conv_id: 1, media: MediaRuntime::detached(store.clone()), store, web: None };
+            ToolCtx { user_id: 1, conv_id: 1, media: MediaRuntime::detached(store.clone()), store, web: None, confirm: None };
         (ctx, dir)
     }
 
