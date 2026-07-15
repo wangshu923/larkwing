@@ -97,6 +97,7 @@ export default {
     render_click: 'Clicking “{t}”…',
     render_back: 'Going back…',
     render_input: 'Filling the form…',
+    render_upload: 'Uploading files…',
     render_scroll: 'Scrolling…',
     render_snap: 'Reading the page…',
     relocate_copy: 'Copying files…',

@@ -3,8 +3,10 @@
 //! (webrender 接缝,壳层注入;没注入 = 如实说没有渲染组件)。
 //! L2 会话式浏览(2026-07-10 用户拍板,DOM/文本编号快照路线):每步回**编号元素**
 //! 快照(文本版 Set-of-Marks),窗口跨调用存活(session,TTL 3 分钟)——看 → 点编号 →
-//! 返回 → 再看连续走。**动作只有看/点/返回,输入/填表仍不做**(等 Tool::risk 确认闸门,
-//! §7.8);截图混合档等 ToolResult 支持图后再加(当前纯文本,§6.3)。
+//! 返回 → 再看连续走。完全操作第一批(2026-07-14)开了填字/批量填表/选下拉/按键/提交/
+//! 滚动 + 截图可选第二只眼;**文件上传(2026-07-15)**:upload_ref+upload_paths 把本机
+//! 文件传给页面的上传框(壳层 DataTransfer 注入)。**凭证代填 / CDP 可信输入仍不做**,
+//! 敏感字段标出交用户在可见小窗自己输(§7.8;确认闸门另案)。
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -42,7 +44,11 @@ fn wanted_action(
     fill: &[FillField],
     select_ref: Option<u32>,
     press_key: Option<&str>,
+    upload_ref: Option<u32>,
 ) -> Option<String> {
+    if let Some(n) = upload_ref {
+        return Some(format!("往[{n}]传文件"));
+    }
     if let Some(n) = click_ref {
         return Some(format!("[{n}]"));
     }
@@ -88,6 +94,20 @@ fn render_element(e: &PageElement) -> String {
             let mark = if e.checked == Some(true) { "☑" } else { "☐" };
             format!("[{n}] {mark} 勾选「{}」(click_ref 点它切换)\n", e.text)
         }
+        "file" => {
+            let mut extra = String::new();
+            if !e.accept.is_empty() {
+                extra.push_str(&format!(";收:{}", e.accept));
+            }
+            if e.multiple {
+                extra.push_str(";可传多个");
+            }
+            format!(
+                "[{n}] 文件上传框「{}」= 已选 {}{extra}(upload_ref={n} + upload_paths 传本机文件)\n",
+                e.text,
+                val(&e.value)
+            )
+        }
         "editable" => format!("[{n}] 可编辑区「{}」= {}\n", e.text, val(&e.value)),
         _ => format!("[{n}] 可点「{}」\n", e.text),
     }
@@ -112,8 +132,10 @@ impl WebRender {
                               分钟,可连续操作:带 session 加 click_ref 点编号、type_ref+text 往\
                               编号输入框填字、fill 批量填表、select_ref+option 选下拉、勾选框用 \
                               click_ref 点、press_key 按键(Enter/Escape…)、submit 提交表单、\
-                              scroll 上/下翻页、back 返回、再带 url 跳新地址。填完下张快照会回读\
-                              各框当前值,自己核对填对没。点出的下载自动存到本机并返回路径。\
+                              upload_ref+upload_paths 往文件上传框传本机文件(只传用户点名/这次\
+                              差事里的文件)、scroll 上/下翻页、back 返回、再带 url 跳新地址。填完\
+                              下张快照会回读各框当前值,自己核对填对没。点出的下载自动存到本机并\
+                              返回路径。\
                               浏览窗在屏幕右下角对用户可见:遇到要登录/扫码/验证码,或要填密码/\
                               银行卡这类敏感信息,别自己填——请用户在那个小窗里操作,完成后你带 \
                               session 继续。比 web_fetch 慢得多,先试 web_fetch 不行再用它。",
@@ -166,6 +188,15 @@ impl WebRender {
                         "option": {
                             "type": "string",
                             "description": "配 select_ref:要选的选项(选项文字或值)"
+                        },
+                        "upload_ref": {
+                            "type": "integer",
+                            "description": "往这个编号的文件上传框传本机文件(配 upload_paths);快照里标「文件上传框」的编号"
+                        },
+                        "upload_paths": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "配 upload_ref:要上传的本机文件绝对路径;多个 = 传给支持多选的框(单个也用数组)"
                         },
                         "submit": {
                             "type": "boolean",
@@ -277,6 +308,45 @@ impl WebRender {
             .unwrap_or_default();
         let select_ref = opt_ref(&args, "select_ref");
         let select_option = str_arg(&args, "option");
+        // 上传:路径在这里就验(缺文件/超闸别开窗白跑一步);字节由壳层读、注入页面。
+        let upload_ref = opt_ref(&args, "upload_ref");
+        let upload_paths: Vec<PathBuf> = match args.get("upload_paths") {
+            Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
+                vec![PathBuf::from(s.trim())]
+            }
+            Some(serde_json::Value::Array(a)) => a
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .collect(),
+            _ => Vec::new(),
+        };
+        if upload_ref.is_some() || !upload_paths.is_empty() {
+            anyhow::ensure!(
+                upload_ref.is_some(),
+                "传文件要配 upload_ref(上张快照里「文件上传框」的编号)"
+            );
+            anyhow::ensure!(
+                !upload_paths.is_empty(),
+                "upload_paths 是空的——给要上传的本机文件绝对路径"
+            );
+            let mut total: u64 = 0;
+            for p in &upload_paths {
+                anyhow::ensure!(p.is_absolute(), "上传路径要绝对路径,收到: {}", p.display());
+                let meta = std::fs::metadata(p)
+                    .with_context(|| format!("找不到要上传的文件: {}", p.display()))?;
+                anyhow::ensure!(meta.is_file(), "{} 不是文件,传不了", p.display());
+                total += meta.len();
+            }
+            anyhow::ensure!(
+                total <= crate::webrender::UPLOAD_MAX_BYTES,
+                "这批文件共 {},超过单次上传上限 {}——分开传或挑小的",
+                super::fs::human_size(total),
+                super::fs::human_size(crate::webrender::UPLOAD_MAX_BYTES)
+            );
+        }
         let submit = super::arg_bool(&args, "submit", false);
         let press_key = str_arg(&args, "press_key");
         let scroll = str_arg(&args, "scroll");
@@ -303,6 +373,7 @@ impl WebRender {
             &fill,
             select_ref,
             press_key.as_deref(),
+            upload_ref,
         );
         let outcome = renderer
             .render(RenderRequest {
@@ -315,6 +386,8 @@ impl WebRender {
                 type_text,
                 fill,
                 submit,
+                upload_ref,
+                upload_paths,
                 select_ref,
                 select_option,
                 press_key,
@@ -340,7 +413,7 @@ impl WebRender {
                 if !page.elements.is_empty() {
                     out.push_str(
                         "\n\n【交互元素】(带 session 用编号:click_ref 点 / type_ref+text 填 / \
-                         select_ref+option 选;编号只在本页有效)\n",
+                         select_ref+option 选 / upload_ref+upload_paths 传文件;编号只在本页有效)\n",
                     );
                     for e in &page.elements {
                         out.push_str(&render_element(e));
@@ -366,6 +439,9 @@ impl WebRender {
                 }
                 if page.click_ref_stale {
                     out.push_str("\n(那个编号已经失效——页面变过了,按上面新快照的编号再操作)");
+                }
+                if !page.click_note.is_empty() {
+                    out.push_str(&format!("\n({})", page.click_note));
                 }
                 match (&wanted, page.clicked, &outcome.download) {
                     (Some(t), false, _) if !page.click_ref_stale => out.push_str(&format!(
@@ -678,6 +754,104 @@ mod tests {
         assert_eq!(req.press_key.as_deref(), Some("Enter"));
         assert_eq!(req.scroll.as_deref(), Some("down"));
         assert_eq!(req.wait_text.as_deref(), Some("结果"));
+    }
+
+    #[tokio::test]
+    async fn upload_args_validate_and_pass_through() {
+        let mut ctx = base_ctx("upload");
+        let fake = Arc::new(FakeRender::new(RenderOutcome {
+            page: Some(RenderedPage {
+                title: "表单".into(),
+                text: "正文".into(),
+                clicked: true,
+                clicked_desc: "传文件[4]:单据.pdf".into(),
+                ..Default::default()
+            }),
+            session: Some("s".into()),
+            ..Default::default()
+        }));
+        ctx.web = Some(fake.clone());
+
+        // 配对校验:只给 ref 缺 paths / 只给 paths 缺 ref,都要明白话退回
+        let err = WebRender::new()
+            .run(serde_json::json!({"session": "s", "upload_ref": 4}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("upload_paths"), "{err:#}");
+        let err = WebRender::new()
+            .run(serde_json::json!({"session": "s", "upload_paths": ["/tmp/x.pdf"]}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("upload_ref"), "{err:#}");
+
+        // 相对路径 / 不存在的文件:开窗前就拦
+        let err = WebRender::new()
+            .run(
+                serde_json::json!({"session": "s", "upload_ref": 4, "upload_paths": ["单据.pdf"]}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("绝对路径"), "{err:#}");
+        let gone = std::env::temp_dir().join("lw-upload-不存在-xyz.pdf");
+        let err = WebRender::new()
+            .run(
+                serde_json::json!({"session": "s", "upload_ref": 4, "upload_paths": [gone.to_string_lossy()]}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("找不到"), "{err:#}");
+
+        // 真文件透传(单个字符串也认——quirk 宽容,同 arg_bool 哲学)
+        let f = std::env::temp_dir().join(format!("lw-upload-{}-单据.pdf", std::process::id()));
+        std::fs::write(&f, b"%PDF-1.4 fake").unwrap();
+        let out = WebRender::new()
+            .run(
+                serde_json::json!({"session": "s", "upload_ref": 4, "upload_paths": f.to_string_lossy()}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("传文件[4]:单据.pdf"), "{out}");
+        let req = fake.1.lock().unwrap().clone().unwrap();
+        assert_eq!(req.upload_ref, Some(4));
+        assert_eq!(req.upload_paths, vec![f.clone()]);
+        let _ = std::fs::remove_file(f);
+    }
+
+    #[tokio::test]
+    async fn renders_file_element_and_click_note() {
+        let mut ctx = base_ctx("file-el");
+        ctx.web = Some(Arc::new(FakeRender::new(RenderOutcome {
+            page: Some(RenderedPage {
+                title: "表单".into(),
+                text: "正文".into(),
+                elements: vec![crate::webrender::PageElement {
+                    ref_no: 4,
+                    role: "file".into(),
+                    text: "附件".into(),
+                    value: "老单据.pdf".into(),
+                    accept: ".pdf,image/*".into(),
+                    multiple: true,
+                    ..Default::default()
+                }],
+                click_note: "这个框只收一个文件,先传了第一个:单据.pdf".into(),
+                ..Default::default()
+            }),
+            session: Some("s".into()),
+            ..Default::default()
+        })));
+        let out = WebRender::new()
+            .run(serde_json::json!({"url": "https://x.example.com"}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            out.contains("[4] 文件上传框「附件」= 已选 「老单据.pdf」;收:.pdf,image/*;可传多个"),
+            "{out}"
+        );
+        assert!(out.contains("upload_ref=4"), "{out}");
+        assert!(out.contains("(这个框只收一个文件,先传了第一个:单据.pdf)"), "{out}");
     }
 
     #[tokio::test]

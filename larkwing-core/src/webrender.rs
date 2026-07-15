@@ -10,6 +10,11 @@ use std::time::Duration;
 
 use crate::web::PageLink;
 
+/// 单次上传的总字节上限(工具层验元数据、壳层读字节时再验)。取值沿用 web_download 的
+/// 50MB 闸口径(`tools/web.rs::DOWNLOAD_MAX_BYTES`)——网页世界一次进出的文件同一尺度,
+/// 不另造新默认;再大的 base64 分片注入也会让页面内存吃紧。
+pub const UPLOAD_MAX_BYTES: u64 = 50 * 1024 * 1024;
+
 /// 渲染后页面(注入脚本抽取、`/collect` 回传的 JSON 形)。字段全宽松缺省 ——
 /// 载荷来自页面世界,坏形状只当空,绝不让一张恶意页把回合炸掉。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -25,6 +30,9 @@ pub struct RenderedPage {
     pub clicked: bool,
     /// 实际点中的元素描述(如 `BUTTON「下载」`):多个候选时模型能核对点没点对。
     pub clicked_desc: String,
+    /// 动作的补充说明(编号对上了但动作有折扣/没做成时的人话:「这个框只收一个文件,
+    /// 先传了第一个」「[N] 不是文件上传框」)。空 = 没什么要补充的。
+    pub click_note: String,
     /// **编号交互元素**(文本版 Set-of-Marks,L2 会话式浏览的 grounding):快照时给页面
     /// 元素打 `data-lw-ref` 编号——可点的(按钮/链接)按编号 `click_ref` 点,可填的
     /// (输入框/文本域/可编辑区)按编号 `type_ref` 填、可选的(下拉)按编号 `select_ref` 选、
@@ -38,7 +46,8 @@ pub struct RenderedPage {
 }
 
 /// 一个编号交互元素。role:button / link / click(泛 onclick)/ input(文本框)/
-/// textarea / select(下拉)/ checkbox / radio / editable(contenteditable)。
+/// textarea / select(下拉)/ checkbox / radio / editable(contenteditable)/
+/// file(文件上传框——常见实现是 `display:none` 的隐藏 input,快照对它豁免可见性过滤)。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct PageElement {
@@ -59,14 +68,19 @@ pub struct PageElement {
     /// 敏感字段(type=password):标出让模型知道它在,但**不回读 value、也不该往里填**
     /// (凭证交用户在可见小窗自己输;第一批不做闸,靠工具描述引导)。
     pub secret: bool,
+    /// 文件上传框的 accept 属性(站点声明收什么,如 `.pdf,image/*`;空 = 没声明)。
+    pub accept: String,
+    /// 文件上传框是否收多个文件(`multiple` 属性)。
+    pub multiple: bool,
 }
 
 /// 一次渲染/浏览请求(工具 → 壳层)。L2 会话式浏览(2026-07-10 解锁)+ **完全操作
-/// 第一批(2026-07-14):看 / 点 / 返回 / 填字 / 批量填表 / 选下拉 / 按键 / 滚动**。
-/// 窗口跨调用存活,连续走。一次调用做**一个主动作**(壳层按优先级择一:back > 输入类
-/// (type/fill/select/press)> click > scroll);`submit`(表单提交)是 type/fill 的修饰,
-/// `wait_text`(动作后等文字出现再快照)对任何动作通用。**文件上传 / 凭证代填 / CDP 可信
-/// 输入仍不做**(§7.8)。
+/// 第一批(2026-07-14):看 / 点 / 返回 / 填字 / 批量填表 / 选下拉 / 按键 / 滚动** +
+/// **文件上传(2026-07-15:本机文件 base64 分片注入 → 页面里组装 File + DataTransfer
+/// 赋给 `input.files`,Playwright 同思路的纯 JS 版)**。窗口跨调用存活,连续走。一次调用
+/// 做**一个主动作**(壳层按优先级择一:back > 输入类(upload/type/fill/select/press)>
+/// click > scroll);`submit`(表单提交)是输入类的修饰,`wait_text`(动作后等文字出现再
+/// 快照)对任何动作通用。**凭证代填 / CDP 可信输入仍不做**(§7.8)。
 #[derive(Debug, Clone, Default)]
 pub struct RenderRequest {
     /// 打开的地址。带 session 续用时可空(空 = 不导航,只在当前页上动作/观察)。
@@ -88,6 +102,10 @@ pub struct RenderRequest {
     pub fill: Vec<FillField>,
     /// type / fill 之后提交所在表单(`form.requestSubmit()`;合成回车不触发提交,故走这条)。
     pub submit: bool,
+    /// 往编号文件上传框传本机文件(配 `upload_paths`;优先级最高的输入动作)。
+    pub upload_ref: Option<u32>,
+    /// 配 `upload_ref`:要上传的本机文件绝对路径(工具层已验存在/大小;壳层读字节注入)。
+    pub upload_paths: Vec<PathBuf>,
     /// 原生下拉按选项文本/值选(配 `select_option`)。
     pub select_ref: Option<u32>,
     /// 配 `select_ref` 的目标选项(文本或 value,壳层两边试匹配)。

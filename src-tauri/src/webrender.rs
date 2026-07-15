@@ -5,9 +5,11 @@
 //! `data-lw-ref`,文本版 Set-of-Marks)经 relay `/collect/{token}` POST 回 core。
 //! 下载由 `on_download` 接管(Requested 时定落点 sanitize+dedupe;**mac 的 Finished.path
 //! 恒空——只能用 Requested 时自己记下的落点**,tauri 文档明示的平台差异)。
-//! 纪律:不给远程页任何 IPC 桥(注入脚本只 POST loopback 一次性 token);动作空间只有
-//! 看/点/返回,**输入/填表不做**(等 Tool::risk 确认闸门);会话窗生死归 TTL/清扫,
-//! 绝不无限存活。
+//! 完全操作第一批(2026-07-14)开了填字/填表/选下拉/按键/提交/滚动;**文件上传
+//! (2026-07-15)**:Rust 读文件 → base64 分片 eval 暂存进页面(`window.__lwUpStage`)→
+//! 输入脚本组装 File + DataTransfer 赋给 `input.files` + 派发 change(Playwright 同思路
+//! 的纯 JS 版;凭证代填 / CDP 可信输入仍不做)。纪律:不给远程页任何 IPC 桥(注入脚本
+//! 只 POST loopback 一次性 token);会话窗生死归 TTL/清扫,绝不无限存活。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -187,7 +189,9 @@ async fn browse_step_inner(
     let mut post_click_url = None;
     let mut skip_snapshot = false;
     let did_click = req.click_ref.is_some() || req.click_text.is_some();
-    let did_input = req.type_ref.is_some()
+    let did_upload = req.upload_ref.is_some();
+    let did_input = did_upload
+        || req.type_ref.is_some()
         || !req.fill.is_empty()
         || req.select_ref.is_some()
         || req.press_key.is_some();
@@ -197,7 +201,14 @@ async fn browse_step_inner(
         let _ = entry.win.eval("try{history.back()}catch(e){}");
         wait_for_load(&entry, seq0, deadline).await;
     } else if did_input {
-        task.step("step.render_input", serde_json::Value::Null);
+        task.step(
+            if did_upload { "step.render_upload" } else { "step.render_input" },
+            serde_json::Value::Null,
+        );
+        // 上传先把文件字节暂存进页面世界(分片 eval),输入脚本再组装成 File 赋给上传框
+        if did_upload {
+            stage_upload_files(&entry, &req.upload_paths).await?;
+        }
         let act_moment = Instant::now();
         let seq0 = entry.load_seq.load(Ordering::Relaxed);
         let js = build_input_script(&req);
@@ -668,12 +679,83 @@ fn build_click_script(click_ref: Option<u32>, click_text: Option<&str>) -> Strin
     )
 }
 
+/// 上传暂存:把本机文件读进来,base64 **分片** eval 进页面世界的 `window.__lwUpStage`
+/// (b64 字母表无引号/反斜杠,直接嵌进 JS 字符串安全;分片防单条 eval 过大,两端 WebView
+/// 都稳)。输入脚本里 `stagedFiles()` 组装成 File。总量闸复验(工具层验过元数据,这里按
+/// 真实字节再验一道,单源 `webrender::UPLOAD_MAX_BYTES`)。
+async fn stage_upload_files(entry: &Arc<SessionEntry>, paths: &[PathBuf]) -> Result<()> {
+    /// 每条 eval 的 base64 字符数(≈1.5MB 原始字节)。
+    const CHUNK: usize = 2 * 1024 * 1024;
+    let mut total: u64 = 0;
+    entry.win.eval("window.__lwUpStage = [];").context("上传暂存没建起来")?;
+    for (i, p) in paths.iter().enumerate() {
+        let bytes = tokio::fs::read(p).await.with_context(|| format!("读不了 {}", p.display()))?;
+        total += bytes.len() as u64;
+        anyhow::ensure!(
+            total <= larkwing_core::webrender::UPLOAD_MAX_BYTES,
+            "这批文件加起来超过上传上限,传不了"
+        );
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("file{i}"));
+        let name_js = serde_json::to_string(&name).unwrap_or_else(|_| "\"file\"".into());
+        let mime_js = serde_json::to_string(upload_mime(&name)).unwrap_or_else(|_| "\"\"".into());
+        entry
+            .win
+            .eval(format!("window.__lwUpStage.push({{name:{name_js},type:{mime_js},parts:[]}});").as_str())
+            .context("上传暂存没建起来")?;
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        for chunk in b64.as_bytes().chunks(CHUNK) {
+            let s = std::str::from_utf8(chunk).expect("base64 是纯 ASCII");
+            entry
+                .win
+                .eval(format!("window.__lwUpStage[{i}].parts.push(\"{s}\");").as_str())
+                .context("上传分片没送进页面")?;
+        }
+    }
+    Ok(())
+}
+
+/// 上传文件的 MIME(File.type;站点常拿它对 accept 校验)。图片族复用 core 的单源映射,
+/// 其余补常见文档/媒体,认不出回落 octet-stream(多数站点只看扩展名,无碍)。
+fn upload_mime(name: &str) -> &'static str {
+    if let Some(m) = larkwing_core::attach::image_mime_by_ext(name) {
+        return m;
+    }
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "pdf" => "application/pdf",
+        "txt" | "md" | "log" => "text/plain",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "xml" => "text/xml",
+        "html" | "htm" => "text/html",
+        "zip" => "application/zip",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        _ => "application/octet-stream",
+    }
+}
+
 /// 输入类动作脚本(完全操作第一批):按编号 type 填字 / fill 批量 / select 选下拉 /
 /// press 按键,可选 submit 提交表单。React/Vue 受控组件走「原生 value setter + input 事件」
 /// (直接改 `.value` 不触发框架状态更新,业界事实标准);填后 blur 触发 on-blur 校验;下张
 /// 快照回读 value = 天然「填对没」校验。合成键盘事件 isTrusted=false **不触发原生提交** →
-/// 提交走 `requestSubmit()`。结果写 window.__lwClick(clicked=acted/desc/stale;编号失效 stale),
-/// 下张快照带回(与点击同一回传口,壳层/工具复用 clicked/stale 呈现)。
+/// 提交走 `requestSubmit()`。**上传(UP)**:组装 `stage_upload_files` 暂存的分片成 File,
+/// DataTransfer 赋给 `input.files` + 派发 input/change(编号不是文件框时就近找一个:
+/// 自身 → 后代 → label 指向的控件——「上传」按钮和隐藏 input 分家是常见页型);单选框
+/// 给了多个文件只传第一个、note 如实说。结果写 window.__lwClick(clicked=acted/desc/stale/
+/// note),下张快照带回(与点击同一回传口,壳层/工具复用 clicked/stale/note 呈现)。
 fn build_input_script(req: &RenderRequest) -> String {
     let ref_js = req.type_ref.map(|n| n.to_string()).unwrap_or_else(|| "null".into());
     let txt_js =
@@ -690,13 +772,27 @@ fn build_input_script(req: &RenderRequest) -> String {
         .unwrap_or_else(|_| "\"\"".into());
     let key_js =
         serde_json::to_string(req.press_key.as_deref().unwrap_or("")).unwrap_or_else(|_| "\"\"".into());
+    let up_js = req.upload_ref.map(|n| n.to_string()).unwrap_or_else(|| "null".into());
     let submit = req.submit;
     format!(
         r#"(function() {{
   var REF = {ref_js}; var TXT = {txt_js}; var FILL = {fill_js};
-  var SEL = {sel_js}; var OPT = {opt_js}; var KEY = {key_js}; var SUBMIT = {submit};
-  var stale = false, acted = false, desc = '', last = null;
+  var SEL = {sel_js}; var OPT = {opt_js}; var KEY = {key_js}; var UP = {up_js}; var SUBMIT = {submit};
+  var stale = false, acted = false, desc = '', note = '', last = null;
   function byRef(n) {{ var el = document.querySelector('[data-lw-ref="' + n + '"]'); if (!el) stale = true; return el; }}
+  function stagedFiles() {{
+    var st = window.__lwUpStage || []; var out = [];
+    try {{
+      for (var i = 0; i < st.length; i++) {{
+        var bin = atob((st[i].parts || []).join(''));
+        var u8 = new Uint8Array(bin.length);
+        for (var k = 0; k < bin.length; k++) u8[k] = bin.charCodeAt(k);
+        out.push(new File([u8], st[i].name || ('file' + i), {{ type: st[i].type || '' }}));
+      }}
+    }} catch (e) {{ out = []; }}
+    try {{ delete window.__lwUpStage; }} catch (e) {{}}
+    return out;
+  }}
   function setVal(el, v) {{
     try {{ el.focus(); }} catch (e) {{}}
     if (el.isContentEditable) {{
@@ -710,7 +806,33 @@ fn build_input_script(req: &RenderRequest) -> String {
     el.dispatchEvent(new Event('change', {{ bubbles: true }}));
     try {{ el.blur(); }} catch (e) {{}}
   }}
-  if (REF !== null) {{ var e0 = byRef(REF); if (e0) {{ setVal(e0, TXT); acted = true; last = e0; desc = '填入[' + REF + ']'; }} }}
+  if (UP !== null) {{
+    var eu = byRef(UP);
+    if (eu) {{
+      var fi = null;
+      if (eu.tagName === 'INPUT' && (eu.getAttribute('type') || '').toLowerCase() === 'file') fi = eu;
+      else if (eu.querySelector) fi = eu.querySelector('input[type=file]');
+      if (!fi && eu.tagName === 'LABEL' && eu.control) fi = eu.control;
+      var files = stagedFiles();
+      if (!fi) {{ note = '[' + UP + '] 不是文件上传框(里面也没找到)——从快照里挑标「文件上传框」的编号'; }}
+      else if (!files.length) {{ note = '文件没送进页面(可能页面刚跳转把暂存冲掉了)——再试一次'; }}
+      else {{
+        var use = files;
+        if (!fi.multiple && files.length > 1) {{ use = [files[0]]; note = '这个框只收一个文件,先传了第一个:' + use[0].name; }}
+        try {{
+          var dt = new DataTransfer();
+          for (var w = 0; w < use.length; w++) dt.items.add(use[w]);
+          fi.files = dt.files;
+          fi.dispatchEvent(new Event('input', {{ bubbles: true }}));
+          fi.dispatchEvent(new Event('change', {{ bubbles: true }}));
+          acted = true; last = fi;
+          var nm = []; for (var v = 0; v < use.length; v++) nm.push(use[v].name);
+          desc = '传文件[' + UP + ']:' + nm.join('、').slice(0, 60);
+        }} catch (e) {{ note = '上传框不认这批文件(' + ((e && e.message) || 'DataTransfer 失败') + ')'; }}
+      }}
+    }}
+  }}
+  else if (REF !== null) {{ var e0 = byRef(REF); if (e0) {{ setVal(e0, TXT); acted = true; last = e0; desc = '填入[' + REF + ']'; }} }}
   else if (FILL && FILL.length) {{ for (var i = 0; i < FILL.length; i++) {{ var ei = byRef(FILL[i].ref); if (ei) {{ setVal(ei, FILL[i].value); acted = true; last = ei; }} }} desc = '批量填 ' + FILL.length + ' 项'; }}
   else if (SEL !== null) {{
     var s = byRef(SEL);
@@ -730,7 +852,7 @@ fn build_input_script(req: &RenderRequest) -> String {
     var f = (last && last.form) || (document.activeElement && document.activeElement.form) || document.querySelector('form');
     if (f) {{ setTimeout(function() {{ try {{ f.requestSubmit(); }} catch (e) {{ try {{ f.submit(); }} catch (e2) {{}} }} }}, 60); desc += ' + 提交'; acted = true; }}
   }}
-  window.__lwClick = {{ clicked: acted, desc: desc, stale: stale }};
+  window.__lwClick = {{ clicked: acted, desc: desc, stale: stale, note: note }};
 }})();"#
     )
 }
@@ -933,6 +1055,10 @@ fn build_snapshot_script(collect_url: &str) -> String {
     if (tag === 'A') {{ var at = txt(el); return at ? {{ role: el.getAttribute('href') ? 'link' : 'click', text: at }} : null; }}
     if (tag === 'INPUT' && (type === 'checkbox' || type === 'radio')) {{ return {{ role: type, text: labelOf(el) || type, checked: !!el.checked }}; }}
     if (tag === 'INPUT' && type === 'hidden') return null;
+    if (tag === 'INPUT' && type === 'file') {{
+      var names = []; try {{ for (var q = 0; q < el.files.length; q++) names.push(el.files[q].name); }} catch (e) {{}}
+      return {{ role: 'file', text: labelOf(el) || '文件上传', value: names.join(', ').slice(0, 80), accept: (el.getAttribute('accept') || '').slice(0, 60), multiple: !!el.multiple }};
+    }}
     if (tag === 'INPUT') {{ var sec = (type === 'password'); return {{ role: 'input', text: labelOf(el) || '输入框', value: sec ? '' : (el.value || '').slice(0, 80), secret: sec }}; }}
     if (tag === 'TEXTAREA') {{ return {{ role: 'textarea', text: labelOf(el) || '文本域', value: (el.value || '').slice(0, 80) }}; }}
     if (tag === 'SELECT') {{
@@ -956,12 +1082,14 @@ fn build_snapshot_script(collect_url: &str) -> String {
   var no = 1;
   for (var j = 0; j < cands.length && elements.length < 60; j++) {{
     var el = cands[j];
-    if (el.offsetParent === null) continue; // display:none 等不可见的不编号
+    // 文件上传框豁免可见性过滤:常见页型就是 display:none 的隐藏 input + 好看的按钮
+    var isFile = (el.tagName === 'INPUT' && (el.getAttribute('type') || '').toLowerCase() === 'file');
+    if (el.offsetParent === null && !isFile) continue; // display:none 等不可见的不编号
     var d = describe(el);
     if (!d) continue;
     el.setAttribute('data-lw-ref', String(no));
     var h = (el.tagName === 'A' && el.href && /^https?:/.test(el.href)) ? el.href : null;
-    elements.push({{ ref: no, role: d.role, text: d.text, href: h, value: d.value || '', checked: (d.checked === undefined ? null : d.checked), options: d.options || [], secret: !!d.secret }});
+    elements.push({{ ref: no, role: d.role, text: d.text, href: h, value: d.value || '', checked: (d.checked === undefined ? null : d.checked), options: d.options || [], secret: !!d.secret, accept: d.accept || '', multiple: !!d.multiple }});
     no++;
   }}
   var scroll_hint = '';
@@ -982,9 +1110,37 @@ fn build_snapshot_script(collect_url: &str) -> String {
     scroll_hint: scroll_hint,
     clicked: !!click.clicked,
     clicked_desc: click.desc || '',
-    click_ref_stale: !!click.stale
+    click_ref_stale: !!click.stale,
+    click_note: click.note || ''
   }};
   try {{ fetch(POST, {{ method: 'POST', headers: {{ 'Content-Type': 'text/plain' }}, body: JSON.stringify(payload) }}); }} catch (e) {{}}
 }})();"#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 上传/快照脚本的形状守卫;`--nocapture` 时打印成品脚本(浏览器冒烟验 JS 语法/行为用:
+    /// format! 模板的括号转义错误只有真跑 JS 才抓得到)。
+    #[test]
+    fn upload_and_snapshot_scripts_shape() {
+        for (up, tag) in [(4u32, "UP4"), (5, "UP5"), (1, "UP1")] {
+            let req = RenderRequest {
+                upload_ref: Some(up),
+                upload_paths: vec![PathBuf::from("/tmp/单据.pdf")],
+                ..Default::default()
+            };
+            let js = build_input_script(&req);
+            assert!(js.contains(&format!("var UP = {up}")), "{js}");
+            assert!(js.contains("stagedFiles") && js.contains("DataTransfer"), "{js}");
+            assert!(js.contains("note: note"), "{js}");
+            println!("__SCRIPT_{tag}__\n{js}");
+        }
+        let snap = build_snapshot_script("http://127.0.0.1:1/collect/x");
+        assert!(snap.contains("type === 'file'"), "{snap}");
+        assert!(snap.contains("click_note"), "{snap}");
+        println!("__SCRIPT_SNAP__\n{snap}\n__END__");
+    }
 }

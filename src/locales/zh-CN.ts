@@ -96,6 +96,7 @@ export default {
     render_click: '点一下「{t}」…',
     render_back: '返回上一页…',
     render_input: '填写表单…',
+    render_upload: '上传文件…',
     render_scroll: '翻页…',
     render_snap: '读取页面内容…',
     relocate_copy: '复制文件…',
