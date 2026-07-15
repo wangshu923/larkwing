@@ -207,6 +207,8 @@ export interface ModelOverride {
   outUsdPerM?: number
   ctxWindowTokens?: number
   billing?: BillingMode
+  /** 能不能看图;省略 = 用目录猜测(自架视觉模型靠它标上)。 */
+  vision?: boolean
 }
 
 /** 目录对某模型的猜测(给「高级」占位用;null = 目录也不知道)。 */
@@ -216,6 +218,8 @@ export interface ModelGuess {
   outUsdPerM: number | null
   ctxWindowTokens: number | null
   billing: BillingMode
+  /** 目录猜的「能不能看图」(未知 = false)。 */
+  vision: boolean
 }
 
 /** 设置页「高级」一格全貌:目录猜测(占位)+ 当前覆盖(值)。 */

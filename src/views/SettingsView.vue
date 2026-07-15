@@ -912,7 +912,7 @@ function protoLabel(p: ProviderView) {
 const advOpen = reactive<Record<string, boolean>>({})
 const modelMeta = reactive<Record<string, ModelMeta>>({}) // 键 = model id
 // 浏览器预览没有后端:给个保守假 meta(纯目录未知态),让面板照样能渲染/点
-const FAKE_META: ModelMeta = { guess: { tier: 'balanced', inUsdPerM: null, outUsdPerM: null, ctxWindowTokens: null, billing: 'cached' }, over: null }
+const FAKE_META: ModelMeta = { guess: { tier: 'balanced', inUsdPerM: null, outUsdPerM: null, ctxWindowTokens: null, billing: 'cached', vision: false }, over: null }
 async function fetchMeta(model: string) {
   if (!model) return
   modelMeta[model] = isTauri() ? await api.modelMeta(model) : { ...FAKE_META }
@@ -944,6 +944,15 @@ function tierOpts(meta: ModelMeta) {
     { value: 'smart', label: t('settings.brain.tier_smart') },
   ]
 }
+/** 图片理解下拉项(SkinSelect):自动(带目录猜测)/能看图/只看文字。 */
+function visionOpts(meta: ModelMeta) {
+  const guess = t(meta.guess.vision ? 'settings.brain.visionYes' : 'settings.brain.visionNo')
+  return [
+    { value: '', label: t('settings.brain.auto', { v: guess }) },
+    { value: 'true', label: t('settings.brain.visionYes') },
+    { value: 'false', label: t('settings.brain.visionNo') },
+  ]
+}
 /** 计价方式下拉项(SkinSelect)。 */
 const billingOpts = computed(() => [
   { value: '', label: t('settings.brain.billingAuto') },
@@ -969,6 +978,10 @@ async function saveOvRaw(p: ProviderView, field: keyof ModelOverride, rawIn: str
   if (field === 'tier' || field === 'billing') {
     if (raw) (cur as unknown as Record<string, unknown>)[field] = raw
     else delete cur[field]
+  } else if (field === 'vision') {
+    // 三态:'' = 自动(删格回落目录),'true'/'false' = 显式标注
+    if (raw) cur.vision = raw === 'true'
+    else delete cur.vision
   } else if (raw === '') {
     delete cur[field]
   } else if (field === 'ctxWindowTokens') {
@@ -1334,6 +1347,13 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               :options="billingOpts"
               :aria-label="t('settings.brain.billing')"
               @update:model-value="(v: string) => saveOvRaw(p, 'billing', v)"
+            />
+            <label>{{ t('settings.brain.vision') }}</label>
+            <SkinSelect
+              :model-value="modelMeta[p.model].over?.vision == null ? '' : String(modelMeta[p.model].over?.vision)"
+              :options="visionOpts(modelMeta[p.model])"
+              :aria-label="t('settings.brain.vision')"
+              @update:model-value="(v: string) => saveOvRaw(p, 'vision', v)"
             />
             <p class="adv-hint">{{ t('settings.brain.advHint') }}</p>
           </div>

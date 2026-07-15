@@ -504,6 +504,9 @@ export default {
       billing_cached: 'Metered · cached',
       billing_uncached: 'Metered · no cache',
       billing_percall: 'Per call',
+      vision: 'Image input',
+      visionYes: 'Can see images',
+      visionNo: 'Text only',
       auto: 'Auto: {v}', // {v} filled by code (catalog guess; — = unknown)
     },
     family: {

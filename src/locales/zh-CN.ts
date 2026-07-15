@@ -503,6 +503,9 @@ export default {
       billing_cached: '按量 · 可缓存',
       billing_uncached: '按量 · 不缓存',
       billing_percall: '按次',
+      vision: '图片理解',
+      visionYes: '能看图',
+      visionNo: '只看文字',
       auto: '自动:{v}', // {v} 由代码填(目录猜测值,— = 不知道)
     },
     family: {

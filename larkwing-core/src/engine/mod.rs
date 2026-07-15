@@ -314,6 +314,8 @@ pub struct ModelGuess {
     pub out_usd_per_m: Option<f64>,
     pub ctx_window_tokens: Option<u32>,
     pub billing: crate::llm::catalog::BillingMode,
+    /// 目录猜的「能不能看图」(未知 = false,§6.3)。
+    pub vision: bool,
 }
 
 /// 设置页「高级」一格的全貌:目录猜测(占位)+ 当前用户覆盖(值)。
@@ -1313,6 +1315,7 @@ impl Engine {
             ctx_window_tokens: g.and_then(|i| i.ctx_window_tokens),
             // 目录无计价列(当前 provider 都有前缀缓存)→ 猜测恒为默认「按量+缓存」。
             billing: crate::llm::catalog::BillingMode::default(),
+            vision: g.map(|i| i.vision).unwrap_or(false),
         };
         let over = self
             .load_model_overrides()

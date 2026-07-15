@@ -55,6 +55,10 @@ pub struct ModelOverride {
     pub ctx_window_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billing: Option<BillingMode>,
+    /// 能不能看图(None = 用目录猜测)。目录不认识的自架视觉模型(llava / qwen-vl 自部署)
+    /// 靠它标上;目录说错了也靠它纠(2026-07-15,用户要求 robot supported_media 的对应物)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
 }
 
 impl ModelOverride {
@@ -65,6 +69,7 @@ impl ModelOverride {
             && self.out_usd_per_m.is_none()
             && self.ctx_window_tokens.is_none()
             && self.billing.is_none()
+            && self.vision.is_none()
     }
 }
 
@@ -136,7 +141,17 @@ const CATALOG: &[ModelInfo] = &[
     // 其他常见(经 OpenAI 兼容端点/中转可达)
     m("gpt-5-mini", Tier::Light, true, Some(0.25), Some(2.0), Some(400_000)),
     m("gpt-5", Tier::Smart, true, Some(0.625), Some(5.0), Some(400_000)),
+    // Kimi:K2.5/K2.6 起原生多模态(MoonViT,图/视频输入;2026-07 官方 API 核实),
+    // 老 K2 是纯文本 —— 特异在前,免得 k2.5/k2.6 被 kimi-k2 行错杀成不看图。
+    m("kimi-k2.6", Tier::Smart, true, None, None, Some(256_000)),
+    m("kimi-k2.5", Tier::Smart, true, None, None, Some(256_000)),
     m("kimi-k2", Tier::Balanced, false, None, None, Some(256_000)),
+    // Qwen:qwen-max 的 API 仍是纯文本;视觉/全模态是独立的 VL / Omni 系(dashscope,
+    // 2026-07 核实)。窗口/价随版本浮动不装懂,留 None。
+    m("qwen3-vl", Tier::Balanced, true, None, None, None),
+    m("qwen-vl", Tier::Balanced, true, None, None, None),
+    m("qwen3-omni", Tier::Balanced, true, None, None, None),
+    m("qwen-omni", Tier::Balanced, true, None, None, None),
     m("qwen-max", Tier::Balanced, false, None, None, Some(256_000)), // 3.6-Max 256K(3.7-Max 已 1M,保守取低)
     // Google Gemini(经官方 OpenAI 兼容端点;牌价随版本浮动、存疑就不装懂 → 留 None 只报 token)。
     // 特异在前、通配在后(子串匹配按顺序)。窗口全系 1M。
@@ -156,9 +171,13 @@ pub fn lookup(model_id: &str) -> Option<&'static ModelInfo> {
     CATALOG.iter().find(|info| id.contains(info.family))
 }
 
-/// 能不能看图:目录数据,未知模型按 **false**(宁可少看图、不可让 image_url 打挂回合——
-/// DeepSeek 真机 400 实锤 2026-07-03)。本地视觉模型(llava 类)真有人用再登记进目录。
+/// 能不能看图:先看用户覆盖(「高级」里标的,自架 llava / qwen-vl 类靠它),再查目录;
+/// 未知模型按 **false**(宁可少看图、不可让 image_url 打挂回合——DeepSeek 真机 400
+/// 实锤 2026-07-03;且同一家不同端点行为不一,不可赌服务商自己占位)。
 pub fn supports_vision(model_id: &str) -> bool {
+    if let Some(v) = override_for(model_id).and_then(|o| o.vision) {
+        return v;
+    }
     lookup(model_id).map(|i| i.vision).unwrap_or(false)
 }
 
@@ -284,10 +303,12 @@ mod tests {
             out_usd_per_m: Some(8.0),
             ctx_window_tokens: Some(32_000),
             billing: Some(BillingMode::Uncached),
+            vision: Some(true),
         }]);
         assert_eq!(tier_of(id), Tier::Smart, "覆盖档位生效");
         assert_eq!(ctx_window_of(id), Some(32_000), "覆盖窗口生效");
         assert_eq!(billing_of(id), BillingMode::Uncached, "覆盖计价方式生效");
+        assert!(supports_vision(id), "覆盖 vision 生效(自架视觉模型标上)");
         let usage = Usage { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_hit_tokens: 0 };
         assert!((est_cost_usd(id, &usage).unwrap() - 10.0).abs() < 1e-9, "覆盖价 2+8=10");
         // 半价覆盖(只给进价)→ 整体回落目录;未知模型目录无价 → None
@@ -298,11 +319,28 @@ mod tests {
             out_usd_per_m: None,
             ctx_window_tokens: None,
             billing: None,
+            vision: None,
         }]);
         assert!(est_cost_usd(id, &usage).is_none(), "半价覆盖不生效,回落目录(无价)");
         assert_eq!(tier_of(id), Tier::Balanced, "tier 未覆盖 → 回落");
+        assert!(!supports_vision(id), "vision 未覆盖 → 回落目录(未知 = false)");
         set_overrides(vec![]); // 收尾清空,不泄漏给其他测试
         assert_eq!(tier_of(id), Tier::Balanced);
+    }
+
+    // 2026-07 校订的视觉家族行:特异在前的排序是承重的(k2.5/k2.6 不被 kimi-k2 错杀)
+    #[test]
+    fn vision_catalog_families_2026_07() {
+        assert!(supports_vision("kimi-k2.6-preview"), "K2.6 原生多模态");
+        assert!(supports_vision("kimi-k2.5"), "K2.5 原生多模态");
+        assert!(!supports_vision("kimi-k2-0711-preview"), "老 K2 纯文本");
+        assert!(supports_vision("qwen-vl-max"));
+        assert!(supports_vision("qwen3-vl-plus"));
+        assert!(supports_vision("qwen3-omni-flash"));
+        assert!(!supports_vision("qwen-max"), "qwen-max 的 API 仍纯文本");
+        assert!(!supports_vision("llava:13b"), "目录不认识 → false,靠覆盖标");
+        assert!(supports_vision("gemini-2.5-flash") && supports_vision("claude-sonnet-5"));
+        assert!(!supports_vision("deepseek-v4"), "DeepSeek API 无图片输入(网页端灰度不算)");
     }
 
     #[test]
