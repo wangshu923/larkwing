@@ -690,15 +690,33 @@ async fn send_text(
     send_item(net, base, token, to_user_id, context_token, item).await
 }
 
-/// 发一条结构化消息项(文本/图片/文件…共用出口)。
-async fn send_item(
+/// 过期会话令牌的在野错误码:iLink 对带过期 context_token 的 sendmessage 回 ret=-2
+/// (errmsg 见过 "prepare failed" / "rate limited",不是文档预期的 -14「会话过期」;
+/// 2026-07-18 真机实锤——重试/重启渠道都救不回,只有对方再来一条消息才刷新令牌)。
+const RET_STALE_CONTEXT: i64 = -2;
+
+/// sendmessage 响应判定:ret / errcode 双字段在野都有人用(getupdates 同款),任一非 0
+/// = 失败;只看 ret 会把 errcode-only 的失败当成功,误报「发出去了」。
+fn sendmessage_err(resp: &Value) -> Option<(i64, String)> {
+    let ret = resp.get("ret").and_then(Value::as_i64).unwrap_or(0);
+    let errcode = resp.get("errcode").and_then(Value::as_i64).unwrap_or(0);
+    let code = if ret != 0 { ret } else { errcode };
+    if code == 0 {
+        return None;
+    }
+    let errmsg = resp.get("errmsg").and_then(Value::as_str).unwrap_or("").to_string();
+    Some((code, errmsg))
+}
+
+/// 单次 sendmessage(不含降级;send_item 在此之上做过期令牌降级)。
+async fn sendmessage_once(
     net: &net::Client,
     base: &str,
     token: &str,
     to_user_id: &str,
     context_token: &str,
-    item: Value,
-) -> Result<()> {
+    item: &Value,
+) -> Result<Value> {
     let mut msg = json!({
         "from_user_id": "",
         "to_user_id": to_user_id,
@@ -711,13 +729,36 @@ async fn send_item(
         msg["context_token"] = Value::String(context_token.to_string());
     }
     let body = json!({ "msg": msg, "base_info": base_info() });
-    let resp = post_json(net, base, "ilink/bot/sendmessage", &body, Some(token)).await?;
-    let ret = resp.get("ret").and_then(Value::as_i64).unwrap_or(0);
-    if ret != 0 {
-        let errmsg = resp.get("errmsg").and_then(Value::as_str).unwrap_or("");
-        bail!("sendmessage ret={ret} errmsg={errmsg}");
+    post_json(net, base, "ilink/bot/sendmessage", &body, Some(token)).await
+}
+
+/// 发一条结构化消息项(文本/图片/文件…共用出口),内建过期令牌降级:带 context_token
+/// 撞上 ret=-2 → 去掉令牌原样重发一次(无令牌发送是官方插件的合法路径,openclaw 缺令牌
+/// 仅 warn 照发),仍失败才如实退回。多段发送(附言+文件/长文分片)各段自行降级,过期
+/// 路径每段多付一次往返——省掉跨调用状态,段数(≤几段)下可接受;下一条入站消息会把
+/// push_id 刷新鲜,常态零开销。
+async fn send_item(
+    net: &net::Client,
+    base: &str,
+    token: &str,
+    to_user_id: &str,
+    context_token: &str,
+    item: Value,
+) -> Result<()> {
+    let resp = sendmessage_once(net, base, token, to_user_id, context_token, &item).await?;
+    let Some((code, errmsg)) = sendmessage_err(&resp) else { return Ok(()) };
+    if code != RET_STALE_CONTEXT || context_token.is_empty() {
+        bail!("sendmessage ret={code} errmsg={errmsg}");
     }
-    Ok(())
+    tracing::warn!(errmsg = %errmsg, "微信 sendmessage ret=-2(疑似 context_token 过期),去掉令牌重发一次");
+    let resp = sendmessage_once(net, base, token, to_user_id, "", &item).await?;
+    match sendmessage_err(&resp) {
+        None => Ok(()),
+        Some((code, errmsg)) => bail!(
+            "sendmessage ret={code} errmsg={errmsg}(去掉过期会话令牌重发仍失败;\
+             可让对方在微信上先给我发一句话再试)"
+        ),
+    }
 }
 
 fn base_info() -> Value {
@@ -1310,5 +1351,95 @@ mod tests {
         let uin = random_wechat_uin();
         assert!(base64::engine::general_purpose::STANDARD.decode(&uin).is_ok(), "UIN 是 base64");
         assert!(random_client_id().starts_with("larkwing-"));
+    }
+
+    /// 过期 context_token 降级:带令牌被拒 ret=-2 → 去令牌原样重发一次即成功。
+    /// (真微信的过期令牌行为归真机验;这里锁客户端侧的降级机器。)
+    #[tokio::test]
+    async fn send_item_degrades_stale_context_token() {
+        use axum::{routing::post, Router};
+        use std::sync::Mutex;
+        static SEEN: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+
+        async fn sink(body: axum::body::Bytes) -> &'static str {
+            let v: Value = serde_json::from_slice(&body).unwrap();
+            let with_token = v["msg"].get("context_token").is_some();
+            SEEN.lock().unwrap().push(v);
+            if with_token {
+                r#"{"ret":-2,"errmsg":"prepare failed"}"#
+            } else {
+                r#"{"ret":0}"#
+            }
+        }
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/ilink/bot/sendmessage", post(sink)))
+                .await
+                .ok();
+        });
+
+        let net = net::Client::new(|b| b);
+        let base = format!("http://127.0.0.1:{port}");
+        send_text(&net, &base, "tok", "u1", "stale-ctx", "你好").await.unwrap();
+
+        let seen = SEEN.lock().unwrap();
+        assert_eq!(seen.len(), 2, "带令牌被拒后去令牌重发一次");
+        assert_eq!(seen[0]["msg"]["context_token"], "stale-ctx");
+        assert!(seen[1]["msg"].get("context_token").is_none(), "重发不带 context_token");
+        assert_eq!(seen[1]["msg"]["item_list"][0]["text_item"]["text"], "你好", "消息项原样重发");
+    }
+
+    /// errcode-only 的失败也要认(此前只看 ret 会当成功误报「发出去了」);
+    /// 没带令牌的 ret=-2 没东西可降 → 不重试、一次就退。
+    #[tokio::test]
+    async fn send_item_reads_errcode_and_skips_retry_without_token() {
+        use axum::{routing::post, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static HITS: AtomicUsize = AtomicUsize::new(0);
+
+        async fn sink(_body: axum::body::Bytes) -> &'static str {
+            HITS.fetch_add(1, Ordering::Relaxed);
+            r#"{"errcode":-2,"errmsg":"prepare failed"}"#
+        }
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/ilink/bot/sendmessage", post(sink)))
+                .await
+                .ok();
+        });
+
+        let net = net::Client::new(|b| b);
+        let base = format!("http://127.0.0.1:{port}");
+        let err = send_text(&net, &base, "tok", "u1", "", "hi").await.unwrap_err();
+        assert!(format!("{err:#}").contains("ret=-2"), "errcode-only 也判失败: {err:#}");
+        assert_eq!(HITS.load(Ordering::Relaxed), 1, "无令牌不重试");
+    }
+
+    /// 降级后仍被拒 → 如实退回,错误里带续办提示(让对方先发一句话)。
+    #[tokio::test]
+    async fn send_item_degraded_still_failing_reports_hint() {
+        use axum::{routing::post, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static HITS: AtomicUsize = AtomicUsize::new(0);
+
+        async fn sink(_body: axum::body::Bytes) -> &'static str {
+            HITS.fetch_add(1, Ordering::Relaxed);
+            r#"{"ret":-2,"errmsg":"prepare failed"}"#
+        }
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/ilink/bot/sendmessage", post(sink)))
+                .await
+                .ok();
+        });
+
+        let net = net::Client::new(|b| b);
+        let base = format!("http://127.0.0.1:{port}");
+        let err = send_text(&net, &base, "tok", "u1", "ctx", "hi").await.unwrap_err();
+        assert_eq!(HITS.load(Ordering::Relaxed), 2, "带令牌一次 + 去令牌一次");
+        assert!(format!("{err:#}").contains("重发仍失败"), "错误带续办提示: {err:#}");
     }
 }

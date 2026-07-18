@@ -3159,7 +3159,7 @@ dependencies = [
 
 [[package]]
 name = "larkwing"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3197,7 +3197,7 @@ dependencies = [
 
 [[package]]
 name = "larkwing-core"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "aes",
  "anyhow",
