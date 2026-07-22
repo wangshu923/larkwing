@@ -97,6 +97,25 @@ pub(crate) fn arg_u64(args: &serde_json::Value, key: &str, default: u64) -> u64 
     }
 }
 
+/// 路径入参的 `~` 宽容展开(§4.4 Quirks,arg_bool 同族;2026-07-21):用户嘴里的
+/// 「~/Downloads」会被模型原样写进参数(它不知道主目录在哪、也不会自己展开——真机 reasoning
+/// 实锤「以后用的时候再展开」),工具边界统一吃下。mac = `$HOME`,Windows = `C:\Users\<名>`
+/// (`dirs::home_dir()`,中文用户名 OK)。只认裸 `~` 与 `~/`、`~\` 前缀;`~某用户名` 指向
+/// 别人主目录的形不猜(原样返回,让下游如实报错);取不到主目录(极端环境)也原样返回。
+/// **收路径的工具一律经它**(直接 `Path::new(原始入参)` 是漏网)。
+pub(crate) fn expand_home(path: &str) -> String {
+    let rest = if path == "~" {
+        Some("")
+    } else {
+        path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\"))
+    };
+    match (rest, dirs::home_dir()) {
+        (Some(""), Some(home)) => home.to_string_lossy().into_owned(),
+        (Some(r), Some(home)) => home.join(r).to_string_lossy().into_owned(),
+        _ => path.to_string(),
+    }
+}
+
 /// 每次执行的现场:多用户与会话归属由此带入,工具自身无状态。
 pub struct ToolCtx {
     pub user_id: i64,
@@ -271,6 +290,21 @@ impl Tools {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expand_home_forms() {
+        let home = dirs::home_dir().expect("测试环境应有主目录");
+        let h = home.to_string_lossy().into_owned();
+        assert_eq!(expand_home("~"), h, "裸 ~ = 主目录");
+        assert_eq!(expand_home("~/Downloads"), home.join("Downloads").to_string_lossy());
+        assert_eq!(expand_home("~\\Downloads"), home.join("Downloads").to_string_lossy(), "反斜杠形也认");
+        // 不该碰的形:别人的主目录 / 已是绝对路径 / 空串
+        assert_eq!(expand_home("~other/x"), "~other/x", "别人的主目录不猜");
+        assert_eq!(expand_home("/abs/x.mp3"), "/abs/x.mp3");
+        assert_eq!(expand_home("C:\\Movies\\a.mp4"), "C:\\Movies\\a.mp4");
+        assert_eq!(expand_home("https://example.com/~user/"), "https://example.com/~user/", "URL 原样");
+        assert_eq!(expand_home(""), "");
+    }
 
     #[test]
     fn builtin_registry_and_subset_base_first_scene_after() {

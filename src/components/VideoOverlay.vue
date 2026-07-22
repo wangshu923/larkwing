@@ -2,6 +2,9 @@
 // 视频浮层:current.kind === 'video' 时出现。<video> 挂载即向 VM 登记。
 // 全屏 = 原生窗口全屏(非 HTML5 requestFullscreen —— 后者在 WebView2 上与 DWM 合成器打架,
 // 闪烁/退出穿帮),包壳加 .maximized 铺满;混流流无原生 seek,滑杆松手 = 换 src 重启(?t=)。
+// 窗口态 = 非模态应用内小视窗(webrender 可见任务窗同款形态:右下停靠、标题栏拖动、拖角缩放),
+// 底下界面照常可用。不开真原生第二窗:播放引擎(MSE/relay 会话/useMedia VM)全在主窗 WebView,
+// 挪窗 = 悬浮窗双播陷阱同族 + 采集端 AEC 参考信号断链(§7.5)。
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { registerVideoEl, useMedia } from '../composables/useMedia'
@@ -9,10 +12,14 @@ import { win } from '../lib/backend'
 import { fmtClock } from '../lib/fmt'
 
 const { t } = useI18n()
-const { state, toggle, stop, seek, setVolume, setRate, next, prev } = useMedia()
+const { state, toggle, stop, seek, setVolume, setRate, next, prev, cycleAudioTrack, audioTrackLabel } =
+  useMedia()
 
 /** 多集剧集才出集数指示 + 上/下一集按钮(单集/电影为 null,不出现)。 */
 const playlist = computed(() => state.current?.playlist ?? null)
+/** ≥2 条音轨才出切换钮(双语片);label = 当前轨的友好名(国语/英语/元数据标题)。 */
+const audioTrackCount = computed(() => state.current?.audio_tracks?.length ?? 0)
+const audioLabel = computed(() => audioTrackLabel(state.current?.audio_track ?? 0))
 
 /** 「怎么放的」徽章:直连/自适应/免转码=省(ok 绿),转码中=吃 CPU(attn 琥珀),混流=中性(accent)。
  *  route 缺省(浏览器预览假数据 / 老数据)→ 不显。key 由 core PlaybackRoute snake → camel 对齐字典。 */
@@ -42,11 +49,17 @@ function onVolume(e: Event) {
 }
 
 const video = ref<HTMLVideoElement | null>(null)
+/** 每个播放会话一个**全新** <video> 元素(key = 本次会话的流地址,每次注册都换 token):
+ *  WKWebView 在「元素出声中原地拆 MSE、复用同一元素开新 MediaSource」后,新会话音频 SB 的
+ *  append 会被引擎粘住的旧轨道状态静默丢弃(buffered 恒空 → 切轨无声,2026-07-22 真机定案);
+ *  换新元素 = 零残留。watch(video) 会对新元素自动 registerVideoEl 重接线。 */
+const videoKey = computed(() => state.current?.stream_url ?? 'idle')
 const show = computed(() => state.current?.kind === 'video')
 
-// 浮层出现 = 模态接管:把焦点从底下的元素(典型 = 聊天输入框)拿走,否则 onKey 的
+// 起播即接管焦点:把焦点从底下的元素(典型 = 聊天输入框)拿走,否则 onKey 的
 // 「输入框让位」会把快捷键全吞掉——打字"放个片"回车起播,焦点仍在 textarea,
-// 空格/方向键全打进被浮层盖住的输入框(全屏与否同病;进全屏那次点击恰好移走焦点才显得"全屏才灵")。
+// 空格/方向键全打进输入框(全屏与否同病;进全屏那次点击恰好移走焦点才显得"全屏才灵")。
+// 窗口态非模态:用户点回输入框打字 = 快捷键让位;点一下小窗(grabFocus)= 拿回快捷键。
 watch(
   show,
   (s) => {
@@ -54,6 +67,93 @@ watch(
   },
   { immediate: true },
 )
+
+/* —— 窗口态小视窗:位置/宽度(会话内记住,组件常驻挂载 ref 即活)——
+ * pos = null 表示还停靠在默认右下角(CSS right/bottom 锚定);拖过一次即换显式 left/top。 */
+const panelEl = ref<HTMLElement | null>(null)
+const pos = ref<{ x: number; y: number } | null>(null)
+const boxW = ref(380) // 默认宽度对齐 webrender 任务窗(380×260 量级)
+const MIN_W = 280
+const EDGE = 8 // 拖动/缩放时距视口边的最小留白
+
+const panelStyle = computed(() => {
+  if (state.fullscreen) return {} // 影院态交给 .maximized(inset:0);内联清空免得盖过类
+  const s: Record<string, string> = { width: boxW.value + 'px' }
+  if (pos.value) {
+    s.left = pos.value.x + 'px'
+    s.top = pos.value.y + 'px'
+  } else {
+    s.right = '16px'
+    s.bottom = '92px' // 默认停靠右下,抬高避开底部输入区
+  }
+  return s
+})
+/** 窄框放不下整排控件:压缩模式只留 播放/进度/当前时刻/全屏,拖宽自然全回来。 */
+const compact = computed(() => !state.fullscreen && boxW.value < 560)
+
+function clampPos(x: number, y: number, w: number, h: number) {
+  return {
+    x: Math.min(Math.max(x, EDGE), Math.max(EDGE, window.innerWidth - w - EDGE)),
+    y: Math.min(Math.max(y, EDGE), Math.max(EDGE, window.innerHeight - h - EDGE)),
+  }
+}
+
+/** 标题栏拖动(按钮除外);先把「停靠右下」折算成显式坐标再跟手,视觉零跳变。
+ *  用 window 级 move/up(不靠 pointer capture),拖出面板也不丢跟踪。 */
+function onDragStart(e: PointerEvent) {
+  if (state.fullscreen) return
+  if ((e.target as HTMLElement).closest('button')) return
+  const el = panelEl.value
+  if (!el) return
+  const rect = el.getBoundingClientRect()
+  const dx = e.clientX - rect.left
+  const dy = e.clientY - rect.top
+  pos.value = { x: rect.left, y: rect.top }
+  const move = (ev: PointerEvent) => {
+    pos.value = clampPos(ev.clientX - dx, ev.clientY - dy, rect.width, rect.height)
+  }
+  const up = () => {
+    window.removeEventListener('pointermove', move)
+    window.removeEventListener('pointerup', up)
+  }
+  window.addEventListener('pointermove', move)
+  window.addEventListener('pointerup', up)
+  e.preventDefault() // 拖动不选中标题文字
+}
+
+/** 右下角把手:拖宽,高度随视频比例自己长(左上角钉住的标准角缩放语义)。
+ *  每步 rAF 后按新尺寸 clamp 位置:右缘/下缘顶到视口就整框左移/上移,把手始终跟手
+ *  ——停靠在右下角的默认态因此也能直接拖大,不会「没有生长空间」。 */
+function onGripDown(e: PointerEvent) {
+  if (state.fullscreen) return
+  const el = panelEl.value
+  if (!el) return
+  const rect = el.getBoundingClientRect()
+  pos.value = { x: rect.left, y: rect.top } // 停靠态先钉住左上角(右缘锚定会反向生长)
+  const startX = e.clientX
+  const startW = rect.width
+  const move = (ev: PointerEvent) => {
+    const cap = Math.max(MIN_W, window.innerWidth * 0.9)
+    boxW.value = Math.round(Math.min(Math.max(startW + (ev.clientX - startX), MIN_W), cap))
+    requestAnimationFrame(() => {
+      const r = el.getBoundingClientRect()
+      if (pos.value) pos.value = clampPos(pos.value.x, pos.value.y, r.width, r.height)
+    })
+  }
+  const up = () => {
+    window.removeEventListener('pointermove', move)
+    window.removeEventListener('pointerup', up)
+  }
+  window.addEventListener('pointermove', move)
+  window.addEventListener('pointerup', up)
+  e.preventDefault()
+  e.stopPropagation()
+}
+
+/** 点一下小窗 = 拿回快捷键:非模态下点视频不会自动改焦点,空格仍会打进聊天输入框。 */
+function grabFocus() {
+  ;(document.activeElement as HTMLElement | null)?.blur()
+}
 
 // 进度条:拖动中只动视觉(scrub),无视 timeupdate 抢拇指;松手(change)才真 seek 一次。
 // —— 否则 @input 每 tick 都 seek:本地是 currentTime 风暴,混流是每 tick 重启 ffmpeg。
@@ -143,12 +243,11 @@ function onKey(e: KeyboardEvent) {
   showControls() // 调整后让控制条/OSD 浮现一下(全屏态)
 }
 
-// 全屏 = 影院视图:控制条覆盖在画面上,播放中 2.8s 无操作自动隐藏(鼠标一动即现);
-// 窗口模式常显。这样全屏不再"一直挂着标题栏 X、画面被上下条夹小"。
+// 控制条覆盖在画面上,播放中 2.8s 无操作自动隐藏(鼠标一动即现)。两种模式同一套:
+// 全屏影院藏上下两条 + 光标;窗口小窗只藏底部控制条(标题栏 = 拖动把手,常显)。
 const controlsVisible = ref(true)
 let hideTimer = 0
 function showControls() {
-  if (!state.fullscreen) return
   controlsVisible.value = true
   clearTimeout(hideTimer)
   if (state.status === 'playing') {
@@ -158,9 +257,10 @@ function showControls() {
 watch(
   () => state.fullscreen,
   (fs) => {
-    clearTimeout(hideTimer)
-    controlsVisible.value = true
-    if (fs) showControls()
+    showControls() // 切换模式先亮一下(播放中会自动再藏)
+    // 置顶跟随影院态:全屏 = 看片别被盖;窗口小窗 = 别拿整个主窗压着别的程序。
+    // 起播(useMedia)/stop 两端各自已设,这里兜「中途进出全屏」;重复设置幂等无害。
+    if (show.value) void win.setAlwaysOnTop(fs)
   },
 )
 watch(
@@ -184,6 +284,16 @@ onMounted(() => {
   stopResize = win.onResized(async () => {
     if (!show.value) return
     state.fullscreen = await win.isFullscreen()
+    // 主窗变小可能把小窗甩出视口:按新视口收窄宽度 + 拉回位置(停靠态右下锚定,天然不越界)
+    if (!state.fullscreen && pos.value) {
+      boxW.value = Math.min(boxW.value, Math.max(MIN_W, window.innerWidth - EDGE * 2))
+      requestAnimationFrame(() => {
+        const el = panelEl.value
+        if (!el || !pos.value) return
+        const r = el.getBoundingClientRect()
+        pos.value = clampPos(pos.value.x, pos.value.y, r.width, r.height)
+      })
+    }
   })
 })
 onUnmounted(() => {
@@ -195,91 +305,100 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div v-if="show" class="veil">
-    <div
-      class="panel"
-      :class="{ maximized: state.fullscreen, 'controls-hidden': state.fullscreen && !controlsVisible }"
-      @mousemove="showControls"
-    >
-      <header class="bar top">
-        <span class="title">{{ state.current!.title }}</span>
-        <span
-          v-if="routeInfo"
-          class="route"
-          :class="'tone-' + routeInfo.tone"
-          :title="routeInfo.hint"
-          >{{ routeInfo.label }}</span
-        >
-        <span v-if="playlist" class="ep">{{
-          t('media.episodeOf', { cur: playlist.index + 1, total: playlist.total })
-        }}</span>
-        <button class="vbtn" @click="stop" :title="t('media.closeVideo')">✕</button>
-      </header>
-      <video ref="video" class="screen" playsinline @dblclick="toggleFullscreen"></video>
-      <div v-if="state.status === 'loading'" class="spinner" aria-hidden="true"></div>
-      <footer class="bar bottom">
-        <button
-          v-if="playlist"
-          class="vbtn"
-          @click="prev"
-          :disabled="playlist.index <= 0"
-          :title="t('media.prevEp')"
-        >
-          ⏮
-        </button>
-        <button class="vbtn" @click="toggle">
-          {{ state.status === 'playing' ? '⏸' : '▶' }}
-        </button>
-        <button
-          v-if="playlist"
-          class="vbtn"
-          @click="next"
-          :disabled="playlist.index >= playlist.total - 1"
-          :title="t('media.nextEp')"
-        >
-          ⏭
-        </button>
-        <span class="clock">{{ fmtClock(displayPos) }} / {{ fmtClock(state.duration) }}</span>
-        <input
-          class="slider"
-          type="range"
-          min="0"
-          max="100"
-          step="0.1"
-          :value="pct"
-          @input="onScrubInput"
-          @change="onScrubCommit"
-          :style="{ '--pct': pct + '%' }"
-        />
-        <button class="vbtn rate" @click="cycleRate" :title="t('media.speed')">
-          {{ state.rate }}x
-        </button>
-        <input
-          class="vol-slider"
-          type="range"
-          min="0"
-          max="100"
-          :value="Math.round(state.volume * 100)"
-          @input="onVolume"
-          :title="t('media.volume')"
-          :style="{ '--pct': state.volume * 100 + '%' }"
-        />
-        <button class="vbtn" @click="toggleFullscreen" :title="t('media.fullscreen')">⛶</button>
-      </footer>
-    </div>
+  <div
+    v-if="show"
+    ref="panelEl"
+    class="panel"
+    :class="{ maximized: state.fullscreen, 'controls-hidden': !controlsVisible }"
+    :style="panelStyle"
+    @mousemove="showControls"
+    @pointerdown="grabFocus"
+  >
+    <header class="bar top" @pointerdown="onDragStart">
+      <span class="title">{{ state.current!.title }}</span>
+      <span
+        v-if="routeInfo"
+        class="route"
+        :class="'tone-' + routeInfo.tone"
+        :title="routeInfo.hint"
+        >{{ routeInfo.label }}</span
+      >
+      <span v-if="playlist" class="ep">{{
+        t('media.episodeOf', { cur: playlist.index + 1, total: playlist.total })
+      }}</span>
+      <button class="vbtn" @click="stop" :title="t('media.closeVideo')">✕</button>
+    </header>
+    <video :key="videoKey" ref="video" class="screen" playsinline @dblclick="toggleFullscreen"></video>
+    <div v-if="state.status === 'loading'" class="spinner" aria-hidden="true"></div>
+    <footer class="bar bottom">
+      <button
+        v-if="playlist"
+        class="vbtn"
+        @click="prev"
+        :disabled="playlist.index <= 0"
+        :title="t('media.prevEp')"
+      >
+        ⏮
+      </button>
+      <button class="vbtn" @click="toggle">
+        {{ state.status === 'playing' ? '⏸' : '▶' }}
+      </button>
+      <button
+        v-if="playlist"
+        class="vbtn"
+        @click="next"
+        :disabled="playlist.index >= playlist.total - 1"
+        :title="t('media.nextEp')"
+      >
+        ⏭
+      </button>
+      <span class="clock"
+        >{{ fmtClock(displayPos) }}<template v-if="!compact"> / {{ fmtClock(state.duration) }}</template></span
+      >
+      <input
+        class="slider"
+        type="range"
+        min="0"
+        max="100"
+        step="0.1"
+        :value="pct"
+        @input="onScrubInput"
+        @change="onScrubCommit"
+        :style="{ '--pct': pct + '%' }"
+      />
+      <button
+        v-if="audioTrackCount >= 2 && !compact"
+        class="vbtn rate"
+        @click="cycleAudioTrack"
+        :title="t('media.audioTrack', { label: audioLabel })"
+      >
+        {{ audioLabel }}
+      </button>
+      <button v-if="!compact" class="vbtn rate" @click="cycleRate" :title="t('media.speed')">
+        {{ state.rate }}x
+      </button>
+      <input
+        v-if="!compact"
+        class="vol-slider"
+        type="range"
+        min="0"
+        max="100"
+        :value="Math.round(state.volume * 100)"
+        @input="onVolume"
+        :title="t('media.volume')"
+        :style="{ '--pct': state.volume * 100 + '%' }"
+      />
+      <button class="vbtn" @click="toggleFullscreen" :title="t('media.fullscreen')">⛶</button>
+    </footer>
+    <div v-if="!state.fullscreen" class="grip" @pointerdown="onGripDown" aria-hidden="true"></div>
   </div>
 </template>
 
 <style scoped>
-.veil {
-  position: fixed; inset: 0; z-index: 30;
-  display: flex; align-items: center; justify-content: center;
-  background: rgba(var(--veil-rgb, 0 0 0), 0.6); /* 模态暗罩:同 App.vue 数据弹窗约定,各皮一致地压暗背景 */
-  backdrop-filter: blur(5px); -webkit-backdrop-filter: blur(5px);
-}
+/* 窗口态 = 非模态应用内小视窗(webrender 可见任务窗同款形态):右下停靠、可拖、拖角缩放。
+   位置/宽度走内联样式(panelStyle);全屏时内联清空,交给 .maximized 铺满。 */
 .panel {
-  position: relative;
-  width: min(80vw, 980px);
+  position: fixed; z-index: 30;
   display: flex; flex-direction: column;
   border-radius: 14px; overflow: hidden;
   background: var(--surface); /* 窗口模式机框随皮肤(科幻=玻璃,护眼/暖萌=近不透明);全屏下被 #000 覆盖 */
@@ -289,7 +408,7 @@ onUnmounted(() => {
 /* 全屏 = 原生窗口全屏 + 这个类铺满(不再用 :fullscreen 伪类)。影院视图:画面铺满整屏(黑底、
    无边框无投影),控制条覆盖在画面上(不再夹小画面、不再露主窗一圈透明边框)。 */
 .panel.maximized {
-  width: 100%; height: 100%;
+  inset: 0; width: 100%; height: 100%;
   border: none; border-radius: 0; box-shadow: none; background: #000;
 }
 .panel.maximized .screen {
@@ -297,17 +416,32 @@ onUnmounted(() => {
   width: 100%; height: 100%; min-height: 0; max-height: none;
   object-fit: contain; /* 不裁不拉伸,留黑边 */
 }
-.panel.maximized .bar {
-  position: absolute; left: 0; right: 0; z-index: 2;
+/* 底部控制条:两种模式都覆盖在画面上(黑底渐变),播放中 2.8s 无操作自动隐藏(鼠标一动即现)。
+   覆盖媒体豁免:恒亮浅字不随皮肤(浅皮深字压在视频上读不清),同 #000 视频底。 */
+.bar.bottom {
+  position: absolute; left: 0; right: 0; bottom: 0; z-index: 2;
+  padding-bottom: 12px;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.65), rgba(0, 0, 0, 0));
+  color: #eaf2fb;
   transition: opacity 0.25s ease;
 }
-.panel.maximized .bar.top { top: 0; background: linear-gradient(to bottom, rgba(0, 0, 0, 0.65), rgba(0, 0, 0, 0)); }
-.panel.maximized .bar.bottom { bottom: 0; padding-bottom: 14px; background: linear-gradient(to top, rgba(0, 0, 0, 0.65), rgba(0, 0, 0, 0)); }
-/* 影院视图播放中自动隐藏控制条(鼠标一动即现) */
-.panel.controls-hidden { cursor: none; }
-.panel.controls-hidden .bar { opacity: 0; pointer-events: none; }
+.bar.bottom .clock { color: rgba(234, 242, 251, 0.72); }
+.panel.controls-hidden .bar.bottom { opacity: 0; pointer-events: none; }
+/* 窗口态标题栏 = 拖动把手(细条、常显、随皮肤);全屏影院才转覆盖式,跟控制条一起隐、并藏光标 */
+.bar.top { cursor: grab; user-select: none; -webkit-user-select: none; touch-action: none; }
+.panel:not(.maximized) .bar.top { padding: 6px 10px; }
+.panel:not(.maximized) .bar.top .vbtn { width: 24px; height: 24px; border-radius: 7px; font-size: 12px; }
+.panel.maximized .bar.top {
+  cursor: default;
+  position: absolute; top: 0; left: 0; right: 0; z-index: 2;
+  background: linear-gradient(to bottom, rgba(0, 0, 0, 0.65), rgba(0, 0, 0, 0));
+  color: #eaf2fb;
+  transition: opacity 0.25s ease;
+}
+.panel.maximized.controls-hidden { cursor: none; }
+.panel.maximized.controls-hidden .bar.top { opacity: 0; pointer-events: none; }
 
-.screen { width: 100%; max-height: 62vh; background: #000; display: block; }
+.screen { width: 100%; max-height: 78vh; background: #000; display: block; }
 
 /* 加载/混流换台 spinner:黑屏期间显示"在转",别看着像卡死(混流 ?t= seek 必有黑屏间隙)。 */
 .spinner {
@@ -324,10 +458,6 @@ onUnmounted(() => {
   padding: 9px 13px;
   color: var(--text); font-size: 13px;
 }
-/* 全屏 = 控制条覆盖在视频画面上(黑底渐变) → 文字/时钟恒亮:这是「覆盖媒体」豁免(同 #000 视频底),
-   不随皮肤,否则浅皮的深色字压在视频上读不清。 */
-.panel.maximized .bar { color: #eaf2fb; }
-.panel.maximized .clock { color: rgba(234, 242, 251, 0.72); }
 .title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; letter-spacing: .4px; }
 .ep {
   flex: none; color: var(--accent); font-size: 11.5px; letter-spacing: .4px;
@@ -373,5 +503,17 @@ onUnmounted(() => {
   -webkit-appearance: none; appearance: none;
   width: 9px; height: 9px; border-radius: 50%;
   background: var(--accent); box-shadow: 0 0 6px rgba(var(--accent-rgb), 0.8);
+}
+
+/* 右下角缩放把手(浮在控制条上层;控制条自动隐藏后仍可用) */
+.grip {
+  position: absolute; right: 0; bottom: 0; z-index: 3;
+  width: 16px; height: 16px; cursor: nwse-resize;
+}
+.grip::before {
+  content: ''; position: absolute; right: 4px; bottom: 4px;
+  width: 7px; height: 7px;
+  border-right: 2px solid rgba(var(--accent-rgb), 0.55);
+  border-bottom: 2px solid rgba(var(--accent-rgb), 0.55);
 }
 </style>

@@ -32,6 +32,11 @@ const state = reactive({
   volume: 1,
   /** 倍速:每次新播放复位 1(mpv 时代的教训——倍速粘住,放完电影再放歌还是 2 倍)。 */
   rate: 1,
+  /** 循环模式(core 是真相源,这里是镜像:Play 事件全量捎带 + Control 事件增量对齐)。
+   *  one=单曲(落 el.loop 原生无缝循环);all=列表(core auto_next 回卷;没队列时也落 el.loop)。 */
+  loopMode: 'off' as 'off' | 'one' | 'all',
+  /** 随机播放镜像(多集队列才可能 true;挑歌在 core)。 */
+  shuffle: false,
   /** 视频全屏中(HUD 缩成迷你胶囊的信号)。 */
   fullscreen: false,
   /** 建议气泡:扫码登录(首次播放后 core 提示一次;登录成功自动撤)。 */
@@ -85,6 +90,49 @@ function fadeToLive(ms: number) {
     if (k >= 1) cancelFade()
   }, STEP_MS)
 }
+/** 一次性起播定位:元数据就绪后把播放头挪到 at 秒(切音轨重建管线后 core 经
+ *  NowPlaying.resume_at 要求「接着刚才的位置放」)。at 无效 = no-op。 */
+function applyResume(el: HTMLMediaElement, at?: number) {
+  if (!at || at <= 0) return
+  el.addEventListener(
+    'loadedmetadata',
+    () => {
+      try {
+        el.currentTime = at
+      } catch {
+        /* 元数据异常时放弃回跳,从头播也比不播强 */
+      }
+    },
+    { once: true },
+  )
+}
+
+/** 多音轨收敛:用 audioTracks API 只启用选中那条(WKWebView/Safari 支持;Chromium 没有 = no-op)。
+ *  **只作用于直传路**(元素直接播放含多条真实音轨的原始容器,BD remux 全轨 enabled 会混播)。
+ *  ⚠️ MSE 路(自适应/HLS/DASH//m/)绝不能进来:选轨已由服务端 `-map` 完成,呈现里只有**一条**
+ *  音轨——在它上面按「文件轨号」收敛,轨号 ≠0 时会把唯一音轨 disable 掉,WebKit 随即丢弃该轨
+ *  全部样本(append 成功、buffered 恒空)= 切音轨无声/卡死的终极真凶(2026-07-22,四轮排查)。 */
+function applyAudioTrackToEl(el: HTMLMediaElement) {
+  const cur = state.current
+  if (!cur || cur.manifest_url || cur.stream_url.includes('/m/')) return // 非直传:交给 -map
+  const list = (el as { audioTracks?: { length: number; [i: number]: { enabled: boolean } } })
+    .audioTracks
+  const total = cur.audio_tracks?.length ?? 0
+  if (total < 2 || !list || typeof list.length !== 'number') return
+  const want = cur.audio_track ?? 0
+  for (let i = 0; i < list.length; i++) list[i].enabled = i === want
+}
+
+/** 循环落到播放元素:单曲循环用原生 el.loop(无缝、ended 压根不触发);
+ *  「列表循环 + 没队列」只有一首,同样落 el.loop(等价单曲)。列表循环有队列时不设
+ *  loop —— ended 正常触发,由 core auto_next 回卷。 */
+function syncLoopToEl() {
+  const native =
+    state.loopMode === 'one' || (state.loopMode === 'all' && !state.current?.playlist)
+  if (audio) audio.loop = native
+  if (videoEl) videoEl.loop = native
+}
+
 /** 视频起播前主窗是否藏在托盘:停时据此藏回去(别看完视频凭空冒出主界面)。 */
 let videoWasHidden = false
 let wired = false
@@ -137,12 +185,24 @@ async function loadVideoInto(el: HTMLVideoElement) {
   if (!cur || cur.kind !== 'video') return
   el.playbackRate = 1
   el.volume = liveVolume()
+  // 起播定位(切音轨重建管线的「接着放」):消费一次即清,防浮层重挂载重复回跳
+  const resume = cur.resume_at && cur.resume_at > 0 ? cur.resume_at : 0
+  if (cur.resume_at != null) cur.resume_at = undefined
   if (!cur.manifest_url) {
-    el.src = cur.stream_url
+    if (resume && cur.stream_url.includes('/m/')) {
+      // /m/ 渐进混流无原生 seek:定位烤进 ?t=(与 seek() 同机制)
+      videoBase = resume
+      el.src = `${cur.stream_url.split('?')[0]}?t=${resume.toFixed(1)}`
+    } else {
+      el.src = cur.stream_url
+      applyResume(el, resume)
+    }
     void el.play().catch(() => (state.status = 'paused'))
     return
   }
   // 本地自适应(/la/):手写 MSE(音视频分离,连续音频治漂移 + 视频 copy 省 CPU)。绕开 shaka。
+  // 续播位直接传进 playAdaptive(段指针直指目标,不从 0 爬灌)——绝不走 applyResume 的
+  // 「先播 0 再跳」:那会撞「WKWebView 不接入播放开始后才补进的音频」→ 切轨无声(2026-07-22)。
   if (isAdaptiveUrl(cur.manifest_url)) {
     destroyAdaptive()
     await destroyShaka()
@@ -157,7 +217,7 @@ async function loadVideoInto(el: HTMLVideoElement) {
       if (isTauri()) void api.mediaReplayCompat(cur.page_url, cur.kind === 'audio').catch(() => {})
     }
     try {
-      const ctl = await playAdaptive(el, cur.manifest_url, fallbackCompat)
+      const ctl = await playAdaptive(el, cur.manifest_url, fallbackCompat, resume)
       if (state.current !== cur) ctl.stop() // 加载期间已切走
       else {
         adaptiveCtl = ctl
@@ -168,6 +228,7 @@ async function loadVideoInto(el: HTMLVideoElement) {
     }
     return
   }
+  applyResume(el, resume) // shaka(muxed HLS/DASH):元数据就绪后原生 seek 回续播位
   try {
     const shaka = await loadShaka()
     await destroyShaka()
@@ -218,8 +279,11 @@ function ensureAudio(): HTMLAudioElement {
     audio.addEventListener('error', () => {
       if (state.current?.kind === 'audio') state.status = 'paused'
     })
+    // 多音轨收敛(≥2 轨才动作;单轨/无 API 是 no-op)
+    audio.addEventListener('loadedmetadata', () => applyAudioTrackToEl(audio!))
   }
   audio.volume = liveVolume()
+  syncLoopToEl()
   return audio
 }
 
@@ -259,8 +323,11 @@ export function registerVideoEl(el: HTMLVideoElement | null) {
   el.addEventListener('error', () => {
     if (state.current?.kind === 'video') state.status = 'paused'
   })
+  // 多音轨收敛:直传的多音轨片只留选中那条(治 WKWebView 全轨混播;≥2 轨才动作)
+  el.addEventListener('loadedmetadata', () => applyAudioTrackToEl(el))
   el.volume = liveVolume()
   el.playbackRate = state.rate
+  syncLoopToEl()
   if (state.current?.kind === 'video') {
     void loadVideoInto(el) // 后挂场景:接力起播(自适应走 shaka,否则原生 src)
   }
@@ -288,17 +355,24 @@ function play(np: NowPlaying) {
   state.position = 0
   state.duration = np.duration_seconds ?? 0
   state.rate = 1 // 倍速不跨播放粘住;音量粘住
+  // 循环/随机镜像:core 每次 Play 全量捎带(新播放的复位、切集/自动续播的延续,这里零猜测)。
+  state.loopMode = np.loop_mode ?? 'off'
+  state.shuffle = np.shuffle ?? false
+  syncLoopToEl()
   videoBase = 0
   if (!continuation) videoWasHidden = false // 新播放复位;续播保留首集起的"是否藏着"
   syncToPeers() // 广播"在放这个"给悬浮窗镜像
   if (np.kind === 'audio') {
     const a = ensureAudio()
     a.playbackRate = 1
+    const resume = np.resume_at && np.resume_at > 0 ? np.resume_at : 0
+    if (np.resume_at != null && state.current) state.current.resume_at = undefined
     a.src = np.stream_url
+    applyResume(a, resume)
     void a.play().catch(() => (state.status = 'paused'))
   } else if (np.kind === 'video') {
-    if (videoEl) void loadVideoInto(videoEl) // 自适应走 shaka,否则原生 src
-    // videoEl 还没挂:VideoOverlay 随 current 出现,registerVideoEl 接力起播(同样走 loadVideoInto)。
+    // 不在旧元素上直接起播:VideoOverlay 的 <video> 按会话 key 重建(WKWebView 复用出过声的
+    // 元素会拖死新会话的音频 SB),新元素挂上后由 registerVideoEl → loadVideoInto 接力起播。
     if (!continuation) {
       // 首次起播视频:叫主窗到最前(藏在托盘/别的窗后面时只闻其声)+ 置顶(别被盖住)+ 全屏(用户要求)。
       // 置位放在 videoEl 守卫外,后挂场景也直接铺满、不窗口化闪一下;.maximized 绑 state.fullscreen,
@@ -427,23 +501,27 @@ function stop() {
   state.position = 0
   state.duration = 0
   state.fullscreen = false
+  state.loopMode = 'off' // 停了就归位(core 侧下次 play() 也会复位);随机随队列生灭
+  state.shuffle = false
+  syncLoopToEl()
   syncToPeers() // 广播"停了"给悬浮窗(修:UI 点停止 / 自然播完时它仍显在放)
 }
 
-/** 一集放完:有下一集 → 自动续播(core 现取现播,publishes Play 接力,保持全屏);否则正常停。
- *  只在主窗触发(悬浮窗不实际播放、不会冒 ended)。 */
+/** 一集放完:「接下来放什么」归 core(auto_next:顺序下一集 / 列表循环回卷 / 随机挑;
+ *  true=已接管,core 现取现播 publishes Play 接力、保持全屏;false=没有下一首 → 正常停)。
+ *  单曲循环由 el.loop 原生循环,ended 压根不触发。只在主窗触发(悬浮窗不实际播放、不会冒 ended)。 */
 function onEnded() {
-  const pl = state.current?.playlist
-  if (pl && pl.index < pl.total - 1) {
-    if (isTauri()) {
-      state.status = 'loading' // 续播解析的空档显 spinner(别看着像卡死)
-      void api.mediaAdvance(1).catch(() => stop()) // 切集失败兜底停
-    } else {
-      stop() // 浏览器预览无 core
-    }
+  if (state.current?.playlist && isTauri()) {
+    state.status = 'loading' // 续播解析的空档显 spinner(别看着像卡死)
+    api
+      .mediaAutoNext()
+      .then((took) => {
+        if (!took) stop() // 放完了(末集且不循环 / 随机放完一轮):正常收尾
+      })
+      .catch(() => stop()) // 切集失败兜底停
     return
   }
-  stop() // 末集 / 单集:正常收尾
+  stop() // 单集(el.loop 没开才会走到 ended)/ 浏览器预览:正常收尾
 }
 
 /** 上/下一集(+1/-1):播放器按钮 + 嘴控都最终汇到 core 的 advance(全局队列);任意窗口可调
@@ -479,6 +557,22 @@ function seek(seconds: number) {
   reportToCore() // 跳转后位置基准变了,立刻校准 core 的「此刻」进度
 }
 
+/** 播放条循环按钮:关 → 列表循环 → 单曲循环 → 关。经壳层命令走 core(校验/落状态/广播),
+ *  与嘴控同一执行口;浏览器预览无 core,本地生效纯看视觉。 */
+function cycleLoop() {
+  const next =
+    state.loopMode === 'off' ? 'loop_all' : state.loopMode === 'all' ? 'loop_one' : 'loop_off'
+  if (isTauri()) void api.mediaMode(next).catch(() => {})
+  else applyControl(next)
+}
+
+/** 播放条随机按钮(多集队列才显示)。 */
+function toggleShuffle() {
+  const next = state.shuffle ? 'shuffle_off' : 'shuffle_on'
+  if (isTauri()) void api.mediaMode(next).catch(() => {})
+  else applyControl(next)
+}
+
 function dismissLoginHint() {
   state.loginHint = null
 }
@@ -500,6 +594,38 @@ function applyControl(action: string, value?: number) {
   else if (action === 'volume' && value != null) setVolume(value / 100) // 绝对音量(core 已校验 0–100)
   else if (action === 'speed' && value != null) setRate(value)
   else if (action === 'seek' && value != null) seek(value)
+  else if (action === 'loop_one' || action === 'loop_all' || action === 'loop_off') {
+    // 循环/随机:core 已先落状态(嘴控/按钮同一口),这里对齐镜像 + 播放元素
+    state.loopMode = action === 'loop_one' ? 'one' : action === 'loop_all' ? 'all' : 'off'
+    syncLoopToEl()
+  } else if (action === 'shuffle_on' || action === 'shuffle_off') {
+    state.shuffle = action === 'shuffle_on'
+  } else if (action === 'audio_track' && value != null) {
+    // mac 直传切音轨:core 已落状态并发来事件,这里就地启停(无缝);管线路不经这(core 重发 Play)
+    if (state.current) state.current.audio_track = Math.max(0, Math.round(value) - 1)
+    const el = activeEl()
+    if (el) applyAudioTrackToEl(el)
+  }
+}
+
+/** 音轨按钮:循环切到下一条(1 起的轨号交 core;mac 直传就地启停、其余重建管线原位续播)。 */
+function cycleAudioTrack() {
+  const total = state.current?.audio_tracks?.length ?? 0
+  if (total < 2) return
+  const next = (((state.current?.audio_track ?? 0) + 1) % total) + 1
+  if (isTauri()) void api.mediaMode('audio_track', next).catch(() => {})
+  else applyControl('audio_track', next) // 浏览器预览:本地镜像纯看视觉
+}
+
+/** 音轨显示名:元数据标题 > 语言码的词典名(没词条就显原码)> 「音轨 N」。 */
+function audioTrackLabel(i: number): string {
+  const tr = state.current?.audio_tracks?.[i]
+  if (tr?.title) return tr.title
+  if (tr?.lang) {
+    const key = `media.lang.${tr.lang}`
+    return i18n.global.te(key) ? i18n.global.t(key) : tr.lang
+  }
+  return i18n.global.t('media.trackN', { n: i + 1 })
 }
 
 function onMedia(ev: MediaEvent) {
@@ -557,6 +683,11 @@ function wire() {
       page_url: '#',
       source: 'local',
       playlist: { index: 2, total: 12, resumed: false },
+      audio_tracks: [
+        { codec: 'ac-3', lang: 'chi' },
+        { codec: 'ac-3', lang: 'eng' },
+      ],
+      audio_track: 0,
     }
     state.status = 'playing'
     state.duration = 320
@@ -573,6 +704,11 @@ function wire() {
       source: 'bilibili',
       // 多集音频(评书/儿歌合集):播放条出集数 + 上/下一集
       playlist: { index: 6, total: 30, resumed: false },
+      audio_tracks: [
+        { codec: 'mp4a', lang: 'chi', title: '普通话' },
+        { codec: 'mp4a', lang: 'yue' },
+      ],
+      audio_track: 0,
     }
     state.status = 'playing'
     state.duration = 225
@@ -595,6 +731,10 @@ export function useMedia() {
     setRate,
     next: () => advance(1),
     prev: () => advance(-1),
+    cycleLoop,
+    toggleShuffle,
+    cycleAudioTrack,
+    audioTrackLabel,
     loginNow,
     dismissLoginHint,
   }

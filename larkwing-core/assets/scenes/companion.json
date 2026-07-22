@@ -12,33 +12,33 @@
   "options": {},
   "tools": ["now", "weather", "media_search", "media_play", "media_control", "open", "system_volume", "power", "fs_list", "fs_find", "fs_read_text", "fs_move", "fs_copy", "fs_mkdir", "fs_trash", "fs_write_text", "fs_append", "fs_edit", "fs_undo", "reminder_set", "reminder_list", "reminder_cancel", "watch_set", "web_search", "web_fetch", "web_download", "web_render", "qr_decode", "pdf_to_png", "read_image", "send_file", "note_todo", "finish_todo"],
   "few_shots": [
-    { "role": "user", "content": "【示范】记一下,电影都放在 D:\\Movies" },
+    { "role": "user", "content": "【示范】记一下,电影都放在 D:\\示例片库" },
     {
       "role": "assistant",
       "content": "",
-      "tool_calls": [{ "id": "fs_b1", "name": "briefing_write", "args": { "domain": "media", "content": "电影在 D:\\Movies" } }]
+      "tool_calls": [{ "id": "fs_b1", "name": "briefing_write", "args": { "domain": "media", "content": "电影在 D:\\示例片库" } }]
     },
     { "role": "tool", "call_id": "fs_b1", "content": "ok,已记入家庭备忘(主题: media)" },
     { "role": "assistant", "content": "记下了,放电影我会先去那个目录找。" },
-    { "role": "user", "content": "【示范】音乐也加一下,在 D:\\Music" },
+    { "role": "user", "content": "【示范】音乐也加一下,在 D:\\示例曲库" },
     {
       "role": "assistant",
       "content": "",
-      "tool_calls": [{ "id": "fs_b2", "name": "briefing_write", "args": { "domain": "media", "content": "电影在 D:\\Movies;音乐在 D:\\Music" } }]
+      "tool_calls": [{ "id": "fs_b2", "name": "briefing_write", "args": { "domain": "media", "content": "电影在 D:\\示例片库;音乐在 D:\\示例曲库" } }]
     },
-    { "role": "tool", "call_id": "fs_b2", "content": "ok,已更新家庭备忘(主题: media)。(此前记的是:电影在 D:\\Movies)" },
+    { "role": "tool", "call_id": "fs_b2", "content": "ok,已更新家庭备忘(主题: media)。(此前记的是:电影在 D:\\示例片库)" },
     { "role": "assistant", "content": "都记下了。以后补充我会把旧的也带上,不会把之前的冲掉。" },
     { "role": "user", "content": "【示范】放首儿歌" },
     {
       "role": "assistant",
       "content": "",
-      "tool_calls": [{ "id": "fs_m1", "name": "fs_find", "args": { "root": "D:\\Music", "pattern": "儿歌" } }]
+      "tool_calls": [{ "id": "fs_m1", "name": "fs_find", "args": { "root": "D:\\示例曲库", "pattern": "儿歌" } }]
     },
-    { "role": "tool", "call_id": "fs_m1", "content": "D:\\Music\\儿歌串烧.mp3" },
+    { "role": "tool", "call_id": "fs_m1", "content": "D:\\示例曲库\\儿歌串烧.mp3" },
     {
       "role": "assistant",
       "content": "",
-      "tool_calls": [{ "id": "fs_m2", "name": "media_play", "args": { "url": "D:\\Music\\儿歌串烧.mp3", "audio_only": true } }]
+      "tool_calls": [{ "id": "fs_m2", "name": "media_play", "args": { "url": "D:\\示例曲库\\儿歌串烧.mp3", "audio_only": true } }]
     },
     { "role": "tool", "call_id": "fs_m2", "content": "已开始播放《儿歌串烧》" },
     { "role": "assistant", "content": "本地找到一份儿歌,放上了。想换跟我说。" },
@@ -46,9 +46,9 @@
     {
       "role": "assistant",
       "content": "",
-      "tool_calls": [{ "id": "fs_v1", "name": "fs_find", "args": { "root": "D:\\Movies", "pattern": "星海漫游" } }]
+      "tool_calls": [{ "id": "fs_v1", "name": "fs_find", "args": { "root": "D:\\示例片库", "pattern": "星海漫游" } }]
     },
-    { "role": "tool", "call_id": "fs_v1", "content": "在 D:\\Movies 里没找到匹配的文件" },
+    { "role": "tool", "call_id": "fs_v1", "content": "在 D:\\示例片库 里没找到匹配的文件" },
     {
       "role": "assistant",
       "content": "",
@@ -70,16 +70,16 @@
     {
       "role": "assistant",
       "content": "",
-      "tool_calls": [{ "id": "fs_o1", "name": "fs_list", "args": { "path": "D:\\Downloads" } }]
+      "tool_calls": [{ "id": "fs_o1", "name": "fs_list", "args": { "path": "D:\\示例下载" } }]
     },
     { "role": "tool", "call_id": "fs_o1", "content": "歌手A-歌曲一.mp3 (8MB)\n歌手A-歌曲二.mp3 (7MB)\n歌手B-歌曲三.mp3 (8MB)" },
     {
       "role": "assistant",
       "content": "",
       "tool_calls": [{ "id": "fs_o2", "name": "fs_move", "args": { "moves": [
-        { "src": "D:\\Downloads\\歌手A-歌曲一.mp3", "dst": "D:\\Downloads\\歌手A\\歌手A-歌曲一.mp3" },
-        { "src": "D:\\Downloads\\歌手A-歌曲二.mp3", "dst": "D:\\Downloads\\歌手A\\歌手A-歌曲二.mp3" },
-        { "src": "D:\\Downloads\\歌手B-歌曲三.mp3", "dst": "D:\\Downloads\\歌手B\\歌手B-歌曲三.mp3" }
+        { "src": "D:\\示例下载\\歌手A-歌曲一.mp3", "dst": "D:\\示例下载\\歌手A\\歌手A-歌曲一.mp3" },
+        { "src": "D:\\示例下载\\歌手A-歌曲二.mp3", "dst": "D:\\示例下载\\歌手A\\歌手A-歌曲二.mp3" },
+        { "src": "D:\\示例下载\\歌手B-歌曲三.mp3", "dst": "D:\\示例下载\\歌手B\\歌手B-歌曲三.mp3" }
       ] } }]
     },
     { "role": "tool", "call_id": "fs_o2", "content": "移动了 3 个" },

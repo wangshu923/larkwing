@@ -221,6 +221,27 @@ export default {
     prevEp: 'Previous',
     nextEp: 'Next',
     episodeOf: 'Ep {cur}/{total}',
+    // Audio player bar uses track wording; loop/shuffle button titles state the current mode
+    prevTrack: 'Previous track',
+    nextTrack: 'Next track',
+    trackOf: 'Track {cur}/{total}',
+    loopOff: 'Repeat: off',
+    loopAll: 'Repeating all',
+    loopOne: 'Repeating one',
+    shuffleOn: 'Shuffle: on',
+    shuffleOff: 'Shuffle: off',
+    // Audio track switching (dual-language rips): button shows the current track's friendly name
+    audioTrack: 'Audio track: {label} (click to switch)',
+    trackN: 'Track {n}',
+    lang: {
+      chi: 'Chinese',
+      zho: 'Chinese',
+      cmn: 'Mandarin',
+      eng: 'English',
+      yue: 'Cantonese',
+      jpn: 'Japanese',
+      kor: 'Korean',
+    },
     // "How it's playing" badge: short label on the bar, hint in the title tooltip. Keys mirror core PlaybackRoute.
     route: {
       direct: 'Direct',
@@ -392,9 +413,6 @@ export default {
     minutesAgo: '{n} min ago',
     hoursAgo: '{n} h ago',
     yesterday: 'yesterday',
-  },
-  boot: {
-    skip: 'Click anywhere to skip',
   },
   // Data relocation notices (shown on main-window boot: location missing → recover / old data → clean up)
   dataNotice: {

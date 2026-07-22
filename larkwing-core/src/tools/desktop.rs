@@ -25,7 +25,7 @@ impl Open {
             spec: ToolSpec {
                 name: "open",
                 description: "在这台电脑上打开一个东西:应用程序(「打开微信」「打开浏览器」)、\
-                              文件或文件夹(给绝对路径,如「打开 D:\\照片」)、或网址\
+                              文件或文件夹(给绝对路径,支持 ~ 开头)、或网址\
                               (「打开 B 站」= https://www.bilibili.com)。target 传应用名、\
                               绝对路径、或 http(s) 网址。这是「打开/启动」本身 —— 想搜并播放\
                               具体的歌或视频用 media_play、想看文件夹里有什么用 fs_list,别混。\
@@ -35,7 +35,7 @@ impl Open {
                     "properties": {
                         "target": {
                             "type": "string",
-                            "description": "要打开的东西:应用名(微信 / 计算器 / Chrome)、绝对路径(D:\\照片、/Users/x/a.pdf)、或 http(s) 网址"
+                            "description": "要打开的东西:应用名(微信 / 计算器 / Chrome)、绝对路径(支持 ~ 开头)、或 http(s) 网址"
                         }
                     },
                     "required": ["target"]
@@ -59,8 +59,9 @@ impl Tool for Open {
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
+            .map(super::expand_home) // 「~/xxx」路径形宽容展开(§4.4;应用名/网址原样)
             .ok_or_else(|| anyhow::anyhow!("缺少 target 参数(要打开什么)"))?;
-        open_target(target).await?;
+        open_target(&target).await?;
         // 结果是喂给模型的观察(不是 UI 文案),模型用当前人格的语言转述
         Ok(format!("已打开 {target}"))
     }

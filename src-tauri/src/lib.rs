@@ -414,6 +414,8 @@ pub fn run() {
       commands::retry_download,
       commands::retry_voice_model,
       commands::media_advance,
+      commands::media_auto_next,
+      commands::media_mode,
       commands::report_media_state,
       commands::media_log,
       commands::media_replay_compat,

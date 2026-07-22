@@ -68,7 +68,7 @@ impl BriefingWrite {
                         },
                         "content": {
                             "type": "string",
-                            "description": "该主题的完整当前状态,简短陈述,如「电影在 \\\\nas\\film 和 D:\\Movies;动画片在 \\\\nas\\kids」"
+                            "description": "该主题的完整当前状态,简短陈述,多处/多条并进同一句。**只写用户真实说过的信息**——路径/位置一字不差照用户的写,绝不自己补一个没提过的地点"
                         },
                         "scope": {
                             "type": "string",

@@ -40,7 +40,8 @@ const isFloat = windowLabel() === 'float'
 if (isMacOS && !isFloat) document.documentElement.classList.add('is-macos')
 
 // 启动编排(仅主窗):phase = 'boot' → 'ready';背景与主界面各自订阅它做入场。
-const { phase, run, skip } = useBoot(1800)
+// 跳过靠 useBoot 的 window 级监听(任意键/点击),不设提示文案 —— 1.8s 一次性动画不值得教学。
+const { phase, run } = useBoot(1800)
 if (!isFloat) run()
 const booting = computed(() => !isFloat && phase.value === 'boot')
 
@@ -165,9 +166,6 @@ if (!isFloat && isTauri()) {
       <!-- 主窗自绘三键(无边框补窗控,PLAN §12) -->
       <WindowControls />
     </div>
-    <transition name="boot-hint">
-      <div v-if="booting" class="skip-hint" @click="skip">{{ t('boot.skip') }}</div>
-    </transition>
     <!-- 数据「搬家」提示:位置失效(恢复)/ 搬完旧数据待清理(主动弹一次,§3.5) -->
     <transition name="boot-hint">
       <div v-if="dataNotice" class="data-modal-veil">
@@ -210,11 +208,7 @@ if (!isFloat && isTauri()) {
   to { opacity: 1; transform: scale(1) rotate(0deg); filter: blur(0); }
 }
 
-.skip-hint {
-  position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 50;
-  font: 12px/1 ui-monospace, "SF Mono", monospace; letter-spacing: 2px;
-  color: rgba(var(--accent-rgb), 0.5); pointer-events: none; user-select: none;
-}
+/* boot-hint 过渡:数据搬家弹窗在用(boot 后浮现),名字沿用 */
 .boot-hint-enter-active, .boot-hint-leave-active { transition: opacity .4s ease; }
 .boot-hint-enter-from, .boot-hint-leave-to { opacity: 0; }
 

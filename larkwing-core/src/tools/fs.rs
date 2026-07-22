@@ -56,7 +56,7 @@ impl FsList {
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "文件夹绝对路径,如 D:\\Movies 或 \\\\nas\\film 或 /Users/me/Movies"
+                            "description": "文件夹绝对路径(盘符 D:\\…、UNC \\\\nas\\…、Unix /…;支持 ~ 开头 = 用户主目录)"
                         }
                     },
                     "required": ["path"]
@@ -80,8 +80,8 @@ impl Tool for FsList {
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .context("缺少 path 参数")?
-            .to_string();
+            .map(super::expand_home) // 「~/xxx」宽容展开(§4.4)
+            .context("缺少 path 参数")?;
         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let dir = Path::new(&path);
             anyhow::ensure!(dir.is_dir(), "{path} 不是文件夹或不存在");
@@ -129,19 +129,19 @@ impl FsFind {
             spec: ToolSpec {
                 name: "fs_find",
                 description: "在一个目录树里按 glob 模式找文件(不分大小写,递归几层)。\
-                              pattern 支持 * 和 ?:如 *佩奇*.mp4、*.mp3;含 / 时按相对路径匹配\
-                              (如 kids/*.mp4);纯关键词(无通配符)自动当 *关键词* 用。\
+                              pattern 支持 * 和 ?:如 *动画*.mp4、*.mp3;含 / 时按相对路径匹配\
+                              (如 某子目录/*.mp4);纯关键词(无通配符)自动当 *关键词* 用。\
                               知道想找什么时比逐层 fs_list 快,返回绝对路径列表。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "root": {
                             "type": "string",
-                            "description": "从哪个文件夹开始找(绝对路径)"
+                            "description": "从哪个文件夹开始找(绝对路径;支持 ~ 开头 = 用户主目录)"
                         },
                         "pattern": {
                             "type": "string",
-                            "description": "glob 模式或关键词,如「*佩奇*.mp4」「晴天」"
+                            "description": "glob 模式或关键词(拿用户说的词组模式,别自己编)"
                         }
                     },
                     "required": ["root", "pattern"]
@@ -229,8 +229,8 @@ impl Tool for FsFind {
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .context("缺少 root 参数")?
-            .to_string();
+            .map(super::expand_home) // 「~/xxx」宽容展开(§4.4)
+            .context("缺少 root 参数")?;
         let raw = args
             .get("pattern")
             .and_then(serde_json::Value::as_str)
@@ -283,18 +283,23 @@ fn arg_str(v: &serde_json::Value, key: &str) -> anyhow::Result<String> {
         .with_context(|| format!("缺少 {key} 参数"))
 }
 
-/// 取 `key` 下的 `[{src, dst}, …]`。
+/// 取一个**路径**字段:非空 + `~` 前缀宽容展开(`tools::expand_home`,§4.4)。
+fn arg_path(v: &serde_json::Value, key: &str) -> anyhow::Result<String> {
+    Ok(super::expand_home(&arg_str(v, key)?))
+}
+
+/// 取 `key` 下的 `[{src, dst}, …]`(src/dst 都是路径,`~` 展开)。
 fn arg_pairs(args: &serde_json::Value, key: &str) -> anyhow::Result<Vec<(String, String)>> {
     let arr = args.get(key).and_then(|v| v.as_array()).with_context(|| format!("缺少 {key}(应为数组)"))?;
     let mut out = Vec::with_capacity(arr.len());
     for it in arr {
-        out.push((arg_str(it, "src")?, arg_str(it, "dst")?));
+        out.push((arg_path(it, "src")?, arg_path(it, "dst")?));
     }
     anyhow::ensure!(!out.is_empty(), "{key} 是空的");
     Ok(out)
 }
 
-/// 取 `key` 下的字符串数组(空项跳过)。
+/// 取 `key` 下的**路径**字符串数组(空项跳过,`~` 展开)。
 fn arg_paths(args: &serde_json::Value, key: &str) -> anyhow::Result<Vec<String>> {
     let arr = args.get(key).and_then(|v| v.as_array()).with_context(|| format!("缺少 {key}(应为数组)"))?;
     let out: Vec<String> = arr
@@ -302,7 +307,7 @@ fn arg_paths(args: &serde_json::Value, key: &str) -> anyhow::Result<Vec<String>>
         .filter_map(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
+        .map(super::expand_home)
         .collect();
     anyhow::ensure!(!out.is_empty(), "{key} 是空的");
     Ok(out)
@@ -385,7 +390,7 @@ impl Tool for FsReadText {
     }
 
     async fn run(&self, args: serde_json::Value, _ctx: &ToolCtx) -> anyhow::Result<String> {
-        let path = arg_str(&args, "path")?;
+        let path = arg_path(&args, "path")?;
         let offset = super::arg_u64(&args, "offset", 0) as usize;
         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let p = Path::new(&path);
@@ -724,7 +729,7 @@ impl Tool for FsWriteText {
     }
 
     async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
-        let path = arg_str(&args, "path")?;
+        let path = arg_path(&args, "path")?;
         let content = args
             .get("content")
             .and_then(serde_json::Value::as_str)
@@ -778,7 +783,7 @@ impl Tool for FsAppend {
     }
 
     async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
-        let path = arg_str(&args, "path")?;
+        let path = arg_path(&args, "path")?;
         let text = args
             .get("text")
             .and_then(serde_json::Value::as_str)
@@ -834,7 +839,7 @@ impl Tool for FsEdit {
     }
 
     async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
-        let path = arg_str(&args, "path")?;
+        let path = arg_path(&args, "path")?;
         let find = arg_str(&args, "find")?;
         let replace = args.get("replace").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
         let store = ctx.store.clone();
@@ -908,6 +913,19 @@ mod tests {
     use super::*;
     use crate::media::MediaRuntime;
     use crate::store::Store;
+
+    #[test]
+    fn arg_path_expands_home_prefix() {
+        let home = dirs::home_dir().unwrap();
+        let v = serde_json::json!({"path": "~/某文件夹"});
+        assert_eq!(arg_path(&v, "path").unwrap(), home.join("某文件夹").to_string_lossy());
+        let v = serde_json::json!({"path": "/abs/x"});
+        assert_eq!(arg_path(&v, "path").unwrap(), "/abs/x", "非 ~ 形原样");
+        let v = serde_json::json!({"paths": ["~/a", "D:\\b"]});
+        let got = arg_paths(&v, "paths").unwrap();
+        assert_eq!(got[0], home.join("a").to_string_lossy());
+        assert_eq!(got[1], "D:\\b");
+    }
 
     fn ctx_and_dir(tag: &str) -> (ToolCtx, PathBuf) {
         let dir = std::env::temp_dir().join(format!("lw-fs-test-{}-{tag}", std::process::id()));

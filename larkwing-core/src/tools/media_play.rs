@@ -15,19 +15,20 @@ impl MediaPlay {
         MediaPlay {
             spec: ToolSpec {
                 name: "media_play",
-                description: "播放音视频:网络页面链接(通常来自 media_search)或**本地文件\
-                              绝对路径**(配合任务需知里的目录 + fs_list/fs_find 找到的文件,\
+                description: "播放音视频:网络页面链接(通常来自 media_search)或**本地文件/\
+                              音频文件夹绝对路径**(配合任务需知里的目录 + fs_list/fs_find 找到,\
                               含 NAS 路径)。放歌/听故事/白噪音用 audio_only=true(只出声音);\
-                              看视频/动画片用 false。**多集会自动续播**:B 站合集/分P、本地同一季\
-                              文件夹放一集会自动接着放下一集,并记住上次放到哪集——用户没指定第几集时\
-                              默认从上次那集接着放;用户说「从头/重新看/从第一集」时传 restart=true。\
-                              开始播放后简短告诉用户放的是什么就好。",
+                              看视频/动画片用 false。**连播**:B 站合集/分P、本地剧集文件夹放一集\
+                              自动接着下一集;本地音频放一首自动接着同文件夹的下一首,给音频\
+                              **文件夹路径**则把整夹当列表从头连着放——都记住上次放到哪,用户没指定\
+                              第几集/首时默认接着上次;说「从头/重新看/从第一集」时传 restart=true。\
+                              循环/随机用 media_control。开始播放后简短告诉用户放的是什么就好。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "url": {
                             "type": "string",
-                            "description": "网络页面链接(https://…)或本地文件绝对路径(D:\\…、\\\\nas\\…、/Users/…)"
+                            "description": "网络页面链接(https://…)或本地文件/音频文件夹绝对路径(盘符 D:\\…、UNC \\\\nas\\…、Unix /…;支持 ~ 开头 = 用户主目录)"
                         },
                         "audio_only": {
                             "type": "boolean",
@@ -59,14 +60,18 @@ impl Tool for MediaPlay {
             .get("url")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
-            .filter(|s| {
-                s.starts_with("http://")
-                    || s.starts_with("https://")
-                    || crate::media::is_local_path(s)
-            })
+            .filter(|s| !s.is_empty())
+            .map(super::expand_home) // 「~/xxx」宽容展开(§4.4),再验合法性
             .ok_or_else(|| {
-                anyhow::anyhow!("缺少合法的 url 参数(http(s) 链接或本地文件绝对路径)")
+                anyhow::anyhow!("缺少合法的 url 参数(http(s) 链接或本地文件/文件夹绝对路径)")
             })?;
+        anyhow::ensure!(
+            url.starts_with("http://")
+                || url.starts_with("https://")
+                || crate::media::is_local_path(&url),
+            "url 不合法(要 http(s) 链接或本地文件/文件夹绝对路径),收到: {url}"
+        );
+        let url = url.as_str();
         // 宽容解析:模型常把 audio_only 发成字符串 "true"(裸 as_bool 认不出 → 回落 false →
         // 放歌弹全屏视频框)。走共享 arg_bool 兜底(§4.4 Quirks)。
         let audio_only = super::arg_bool(&args, "audio_only", false);
@@ -74,16 +79,18 @@ impl Tool for MediaPlay {
 
         match ctx.media.play(ctx.user_id, url, audio_only, restart).await? {
             crate::media::PlayOutcome::Playing(np) => {
-                // 多集:带上「第N/共M集」+ 续播时点明"接着上次"(让模型如实转述)。
+                // 多集:带上「第N/共M集(音频=首)」+ 续播时点明"接着上次"(让模型如实转述)。
+                let unit =
+                    if matches!(np.kind, crate::media::MediaKind::Audio) { "首" } else { "集" };
                 let mut out = match &np.playlist {
                     Some(p) if p.resumed => format!(
-                        "接着上次,从《{}》第{}集继续播放(共{}集)",
+                        "接着上次,从《{}》第{}{unit}继续播放(共{}{unit})",
                         np.title,
                         p.index + 1,
                         p.total
                     ),
                     Some(p) => format!(
-                        "已开始播放《{}》(第{}集/共{}集)",
+                        "已开始播放《{}》(第{}{unit}/共{}{unit})",
                         np.title,
                         p.index + 1,
                         p.total
@@ -98,7 +105,7 @@ impl Tool for MediaPlay {
                     out.push_str(&format!(",时长 {m}:{s:02}"));
                 }
                 if np.playlist.is_some() {
-                    out.push_str(";放完会自动接着下一集");
+                    out.push_str(&format!(";放完会自动接着下一{unit}"));
                 }
                 Ok(out)
             }

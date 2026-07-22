@@ -10,7 +10,12 @@
 //
 // 任何致命错误(setUp/append/解析)→ 调 `onError`,useMedia 据此回落(后端注册时也已做前提兜底)。
 
-import { isTauri } from '../lib/backend'
+import { api, isTauri } from '../lib/backend'
+
+/** 诊断日志 → larkwing.log(`media_log` 桥;正式版无 JS console,0.2.6 定位黑屏就靠它)。 */
+function dlog(msg: string) {
+  if (isTauri()) void api.mediaLog('[adaptive] ' + msg).catch(() => {})
+}
 
 /** 后端 `/la/{token}/desc` 的 JSON。 */
 interface AdaptiveDesc {
@@ -43,6 +48,7 @@ export async function playAdaptive(
   el: HTMLVideoElement,
   descUrl: string,
   onError: (why: string) => void,
+  startAt = 0,
 ): Promise<AdaptiveController> {
   const base = descUrl.replace(/\/desc$/, '')
   const desc: AdaptiveDesc = await fetch(descUrl).then((r) => {
@@ -130,16 +136,47 @@ export async function playAdaptive(
 
   // seek 代次:seek 时 +1,让 seek 前发出的在途请求(resolve 时)自弃,不把过期段 append 到错位。
   let gen = 0
-  let nextSeg = 0 // 下一个待喂的**视频**段号(顺序推进;seek 重设)
-  let nextAudioSeg = 0 // 下一个待喂的**音频**段号(固定 6s 网格)
+  // 起播位(切音轨原位续播):段指针直指目标,**绝不从 0 爬灌** —— 否则续播 seek 和初始爬灌
+  // 竞态(onSeeking 的重灌被 pumping 标志挡成 no-op),音频晚于起播才就位,而 WKWebView
+  // 不接入「播放开始后才补进的音频」→ 无声(2026-07-22 真机定案);顺带 t=0 画面不再闪现。
+  const start = Math.max(0, Math.min(startAt, Math.max(0, desc.duration - 1)))
+  const vsegAt = (t: number): number => {
+    const i = desc.segments.findIndex((sg) => sg.start <= t && sg.start + sg.dur > t)
+    return i < 0 ? 0 : i
+  }
+  let nextSeg = start > 0 ? vsegAt(start) : 0 // 下一个待喂的**视频**段号(顺序推进;seek 重设)
+  let nextAudioSeg = start > 0 ? Math.max(0, Math.floor(start / desc.audioSeg)) : 0 // 音频段号(固定 6s 网格)
   const audioSegCount = Math.max(1, Math.ceil(desc.duration / desc.audioSeg))
   let pumpingV = false
   let pumpingA = false
+  let aDiag = 3 // 每会话头几次音频 append 打落点诊断(排「样本被窗裁光」类哑巴故障)
+  // 音频先行(2026-07-22 真机定案):用户系统的 WKWebView 会**仅凭视频完成 seek/canplay**,
+  // 之后补进的音频样本被静默丢弃(append 成功、回读正确、buffered 恒空;上游 Playwright WebKit
+  // 无此行为,seek 会等双轨)。治法 = 播放头处音频未落桶前,视频段暂缓喂入 —— seek 只能在
+  // 双轨齐备后完成,迟到音频从结构上不存在。1.5s 超时放行防饿死(音频源故障时宁可无声别卡死)。
+  let audioFirstDeadline = performance.now() + 1500
+  const audioCovers = (t: number): boolean => {
+    try {
+      const b = asb!.buffered
+      for (let i = 0; i < b.length; i++) {
+        if (b.start(i) <= t + 0.3 && b.end(i) > t) return true
+      }
+    } catch {
+      /* 当没货 */
+    }
+    return false
+  }
 
   // 视频按需泵:保证 [now−BEHIND, now+AHEAD] 有段;落后的驱逐。串行、无并发 append。
   const pumpVideo = async () => {
     if (pumpingV || stopped || dead || !vsb || ms.readyState !== 'open') return
+    // 音频先行:播放头处音频还没落桶 → 视频缓一拍再来(80ms 轮询,超时放行)
+    if (asb && !audioCovers(el.currentTime) && performance.now() < audioFirstDeadline) {
+      setTimeout(() => void pumpVideo(), 80)
+      return
+    }
     pumpingV = true
+    const entryGenV = gen
     try {
       const now = el.currentTime
       const b = vsb.buffered
@@ -163,6 +200,9 @@ export async function playAdaptive(
       if (!stopped) fail('video pump: ' + e)
     } finally {
       pumpingV = false
+      // 本轮跑动中被 seek 换代:指针已被 onSeeking 重设,立刻按新指针再泵一轮
+      //(否则 onSeeking 的 pump() 被 pumping 标志挡掉后,要等下一个 timeupdate 才有人接手)。
+      if (!stopped && !dead && gen !== entryGenV) void pumpVideo()
     }
   }
 
@@ -172,6 +212,7 @@ export async function playAdaptive(
   const pumpAudio = async () => {
     if (pumpingA || stopped || dead || !asb || ms.readyState !== 'open') return
     pumpingA = true
+    const entryGenA = gen
     try {
       const now = el.currentTime
       const b = asb.buffered
@@ -197,11 +238,22 @@ export async function playAdaptive(
           asb!.timestampOffset = n > 0 ? grid - desc.audioPreroll : 0
           asb!.appendBuffer(new Uint8Array(buf))
         })
+        // 前几段的落点诊断:append 后缓冲没长 = 样本被 appendWindow 裁光(时间戳错位的指纹)
+        if (aDiag > 0) {
+          aDiag--
+          // 回读三件套:tsOff/win 若与设置值不符(比如回读为 0)= WebKit 静默无视了 setter,
+          // 样本按原始 0~6.5s 落点被窗整段裁光 —— 「append 成功缓冲为空」的最后嫌疑。
+          dlog(
+            `a${n} appended ${buf.byteLength}B → abuf=[${ranges(asb)}] ` +
+              `tsOff=${asb!.timestampOffset.toFixed(1)} win=[${asb!.appendWindowStart.toFixed(1)},${asb!.appendWindowEnd === Infinity ? 'inf' : asb!.appendWindowEnd.toFixed(1)}]`,
+          )
+        }
       }
     } catch (e) {
       if (!stopped) fail('audio pump: ' + e)
     } finally {
       pumpingA = false
+      if (!stopped && !dead && gen !== entryGenA) void pumpAudio()
     }
   }
 
@@ -216,6 +268,7 @@ export async function playAdaptive(
     const t = el.currentTime
     if (bufEnd(vsb, t) > t + 0.3 && bufEnd(asb, t) > t + 0.3) return // 命中缓冲,原生 seek 即可
     gen++
+    audioFirstDeadline = performance.now() + 1500 // 新目标位:音频重新先行
     let vseg = desc.segments.findIndex((s) => s.start <= t && s.start + s.dur > t)
     if (vseg < 0) vseg = Math.max(0, desc.segments.length - 1)
     nextSeg = vseg
@@ -244,6 +297,7 @@ export async function playAdaptive(
       }
       vq = mkQueue(vsb)
       aq = mkQueue(asb)
+      dlog(`sourceopen ok copy=${desc.copyVideo} startAt=${start.toFixed(1)} vmime=${desc.videoMime}`)
       // 先喂两轨 init,再泵段(视频 + 音频离散段)。
       try {
         const [vinit, ainit] = await Promise.all([
@@ -252,23 +306,126 @@ export async function playAdaptive(
         ])
         await vq(() => vsb!.appendBuffer(new Uint8Array(vinit)))
         await aq(() => asb!.appendBuffer(new Uint8Array(ainit)))
+        dlog(`init appended v=${vinit.byteLength}B a=${ainit.byteLength}B`)
       } catch (e) {
         reject(new Error('init: ' + e))
         return
       }
+      // 启动定位放在挂 onSeeking **之前**:段指针本就初始化在起播位,这记 seek 不该换代
+      // (换代会作废首轮泵的成果、多跑一轮 → 音频晚到,输给 canplay)。
+      if (start > 0) {
+        try {
+          el.currentTime = start
+        } catch {
+          el.addEventListener('loadedmetadata', () => (el.currentTime = start), { once: true })
+        }
+      }
       el.addEventListener('timeupdate', pump)
       el.addEventListener('seeking', onSeeking)
-      pump() // 首泵:视频段 + 音频段都喂上(覆盖 t=0)
-      void el.play().catch(() => {})
-      // 停滞看门狗:MSE 有时既不报错也不出画(静默黑屏)。12s 后若仍卡在起点(且非用户暂停)→
-      // 判失败,触发 onError → useMedia 兜底回落 muxed HLS(能放的老路)。宽松阈值防弱机首段慢误杀。
+      // 生命周期诊断(一次性;真机绿屏定位用——上回停滞时这中间一片静默,只能瞎猜)
+      for (const ev of ['loadedmetadata', 'canplay', 'playing'] as const) {
+        el.addEventListener(
+          ev,
+          () => dlog(`${ev} rs=${el.readyState} ct=${el.currentTime.toFixed(2)}`),
+          { once: true },
+        )
+      }
+      el.addEventListener(
+        'error',
+        () => dlog(`element error code=${el.error?.code} msg=${el.error?.message ?? ''}`),
+        { once: true },
+      )
+      pump() // 首泵:两轨段从起播位喂起(无 startAt 时即 t=0)
+      // 起播闸:**两轨在起播位都有货才 play()**。WebKit 不接入「播放开始后才补进的音频」——
+      // 视频段 copy 极快,canplay 抢跑后音频再 append 就永远无声(2026-07-22 真机 5/5 会话
+      // 相关性;Chromium harness 证明字节与窗口数学无罪)。4s 超时兜底照常放行(宁可无声也
+      // 别卡死,看门狗还在后面)。
+      const covered = (sb: SourceBuffer | null, t: number): boolean => {
+        try {
+          const b = sb!.buffered
+          for (let i = 0; i < b.length; i++) {
+            if (b.start(i) <= t + 0.3 && b.end(i) > t + 0.1) return true
+          }
+        } catch {
+          /* buffered 读取竞态,当没货 */
+        }
+        return false
+      }
+      const doPlay = () => {
+        el.play()
+          .then(() => dlog(`play() ok rs=${el.readyState}`))
+          .catch((e) => dlog(`play() rejected: ${e} rs=${el.readyState}`))
+      }
+      const gateT0 = performance.now()
+      const gate = window.setInterval(() => {
+        if (stopped || dead) {
+          clearInterval(gate)
+          return
+        }
+        const ok = covered(vsb, start) && covered(asb, start)
+        if (ok || performance.now() - gateT0 > 4000) {
+          clearInterval(gate)
+          dlog(`起播闸${ok ? '开' : '超时'} v=${covered(vsb, start)} a=${covered(asb, start)}`)
+          doPlay()
+        }
+      }, 50)
+      // 最小版 gap-jump(2026-07-22 真机定案的 WebKit 起播卡点):B 帧片源首个视频样本
+      // PTS≈0.1s → 缓冲从 0.1 起,播放头停在 0.0;Chromium 自己就近起播,WebKit 严格等
+      // 「正好覆盖播放头」的样本 → readyState 永卡 1(绿屏/12s 看门狗回落)。shaka 内建
+      // gap-jumping 治的就是它(muxed 路经 shaka 没事的原因)。低频巡逻:播放头落在某段
+      // 视频缓冲起点前不到半秒且没起来 → 挪进去补一脚 play()。起播与 seek 落点都覆盖。
+      const nudge = window.setInterval(() => {
+        if (stopped || dead) {
+          clearInterval(nudge)
+          return
+        }
+        try {
+          const b = vsb!.buffered
+          for (let i = 0; i < b.length; i++) {
+            const s = b.start(i)
+            if (el.readyState < 3 && el.currentTime < s && s - el.currentTime < 0.5) {
+              dlog(`gap-jump: ${el.currentTime.toFixed(3)} → ${s.toFixed(3)} rs=${el.readyState}`)
+              el.currentTime = s + 0.001
+              void el.play().catch(() => {})
+              break
+            }
+          }
+        } catch {
+          /* buffered 读取竞态,忽略这一拍 */
+        }
+      }, 500)
+      // 5s 快照:两轨缓冲区间 + readyState 一行看全(停滞时分辨「没喂进数据」还是「喂了解不动」)
+      const snap = window.setTimeout(() => {
+        const rng = (sb: SourceBuffer | null) => {
+          try {
+            const b = sb?.buffered
+            return b && b.length ? `${b.start(0).toFixed(1)}~${b.end(b.length - 1).toFixed(1)}` : '空'
+          } catch {
+            return '?'
+          }
+        }
+        dlog(
+          `5s 快照 rs=${el.readyState} ct=${el.currentTime.toFixed(2)} paused=${el.paused} ` +
+            `v=[${rng(vsb)}] a=[${rng(asb)}] err=${el.error?.message ?? '无'}`,
+        )
+      }, 5000)
+      // 停滞看门狗:MSE 有时既不报错也不出画(静默黑屏)。12s 后若仍卡在起点 → 判失败,
+      // 触发 onError → useMedia 兜底回落 muxed HLS(能放的老路)。宽松阈值防弱机首段慢误杀。
+      // 两种卡法都要兜:!paused = 播着却不走;readyState<2 = 连首帧都没解出来 —— WKWebView 上
+      // play() 被 MSE 拒掉会把 paused 弹回 true,原先只查 !paused 就永远不触发(2026-07-21
+      // Mac 绿屏卡死实锤)。用户在首帧后主动暂停 = paused 且 readyState≥2,不会误杀。
       const watchdog = window.setTimeout(() => {
-        if (!stopped && !dead && el.currentTime < 0.3 && !el.paused) fail('stall: no progress in 12s')
+        if (!stopped && !dead && el.currentTime < 0.3 && (!el.paused || el.readyState < 2)) {
+          fail('stall: no progress in 12s')
+        }
       }, 12000)
       resolve({
         stop: () => {
           stopped = true
           clearTimeout(watchdog)
+          clearTimeout(snap)
+          clearInterval(nudge)
+          clearInterval(gate)
           el.removeEventListener('timeupdate', pump)
           el.removeEventListener('seeking', onSeeking)
           try {

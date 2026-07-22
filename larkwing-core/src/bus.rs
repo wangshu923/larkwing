@@ -77,8 +77,10 @@ pub struct TaskView {
 pub enum MediaEvent {
     /// 解析完成,前端把 stream_url 挂上 <audio>/<video>。
     Play(crate::media::NowPlaying),
-    /// 模型侧的播放控制(用户用嘴说"暂停/大点声/倍速/跳到第几秒"):
-    /// pause | resume | stop | louder | softer | speed | seek;speed/seek 带 value。
+    /// 模型侧的播放控制(用户用嘴说"暂停/大点声/倍速/跳到第几秒/单曲循环/随机放"):
+    /// pause | resume | stop | louder | softer | volume | speed | seek |
+    /// loop_one | loop_all | loop_off | shuffle_on | shuffle_off;volume/speed/seek 带 value。
+    /// 循环/随机已先落 core 状态,事件只为前端对齐 el.loop/按钮态。
     Control {
         action: String,
         #[serde(skip_serializing_if = "Option::is_none")]

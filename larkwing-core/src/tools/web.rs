@@ -274,7 +274,7 @@ impl Tool for WebDownload {
             .context("缺少合法的 url 参数(需要 http(s) 直链)")?;
         let dir = match args.get("dir").and_then(serde_json::Value::as_str).map(str::trim) {
             Some(d) if !d.is_empty() => {
-                let p = PathBuf::from(d);
+                let p = PathBuf::from(super::expand_home(d)); // 「~/xxx」宽容展开(§4.4)
                 anyhow::ensure!(p.is_absolute(), "dir 需要绝对路径,收到: {d}");
                 p
             }

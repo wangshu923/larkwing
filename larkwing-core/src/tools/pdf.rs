@@ -76,8 +76,9 @@ impl Tool for PdfToPng {
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
+            .map(super::expand_home) // 「~/xxx」宽容展开(§4.4)
             .context("缺少 path 参数(PDF 的绝对路径)")?;
-        let pdf = PathBuf::from(path);
+        let pdf = PathBuf::from(&path);
         anyhow::ensure!(pdf.is_absolute(), "path 需要绝对路径,收到: {path}");
         anyhow::ensure!(pdf.is_file(), "文件不存在: {path}");
         let pages: Vec<usize> = args
@@ -92,7 +93,7 @@ impl Tool for PdfToPng {
         );
         let out_dir = match args.get("dir").and_then(serde_json::Value::as_str).map(str::trim) {
             Some(d) if !d.is_empty() => {
-                let p = PathBuf::from(d);
+                let p = PathBuf::from(super::expand_home(d)); // 「~/xxx」宽容展开(§4.4)
                 anyhow::ensure!(p.is_absolute(), "dir 需要绝对路径,收到: {d}");
                 std::fs::create_dir_all(&p)
                     .with_context(|| format!("建不了目标文件夹 {}", p.display()))?;

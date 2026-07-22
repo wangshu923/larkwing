@@ -7,11 +7,37 @@ import { useMedia } from '../composables/useMedia'
 import { fmtClock } from '../lib/fmt'
 
 const { t } = useI18n()
-const { state, toggle, stop, seek, setVolume, next, prev, loginNow, dismissLoginHint } = useMedia()
+const {
+  state,
+  toggle,
+  stop,
+  seek,
+  setVolume,
+  next,
+  prev,
+  cycleLoop,
+  toggleShuffle,
+  cycleAudioTrack,
+  audioTrackLabel,
+  loginNow,
+  dismissLoginHint,
+} = useMedia()
 
 const showBar = computed(() => state.current?.kind === 'audio')
-/** 多集音频(评书/儿歌合集等)才出集数 + 上/下一集。 */
+/** 多集音频(评书/儿歌合集等)才出集数 + 上/下一首。 */
 const playlist = computed(() => state.current?.playlist ?? null)
+/** ≥2 条音轨才出切换钮(有声书双语版这类;label = 当前轨友好名)。 */
+const audioTrackCount = computed(() => state.current?.audio_tracks?.length ?? 0)
+const audioLabel = computed(() => audioTrackLabel(state.current?.audio_track ?? 0))
+/** 上/下一首在「随机」或「列表循环」时永不禁用(随机恒有下一首;循环到头回卷)。 */
+const freeMove = computed(() => state.shuffle || state.loopMode === 'all')
+const loopTitle = computed(() =>
+  state.loopMode === 'one'
+    ? t('media.loopOne')
+    : state.loopMode === 'all'
+      ? t('media.loopAll')
+      : t('media.loopOff'),
+)
 const pct = computed(() =>
   state.duration > 0 ? Math.min(100, (state.position / state.duration) * 100) : 0,
 )
@@ -37,8 +63,8 @@ function onVolume(e: Event) {
       v-if="playlist"
       class="pbtn"
       @click="prev"
-      :disabled="playlist.index <= 0"
-      :title="t('media.prevEp')"
+      :disabled="!freeMove && playlist.index <= 0"
+      :title="t('media.prevTrack')"
     >
       ⏮
     </button>
@@ -53,17 +79,37 @@ function onVolume(e: Event) {
       v-if="playlist"
       class="pbtn"
       @click="next"
-      :disabled="playlist.index >= playlist.total - 1"
-      :title="t('media.nextEp')"
+      :disabled="!freeMove && playlist.index >= playlist.total - 1"
+      :title="t('media.nextTrack')"
     >
       ⏭
+    </button>
+    <button class="pbtn" :class="{ on: state.loopMode !== 'off' }" @click="cycleLoop" :title="loopTitle">
+      {{ state.loopMode === 'one' ? '🔂' : '🔁' }}
+    </button>
+    <button
+      v-if="playlist"
+      class="pbtn"
+      :class="{ on: state.shuffle }"
+      @click="toggleShuffle"
+      :title="state.shuffle ? t('media.shuffleOn') : t('media.shuffleOff')"
+    >
+      🔀
+    </button>
+    <button
+      v-if="audioTrackCount >= 2"
+      class="pbtn track"
+      @click="cycleAudioTrack"
+      :title="t('media.audioTrack', { label: audioLabel })"
+    >
+      {{ audioLabel }}
     </button>
     <div class="mid">
       <div class="title-row">
         <span class="note" :class="{ live: state.status === 'playing' }">♪</span>
         <span class="title">{{ state.current!.title }}</span>
         <span v-if="playlist" class="ep">{{
-          t('media.episodeOf', { cur: playlist.index + 1, total: playlist.total })
+          t('media.trackOf', { cur: playlist.index + 1, total: playlist.total })
         }}</span>
         <span class="clock">{{ fmtClock(state.position) }} / {{ fmtClock(state.duration) }}</span>
       </div>
@@ -110,6 +156,12 @@ function onVolume(e: Event) {
 }
 .pbtn:hover { border-color: var(--accent); box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.3); }
 .pbtn:disabled { opacity: .32; cursor: default; border-color: var(--line); box-shadow: none; }
+.pbtn.on {
+  border-color: var(--accent);
+  background: rgba(var(--accent-rgb), 0.22);
+  box-shadow: 0 0 10px rgba(var(--accent-rgb), 0.35);
+}
+.pbtn.track { width: auto; min-width: 34px; padding: 0 8px; font-size: 11px; white-space: nowrap; }
 .pbtn.stop { color: var(--attn); border-color: rgba(var(--attn-rgb), 0.35); }
 .pbtn.stop:hover { border-color: var(--attn); box-shadow: 0 0 12px rgba(var(--attn-rgb), 0.3); }
 

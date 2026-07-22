@@ -325,14 +325,14 @@ impl WebRender {
         let upload_ref = opt_ref(&args, "upload_ref");
         let upload_paths: Vec<PathBuf> = match args.get("upload_paths") {
             Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
-                vec![PathBuf::from(s.trim())]
+                vec![PathBuf::from(super::expand_home(s.trim()))]
             }
             Some(serde_json::Value::Array(a)) => a
                 .iter()
                 .filter_map(serde_json::Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(PathBuf::from)
+                .map(|s| PathBuf::from(super::expand_home(s))) // 「~/xxx」宽容展开(§4.4)
                 .collect(),
             _ => Vec::new(),
         };
@@ -368,7 +368,7 @@ impl WebRender {
         let download_dir = match args.get("dir").and_then(serde_json::Value::as_str).map(str::trim)
         {
             Some(d) if !d.is_empty() => {
-                let p = PathBuf::from(d);
+                let p = PathBuf::from(super::expand_home(d)); // 「~/xxx」宽容展开(§4.4)
                 anyhow::ensure!(p.is_absolute(), "dir 需要绝对路径,收到: {d}");
                 p
             }

@@ -881,6 +881,43 @@ pub fn media_advance(state: State<'_, AppState>, delta: i32) -> Result<(), AppEr
     Ok(())
 }
 
+/// 一集自然放完(前端 `ended`):core 按循环/随机决定要不要接管(顺序下一集 / 列表循环回卷 /
+/// 随机挑下一首)。返回 true = 已接管(前端等 Play 事件接力);false = 没有下一首(前端正常收尾)。
+/// 失败按 false 处理(前端停下,§3.5 不静默:原因进日志)。
+#[tauri::command]
+pub async fn media_auto_next(state: State<'_, AppState>) -> Result<bool, AppError> {
+    let user_id = state.engine.store().users.ensure_default_user()?.id;
+    let media = state.media.clone();
+    match media.auto_next(user_id).await {
+        Ok(outcome) => Ok(outcome.is_some()),
+        Err(e) => {
+            tracing::warn!("自动续播失败,交回前端收尾: {e:#}");
+            Ok(false)
+        }
+    }
+}
+
+/// 播放条上的循环/随机/音轨按钮(前端直连,不绕 LLM):与嘴控汇到同一校验/执行口 ——
+/// 循环/随机 = core 校验落状态、广播 Control 事件,主窗 applyControl 落到播放元素;
+/// 音轨 = `set_audio_track`(mac 直传就地启停 / 其余重建管线原位续播),value = 第几条(1 起)。
+#[tauri::command]
+pub async fn media_mode(
+    state: State<'_, AppState>,
+    action: String,
+    value: Option<f64>,
+) -> Result<(), AppError> {
+    if action == "audio_track" {
+        let n = value
+            .filter(|v| v.fract() == 0.0 && *v >= 1.0)
+            .ok_or_else(|| AppError::internal(anyhow::anyhow!("audio_track 需要整数 value(1 起)")))?
+            as usize;
+        let media = state.media.clone();
+        media.set_audio_track(n).await.map(|_| ()).map_err(AppError::internal)
+    } else {
+        state.media.control(&action, value).map_err(AppError::internal)
+    }
+}
+
 /// 前端回报播放器当下状态(播放真相在前端 WebView):playing/paused 时带标题,
 /// ended/stop → idle;富字段(音量/进度/时长/倍速)一并回报,core 据此校准快照,
 /// 下个回合装配时喂模型「此刻」背景(修「歌放完了模型却以为还在播」+ 让它知道当前

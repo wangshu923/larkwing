@@ -144,6 +144,8 @@ enum Entry {
         transcode_video: bool,
         transcode_audio: bool,
         enc: VideoEncoder,
+        /// 选中的音轨(0 起,`-map 0:a:{n}`;单音轨恒 0)。
+        audio_track: usize,
     },
     /// B 站 DASH:两条独立自适应流(video.m4s + audio.m4s)。**不混流** —— 合成一份 DASH MPD,
     /// 前端 shaka 经 MSE 把两条喂给播放器、播放器自己管时间轴 → 原生 seek、天生同步(像 b 站网页)。
@@ -159,7 +161,7 @@ enum Entry {
     /// 已验通的同路、MSE 直吃。无临时目录/无会话(每段无状态),seek = shaka 请求目标段 → 现切现回。
     /// 段一律转码视频 + 下混立体声 AAC(见 build_frag_cmd 三处实证),故无 transcode_* 旋钮。
     /// `enc` = 视频编码器(硬件/软件,注册时定死 → init 与各段同编码器,avcC 一致可拼)。
-    FileHls { path: PathBuf, ffmpeg: PathBuf, duration: f64, enc: VideoEncoder },
+    FileHls { path: PathBuf, ffmpeg: PathBuf, duration: f64, enc: VideoEncoder, audio_track: usize },
     /// 本地不兼容文件的**音视频分离**自适应播放(0.2.6 治本):前端手写 MSE 两条 SourceBuffer —
     /// 视频按需分段(`copy_video` 决定 `-c:v copy` 省 CPU 还是转 H.264)、音频**离散段 + 左预卷**
     /// (前端 appendWindow 裁掉 priming → gapless 无漂移)。端点(`/la/{token}/…`):
@@ -179,6 +181,8 @@ enum Entry {
         /// 视频段计划 `(start, dur)`:copy=关键帧对齐变长,转码=固定 6s。
         segments: Vec<(f64, f64)>,
         duration: f64,
+        /// 选中的音轨(0 起;音频段/init 都按它 `-map`)。
+        audio_track: usize,
     },
 }
 
@@ -311,13 +315,17 @@ impl Relay {
         transcode_video: bool,
         transcode_audio: bool,
         force_software: bool,
+        audio_track: usize,
     ) -> String {
         let enc = if force_software {
             VideoEncoder::Software
         } else {
             self.video_encoder(&ffmpeg).await
         };
-        self.register(Entry::FileRemux { path, ffmpeg, transcode_video, transcode_audio, enc }, "m")
+        self.register(
+            Entry::FileRemux { path, ffmpeg, transcode_video, transcode_audio, enc, audio_track },
+            "m",
+        )
     }
 
     /// B 站 DASH:**不混流**。探两条流的 sidx → 合成 MPD → 注册,返回 `…/dash/{token}/manifest.mpd`。
@@ -354,6 +362,7 @@ impl Relay {
         ffmpeg: PathBuf,
         duration: f64,
         force_software: bool,
+        audio_track: usize,
     ) -> String {
         let enc = if force_software {
             VideoEncoder::Software
@@ -363,7 +372,7 @@ impl Relay {
         let token = self.token();
         self.inner.streams.lock().expect("relay streams lock poisoned").insert(
             token.clone(),
-            Arc::new(Entry::FileHls { path, ffmpeg, duration, enc }),
+            Arc::new(Entry::FileHls { path, ffmpeg, duration, enc, audio_track }),
         );
         format!("http://127.0.0.1:{}/hls/{token}/index.m3u8", self.inner.port)
     }
@@ -381,6 +390,7 @@ impl Relay {
         segments: Vec<(f64, f64)>,
         duration: f64,
         enc: VideoEncoder,
+        audio_track: usize,
     ) -> String {
         let token = self.token();
         self.inner.streams.lock().expect("relay streams lock poisoned").insert(
@@ -394,6 +404,7 @@ impl Relay {
                 video_init,
                 segments,
                 duration,
+                audio_track,
             }),
         );
         format!("http://127.0.0.1:{}/la/{token}/desc", self.inner.port)
@@ -409,7 +420,7 @@ pub async fn gen_video_init(
     copy_video: bool,
     enc: VideoEncoder,
 ) -> Option<Vec<u8>> {
-    let cmd = build_frag_cmd(ffmpeg, path, 0.0, 0.1, copy_video, true, enc);
+    let cmd = build_frag_cmd(ffmpeg, path, 0.0, 0.1, copy_video, true, enc, 0);
     let full = run_ffmpeg_collect(cmd, 8 * 1024 * 1024).await?;
     let moof = super::probe::first_moof_offset(&full)?;
     Some(full[..moof].to_vec())
@@ -671,7 +682,7 @@ async fn collect_preflight() -> Response {
 /// (fMP4 单 moof,一律转码视频 + 立体声 AAC,见 build_frag_cmd)。无临时目录/无会话:每段现切现回。
 async fn hls(State(state): State<Arc<Inner>>, AxPath((token, seg)): AxPath<(String, String)>) -> Response {
     let Some(entry) = lookup(&state, &token) else { return bad(StatusCode::NOT_FOUND) };
-    let Entry::FileHls { path, ffmpeg, duration, enc } = entry.as_ref() else {
+    let Entry::FileHls { path, ffmpeg, duration, enc, audio_track } = entry.as_ref() else {
         return bad(StatusCode::NOT_FOUND);
     };
     // 三种请求:清单 / 共享 init / moof 段。段走 **fMP4(非 mpegts)** —— MSE 直接吃,绕开 shaka 的
@@ -688,7 +699,7 @@ async fn hls(State(state): State<Arc<Inner>>, AxPath((token, seg)): AxPath<(Stri
         // 共享 init(ftyp+moov):切一小段、取首个 moof 之前的部分。codec 配置与各 moof 段一致
         //(同输入 + 同 copy/转码 flag → ffmpeg 产出确定、跨调用兼容,Mac 已验 init+moof 可拼)。
         tracing::info!("HLS:发 init");
-        let cmd = build_frag_cmd(ffmpeg, path, 0.0, 0.1, false, false, *enc);
+        let cmd = build_frag_cmd(ffmpeg, path, 0.0, 0.1, false, false, *enc, *audio_track);
         let Some(full) = run_ffmpeg_collect(cmd, 8 * 1024 * 1024).await else {
             return bad(StatusCode::BAD_GATEWAY);
         };
@@ -711,7 +722,7 @@ async fn hls(State(state): State<Arc<Inner>>, AxPath((token, seg)): AxPath<(Stri
         return bad(StatusCode::NOT_FOUND);
     }
     tracing::info!(seg = n, start, "HLS:现切一段");
-    let cmd = build_frag_cmd(ffmpeg, path, start, HLS_SEG, false, false, *enc);
+    let cmd = build_frag_cmd(ffmpeg, path, start, HLS_SEG, false, false, *enc, *audio_track);
     let Some(full) = run_ffmpeg_collect(cmd, 256 * 1024 * 1024).await else {
         return bad(StatusCode::BAD_GATEWAY);
     };
@@ -745,6 +756,7 @@ async fn local_adaptive(
         video_init,
         segments,
         duration,
+        audio_track,
     } = entry.as_ref()
     else {
         return bad(StatusCode::NOT_FOUND);
@@ -775,7 +787,7 @@ async fn local_adaptive(
     // 响应 WebView2 收得下,同视频段)。ainit=音频 init;a{N}=第 N 段(固定 6s 网格,带左预卷供前端
     // appendWindow 裁掉 priming → gapless 无漂移)。段内 tfdt=0,前端靠 timestampOffset+appendWindow 定位。
     if seg == "ainit" {
-        let cmd = build_audio_frag_cmd(ffmpeg, path, 0.0, 0.1);
+        let cmd = build_audio_frag_cmd(ffmpeg, path, 0.0, 0.1, *audio_track);
         let Some(full) = run_ffmpeg_collect(cmd, 4 * 1024 * 1024).await else {
             return bad(StatusCode::BAD_GATEWAY);
         };
@@ -794,7 +806,7 @@ async fn local_adaptive(
         let (ss, cut) =
             if n > 0 { (grid - AUDIO_PREROLL, seg_dur + AUDIO_PREROLL) } else { (0.0, seg_dur) };
         tracing::info!(seg = n, grid, "自适应:现切音频段");
-        let cmd = build_audio_frag_cmd(ffmpeg, path, ss, cut);
+        let cmd = build_audio_frag_cmd(ffmpeg, path, ss, cut, *audio_track);
         let Some(full) = run_ffmpeg_collect(cmd, 16 * 1024 * 1024).await else {
             return bad(StatusCode::BAD_GATEWAY);
         };
@@ -802,8 +814,15 @@ async fn local_adaptive(
             return bad(StatusCode::INTERNAL_SERVER_ERROR);
         };
         let end = super::probe::moof_segment_end(&full, moof);
-        // tfdt 不改(=0):前端用 timestampOffset=grid-preroll 放到真时间轴,appendWindow 裁到 [grid, grid+dur]。
-        return bytes_response(full[moof..end].to_vec(), "audio/mp4");
+        // 前端契约 = 段内 tfdt=0(时间轴由 timestampOffset+appendWindow 决定)。ffmpeg 对非默认
+        // 音轨(-map 0:a:1)-ss 后可能残留非零 tfdt → 样本落到窗外被整段裁光(切英语轨无声,
+        // 2026-07-22 真机)——这里**强制归零**,本就为 0 的段是 no-op;原值非零时记日志定案。
+        let mut body = full[moof..end].to_vec();
+        let tfdt_was = super::probe::zero_tfdt(&mut body);
+        if tfdt_was != 0 {
+            tracing::info!(seg = n, tfdt_was, bytes = body.len(), "音频段 tfdt 非零,已归零");
+        }
+        return bytes_response(body, "audio/mp4");
     }
     // v{N} → 视频段 N(video-only 分片,tfdt 改累计起点;与 HLS 段同款处理,只是无音轨)。
     let Some(n) = seg.strip_prefix('v').and_then(|s| s.parse::<usize>().ok()) else {
@@ -811,7 +830,7 @@ async fn local_adaptive(
     };
     let Some(&(start, dur)) = segments.get(n) else { return bad(StatusCode::NOT_FOUND) };
     tracing::info!(seg = n, start, dur, copy = copy_video, "自适应:现切视频段");
-    let cmd = build_frag_cmd(ffmpeg, path, start, dur, *copy_video, true, *enc);
+    let cmd = build_frag_cmd(ffmpeg, path, start, dur, *copy_video, true, *enc, 0);
     let Some(full) = run_ffmpeg_collect(cmd, 256 * 1024 * 1024).await else {
         return bad(StatusCode::BAD_GATEWAY);
     };
@@ -874,6 +893,7 @@ pub(crate) const AUDIO_LOUDNESS_AF: &str =
 ///
 /// `copy_video`:true = `-c:v copy`(视频已兼容,零重编码,须段界落关键帧);false = 转 H.264。
 /// `video_only`:true = `-an`(分离路的视频段,音频另走连续流);false = 带音轨(老 muxed HLS)。
+#[allow(clippy::too_many_arguments)]
 fn build_frag_cmd(
     ffmpeg: &Path,
     path: &Path,
@@ -882,6 +902,7 @@ fn build_frag_cmd(
     copy_video: bool,
     video_only: bool,
     enc: VideoEncoder,
+    audio_track: usize,
 ) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(ffmpeg);
     cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin");
@@ -898,7 +919,7 @@ fn build_frag_cmd(
     cmd.arg("-i").arg(path).arg("-t").arg(format!("{dur:.6}"));
     cmd.arg("-map").arg("0:v:0?");
     if !video_only {
-        cmd.arg("-map").arg("0:a:0?");
+        cmd.arg("-map").arg(format!("0:a:{audio_track}?")); // 选中的音轨(多音轨片按此切换)
     }
     if copy_video {
         cmd.arg("-c:v").arg("copy"); // 视频已兼容:原样搬,不掉画质、CPU 近零
@@ -923,13 +944,20 @@ const COPY_SS_EPS: f64 = 0.001;
 /// 构建音频段命令(`-vn` 纯音频 → AAC 立体声 + 响度,单 moof 分片吐 stdout)。`ss>0` 从该秒输入 seek
 /// (段带左预卷时用),`dur` = 要切的时长(含预卷)。init 段取 `ss=0,dur=0.1`。tfdt 由 ffmpeg 归零,
 /// 前端 timestampOffset + appendWindow 定位/裁剪。
-fn build_audio_frag_cmd(ffmpeg: &Path, path: &Path, ss: f64, dur: f64) -> tokio::process::Command {
+fn build_audio_frag_cmd(
+    ffmpeg: &Path,
+    path: &Path,
+    ss: f64,
+    dur: f64,
+    audio_track: usize,
+) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(ffmpeg);
     cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin");
     if ss > 0.0 {
         cmd.arg("-ss").arg(format!("{ss:.6}"));
     }
     cmd.arg("-i").arg(path).arg("-t").arg(format!("{dur:.6}")).arg("-vn")
+        .arg("-map").arg(format!("0:a:{audio_track}?")) // 显式选轨(原 -vn 默认挑轨,多音轨不可控)
         .arg("-c:a").arg("aac").arg("-af").arg(AUDIO_LOUDNESS_AF).arg("-b:a").arg("256k")
         .arg("-movflags").arg("empty_moov+default_base_moof")
         .arg("-frag_duration").arg("600000000")
@@ -1096,7 +1124,7 @@ async fn remux(
                 .arg("-c").arg("copy"); // 纯复制不转码:CPU 几乎零开销
             cmd
         }
-        Entry::FileRemux { path, ffmpeg, transcode_video, transcode_audio, enc } => {
+        Entry::FileRemux { path, ffmpeg, transcode_video, transcode_audio, enc, audio_track } => {
             let mut cmd = tokio::process::Command::new(ffmpeg);
             cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin");
             if q.t > 0.0 {
@@ -1104,7 +1132,7 @@ async fn remux(
             }
             cmd.arg("-i").arg(path);
             // 首条视频可选(纯音频不报错)+ 首条音轨可选(无声轨不报错);字幕等不带。
-            cmd.arg("-map").arg("0:v:0?").arg("-map").arg("0:a:0?");
+            cmd.arg("-map").arg("0:v:0?").arg("-map").arg(format!("0:a:{audio_track}?"));
             if *transcode_video {
                 // HEVC/AV1 等转 H.264:硬件优先(省 CPU),回落 libx264;yuv420p 把 10bit 压回 8bit
                 //(浏览器只认),否则 H.264 10bit 一样放不了。参数收口 apply_video_encode(§4.8 单源)。
@@ -1449,6 +1477,7 @@ mod tests {
             segments,
             dur,
             VideoEncoder::Software,
+            0,
         );
         let base = desc_url.strip_suffix("/desc").unwrap().to_string();
         let http = reqwest::Client::new();

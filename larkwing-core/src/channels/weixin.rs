@@ -23,6 +23,7 @@ use aes::Aes128;
 use anyhow::{bail, ensure, Context, Result};
 use base64::Engine as _;
 use md5::{Digest, Md5};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -331,6 +332,19 @@ async fn handle_message(
         let hint = ONBOARD_HINT.replace("{name}", &ctx.engine.pet_name()).replace("{id}", &p.from_user_id);
         let _ = send_text(net, base, token, &p.from_user_id, &p.context_token, &hint).await;
         return;
+    }
+
+    // 挂起补发:TA 开口 = 新会话令牌到手,先把欠 TA 的文件送掉(§7.7 会话窗口)
+    if !p.context_token.is_empty() {
+        flush_pending_sends(
+            net,
+            base,
+            token,
+            &p.from_user_id,
+            &p.context_token,
+            &ctx.engine.store().settings,
+        )
+        .await;
     }
 
     // 确认闸回话拦截(§7.8):该 chat 挂着确认时,纯文本回话先做应答判定
@@ -695,6 +709,18 @@ async fn send_text(
 /// 2026-07-18 真机实锤——重试/重启渠道都救不回,只有对方再来一条消息才刷新令牌)。
 const RET_STALE_CONTEXT: i64 = -2;
 
+/// 类型标记:带令牌 + 去令牌两趟都被拒 = 会话窗口关死(真机实锤 iLink 不认无令牌发送)。
+/// 挂在 anyhow 链上供 outbound/工具层 downcast——send_file 据此转「挂起补发」而不是干失败。
+#[derive(Debug)]
+pub(super) struct StaleContext;
+
+impl std::fmt::Display for StaleContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("微信会话令牌过期(对方开口前发不进去)")
+    }
+}
+impl std::error::Error for StaleContext {}
+
 /// sendmessage 响应判定:ret / errcode 双字段在野都有人用(getupdates 同款),任一非 0
 /// = 失败;只看 ret 会把 errcode-only 的失败当成功,误报「发出去了」。
 fn sendmessage_err(resp: &Value) -> Option<(i64, String)> {
@@ -754,10 +780,10 @@ async fn send_item(
     let resp = sendmessage_once(net, base, token, to_user_id, "", &item).await?;
     match sendmessage_err(&resp) {
         None => Ok(()),
-        Some((code, errmsg)) => bail!(
+        Some((code, errmsg)) => Err(anyhow::Error::new(StaleContext).context(format!(
             "sendmessage ret={code} errmsg={errmsg}(去掉过期会话令牌重发仍失败;\
              可让对方在微信上先给我发一句话再试)"
-        ),
+        ))),
     }
 }
 
@@ -817,6 +843,115 @@ pub(super) async fn send_file(
     let (media_type, item) = upload_and_build_item(net, base, token, to_user_id, &name, &bytes).await?;
     let _ = media_type;
     send_item(net, base, token, to_user_id, context_token, item).await
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 挂起补发:会话窗口关死时文件不作废,TA 下次开口(新令牌到手)自动送达(§7.7)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 挂起列表的持久化键(settings KV,app 级;渠道运行态,同 updates_buf 一族)。
+const PENDING_KEY: &str = "remote.weixin.pending_sends";
+/// 挂起有效期(小时):等的是「TA 下次说话」,家用节奏一两天内常见;文件不像提醒有
+/// 时效危害,但一周前的文件冷不丁到账也怪——48h 截住,过期在挂起/开口时惰性清理。
+pub(super) const PENDING_TTL_HOURS: i64 = 48;
+const PENDING_TTL_MS: i64 = PENDING_TTL_HOURS * 3600 * 1000;
+/// 挂起列表读改写互斥:工具层挂起(桌面回合)与收循环补发是两个任务,防丢更新。
+static PENDING_MU: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct PendingSend {
+    ext_id: String,
+    path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    caption: Option<String>,
+    created_at: i64,
+}
+
+fn load_pending(settings: &crate::store::SettingsRepo) -> Vec<PendingSend> {
+    settings
+        .get(None, PENDING_KEY)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_pending(settings: &crate::store::SettingsRepo, list: &[PendingSend]) -> Result<()> {
+    settings.set(None, PENDING_KEY, &serde_json::to_string(list)?)
+}
+
+/// 挂一个待补发文件(同目标同文件去重——模型重试不会挂重;顺手清过期项)。
+pub(super) async fn queue_pending_send(
+    settings: &crate::store::SettingsRepo,
+    ext_id: &str,
+    path: &std::path::Path,
+    caption: Option<&str>,
+) -> Result<()> {
+    let path_s = path.to_string_lossy().into_owned();
+    let now = crate::store::now_ms();
+    let _g = PENDING_MU.lock().await;
+    let mut list = load_pending(settings);
+    list.retain(|e| now - e.created_at <= PENDING_TTL_MS);
+    list.retain(|e| !(e.ext_id == ext_id && e.path == path_s));
+    list.push(PendingSend {
+        ext_id: ext_id.to_string(),
+        path: path_s,
+        caption: caption.map(str::to_string),
+        created_at: now,
+    });
+    save_pending(settings, &list)
+}
+
+/// TA 开口(带来新令牌)→ 把挂给 TA 的文件补发出去。成功 / 文件已不在 = 出列;
+/// 送失败 = 回炉等下一条消息再试(TTL 兜底)。在收循环 spawn 的消息任务里内联跑:
+/// 补发先落地、回合回复在后,顺序自然;无挂起时只是一次亚毫秒 KV 读。
+async fn flush_pending_sends(
+    net: &net::Client,
+    base: &str,
+    token: &str,
+    ext_id: &str,
+    context_token: &str,
+    settings: &crate::store::SettingsRepo,
+) {
+    let mine: Vec<PendingSend> = {
+        let _g = PENDING_MU.lock().await;
+        let now = crate::store::now_ms();
+        let list = load_pending(settings);
+        if list.is_empty() {
+            return;
+        }
+        let before = list.len();
+        let (mine, keep): (Vec<_>, Vec<_>) = list
+            .into_iter()
+            .filter(|e| now - e.created_at <= PENDING_TTL_MS)
+            .partition(|e| e.ext_id == ext_id);
+        if mine.is_empty() && keep.len() == before {
+            return; // 没我的件、也没过期件要清
+        }
+        if let Err(e) = save_pending(settings, &keep) {
+            tracing::warn!(err = %format!("{e:#}"), "挂起列表写回失败,本轮不补发");
+            return;
+        }
+        mine
+    };
+    for e in mine {
+        let path = std::path::PathBuf::from(&e.path);
+        if !path.is_file() {
+            tracing::warn!(path = %e.path, "挂起的文件已不在,放弃补发");
+            continue;
+        }
+        match send_file(net, base, token, ext_id, context_token, &path, e.caption.as_deref()).await
+        {
+            Ok(()) => tracing::info!(path = %e.path, "挂起的文件已补发(对方开口刷新了会话)"),
+            Err(err) => {
+                tracing::warn!(err = %format!("{err:#}"), path = %e.path, "补发失败,回炉等下一条消息");
+                let _g = PENDING_MU.lock().await;
+                let mut list = load_pending(settings);
+                list.push(e);
+                let _ = save_pending(settings, &list);
+            }
+        }
+    }
 }
 
 /// 上传本机文件到 CDN(getUploadUrl → AES-128-ECB 加密 → PUT)→ 构造对应 MessageItem。
@@ -1441,5 +1576,107 @@ mod tests {
         let err = send_text(&net, &base, "tok", "u1", "ctx", "hi").await.unwrap_err();
         assert_eq!(HITS.load(Ordering::Relaxed), 2, "带令牌一次 + 去令牌一次");
         assert!(format!("{err:#}").contains("重发仍失败"), "错误带续办提示: {err:#}");
+        assert!(
+            err.chain().any(|c| c.downcast_ref::<StaleContext>().is_some()),
+            "错误链带 StaleContext 标记(工具层据此转挂起补发)"
+        );
+    }
+
+    /// 挂起去重(同目标同文件只留一份 = 模型重试不重复挂)+ 过期件惰性清理。
+    #[tokio::test]
+    async fn pending_queue_dedupes_and_prunes() {
+        let dir = std::env::temp_dir().join(format!("lw-wx-pendq-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(dir.join("t.db"));
+        let s = crate::store::Store::open(&dir.join("t.db")).unwrap();
+
+        let f = std::path::Path::new("/tmp/a.txt");
+        queue_pending_send(&s.settings, "u1", f, Some("说明")).await.unwrap();
+        queue_pending_send(&s.settings, "u1", f, None).await.unwrap(); // 重试 → 顶替不追加
+        let list = load_pending(&s.settings);
+        assert_eq!(list.len(), 1);
+        assert!(list[0].caption.is_none(), "后挂的顶替先挂的");
+
+        // 手写一条过期件 → 下次挂起时被清
+        let mut list = load_pending(&s.settings);
+        list.push(PendingSend {
+            ext_id: "u9".into(),
+            path: "/tmp/old.txt".into(),
+            caption: None,
+            created_at: crate::store::now_ms() - PENDING_TTL_MS - 1,
+        });
+        save_pending(&s.settings, &list).unwrap();
+        queue_pending_send(&s.settings, "u1", std::path::Path::new("/tmp/b.txt"), None)
+            .await
+            .unwrap();
+        let left = load_pending(&s.settings);
+        assert_eq!(left.len(), 2, "过期件已清:{left:?}");
+        assert!(left.iter().all(|e| e.ext_id == "u1"));
+    }
+
+    /// 挂起补发端到端:TA 开口(新令牌)→ 附言 + 文件按序补发并出列;文件已删的丢弃;
+    /// 别人的挂起件不动。(getuploadurl / CDN / sendmessage 全走本地假端点。)
+    #[tokio::test]
+    async fn flush_pending_resends_on_fresh_token() {
+        use axum::{routing::post, Router};
+        use std::sync::atomic::{AtomicU16, Ordering};
+        use std::sync::Mutex;
+        static PORT: AtomicU16 = AtomicU16::new(0);
+        static SENT: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+
+        async fn send_sink(body: axum::body::Bytes) -> &'static str {
+            SENT.lock().unwrap().push(serde_json::from_slice(&body).unwrap());
+            r#"{"ret":0}"#
+        }
+        async fn upload_url(_body: axum::body::Bytes) -> String {
+            format!(
+                r#"{{"upload_full_url":"http://127.0.0.1:{}/up"}}"#,
+                PORT.load(Ordering::Relaxed)
+            )
+        }
+        async fn cdn_up(
+            _body: axum::body::Bytes,
+        ) -> ([(&'static str, &'static str); 1], &'static str) {
+            ([("x-encrypted-param", "dl-param")], "ok")
+        }
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        PORT.store(port, Ordering::Relaxed);
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/ilink/bot/sendmessage", post(send_sink))
+                    .route("/ilink/bot/getuploadurl", post(upload_url))
+                    .route("/up", post(cdn_up)),
+            )
+            .await
+            .ok();
+        });
+
+        let dir = std::env::temp_dir().join(format!("lw-wx-pend-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(dir.join("t.db"));
+        let s = crate::store::Store::open(&dir.join("t.db")).unwrap();
+        let file = dir.join("攻略.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        queue_pending_send(&s.settings, "u1", &file, Some("给你")).await.unwrap();
+        queue_pending_send(&s.settings, "u1", &dir.join("gone.txt"), None).await.unwrap();
+        queue_pending_send(&s.settings, "u2", &file, None).await.unwrap();
+
+        let net = net::Client::new(|b| b);
+        let base = format!("http://127.0.0.1:{port}");
+        flush_pending_sends(&net, &base, "tok", "u1", "fresh-ctx", &s.settings).await;
+
+        // u1 真文件送达:附言文本项在前、file_item 在后,都带新令牌
+        let sent = SENT.lock().unwrap();
+        assert_eq!(sent.len(), 2, "附言 + 文件两条:{sent:?}");
+        assert_eq!(sent[0]["msg"]["item_list"][0]["text_item"]["text"], "给你");
+        assert_eq!(sent[0]["msg"]["context_token"], "fresh-ctx");
+        assert_eq!(sent[1]["msg"]["item_list"][0]["file_item"]["file_name"], "攻略.txt");
+        // 列表只剩 u2 的(u1 真文件送达出列、已删路径丢弃)
+        let left = load_pending(&s.settings);
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].ext_id, "u2");
     }
 }

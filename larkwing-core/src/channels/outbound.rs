@@ -53,6 +53,30 @@ impl Target {
     }
 }
 
+/// 微信「会话窗口关死」判定:anyhow 链上找 weixin::StaleContext 标记
+/// (send_file 工具据此把该文件转「挂起补发」而不是干失败)。
+pub(crate) fn is_stale_weixin(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<super::weixin::StaleContext>().is_some())
+}
+
+/// 微信挂起补发入列(挂到目标线程名下;TA 下次开口由收循环自动补发)。
+pub(crate) async fn queue_weixin_pending(
+    store: &Store,
+    target: &Target,
+    path: &Path,
+    caption: Option<&str>,
+) -> Result<()> {
+    let Target::Weixin { to_user_id, .. } = target else {
+        bail!("挂起补发只支持微信目标")
+    };
+    super::weixin::queue_pending_send(&store.settings, to_user_id, path, caption).await
+}
+
+/// 挂起有效期(小时),给工具话术用(单源在 weixin.rs,§4.11 不留副本)。
+pub(crate) fn weixin_pending_ttl_hours() -> i64 {
+    super::weixin::PENDING_TTL_HOURS
+}
+
 /// 按名字找家人(跨人投递的收件人解析:send_file 的 to / reminder_set 的 for 共用)。
 /// 名字 = 家人页里的称呼(用户数据,非 i18n);找不到 / 重名都给明白话(§3.5),
 /// 错误里带现有名单,让模型自己纠正或如实转告「先去设置·家人里加」。

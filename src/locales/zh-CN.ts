@@ -222,6 +222,27 @@ export default {
     prevEp: '上一集',
     nextEp: '下一集',
     episodeOf: '第 {cur}/{total} 集',
+    // 音频播放条(歌/故事)用「首」词族;循环/随机按钮 title 直述当前状态
+    prevTrack: '上一首',
+    nextTrack: '下一首',
+    trackOf: '第 {cur}/{total} 首',
+    loopOff: '循环:关',
+    loopAll: '列表循环中',
+    loopOne: '单曲循环中',
+    shuffleOn: '随机播放中',
+    shuffleOff: '随机:关',
+    // 音轨切换(双语片):按钮显示当前轨的友好名;语言码词典没收录的显示原码
+    audioTrack: '音轨:{label}(点击切换)',
+    trackN: '音轨 {n}',
+    lang: {
+      chi: '国语',
+      zho: '国语',
+      cmn: '国语',
+      eng: '英语',
+      yue: '粤语',
+      jpn: '日语',
+      kor: '韩语',
+    },
     // 「怎么放的」徽章:label 短(播放条上),hint 进 title 悬浮细说。key 对齐 core PlaybackRoute。
     route: {
       direct: '直连',
@@ -393,9 +414,6 @@ export default {
     minutesAgo: '{n} 分钟前',
     hoursAgo: '{n} 小时前',
     yesterday: '昨天',
-  },
-  boot: {
-    skip: '点击任意处跳过',
   },
   // 数据「搬家」提示弹窗(主窗 boot 后:位置失效恢复 / 搬完旧数据清理)
   dataNotice: {

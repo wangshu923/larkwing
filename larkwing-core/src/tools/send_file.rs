@@ -31,7 +31,8 @@ impl SendFile {
                               「传给我」);「把XX发给妈妈」这类就把 to 填成那位家人的名字。\
                               用户点名了渠道(「发我微信」)才填 channel,没点名就不填。\
                               发之前文件得已经在本机(要下载先 web_download,要转图先 \
-                              pdf_to_png)。对方没连手机会明说。",
+                              pdf_to_png)。对方没连手机会明说。微信会话过期发不进去时会\
+                              自动挂起、对方一开口就补送(结果里会说明),不要重发。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -82,7 +83,7 @@ impl Tool for SendFile {
                     .filter_map(|v| v.as_str())
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .map(PathBuf::from)
+                    .map(|s| PathBuf::from(super::expand_home(s))) // 「~/xxx」宽容展开(§4.4)
                     .collect()
             })
             .unwrap_or_default();
@@ -126,6 +127,7 @@ impl Tool for SendFile {
         let target = outbound::resolve_target(&ctx.store, target_user, channel)?;
 
         let mut sent: Vec<String> = Vec::new();
+        let mut queued: Vec<String> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
         for (i, p) in paths.iter().enumerate() {
             let cap = if i == 0 { note } else { None };
@@ -135,27 +137,49 @@ impl Tool for SendFile {
                 .unwrap_or_else(|| p.display().to_string());
             match outbound::send_file(&self.net, &target, p, cap).await {
                 Ok(()) => sent.push(name),
+                // 微信会话窗口关死(平台限制,非故障)→ 挂起补发,不算失败(§7.7;
+                // 同 §7.1「需登录 ≠ 失败 + 自动重放」哲学);挂也挂不上才算失败
+                Err(e) if outbound::is_stale_weixin(&e) => {
+                    match outbound::queue_weixin_pending(&ctx.store, &target, p, cap).await {
+                        Ok(()) => queued.push(name),
+                        Err(qe) => failed.push(format!("{name}({e:#};挂起也失败:{qe:#})")),
+                    }
+                }
                 Err(e) => failed.push(format!("{name}({e:#})")),
             }
         }
         // 全军覆没 = 错误观察(模型换路/如实说);部分失败 = 汇总 + 点名失败(fs 批量纪律)
+        let whose = recipient.as_ref().map(|u| format!("{}的", u.name)).unwrap_or_default();
         anyhow::ensure!(
-            !sent.is_empty(),
-            "一个都没发出去(经 {}):{}",
+            !sent.is_empty() || !queued.is_empty(),
+            "一个都没发出去(经 {},发往{whose}手机):{}",
             target.channel_name(),
             failed.join(";")
         );
-        let whose = recipient.as_ref().map(|u| format!("{}的", u.name)).unwrap_or_default();
-        let mut out = format!(
-            "已经 {} 发到{whose}手机 {} 个:{}",
-            target.channel_name(),
-            sent.len(),
-            sent.join("、")
-        );
-        if !failed.is_empty() {
-            out.push_str(&format!("\n没发出去 {} 个:{}", failed.len(), failed.join(";")));
+        let who = recipient.as_ref().map(|u| u.name.clone()).unwrap_or_else(|| "你".to_string());
+        let mut parts: Vec<String> = Vec::new();
+        if !sent.is_empty() {
+            parts.push(format!(
+                "已经 {} 发到{whose}手机 {} 个:{}",
+                target.channel_name(),
+                sent.len(),
+                sent.join("、")
+            ));
         }
-        Ok(out)
+        if !queued.is_empty() {
+            parts.push(format!(
+                "{} 个没能马上送到、已挂起:{}——微信限制 bot 只能在对方最近说过话的会话\
+                 窗口内主动发消息,现在窗口过期了;{who}在微信上随便发来一句话就会自动补送\
+                 ({} 小时内有效),不用重发。想立刻送到,就让{who}先给我发句话。",
+                queued.len(),
+                queued.join("、"),
+                outbound::weixin_pending_ttl_hours()
+            ));
+        }
+        if !failed.is_empty() {
+            parts.push(format!("没发出去 {} 个:{}", failed.len(), failed.join(";")));
+        }
+        Ok(parts.join("\n"))
     }
 }
 
@@ -199,6 +223,56 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("还没连上手机"), "{err:#}");
+    }
+
+    /// 微信会话窗口关死 → 文件挂起、结果如实说明(Ok 不是 Err),挂起件落 KV。
+    #[tokio::test]
+    async fn weixin_stale_context_queues_pending() {
+        use axum::{routing::post, Router};
+        async fn deny(_b: axum::body::Bytes) -> &'static str {
+            r#"{"ret":-2,"errmsg":"prepare failed"}"#
+        }
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/ilink/bot/sendmessage", post(deny)))
+                .await
+                .ok();
+        });
+
+        let ctx = ctx("wxpend");
+        // 微信目标:老单 token 迁移形态(唯一账号兜底)+ base_url 指本地假端点 + 线程带 push_id
+        crate::secrets::set(&ctx.store.settings, "remote.weixin.token", "tok").unwrap();
+        ctx.store
+            .settings
+            .set(None, "remote.weixin.base_url", &format!("http://127.0.0.1:{port}"))
+            .unwrap();
+        let owner = ctx.store.users.ensure_default_user().unwrap();
+        let conv =
+            ctx.store.chat.create_conversation_full(owner.id, "companion", "weixin").unwrap();
+        ctx.store.channels.bind("weixin", "wxid_1", conv.id).unwrap();
+        ctx.store.channels.set_push_id("weixin", "wxid_1", "stale-ctx").unwrap();
+
+        let dir = std::env::temp_dir().join(format!("lw-sendfile-pend-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("单据.txt");
+        std::fs::write(&f, b"x").unwrap();
+
+        let tool = SendFile::new();
+        let out = tool
+            .run(
+                serde_json::json!({
+                    "paths": [f.to_string_lossy()], "note": "给你", "channel": "weixin"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("挂起") && out.contains("不用重发"), "如实说明挂起:{out}");
+        // 挂起件落 KV(路径 + 附言都在)
+        let raw =
+            ctx.store.settings.get(None, "remote.weixin.pending_sends").unwrap().unwrap();
+        assert!(raw.contains("单据.txt") && raw.contains("给你"), "{raw}");
     }
 
     #[tokio::test]

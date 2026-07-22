@@ -64,7 +64,7 @@ impl ReadImage {
                     .filter_map(|v| v.as_str())
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .map(String::from)
+                    .map(super::expand_home) // 「~/xxx」宽容展开(§4.4)
                     .collect()
             })
             .unwrap_or_default();

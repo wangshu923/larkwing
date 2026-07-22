@@ -376,6 +376,16 @@ export interface PlaylistPos {
 /** 本次播放走的链路(core 发 key,前端出短标签)。见 Rust `media::PlaybackRoute`。 */
 export type PlaybackRoute = 'direct' | 'dash' | 'hls_copy' | 'hls_transcode' | 'remux'
 
+/** 一条音轨(core 探测;顺序 = 切换时的轨号-1)。 */
+export interface AudioTrackInfo {
+  /** 编码名("ac-3"/"mp4a"/"ac3"/"aac"…;"?" = 没解析出来)。 */
+  codec: string
+  /** ISO-639-2 语言码("chi"/"eng"…);缺省 = 未标注。 */
+  lang?: string
+  /** 元数据标题(mkv 常见「国语 DD5.1」)。 */
+  title?: string
+}
+
 export interface NowPlaying {
   kind: 'audio' | 'video'
   title: string
@@ -392,6 +402,17 @@ export interface NowPlaying {
   source: string
   /** 有值 = 多集剧集:UI 显「第N/共M集」+ 上/下一集按钮;ended 时若非末集自动续播。 */
   playlist?: PlaylistPos
+  /** 循环模式镜像(core 是唯一真相,每次 Play 全量捎带):off / one(单曲,前端 el.loop)/ all(列表)。
+   *  可选:浏览器预览假数据可不带(按 off 处理)。 */
+  loop_mode?: 'off' | 'one' | 'all'
+  /** 随机播放镜像(多集队列才可能 true)。 */
+  shuffle?: boolean
+  /** 全部音轨(本地探测;≥2 条才出切换钮)。缺省/空 = 单音轨或网络流。 */
+  audio_tracks?: AudioTrackInfo[]
+  /** 当前音轨(0 起下标)。 */
+  audio_track?: number
+  /** 有值 = 从这个位置(秒)接着播(切音轨重建管线时 core 带上,加载完 seek 过去)。 */
+  resume_at?: number
 }
 
 export type MediaEvent =
@@ -989,6 +1010,10 @@ export const api = {
   /** 多集续播切集(+1 下一集 / -1 上一集):ended 自动续播、播放器上/下一集按钮直连这里(不绕 LLM)。
    *  越界(到头/到顶)在 core 内静默(只记日志)。fire-and-forget。 */
   mediaAdvance: (delta: number) => invoke<void>('media_advance', { delta }),
+  /** 一集放完问 core「接下来放什么」:true=已接管(循环/随机/顺序切下一首,Play 事件接力);false=正常收尾。 */
+  mediaAutoNext: () => invoke<boolean>('media_auto_next'),
+  /** 播放条循环/随机/音轨按钮 → core 校验落状态(与嘴控同一执行口);audio_track 带 value(1 起)。 */
+  mediaMode: (action: string, value?: number) => invoke<void>('media_mode', { action, value }),
   /** 回报播放器当下状态给 core(只主窗调):状态/标题之外带基准音量(0–100)、进度/时长(秒)、
    *  倍速。core 据此在下个回合喂模型「此刻」背景 —— 修「歌放完了却以为还在播」,并让模型知道
    *  当前音量/进度(才能「调到 50」「快进 5 分钟」)。fire-and-forget。 */

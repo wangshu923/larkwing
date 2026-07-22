@@ -48,11 +48,29 @@ const FFNAME_BAD_VIDEO: &[&str] = &[
     "wmv2", "wmv3", "rv10", "rv20", "rv30", "rv40", "vp6", "vp6f",
 ];
 
+/// 一条音轨的探测结论(顺序 = 文件里的音轨顺序,也就是 ffmpeg `-map 0:a:{n}` 的 n)。
+/// 过桥进 `NowPlaying.audio_tracks`(UI 出切换钮、〔此刻〕喂模型)。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct AudioTrack {
+    /// 编码名(BMFF = stsd fourcc,如 "ac-3"/"mp4a";容器 = ffmpeg 编码名,如 "ac3"/"aac";
+    /// 解析不出 = "?"——占位保序,顺序错了 -map 就切错轨)。
+    pub codec: String,
+    /// ISO-639-2 三字语言码("chi"/"eng"…;"und"/读不出 = None)。core 不翻译(§6.6),
+    /// 前端字典映射常见码 → 「国语/英语」,模型直接认得 ISO 码。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
+    /// 元数据标题(mkv 常见「国语 DD5.1」这类;BMFF 少见)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
 /// 本地 MP4 探测结论。解析不出(非 MP4 / 畸形 / 读不到)→ 全 `false` + 无时长,上层据此
 /// 退回原生直传(保当前行为,绝不因探测失败挡住播放)。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LocalProbe {
     /// 音轨是 AC3/DTS 等 WebView2 解不了的编码 → 需转码 AAC。
+    /// (多音轨文件 = 任一轨不兼容即 true;选轨播放时上层按 `audio_tracks[选中].codec`
+    /// 用 `audio_codec_needs_transcode` 逐轨判,这个粗粒度旗子只当回落。)
     pub audio_incompatible: bool,
     /// 视频是 HEVC/AV1/杜比视界等 WebView2 多半解不了的编码(仅诊断用)。
     pub video_incompatible: bool,
@@ -62,6 +80,8 @@ pub struct LocalProbe {
     pub video_keyframes: Vec<f64>,
     /// 视频轨 H.264 codec 串(`avc1.xxxxxx`);None = 非 H.264 或解不出 → copy 路走不了,回落转码。
     pub video_codec: Option<String>,
+    /// 全部音轨(文件顺序 = `-map 0:a:{n}` 的 n)。空 = 解析不出/无音轨(选轨功能不出现)。
+    pub audio_tracks: Vec<AudioTrack>,
 }
 
 fn ext_lower(path: &Path) -> Option<String> {
@@ -109,25 +129,60 @@ pub fn needs_ffmpeg_container(path: &Path) -> bool {
 /// 判兼容 + 总时长。`ffmpeg -i` 无输出会以非零码退出(“At least one output file…”),但流信息照样
 /// 打在 stderr → 调用方不看退出码、只喂 stderr 进来。任何字段解析不出都按"兼容/无"降级,绝不挡播放。
 pub fn parse_ffmpeg_stderr(stderr: &str) -> LocalProbe {
+    parse_ffmpeg_stderr_with(stderr, cfg!(target_os = "macos"))
+}
+
+/// `mac_native` 注入可测(同 `probe_local_with`;mac 放宽白名单见 `mac_native_ffname`)。
+fn parse_ffmpeg_stderr_with(stderr: &str, mac_native: bool) -> LocalProbe {
     let mut p = LocalProbe::default();
+    // 紧跟在某条音频流后面的 `Metadata: title` 归它(mkv 常见「国语 DD5.1」);
+    // 新的 Stream 行一出现就收口,别把视频/字幕的 title 错挂到音轨上。
+    let mut title_pending = false;
     for raw in stderr.lines() {
         let line = raw.trim();
         if p.duration_seconds.is_none() {
             p.duration_seconds = parse_duration_line(line);
         }
+        if line.starts_with("Stream #") {
+            title_pending = false;
+        }
         // "Stream #0:0(eng): Video: hevc (Main 10), yuv420p10le, 1920x1080 …"
         if let Some(rest) = line.split("Video: ").nth(1) {
             let codec = rest.split([' ', ',', '(']).next().unwrap_or("");
-            if FFNAME_BAD_VIDEO.contains(&codec) {
+            if FFNAME_BAD_VIDEO.contains(&codec) && !mac_native_ffname(codec, mac_native) {
                 p.video_incompatible = true;
             }
         }
-        // "Stream #0:1(chi): Audio: dts (DTS-HD MA), 48000 Hz, 5.1 …"
+        // "Stream #0:1(chi): Audio: dts (DTS-HD MA), 48000 Hz, 5.1 …" —— 括号里是语言码
         if let Some(rest) = line.split("Audio: ").nth(1) {
             let codec = rest.split([' ', ',', '(']).next().unwrap_or("");
-            if FFNAME_BAD_AUDIO.contains(&codec) {
+            if FFNAME_BAD_AUDIO.contains(&codec) && !mac_native_ffname(codec, mac_native) {
                 p.audio_incompatible = true;
             }
+            let lang = line
+                .split(": Audio:")
+                .next()
+                .and_then(|head| head.rsplit_once('(').map(|(_, r)| r))
+                .and_then(|r| r.split(')').next())
+                .map(str::trim)
+                .filter(|s| s.len() == 3 && s.chars().all(|c| c.is_ascii_lowercase()) && *s != "und")
+                .map(str::to_string);
+            p.audio_tracks.push(AudioTrack {
+                codec: if codec.is_empty() { "?".into() } else { codec.to_string() },
+                lang,
+                title: None,
+            });
+            title_pending = true;
+        } else if title_pending && line.starts_with("title") {
+            if let Some((_, v)) = line.split_once(':') {
+                let v = v.trim();
+                if !v.is_empty() {
+                    if let Some(last) = p.audio_tracks.last_mut() {
+                        last.title = Some(v.to_string());
+                    }
+                }
+            }
+            title_pending = false; // 一条 title 就够,后续 Metadata 行不再收
         }
     }
     p
@@ -202,16 +257,119 @@ fn parse_duration_line(line: &str) -> Option<f64> {
     (secs.is_finite() && secs > 0.0).then_some(secs)
 }
 
+/// 开发壳 macOS(WKWebView = AVFoundation 系统解码)**原生就能解、无需转码**的编码白名单。
+/// **只剩视频(HEVC)**——音频(AC3/E-AC3/ALAC)的放宽 2026-07-21 当天回滚(用户拍板
+/// 「音频都转」):直传省下的那点转码换来三亏——多音轨全轨混播(WKWebView 的 audioTracks
+/// API 起播收敛/播放中启停都不生效)、切轨只能重建、浏览器自行下混响度不受控;统一走管线
+/// 转 AAC + 响度链(`AUDIO_LOUDNESS_AF`),两平台音频判定同一张矩阵。视频保留:HEVC 在
+/// mac 直传/管线 copy 都能原生解,与响度无关。DTS/TrueHD/AC-4/AV1/杜比视界两平台都转
+/// (宁可多转,不可无声/花屏 —— §8.1「有画没声」教训)。Windows 恒走完整表,行为零变化。
+fn mac_native_fourcc(tag: &[u8], mac_native: bool) -> bool {
+    mac_native && matches!(tag, b"hev1" | b"hvc1" | b"hvc2")
+}
+
+/// 同上,ffmpeg 编码名词汇(mkv 等容器路:容器仍要转封装,HEVC 流在 mac 可 `-c copy`)。
+fn mac_native_ffname(name: &str, mac_native: bool) -> bool {
+    mac_native && matches!(name, "hevc")
+}
+
+/// **这一条音轨**要不要转码(选轨播放的逐轨判定;fourcc 与 ffmpeg 名两套词汇都认,
+/// mac 白名单同口径)。认不出的编码默认兼容(§7.1「只转处理不了的」)。
+pub fn audio_codec_needs_transcode(codec: &str) -> bool {
+    audio_codec_needs_transcode_with(codec, cfg!(target_os = "macos"))
+}
+
+fn audio_codec_needs_transcode_with(codec: &str, mac_native: bool) -> bool {
+    let c = codec.trim();
+    let bad = INCOMPATIBLE_AUDIO.contains(&c.as_bytes()) || FFNAME_BAD_AUDIO.contains(&c);
+    bad && !(mac_native_fourcc(c.as_bytes(), mac_native) || mac_native_ffname(c, mac_native))
+}
+
 /// 探测本地 MP4 文件的音/视频编码与时长(同步 IO;异步调用方用 `spawn_blocking` 包)。
+/// 兼容判定按**当前编译目标**(mac 开发壳放宽白名单内的编码,见 `mac_native_fourcc`)。
 pub fn probe_local(path: &Path) -> LocalProbe {
+    probe_local_with(path, cfg!(target_os = "macos"))
+}
+
+/// `mac_native` 注入可测(Windows/mac 两套矩阵都有测试钉住;运行时由 `probe_local` 按编译目标传)。
+fn probe_local_with(path: &Path, mac_native: bool) -> LocalProbe {
     let Some(moov) = read_moov(path) else { return LocalProbe::default() };
     LocalProbe {
-        audio_incompatible: INCOMPATIBLE_AUDIO.iter().any(|tag| contains(&moov, tag)),
-        video_incompatible: INCOMPATIBLE_VIDEO.iter().any(|tag| contains(&moov, tag)),
+        audio_incompatible: INCOMPATIBLE_AUDIO
+            .iter()
+            .any(|tag| !mac_native_fourcc(tag, mac_native) && contains(&moov, tag)),
+        video_incompatible: INCOMPATIBLE_VIDEO
+            .iter()
+            .any(|tag| !mac_native_fourcc(tag, mac_native) && contains(&moov, tag)),
         duration_seconds: duration_from_moov(&moov),
         video_keyframes: video_keyframes(&moov).unwrap_or_default(),
         video_codec: video_h264_codec(&moov),
+        audio_tracks: audio_tracks_of_moov(&moov),
     }
+}
+
+/// 列出全部音轨(hdlr='soun' 的 trak,按文件顺序 = `-map 0:a:{n}` 的 n):
+/// stsd 首个 sample-entry 的 fourcc + mdhd 语言。解析不了细节的轨给 "?" 占位**保序**。
+fn audio_tracks_of_moov(moov: &[u8]) -> Vec<AudioTrack> {
+    let (mo_s, mo_e) = find_box(moov, b"moov", 0, moov.len())
+        // probe_local 传进来的通常已是 moov payload(不含盒头):没套 moov 盒时直接在整块上找 trak。
+        .unwrap_or((0, moov.len()));
+    let mut out = Vec::new();
+    for_each_box(moov, mo_s, mo_e, |t, hdr, bs, be| {
+        if t == b"trak" {
+            if let Some(track) = audio_track_of_trak(moov, bs + hdr, be) {
+                out.push(track);
+            }
+        }
+    });
+    out
+}
+
+/// 单条 trak:是音轨(hdlr='soun')则读出编码 fourcc + mdhd 语言;非音轨/结构缺失 → None。
+fn audio_track_of_trak(moov: &[u8], tr_s: usize, tr_e: usize) -> Option<AudioTrack> {
+    let (md_s, md_e) = find_box(moov, b"mdia", tr_s, tr_e)?;
+    let (hd_s, _) = find_box(moov, b"hdlr", md_s, md_e)?;
+    if moov.get(hd_s + 8..hd_s + 12)? != b"soun" {
+        return None;
+    }
+    // stsd payload:version/flags(4) + entry_count(4) + 首个 sample entry(size(4)+fourcc(4)…)
+    let codec = (|| {
+        let (mn_s, mn_e) = find_box(moov, b"minf", md_s, md_e)?;
+        let (st_s, st_e) = find_box(moov, b"stbl", mn_s, mn_e)?;
+        let (sd_s, _) = find_box(moov, b"stsd", st_s, st_e)?;
+        let fourcc = moov.get(sd_s + 12..sd_s + 16)?;
+        let s = String::from_utf8_lossy(fourcc).trim().to_string();
+        (!s.is_empty()).then_some(s)
+    })()
+    .unwrap_or_else(|| "?".into());
+    // mdhd:version/flags(4) + creation/mod(v1:8+8 / v0:4+4) + timescale(4) + duration(v1:8 / v0:4)
+    // 之后 2 字节 = pad(1bit) + 3×5bit 打包语言(各 +0x60 = ISO-639-2 小写字母)。
+    let lang = (|| {
+        let (mh_s, _) = find_box(moov, b"mdhd", md_s, md_e)?;
+        let v = *moov.get(mh_s)?;
+        let lang_off = mh_s + 4 + if v == 1 { 16 + 4 + 8 } else { 8 + 4 + 4 };
+        let raw = u16::from_be_bytes(moov.get(lang_off..lang_off + 2)?.try_into().ok()?);
+        decode_mdhd_lang(raw)
+    })();
+    // trak 级 udta→name:部分 remux 工具把轨道名(「国语 5.1」类)写在这;没有 = None。
+    let title = (|| {
+        let (ud_s, ud_e) = find_box(moov, b"udta", tr_s, tr_e)?;
+        let (nm_s, nm_e) = find_box(moov, b"name", ud_s, ud_e)?;
+        let raw = moov.get(nm_s..nm_e)?;
+        let text = String::from_utf8_lossy(raw).trim_matches(char::from(0)).trim().to_string();
+        (!text.is_empty() && text.chars().count() <= 60).then_some(text)
+    })();
+    Some(AudioTrack { codec, lang, title })
+}
+
+/// mdhd 打包语言 → ISO-639-2 三字码;全零/"und"/解出非小写字母 → None(未标注)。
+fn decode_mdhd_lang(raw: u16) -> Option<String> {
+    if raw == 0 {
+        return None;
+    }
+    let ch = |shift: u16| (((raw >> shift) & 0x1F) as u8 + 0x60) as char;
+    let s: String = [ch(10), ch(5), ch(0)].into_iter().collect();
+    (s.chars().all(|c| c.is_ascii_lowercase()) && s != "und").then_some(s)
 }
 
 /// 逐顶层盒子前进,定位并读出 `moov`(可能在文件尾):用每个盒子的 size 字段 seek 跳过
@@ -420,6 +578,34 @@ pub fn plan_copy_segments(keyframes: &[f64], duration: f64, target: f64) -> Vec<
 }
 
 /// fMP4 里第一个 `moof` 盒的偏移(= `ftyp`+`moov` 之后)。把 ffmpeg 出的「自包含分片 mp4」
+/// 把段内全部 `tfdt` 的 baseMediaDecodeTime **归零**,返回改前的最大原值(诊断用)。
+/// 自适应音频段的前端契约 = 「段内 tfdt=0,时间轴由 timestampOffset+appendWindow 决定」;
+/// ffmpeg 对**非默认音轨**(`-map 0:a:1`)`-ss` 后可能残留非零 tfdt(2026-07-22 真机:切英语轨
+/// 段被 append 但样本全落在 appendWindow 外被静默裁光 → 无声)——归零 = 按构造满足契约,
+/// 对本就为 0 的段是 no-op。找不到 tfdt(不是分片 mp4)= 0,不动。
+pub fn zero_tfdt(seg: &mut [u8]) -> u64 {
+    let mut max_was: u64 = 0;
+    let mut from = 0usize;
+    while let Some(rel) = find_subslice(&seg[from..], b"tfdt") {
+        let tag = from + rel;
+        from = tag + 4;
+        let Some(&version) = seg.get(tag + 4) else { break };
+        let off = tag + 8; // version(1)+flags(3) 之后是 baseMediaDecodeTime
+        if version == 1 {
+            let Some(b8) = seg.get(off..off + 8) else { continue };
+            let was = u64::from_be_bytes(b8.try_into().unwrap());
+            max_was = max_was.max(was);
+            seg[off..off + 8].fill(0);
+        } else {
+            let Some(b4) = seg.get(off..off + 4) else { continue };
+            let was = u32::from_be_bytes(b4.try_into().unwrap()) as u64;
+            max_was = max_was.max(was);
+            seg[off..off + 4].fill(0);
+        }
+    }
+    max_was
+}
+
 /// (ftyp+moov+moof+mdat)切成 HLS fMP4 要的两块:**共享 init**(`0..first_moof`,即 ftyp+moov)
 /// 与 **moof 段**(`first_moof..`,moof+mdat)。逐顶层盒前进找 moof;找不到/畸形 → None。
 pub fn first_moof_offset(b: &[u8]) -> Option<usize> {
@@ -640,10 +826,12 @@ mod tests {
         file.extend_from_slice(&mp4_box(b"moov", &moov_payload));
 
         let path = write_temp("ac3", &file);
-        let probe = probe_local(&path);
+        let probe = probe_local_with(&path, false); // Windows(目标平台)矩阵
         assert!(probe.audio_incompatible, "应识别出 ac-3 音轨需转码");
         assert!(!probe.video_incompatible);
         assert_eq!(probe.duration_seconds, Some(5.0), "mvhd 时长 5000/1000=5.0s");
+        // mac 音频放宽已回滚(混播/切轨/响度三亏,「音频都转」):AC3 在 mac 也转
+        assert!(probe_local_with(&path, true).audio_incompatible, "mac 对 AC3 同样转码");
     }
 
     #[test]
@@ -665,9 +853,142 @@ mod tests {
         moov_payload.extend_from_slice(&mp4_box(b"stsd", b"....hvc1....mp4a...."));
         let mut file = mp4_box(b"ftyp", b"isomhvc1");
         file.extend_from_slice(&mp4_box(b"moov", &moov_payload));
-        let probe = probe_local(&write_temp("hevc", &file));
+        let path = write_temp("hevc", &file);
+        let probe = probe_local_with(&path, false); // Windows(目标平台)矩阵
         assert!(probe.video_incompatible, "hvc1 → 视频不兼容(诊断)");
         assert!(!probe.audio_incompatible, "音轨是 mp4a,不需转码");
+        assert!(!probe_local_with(&path, true).video_incompatible, "mac 原生解 HEVC,不标");
+    }
+
+    #[test]
+    fn mac_whitelist_is_video_only() {
+        // 音频放宽已回滚:AC3/DTS 两套矩阵都转(混播/切轨/响度三亏,「音频都转」拍板)
+        let mut moov_payload = mp4_box(b"mvhd", &mvhd_v0(1000, 5000));
+        moov_payload
+            .extend_from_slice(&mp4_box(b"stsd", b"\x00\x00\x00\x01\x00\x00\x00\x20dtscxxxx"));
+        let mut file = mp4_box(b"ftyp", b"isomiso2avc1mp41");
+        file.extend_from_slice(&mp4_box(b"moov", &moov_payload));
+        let path = write_temp("dts-mac", &file);
+        assert!(probe_local_with(&path, false).audio_incompatible);
+        assert!(probe_local_with(&path, true).audio_incompatible, "DTS 在 mac 也要转");
+
+        // ffmpeg 名字表同口径(mkv 路):视频 hevc mac 放行 -c copy;音频 ac3 两边都转
+        let s = "  Stream #0:0: Video: hevc (Main 10)\n  Stream #0:1: Audio: ac3, 48000 Hz";
+        assert!(parse_ffmpeg_stderr_with(s, false).video_incompatible);
+        assert!(parse_ffmpeg_stderr_with(s, false).audio_incompatible);
+        let mac = parse_ffmpeg_stderr_with(s, true);
+        assert!(!mac.video_incompatible, "mac:hevc 视频可 copy");
+        assert!(mac.audio_incompatible, "mac:ac3 音频同样转(回滚后)");
+        let s2 = "  Stream #0:0: Video: av1\n  Stream #0:1: Audio: truehd";
+        let mac2 = parse_ffmpeg_stderr_with(s2, true);
+        assert!(mac2.video_incompatible && mac2.audio_incompatible, "av1/truehd mac 也不放");
+    }
+
+    /// 造一条音轨 trak(hdlr=soun + mdhd v0 带打包语言 + stsd 首 sample-entry fourcc)。
+    fn audio_trak(fourcc: &[u8; 4], lang: u16) -> Vec<u8> {
+        let hdlr = mp4_box(b"hdlr", &{
+            let mut p = vec![0u8; 8]; // version/flags + pre_defined
+            p.extend_from_slice(b"soun");
+            p.extend_from_slice(&[0u8; 12]);
+            p
+        });
+        let mdhd = mp4_box(b"mdhd", &{
+            let mut p = vec![0u8; 4 + 4 + 4 + 4 + 4]; // v0: vf + creation + mod + timescale + duration
+            p.extend_from_slice(&lang.to_be_bytes());
+            p.extend_from_slice(&[0u8; 2]); // pre_defined
+            p
+        });
+        let stsd = mp4_box(b"stsd", &{
+            let mut p = vec![0, 0, 0, 0, 0, 0, 0, 1]; // vf + entry_count=1
+            p.extend_from_slice(&[0, 0, 0, 0x20]); // entry size
+            p.extend_from_slice(fourcc);
+            p
+        });
+        let stbl = mp4_box(b"stbl", &stsd);
+        let minf = mp4_box(b"minf", &stbl);
+        let mdia = mp4_box(b"mdia", &[hdlr, mdhd, minf].concat());
+        mp4_box(b"trak", &mdia)
+    }
+
+    #[test]
+    fn audio_tracks_enumerated_with_lang_and_per_track_compat() {
+        // chi = (3<<10)|(8<<5)|9 = 0x0D09;eng = (5<<10)|(14<<5)|7 = 0x15C7(mdhd 打包 ISO-639-2)
+        let mut moov_payload = mp4_box(b"mvhd", &mvhd_v0(1000, 5000));
+        moov_payload.extend_from_slice(&audio_trak(b"ac-3", 0x0D09));
+        moov_payload.extend_from_slice(&audio_trak(b"mp4a", 0x15C7));
+        let mut file = mp4_box(b"ftyp", b"isomiso2avc1mp41");
+        file.extend_from_slice(&mp4_box(b"moov", &moov_payload));
+        let path = write_temp("atracks", &file);
+        let p = probe_local_with(&path, false);
+        assert_eq!(p.audio_tracks.len(), 2, "两条音轨按文件顺序列出");
+        assert_eq!(p.audio_tracks[0].codec, "ac-3");
+        assert_eq!(p.audio_tracks[0].lang.as_deref(), Some("chi"));
+        assert_eq!(p.audio_tracks[1].codec, "mp4a");
+        assert_eq!(p.audio_tracks[1].lang.as_deref(), Some("eng"));
+        // 逐轨判定:ac-3 两平台都转(mac 音频放宽已回滚);mp4a(AAC)两边都不转
+        assert!(audio_codec_needs_transcode_with("ac-3", false));
+        assert!(audio_codec_needs_transcode_with("ac-3", true), "mac 音频同一张矩阵");
+        assert!(!audio_codec_needs_transcode_with("mp4a", false));
+        assert!(audio_codec_needs_transcode_with("dtsc", true));
+        assert!(audio_codec_needs_transcode_with("dts", true), "ffmpeg 名同口径");
+    }
+
+    #[test]
+    fn audio_trak_udta_name_becomes_title() {
+        // trak 里带 udta→name(remux 工具写的轨道名)→ 当 title;lang 未标(0)→ None
+        let mut trak_payload = Vec::new();
+        // 复用 audio_trak 的 mdia(剥掉外层 trak 盒头 8 字节取 payload)
+        trak_payload.extend_from_slice(&audio_trak(b"ac-3", 0)[8..]);
+        let name = mp4_box(b"name", "\u{56fd}\u{8bed} 5.1".as_bytes());
+        trak_payload.extend_from_slice(&mp4_box(b"udta", &name));
+        let mut moov_payload = mp4_box(b"mvhd", &mvhd_v0(1000, 5000));
+        moov_payload.extend_from_slice(&mp4_box(b"trak", &trak_payload));
+        let mut file = mp4_box(b"ftyp", b"isomiso2avc1mp41");
+        file.extend_from_slice(&mp4_box(b"moov", &moov_payload));
+        let p = probe_local_with(&write_temp("udta-name", &file), false);
+        assert_eq!(p.audio_tracks.len(), 1);
+        assert_eq!(p.audio_tracks[0].title.as_deref(), Some("国语 5.1"));
+        assert!(p.audio_tracks[0].lang.is_none(), "语言 0 = 未标注");
+    }
+
+    #[test]
+    fn ffmpeg_stderr_lists_audio_tracks_with_lang_and_title() {
+        let stderr = "\
+  Duration: 02:10:33.40, start: 0.000000, bitrate: 18234 kb/s
+    Stream #0:0(eng): Video: hevc (Main 10), yuv420p10le(tv), 1920x1080, 23.98 fps
+    Stream #0:1(chi): Audio: ac3, 48000 Hz, 5.1(side)
+    Metadata:
+      title           : 国语 DD5.1
+    Stream #0:2(eng): Audio: dts (DTS-HD MA), 48000 Hz
+    Stream #0:3: Subtitle: subrip";
+        let p = parse_ffmpeg_stderr_with(stderr, false);
+        assert_eq!(p.audio_tracks.len(), 2, "字幕/视频不混进音轨清单");
+        assert_eq!(p.audio_tracks[0].codec, "ac3");
+        assert_eq!(p.audio_tracks[0].lang.as_deref(), Some("chi"));
+        assert_eq!(p.audio_tracks[0].title.as_deref(), Some("国语 DD5.1"));
+        assert_eq!(p.audio_tracks[1].codec, "dts");
+        assert_eq!(p.audio_tracks[1].lang.as_deref(), Some("eng"));
+        assert!(p.audio_tracks[1].title.is_none(), "title 只归紧跟的那条音轨");
+    }
+
+    #[test]
+    fn zero_tfdt_rewrites_and_reports_original() {
+        let v0 = {
+            let mut p = vec![0u8, 0, 0, 0]; // version 0 + flags
+            p.extend_from_slice(&12_345u32.to_be_bytes());
+            mp4_box(b"tfdt", &p)
+        };
+        let v1 = {
+            let mut p = vec![1u8, 0, 0, 0]; // version 1 + flags
+            p.extend_from_slice(&17_580_000u64.to_be_bytes());
+            mp4_box(b"tfdt", &p)
+        };
+        let mut seg = mp4_box(b"moof", &[v0, v1].concat());
+        assert_eq!(zero_tfdt(&mut seg), 17_580_000, "报告改前最大原值");
+        assert_eq!(zero_tfdt(&mut seg), 0, "二次归零 = no-op(已全 0)");
+        // 没有 tfdt 的数据:不动、报 0
+        let mut plain = mp4_box(b"ftyp", b"isom");
+        assert_eq!(zero_tfdt(&mut plain), 0);
     }
 
     #[test]
@@ -716,7 +1037,7 @@ Input #0, matroska,webm, from 'movie.mkv':
     Stream #0:0(eng): Video: hevc (Main 10), yuv420p10le(tv), 1920x1080, 23.98 fps
     Stream #0:1(chi): Audio: dts (DTS-HD MA), 48000 Hz, 5.1(side), s32p
     Stream #0:2(chi): Subtitle: subrip";
-        let p = parse_ffmpeg_stderr(stderr);
+        let p = parse_ffmpeg_stderr_with(stderr, false); // Windows(目标平台)矩阵
         assert!(p.video_incompatible, "hevc → 转视频");
         assert!(p.audio_incompatible, "dts → 转音轨");
         assert_eq!(p.duration_seconds, Some(2.0 * 3600.0 + 10.0 * 60.0 + 33.4));

@@ -3,6 +3,8 @@
 //! 用法(至少给一个 key;给多个 = 出跨模型矩阵,顺带就是路由选型表):
 //!   DEEPSEEK_API_KEY=sk-… cargo run -p larkwing-core --example eval
 //!   DEEPSEEK_API_KEY=… GEMINI_API_KEY=… EVAL_RUNS=5 cargo run -p larkwing-core --example eval
+//!   OLLAMA_MODEL=gemma3:12b cargo run -p larkwing-core --example eval  # 本地 ollama(base 默认 localhost:11434/v1)
+//!   OLLAMA_BASE_URL=http://localhost:1234/v1 OLLAMA_MODEL=… …  # 或任何 OpenAI 兼容端点(LM Studio / mlx_lm.server)
 //!   EVAL_VERBOSE=1 …  # 失败的 run 打印现场(工具轨迹 / 新记忆 / 提炼数 / 末条回复 / 没过的断言)
 //!   EVAL_THINKING=… # 思考档覆盖 off/light/medium/heavy(=1 等非档位值 → heavy);不设 = 默认 medium(回合 + 提炼)
 //!   EVAL_FILTER=judge …  # 按场景 id 子串过滤(逗号分隔、任一命中);调 rubric / 排障单独重跑,不必整套烧钱
@@ -27,8 +29,17 @@ async fn main() -> anyhow::Result<()> {
     if let Ok(k) = std::env::var("ANTHROPIC_API_KEY") {
         specs.push(ProviderSpec::anthropic(k));
     }
-    if let Ok(base) = std::env::var("OLLAMA_BASE_URL") {
-        specs.push(ProviderSpec::ollama(base));
+    // Ollama 本地:设了 OLLAMA_BASE_URL 或 OLLAMA_MODEL 任一即启用(base 不设 = localhost:11434/v1)。
+    let ollama_base = std::env::var("OLLAMA_BASE_URL").ok();
+    let ollama_model = std::env::var("OLLAMA_MODEL").ok().filter(|s| !s.trim().is_empty());
+    if ollama_base.is_some() || ollama_model.is_some() {
+        let mut spec = ProviderSpec::ollama(ollama_base.unwrap_or_default());
+        // 本地模型名千变万化(gemma3:12b / qwen2.5:7b / …)→ OLLAMA_MODEL 覆盖预设默认(llama3.2)。
+        // 名字必须与 `ollama list`(或 /v1/models)完全一致。
+        if let Some(model) = ollama_model {
+            spec.model = model;
+        }
+        specs.push(spec);
     }
 
     if specs.is_empty() {
@@ -61,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
         runs.map(|r| r.to_string()).unwrap_or_else(|| "默认".into()),
     );
     let thinking_label = match std::env::var("EVAL_THINKING").ok().filter(|s| !s.is_empty()) {
-        Some(v) if ["light", "medium", "heavy"].contains(&v.as_str()) => v,
+        Some(v) if ["off", "light", "medium", "heavy"].contains(&v.as_str()) => v,
         Some(_) => "heavy".into(),
         None => "默认 medium(回合 + 提炼;2026-06-19 起提炼也默认开思考)".into(),
     };
