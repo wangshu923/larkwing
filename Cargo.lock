@@ -491,6 +491,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "bincode"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -912,6 +921,17 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "character_converter"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f399d4f1a0caebb329b79ea33c81afd6073e603de2589878a0770a9cef837797"
+dependencies = [
+ "bincode",
+ "fst",
+ "once_cell",
 ]
 
 [[package]]
@@ -2044,6 +2064,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
+name = "fst"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ab85b9b05e3978cc9a9cf8fea7f01b494e1a09ed3037e16ba39edc7a29eb61a"
+
+[[package]]
 name = "funty"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3159,7 +3185,7 @@ dependencies = [
 
 [[package]]
 name = "larkwing"
-version = "0.2.21"
+version = "0.2.22"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3197,7 +3223,7 @@ dependencies = [
 
 [[package]]
 name = "larkwing-core"
-version = "0.2.21"
+version = "0.2.22"
 dependencies = [
  "aes",
  "anyhow",
@@ -3207,6 +3233,7 @@ dependencies = [
  "bytes",
  "bzip2 0.5.2",
  "calamine",
+ "character_converter",
  "chrono",
  "cpal",
  "dirs 6.0.0",

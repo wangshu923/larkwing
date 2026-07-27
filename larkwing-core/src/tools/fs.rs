@@ -21,15 +21,7 @@ const LIST_MAX: usize = 200;
 const FIND_MAX_DEPTH: usize = 4;
 const FIND_MAX_RESULTS: usize = 50;
 
-pub(super) fn human_size(bytes: u64) -> String {
-    if bytes >= 1 << 30 {
-        format!("{:.1}GB", bytes as f64 / (1u64 << 30) as f64)
-    } else if bytes >= 1 << 20 {
-        format!("{:.0}MB", bytes as f64 / (1u64 << 20) as f64)
-    } else {
-        format!("{}KB", bytes >> 10)
-    }
-}
+pub(super) use crate::files::human_size; // 单源在 files.rs(media 下载话术也用),这里留旧名转发
 
 fn hidden(name: &str) -> bool {
     name.starts_with('.') || name == "$RECYCLE.BIN" || name == "System Volume Information"

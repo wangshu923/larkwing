@@ -21,6 +21,8 @@ export default {
     media_search: '翻翻片库…',
     media_play: '准备开播…',
     media_control: '拨弄播放器…',
+    media_download: '下载歌曲中…',
+    lyrics_fetch: '找歌词中…',
     open: '这就打开…',
     system_volume: '拧音量旋钮…',
     power: '动一下电源开关…',
@@ -60,6 +62,8 @@ export default {
     retry: '重试', // 失败任务的重试按钮(目前仅影音解析/组件下载)
     unknown: '后台小任务',
     resolve: '解析播放地址',
+    media_download: '下载音频',
+    lyrics: '配歌词',
     relocate: '搬家中',
     update: '下载更新',
     remux: '准备视频「{name}」',
@@ -83,6 +87,8 @@ export default {
       relocate: '搬家没成功,数据仍在原处',
       remux: '视频没准备成,已换普通方式播',
       render: '网页那步没办成,它会换个法子或如实说',
+      audio_batch: '{fail} 首没下成(共 {total} 首)',
+      lyrics_batch: '{fail} 个没配上歌词(共 {total} 个)',
     },
   },
   // 动作确认卡(§7.8 确认闸):网页上点「付款/发布/删除」级按钮前先问你一声
@@ -114,6 +120,11 @@ export default {
     verify: '校验中…',
     extract: '解压中…',
     resolve: '找播放地址…',
+    audio_source: '找音源…',
+    audio_fetch: '下载「{t}」…',
+    audio_batch: '下载「{t}」({i}/{n})',
+    audio_lyrics: '找歌词…',
+    lyrics_batch: '找「{t}」的歌词({i}/{n})',
     render_load: '打开页面…',
     render_click: '点一下「{t}」…',
     render_back: '返回上一页…',
@@ -266,6 +277,12 @@ export default {
     attach: '加图片或文件',
     attRemove: '移除',
     dropHint: '松手,把文件交给{name}',
+    // 展开写长文面板(只管写,发送收口在小框) + 粘贴长文收纳小票
+    expandTitle: '展开写长文',
+    expandDone: '确定',
+    expandHint: 'Enter 换行 · {mod}+Enter 完成',
+    pasteName: '粘贴的文本',
+    pasteBackTitle: '点击放回编辑框修改',
     // 「设提醒 → 到点」链路呈现:eventDue = 到点系统线的标签(event 行,交代"定好的安排
     // 叫醒了它");reminderSaved / memorySaved = 回执小票(设了提醒/记了记忆,点击去对应页)
     eventDue: '到点了',

@@ -1,0 +1,162 @@
+//! 能力轴:影音(配词)。给本机已有的音频文件配歌词 —— 旁挂同名 .lrc,**绝不改动音频
+//! 原件**(用户的无损曲库一个字节不碰)。歌名/歌手优先读文件自带标签;缺标签的靠模型
+//! 从文件名判断后带参重试(信息抽取归模型,§5)。与 media_download 的下载配词共用机器件。
+
+use async_trait::async_trait;
+
+use super::{Tool, ToolCtx, ToolRisk, ToolSpec};
+use crate::media::{LyricsBatchOutcome, LyricsFileResult, LyricsItem, LyricsResult};
+
+pub(super) struct LyricsFetch {
+    spec: ToolSpec,
+}
+
+impl LyricsFetch {
+    pub(super) fn new() -> LyricsFetch {
+        LyricsFetch {
+            spec: ToolSpec {
+                name: "lyrics_fetch",
+                description: "给本机已有的音频文件配歌词:在每个文件旁边生成同名 .lrc\
+                              (播放器自动识别),**不改动音频文件本身**;已有 .lrc 的自动跳过。\
+                              歌名/歌手优先读文件自带标签;结果里点名「缺歌名」的文件,从文件名\
+                              判断出歌名/歌手后带 title/artist 对那几个重试。配合 fs_list/\
+                              fs_find 找到音乐文件后把路径喂进来;一次最多 200 个,超过 20 个\
+                              自动转后台(进度在屏幕任务条)。歌词来自公共歌词库,冷门/现场版\
+                              可能找不到——找不到就如实告诉用户。实在要自己从网上扒歌词代写 \
+                              .lrc 时,**绝不编造 [mm:ss] 时间轴**(网页上没有时间轴就写纯文本\
+                              歌词,假时间轴会让播放器乱滚,比没有更糟)。",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "files": {
+                            "type": "array",
+                            "description": "要配歌词的音频文件",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "path": {
+                                        "type": "string",
+                                        "description": "音频文件绝对路径(支持 ~ 开头)"
+                                    },
+                                    "title": {
+                                        "type": "string",
+                                        "description": "干净的歌名(文件标签缺失时才需要;从文件名判断)"
+                                    },
+                                    "artist": {
+                                        "type": "string",
+                                        "description": "演唱者/歌手名(同上,可选)"
+                                    }
+                                },
+                                "required": ["path"]
+                            }
+                        }
+                    },
+                    "required": ["files"]
+                }),
+                // 回合内档最多 20 首 × 约半秒 + 首次 ffmpeg 组件下载
+                timeout: std::time::Duration::from_secs(180),
+                ui_key: "tool.lyrics_fetch",
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for LyricsFetch {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn risk(&self) -> ToolRisk {
+        ToolRisk::Mutating
+    }
+
+    async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
+        let files = args
+            .get("files")
+            .and_then(serde_json::Value::as_array)
+            .filter(|a| !a.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("缺少 files 参数(音频文件列表)"))?;
+        let mut items = Vec::with_capacity(files.len());
+        for f in files {
+            let path = f
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(super::expand_home) // 「~/xxx」宽容展开(§4.4)
+                .ok_or_else(|| anyhow::anyhow!("files 里有一项缺 path"))?;
+            let p = std::path::PathBuf::from(path);
+            anyhow::ensure!(p.is_absolute(), "path 需要绝对路径,收到: {}", p.display());
+            let opt = |key: &str| {
+                f.get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            };
+            items.push(LyricsItem { path: p, title: opt("title"), artist: opt("artist") });
+        }
+
+        match ctx.media.lyrics_for_files(items).await? {
+            LyricsBatchOutcome::JobStarted { total } => Ok(format!(
+                "已开始在后台给 {total} 个文件找歌词,进度在屏幕任务条上;配不上的最后会在\
+                 任务条点名数目。告诉用户过一会儿就好,不用等着。"
+            )),
+            LyricsBatchOutcome::Report(report) => {
+                // 量是一等约束(§7.2):汇总数字 + 只点名要处理的(没找到/缺歌名/无效)。
+                let mut done = 0usize;
+                let mut plain = 0usize;
+                let mut existed = 0usize;
+                let (mut not_found, mut missing, mut unusable) =
+                    (Vec::new(), Vec::new(), Vec::new());
+                let stem = |p: &std::path::Path| {
+                    p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+                };
+                for (path, r) in &report {
+                    match r {
+                        LyricsFileResult::Got(LyricsResult::Lib | LyricsResult::Cc) => done += 1,
+                        LyricsFileResult::Got(LyricsResult::LibPlain) => {
+                            done += 1;
+                            plain += 1;
+                        }
+                        LyricsFileResult::Got(LyricsResult::Existed) => existed += 1,
+                        LyricsFileResult::Got(LyricsResult::NotFound) => {
+                            not_found.push(stem(path));
+                        }
+                        LyricsFileResult::MissingTitle => missing.push(stem(path)),
+                        LyricsFileResult::Unusable(why) => {
+                            unusable.push(format!("{}({why})", stem(path)));
+                        }
+                    }
+                }
+                let mut out = format!("配好 {done} 个");
+                if plain > 0 {
+                    out.push_str(&format!("(其中 {plain} 个是纯文本歌词、无逐句时间轴)"));
+                }
+                if existed > 0 {
+                    out.push_str(&format!(";{existed} 个旁边已有歌词文件,跳过没动"));
+                }
+                if !not_found.is_empty() {
+                    out.push_str(&format!(
+                        ";没找到歌词 {} 个:{}",
+                        not_found.len(),
+                        not_found.join("、")
+                    ));
+                }
+                if !missing.is_empty() {
+                    out.push_str(&format!(
+                        ";缺歌名 {} 个(从文件名判断出歌名/歌手后,带 title/artist 对它们\
+                         重试):{}",
+                        missing.len(),
+                        missing.join("、")
+                    ));
+                }
+                if !unusable.is_empty() {
+                    out.push_str(&format!(";处理不了:{}", unusable.join("、")));
+                }
+                Ok(out)
+            }
+        }
+    }
+}

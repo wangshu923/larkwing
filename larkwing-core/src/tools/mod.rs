@@ -7,7 +7,9 @@ mod briefing;
 mod desktop;
 mod end_conversation;
 mod fs;
+mod lyrics_fetch;
 mod media_control;
+mod media_download;
 mod media_play;
 mod media_search;
 mod now;
@@ -221,6 +223,8 @@ impl Tools {
         tools.register(Arc::new(media_search::MediaSearch::new()));
         tools.register(Arc::new(media_play::MediaPlay::new()));
         tools.register(Arc::new(media_control::MediaControl::new()));
+        tools.register(Arc::new(media_download::MediaDownload::new()));
+        tools.register(Arc::new(lyrics_fetch::LyricsFetch::new()));
         tools.register(Arc::new(desktop::Open::new()));
         tools.register(Arc::new(desktop::SystemVolume::new()));
         tools.register(Arc::new(desktop::Power::new()));

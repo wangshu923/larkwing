@@ -113,6 +113,18 @@ pub fn sanitize_filename(raw: &str) -> String {
     name
 }
 
+/// 字节数 → 人话("1.2GB / 38MB / 512KB")。工具结果与下载类话术共用(单源;
+/// tools::fs 侧以别名转发,老调用点不动)。
+pub fn human_size(bytes: u64) -> String {
+    if bytes >= 1 << 30 {
+        format!("{:.1}GB", bytes as f64 / (1u64 << 30) as f64)
+    } else if bytes >= 1 << 20 {
+        format!("{:.0}MB", bytes as f64 / (1u64 << 20) as f64)
+    } else {
+        format!("{}KB", bytes >> 10)
+    }
+}
+
 /// 系统「下载」文件夹(Windows Known Folder / mac ~/Downloads);找不到回落用户主目录。
 /// web_download 缺省落点 / webrender 下载接管共用。
 pub fn default_download_dir() -> PathBuf {

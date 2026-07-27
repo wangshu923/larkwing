@@ -47,6 +47,8 @@ export interface UiAttachment {
   base64?: string
   /** 历史图片落盘相对名:重开会话经 attachmentUrl 拉回缩略图(填进 dataUrl)。 */
   file?: string
+  /** 粘贴收纳的原文(长文粘贴自动折成小票时才有):点小票放回编辑框用,仅本会话内存态。 */
+  rawText?: string
 }
 
 export interface UiMessage {

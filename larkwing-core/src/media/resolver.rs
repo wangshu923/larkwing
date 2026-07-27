@@ -10,6 +10,11 @@ use serde::Serialize;
 /// 音频优先选 m4a:WebView2(Chromium)和开发机 WKWebView 都原生解码 AAC;
 /// opus/webm 在 WKWebView 放不了,别让开发机和发布机行为分叉。
 const AUDIO_FORMAT: &str = "ba[ext=m4a]/ba/b";
+/// **下载**专用音频格式:质量优先、不锁容器 —— 与播放的 AUDIO_FORMAT 刻意分家
+/// (播放要秒开省流,下载要保真存档,两个诉求不同)。源里有无损(如 B 站大会员
+/// Hi-Res FLAC,码率 ~1400kbps)时 `ba` 按质量排序自然选中它;没有则落最高码率
+/// AAC。`/b` 兜底老式合并单文件(带视频轨),音轨由下载侧 ffmpeg `-vn` 抽出。
+const DOWNLOAD_AUDIO_FORMAT: &str = "ba/b";
 /// 视频:**强制 H.264(avc)** + 1080p 封顶。`[ext=mp4]` 只约束容器不约束编码,
 /// B 站(尤其登录后)常给 HEVC/AV1;WebView2(Windows 发布机)解不了 HEVC(要付费扩展)
 /// /AV1(要免费扩展,常缺)→ 视频轨黑屏、只剩 AAC 声音(开发机 WKWebView 有硬解,故漏网)。
@@ -39,6 +44,14 @@ pub struct UpStream {
     pub bandwidth: Option<u64>,
 }
 
+/// 平台字幕轨(下载配歌词用:音乐视频的人工 CC 常 = 带时间轴的歌词)。
+/// `ai-*` 自动字幕对唱歌错字连篇,解析时已滤掉(宁缺勿错);播放路不消费此字段。
+#[derive(Debug, Clone)]
+pub struct SubtitleRef {
+    pub lang: String,
+    pub url: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Resolved {
     pub title: String,
@@ -46,6 +59,7 @@ pub struct Resolved {
     pub duration_seconds: Option<f64>,
     /// 1 路 = 直转;2 路(视频+音频分离,B 站 DASH 常态)= 走 ffmpeg 混流。
     pub streams: Vec<UpStream>,
+    pub subtitles: Vec<SubtitleRef>,
 }
 
 /// 解析失败的粗分类:登录态问题要单独可见(UI 出扫码入口,模型换话术)。
@@ -70,6 +84,25 @@ pub async fn resolve(
     cookies_file: Option<&Path>,
     audio_only: bool,
 ) -> Result<Resolved, ResolveError> {
+    resolve_fmt(ytdlp, page_url, cookies_file, if audio_only { AUDIO_FORMAT } else { VIDEO_FORMAT })
+        .await
+}
+
+/// 下载音频用的解析(media_download):同一条 yt-dlp 链,只换格式串(见 DOWNLOAD_AUDIO_FORMAT)。
+pub async fn resolve_download(
+    ytdlp: &Path,
+    page_url: &str,
+    cookies_file: Option<&Path>,
+) -> Result<Resolved, ResolveError> {
+    resolve_fmt(ytdlp, page_url, cookies_file, DOWNLOAD_AUDIO_FORMAT).await
+}
+
+async fn resolve_fmt(
+    ytdlp: &Path,
+    page_url: &str,
+    cookies_file: Option<&Path>,
+    format: &str,
+) -> Result<Resolved, ResolveError> {
     let mut cmd = tokio::process::Command::new(ytdlp);
     cmd.arg("-j") // 单条 JSON,不下载
         .arg("--no-warnings")
@@ -84,7 +117,7 @@ pub async fn resolve(
         .arg("--socket-timeout")
         .arg("15")
         .arg("-f")
-        .arg(if audio_only { AUDIO_FORMAT } else { VIDEO_FORMAT });
+        .arg(format);
     if let Some(f) = cookies_file {
         cmd.arg("--cookies").arg(f);
     }
@@ -166,7 +199,29 @@ pub(super) fn parse_resolved(json: &serde_json::Value) -> Result<Resolved> {
         None => vec![fmt_tag(json)],
     };
     tracing::info!(title = %title, streams = streams.len(), fmts = ?fmts, "媒体解析完成");
-    Ok(Resolved { title, uploader, duration_seconds, streams })
+    let subtitles = parse_subtitles(json);
+    Ok(Resolved { title, uploader, duration_seconds, streams, subtitles })
+}
+
+/// 字幕清单:每语言取一条(优先 `ext=json` 变体 = B 站原生字幕形,带 from/to 时间轴);
+/// `ai`/`ai-*`(平台自动识别)整语言丢弃 —— 歌声 ASR 质量差,宁缺勿错。
+fn parse_subtitles(json: &serde_json::Value) -> Vec<SubtitleRef> {
+    let Some(map) = json["subtitles"].as_object() else { return Vec::new() };
+    let mut out = Vec::new();
+    for (lang, variants) in map {
+        if lang == "ai" || lang.starts_with("ai-") {
+            continue;
+        }
+        let Some(arr) = variants.as_array() else { continue };
+        let v = arr
+            .iter()
+            .find(|v| v["ext"].as_str() == Some("json"))
+            .or_else(|| arr.first());
+        if let Some(url) = v.and_then(|v| v["url"].as_str()) {
+            out.push(SubtitleRef { lang: lang.clone(), url: url.to_string() });
+        }
+    }
+    out
 }
 
 /// 一个格式的紧凑诊断标签:`format_id/vcodec`(给日志看选中编码用)。
@@ -241,6 +296,25 @@ mod tests {
     #[test]
     fn no_stream_is_an_error() {
         assert!(parse_resolved(&serde_json::json!({ "title": "x" })).is_err());
+    }
+
+    #[test]
+    fn subtitles_keep_human_cc_and_drop_ai() {
+        let json = serde_json::json!({
+            "title": "某曲目",
+            "url": "https://cdn.example/a.m4a",
+            "subtitles": {
+                "zh-CN": [
+                    { "ext": "srt", "url": "https://sub.example/cc.srt" },
+                    { "ext": "json", "url": "https://sub.example/cc.json" }
+                ],
+                "ai-zh": [ { "ext": "json", "url": "https://sub.example/ai.json" } ]
+            }
+        });
+        let r = parse_resolved(&json).unwrap();
+        assert_eq!(r.subtitles.len(), 1, "ai-* 整语言丢弃");
+        assert_eq!(r.subtitles[0].lang, "zh-CN");
+        assert_eq!(r.subtitles[0].url, "https://sub.example/cc.json", "优先 json 变体");
     }
 
     #[test]

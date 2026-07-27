@@ -5,11 +5,15 @@
 
 mod bilibili;
 pub mod cookies;
+mod download;
+mod lyrics;
 mod probe;
 mod relay;
 mod resolver;
 
 pub use cookies::CookieRec;
+pub use download::{DownloadOutcome, DownloadedAudio, TrackMeta};
+pub use lyrics::{LyricsBatchOutcome, LyricsFileResult, LyricsItem, LyricsResult};
 
 use std::collections::HashMap;
 use std::path::PathBuf;

@@ -22,6 +22,8 @@ export default {
     media_search: 'Digging through the library…',
     media_play: 'Cueing it up…',
     media_control: 'Working the player…',
+    media_download: 'Downloading the track…',
+    lyrics_fetch: 'Finding lyrics…',
     open: 'Opening it up…',
     system_volume: 'Turning the volume knob…',
     power: 'Reaching for the power switch…',
@@ -61,6 +63,8 @@ export default {
     retry: 'Retry', // retry button on a failed task (currently media resolve / component download)
     unknown: 'Background task',
     resolve: 'Resolving the stream',
+    media_download: 'Audio download',
+    lyrics: 'Adding lyrics',
     relocate: 'Moving data',
     update: 'Downloading update',
     remux: 'Preparing video “{name}”',
@@ -84,6 +88,8 @@ export default {
       relocate: 'Move didn’t finish — data is still in place',
       remux: 'Video prep failed — played the normal way instead',
       render: 'That page step didn’t work — it will try another way or say so',
+      audio_batch: '{fail} of {total} tracks didn’t make it',
+      lyrics_batch: '{fail} of {total} files got no lyrics',
     },
   },
   // Action confirmation card (§7.8): asks you before clicking pay/publish/delete-grade buttons on the web
@@ -113,6 +119,11 @@ export default {
     verify: 'Verifying…',
     extract: 'Extracting…',
     resolve: 'Finding the stream…',
+    audio_source: 'Finding the audio source…',
+    audio_fetch: 'Downloading “{t}”…',
+    audio_batch: 'Downloading “{t}” ({i}/{n})',
+    audio_lyrics: 'Finding lyrics…',
+    lyrics_batch: 'Lyrics for “{t}” ({i}/{n})',
     render_load: 'Opening the page…',
     render_click: 'Clicking “{t}”…',
     render_back: 'Going back…',
@@ -265,6 +276,12 @@ export default {
     attach: 'Attach image or file',
     attRemove: 'Remove',
     dropHint: 'Drop to hand the file to {name}',
+    // Expanded long-form editor (writing only; sending stays in the input bar) + long-paste folding
+    expandTitle: 'Expand to write',
+    expandDone: 'Done',
+    expandHint: 'Enter for new line · {mod}+Enter when done',
+    pasteName: 'Pasted text',
+    pasteBackTitle: 'Click to edit in the expanded editor',
     // "Set a reminder → it fires" presentation: eventDue labels the centered system line (event row);
     // reminderSaved / memorySaved are receipt chips (reminder set / memory saved, tap → that page)
     eventDue: 'Time’s up',

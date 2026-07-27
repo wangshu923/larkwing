@@ -82,6 +82,11 @@ pub struct LocalProbe {
     pub video_codec: Option<String>,
     /// 全部音轨(文件顺序 = `-map 0:a:{n}` 的 n)。空 = 解析不出/无音轨(选轨功能不出现)。
     pub audio_tracks: Vec<AudioTrack>,
+    /// 容器全局标签「歌名 / 歌手」(`ffmpeg -i` 首个 Stream 行之前的全局 Metadata 块;
+    /// FLAC/m4a/mp3 通吃,键大小写不限)。给本地音频配歌词用;None = 文件没标 →
+    /// 让模型从文件名判断后带参重试。只在 `ffmpeg -i` 路径有值(BMFF 轻量探测不解析 ilst)。
+    pub tag_title: Option<String>,
+    pub tag_artist: Option<String>,
 }
 
 fn ext_lower(path: &Path) -> Option<String> {
@@ -138,6 +143,9 @@ fn parse_ffmpeg_stderr_with(stderr: &str, mac_native: bool) -> LocalProbe {
     // 紧跟在某条音频流后面的 `Metadata: title` 归它(mkv 常见「国语 DD5.1」);
     // 新的 Stream 行一出现就收口,别把视频/字幕的 title 错挂到音轨上。
     let mut title_pending = false;
+    // 首个 Stream 行之前 = 容器全局 Metadata 块(title/artist 是歌名/歌手标签);
+    // 之后的 title 归各流(上面 title_pending 那套),两边互不串味。
+    let mut seen_stream = false;
     for raw in stderr.lines() {
         let line = raw.trim();
         if p.duration_seconds.is_none() {
@@ -145,6 +153,19 @@ fn parse_ffmpeg_stderr_with(stderr: &str, mac_native: bool) -> LocalProbe {
         }
         if line.starts_with("Stream #") {
             title_pending = false;
+            seen_stream = true;
+        }
+        if !seen_stream {
+            if let Some((k, v)) = line.split_once(':') {
+                let (k, v) = (k.trim(), v.trim());
+                if !v.is_empty() {
+                    if k.eq_ignore_ascii_case("title") && p.tag_title.is_none() {
+                        p.tag_title = Some(v.to_string());
+                    } else if k.eq_ignore_ascii_case("artist") && p.tag_artist.is_none() {
+                        p.tag_artist = Some(v.to_string());
+                    }
+                }
+            }
         }
         // "Stream #0:0(eng): Video: hevc (Main 10), yuv420p10le, 1920x1080 …"
         if let Some(rest) = line.split("Video: ").nth(1) {
@@ -305,6 +326,9 @@ fn probe_local_with(path: &Path, mac_native: bool) -> LocalProbe {
         video_keyframes: video_keyframes(&moov).unwrap_or_default(),
         video_codec: video_h264_codec(&moov),
         audio_tracks: audio_tracks_of_moov(&moov),
+        // 歌名/歌手标签只在 `ffmpeg -i` 路解析(ilst 不在轻量探测范围,播放路用不上)
+        tag_title: None,
+        tag_artist: None,
     }
 }
 
@@ -1041,6 +1065,34 @@ Input #0, matroska,webm, from 'movie.mkv':
         assert!(p.video_incompatible, "hevc → 转视频");
         assert!(p.audio_incompatible, "dts → 转音轨");
         assert_eq!(p.duration_seconds, Some(2.0 * 3600.0 + 10.0 * 60.0 + 33.4));
+    }
+
+    #[test]
+    fn ffmpeg_stderr_global_tags_not_confused_with_stream_titles() {
+        // FLAC 典型形:全局 Metadata 的 TITLE/ARTIST(键大小写不限)= 歌名/歌手标签;
+        // 首个 Stream 行之后的 title 归音轨(mkv「国语 DD5.1」那套),两边不许串味。
+        let stderr = "\
+Input #0, flac, from 'song.flac':
+  Metadata:
+    TITLE           : 示例曲目
+    ARTIST          : 某演唱者
+    ALBUM           : 某专辑
+  Duration: 00:04:11.00, start: 0.000000, bitrate: 912 kb/s
+    Stream #0:0: Audio: flac, 44100 Hz, stereo, s16
+    Metadata:
+      title           : 音轨内部题名";
+        let p = parse_ffmpeg_stderr_with(stderr, false);
+        assert_eq!(p.tag_title.as_deref(), Some("示例曲目"));
+        assert_eq!(p.tag_artist.as_deref(), Some("某演唱者"));
+        assert_eq!(
+            p.audio_tracks[0].title.as_deref(),
+            Some("音轨内部题名"),
+            "流内 title 仍归音轨"
+        );
+        // 没有全局标签的文件 → None(让模型从文件名判断)
+        let bare = "Input #0, mp3, from 'x.mp3':\n  Duration: 00:03:00.00\n    Stream #0:0: Audio: mp3";
+        let p2 = parse_ffmpeg_stderr_with(bare, false);
+        assert!(p2.tag_title.is_none() && p2.tag_artist.is_none());
     }
 
     #[test]

@@ -121,6 +121,25 @@ pub fn suite() -> Vec<Scenario> {
                     _ => false,              // 没查本地就直奔网络 = 回归
                 }
             })),
+        // 下载合集要先确认范围(§7.1 media_download,用户拍板):已知是合集、但没说清
+        // 「一首还是全部」→ 先问,别自作主张开下(不许 all=true,也不该闷头下单曲)。
+        Scenario::turn("download-batch-confirm")
+            .note("合集下载没说清范围先问用户,别直接调 media_download(§7.1)")
+            .say("这个合集挺好的,帮我下载一下 https://www.bilibili.com/video/BVxxxxxxxxxx")
+            .check(tool_not_called("media_download")),
+        // 用户点名「全部」→ 该带 all=true 一次下整批,别只下一首也别再反问。
+        Scenario::turn("download-batch-explicit")
+            .note("用户明说全都要 → media_download 带 all=true(§7.1)")
+            .say("把这个合集里的歌全部下载到电脑上 https://www.bilibili.com/video/BVxxxxxxxxxx")
+            .check(custom("media_download 带 all=true", |o| {
+                o.trace.iter().any(|s| {
+                    s.name == "media_download"
+                        && serde_json::from_str::<serde_json::Value>(&s.args)
+                            .map(|a| a["all"] == serde_json::Value::Bool(true)
+                                || a["all"] == serde_json::Value::String("true".into()))
+                            .unwrap_or(false)
+                })
+            })),
         // 旧事重提该用 recall 去取,而不是装不记得 / 瞎答(§13.7)。
         Scenario::turn("recall-triggers")
             .note("旧事重提、信息在按需层(episodic 非常驻)→ 该调 recall(§13.7)")

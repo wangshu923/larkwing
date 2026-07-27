@@ -83,6 +83,7 @@ aes = "0.8"
 # 微信出站文件:getUploadUrl 要明文 MD5(sha2 不含 MD5);hex = filekey/aeskey/md5 的十六进制编解码。
 md-5 = "0.10"
 hex = "0.4"
+character_converter = "2.1.5"
 
 # 系统音量(tools/desktop.rs 的 system_volume):Windows 走 Core Audio(IAudioEndpointVolume)。
 # 仅 Windows 编译(Mac 走 osascript、Linux 不支持,都不需要);windows 0.61 与 src-tauri 同版本,

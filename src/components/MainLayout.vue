@@ -11,7 +11,7 @@ import { useContextMenu } from '../composables/useContextMenu'
 import { useCharacter } from '../composables/useCharacter'
 import { useMedia } from '../composables/useMedia'
 import { fmtMs, fmtTokens, fmtUsd } from '../lib/fmt'
-import { onFloatSay, openExternal, api, type SearchHit } from '../lib/backend'
+import { onFloatSay, openExternal, api, isMacOS, type SearchHit } from '../lib/backend'
 import { renderMarkdown } from '../lib/md'
 import { copyText } from '../lib/clipboard'
 import MemoryView from '../views/MemoryView.vue'
@@ -156,6 +156,66 @@ function send() {
   nextTick(autoGrow) // 清空后缩回单行高度
 }
 
+// —— 展开写长文:输入行按钮弹出大编辑面板。与小框绑**同一个** input ref,打开即当前
+// 内容、关掉内容仍在,零同步零丢字;键位反转(写文档惯例):Enter 换行、⌘/Ctrl+Enter 发送。
+const expandOpen = ref(false)
+const xpEl = ref<HTMLTextAreaElement | null>(null)
+const modKey = isMacOS ? '⌘' : 'Ctrl'
+function openExpand() {
+  expandOpen.value = true
+  nextTick(() => {
+    const el = xpEl.value
+    if (!el) return
+    el.focus()
+    el.selectionStart = el.selectionEnd = el.value.length // 光标落末尾,接着写
+  })
+}
+function closeExpand() {
+  expandOpen.value = false
+  nextTick(() => {
+    autoGrow() // 内容可能变多,小框重新长到封顶
+    inputEl.value?.focus()
+  })
+}
+function onXpKeydown(e: KeyboardEvent) {
+  // 面板只管写,不设发送出口(发送收口在小框,2026-07-27 用户拍板):Esc/⌘/Ctrl+Enter 都=确定回小框
+  if (e.key === 'Escape' || (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !e.isComposing && e.keyCode !== 229)) {
+    e.preventDefault()
+    closeExpand()
+  }
+}
+
+// —— 粘贴长文自动收成小票(阈值 §4.11 用户拍板 2026-07-27:800 字或 12 行):
+// 小框=对话态,超长粘贴多半是"给它看的材料"→ 折成附件小票走现有文档管道(文字进
+// history,聊天流里也是小票不是巨型气泡);大编辑面板=写作态,粘贴原样进文本(可能
+// 就是要改内容),绝不收纳。收错了有退路:点小票放回大面板接着改。
+const PASTE_FOLD_CHARS = 800
+const PASTE_FOLD_LINES = 12
+// UTF-8 → base64:btoa 只吃 Latin1,先 TextEncoder 出字节;分块拼(整段 spread 大文本会爆栈)
+function textToBase64(text: string): string {
+  const bytes = new TextEncoder().encode(text)
+  let bin = ''
+  const CHUNK = 0x8000
+  for (let i = 0; i < bytes.length; i += CHUNK) bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK))
+  return btoa(bin)
+}
+function foldPaste(text: string) {
+  pending.value.push({
+    kind: 'doc',
+    name: `${t('chat.pasteName')}.txt`,
+    mime: 'text/plain',
+    base64: textToBase64(text),
+    rawText: text,
+  })
+}
+function editPasted(i: number) {
+  const raw = pending.value[i]?.rawText
+  if (!raw) return
+  pending.value.splice(i, 1)
+  input.value = input.value.trim() ? `${input.value}\n\n${raw}` : raw
+  openExpand()
+}
+
 // 加图片/文件:选择器 / 粘贴 / 拖拽 三入口,统一读成 dataUrl(图预览)+ base64(出站)
 function openPicker() {
   fileInput.value?.click()
@@ -206,6 +266,13 @@ function onPaste(e: ClipboardEvent) {
   if (files.length) {
     addFiles(files)
     e.preventDefault() // 只在真有文件时拦,纯文本粘贴照常
+    return
+  }
+  if (expandOpen.value) return // 写作态:粘贴原样进大面板,绝不收纳
+  const text = e.clipboardData.getData('text/plain')
+  if (text.length >= PASTE_FOLD_CHARS || text.split('\n').length >= PASTE_FOLD_LINES) {
+    foldPaste(text)
+    e.preventDefault()
   }
 }
 
@@ -888,13 +955,20 @@ watch(messages, () => nextTick(() => {
             <button class="q-x" @click="dequeue(i)" :title="t('chat.attRemove')">✕</button>
           </div>
         </div>
-        <!-- 待发附件托盘:图缩略 + 文件小票,各带移除 -->
+        <!-- 待发附件托盘:图缩略 + 文件小票,各带移除;粘贴收纳的文本小票可点=放回大面板改 -->
         <div v-if="pending.length" class="att-tray">
-          <div v-for="(a, i) in pending" :key="i" class="att-pill">
+          <div
+            v-for="(a, i) in pending"
+            :key="i"
+            class="att-pill"
+            :class="{ editable: a.rawText }"
+            :title="a.rawText ? t('chat.pasteBackTitle') : undefined"
+            @click="a.rawText && editPasted(i)"
+          >
             <img v-if="a.kind === 'image'" :src="a.dataUrl" class="att-thumb" alt="" />
             <svg v-else class="att-doc" viewBox="0 0 24 24"><path d="M6 2h8l4 4v16H6z" /><path d="M14 2v4h4" /></svg>
             <span class="att-name">{{ a.name }}</span>
-            <button class="att-x" @click="removePending(i)" :title="t('chat.attRemove')">✕</button>
+            <button class="att-x" @click.stop="removePending(i)" :title="t('chat.attRemove')">✕</button>
           </div>
         </div>
         <!-- 听写态:输入框位变波形(点击 = 立即定稿发送;✕/Esc = 取消) -->
@@ -922,6 +996,10 @@ watch(messages, () => nextTick(() => {
           <button class="attach-btn" @click="openPicker" :title="t('chat.attach')">
             <svg viewBox="0 0 24 24"><path d="M8 12V7a4 4 0 0 1 8 0v9a6 6 0 0 1-12 0V8.5" /></svg>
           </button>
+          <!-- 展开写长文:弹出大编辑面板(绑同一 input,内容双向都在);图标=记事本 -->
+          <button class="attach-btn" @click="openExpand" :title="t('chat.expandTitle')">
+            <svg viewBox="0 0 24 24"><rect x="5" y="3.5" width="14" height="17" rx="2" /><path d="M9 8.5h6M9 12h6M9 15.5h3.5" /></svg>
+          </button>
           <!-- 语音输入 = 输入框内的小话筒(轻量,不跟发送键并排抢戏;界面优先,语音只是输入之一) -->
           <span class="field-wrap">
             <textarea
@@ -945,6 +1023,24 @@ watch(messages, () => nextTick(() => {
         </div>
         <!-- 记账灯带:本轮消耗 / 今日累计 / 余额(数据缺席的段自己熄灯) -->
         <UsageStrip />
+      </div>
+
+      <!-- 展开写长文面板:与小框绑同一 input(关掉内容仍在);Esc/遮罩/收起=回小框,⌘/Ctrl+Enter=发送 -->
+      <div v-if="expandOpen" class="xp-veil" @click.self="closeExpand">
+        <div class="xp-panel">
+          <textarea
+            ref="xpEl"
+            v-model="input"
+            class="xp-text"
+            :placeholder="t('chat.placeholder', { name: petName })"
+            @keydown="onXpKeydown"
+            @paste="onPaste"
+          ></textarea>
+          <div class="xp-foot">
+            <span class="xp-hint">{{ t('chat.expandHint', { mod: modKey }) }}</span>
+            <button class="xp-btn xp-done" @click="closeExpand">{{ t('chat.expandDone') }}</button>
+          </div>
+        </div>
       </div>
     </main>
   </div>
@@ -1257,6 +1353,38 @@ textarea.field { resize: none; font-family: inherit; line-height: 1.5; max-heigh
 .att-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .att-x { background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 12px; line-height: 1; padding: 0 2px; flex: 0 0 auto; }
 .att-x:hover { color: var(--danger); }
+.att-pill.editable { cursor: pointer; transition: border-color .15s; }
+.att-pill.editable:hover { border-color: rgba(var(--accent-rgb), 0.45); }
+
+/* —— 展开写长文面板:modal 语言照 App.vue data-modal 先例(veil + surface 面板,全语义 token) —— */
+.xp-veil {
+  position: fixed; inset: 0; z-index: 120; display: flex; align-items: center; justify-content: center;
+  background: rgba(var(--veil-rgb, 0 0 0), 0.55); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px);
+}
+.xp-panel {
+  width: min(760px, 92vw); height: min(70vh, 640px); display: flex; flex-direction: column;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 14px;
+  /* 大面板正对聊天流,半透 surface 会让底下气泡透进来花掉 → 弹层同款 blur(SkinSelect/ContextMenu 先例) */
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.45); overflow: hidden;
+}
+.xp-text {
+  flex: 1; resize: none; border: none; outline: none; background: transparent;
+  color: var(--text); padding: 18px 20px; font-family: inherit; font-size: 14px; line-height: 1.7;
+}
+.xp-text::placeholder { color: var(--text-dim); }
+.xp-foot {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 10px 14px; border-top: 1px solid var(--line);
+}
+.xp-hint { font-size: 12px; color: var(--text-dim); }
+.xp-btn {
+  padding: 8px 16px; border-radius: 9px; border: 1px solid var(--line);
+  background: transparent; color: var(--text); font-size: 13px; cursor: pointer;
+  transition: border-color .15s, background .15s;
+}
+.xp-btn:hover { border-color: var(--accent); }
+.xp-btn.xp-done { background: var(--accent); border-color: var(--accent); color: var(--bg); font-weight: 600; }
 
 .atts { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
 .att-img { max-width: 200px; max-height: 220px; border-radius: 10px; display: block; }
