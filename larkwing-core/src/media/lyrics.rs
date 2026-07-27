@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::bgtasks::cap_names;
 use crate::bus::Text;
 use crate::components::Component;
 
@@ -63,7 +64,13 @@ pub enum LyricsBatchOutcome {
 impl MediaRuntime {
     /// 给本机已有音频批量配歌词(lyrics_fetch 工具的机器件)。ffmpeg 必备(读标签/时长,
     /// 首次用时下载);≤IN_TURN_MAX 回合内跑完出逐文件报告,更多转后台 job。
-    pub async fn lyrics_for_files(&self, items: Vec<LyricsItem>) -> Result<LyricsBatchOutcome> {
+    /// `origin` = (user_id, conv_id):后台 job 收尾把结果插成一条 due=now 的一次性任务,
+    /// 调度器捡起自启回合 → **模型拿到成败名单向用户转述**(不能只在任务条红一下,§3.5)。
+    pub async fn lyrics_for_files(
+        &self,
+        items: Vec<LyricsItem>,
+        origin: (i64, i64),
+    ) -> Result<LyricsBatchOutcome> {
         anyhow::ensure!(!items.is_empty(), "没有收到文件");
         anyhow::ensure!(
             items.len() <= LYRICS_BATCH_MAX,
@@ -80,35 +87,60 @@ impl MediaRuntime {
             return Ok(LyricsBatchOutcome::Report(report));
         }
         let total = items.len();
+        // 登记进后台差事登记处(§bgtasks:此刻/status 可查、可取消、收尾/卡死必汇报);
+        // cap 满 = 如实退回给模型。
+        let ticket =
+            self.inner.bg.submit(format!("批量配歌词({total} 个)"), origin, total)?;
+        let ticket_id = ticket.id();
         let this = self.clone();
-        tokio::spawn(async move {
+        let join = tokio::spawn(async move {
             let net = lyrics_client();
             let task = this.inner.tasks.start("lyrics", Text::new("task.lyrics"));
-            let mut missed = 0usize;
+            let mut results: Vec<(PathBuf, LyricsFileResult)> = Vec::with_capacity(total);
+            let mut cancelled = false;
             for (i, it) in items.iter().enumerate() {
+                if ticket.is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
                 let name = it
                     .path
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default();
+                ticket.beat(i, format!("《{name}》"));
                 task.step_progress(
                     "step.lyrics_batch",
                     serde_json::json!({ "t": name, "i": i + 1, "n": total }),
                     i as f32 / total as f32,
                 );
-                match this.lyrics_one(&net, &ffmpeg, it).await {
+                let r = this.lyrics_one(&net, &ffmpeg, it).await;
+                match &r {
                     LyricsFileResult::Got(
                         LyricsResult::Lib | LyricsResult::LibPlain | LyricsResult::Existed,
                     ) => {}
-                    other => {
-                        missed += 1;
-                        if let LyricsFileResult::Unusable(why) = &other {
-                            tracing::warn!(path = %it.path.display(), "配歌词没成: {why}");
-                        }
+                    LyricsFileResult::Unusable(why) => {
+                        tracing::warn!(path = %it.path.display(), "配歌词没成: {why}");
+                        ticket.miss(&name);
                     }
+                    _ => ticket.miss(&name),
                 }
+                results.push((it.path.clone(), r));
             }
-            if missed == 0 {
+            let missed = results
+                .iter()
+                .filter(|(_, r)| {
+                    !matches!(
+                        r,
+                        LyricsFileResult::Got(
+                            LyricsResult::Lib | LyricsResult::LibPlain | LyricsResult::Existed
+                        )
+                    )
+                })
+                .count();
+            if cancelled {
+                task.fail("task.err.cancelled", serde_json::Value::Null);
+            } else if missed == 0 {
                 task.done();
             } else {
                 task.fail(
@@ -116,7 +148,24 @@ impl MediaRuntime {
                     serde_json::json!({ "fail": missed, "total": total }),
                 );
             }
+            // 收尾汇报经登记处唤回合(§7.4 wake_turn 同一套机器),模型向用户转述。
+            let report = if cancelled {
+                format!(
+                    "批量配歌词按要求停下了(跑到 {}/{total}):{}。把结果简短告诉用户;\
+                     剩下的要不要接着配,听用户的。",
+                    results.len(),
+                    compose_batch_summary(&results)
+                )
+            } else {
+                format!(
+                    "批量配歌词跑完了(共 {total} 个):{}。把结果简短告诉用户;\
+                     没找到/缺歌名的要不要接着处理,听用户的。",
+                    compose_batch_summary(&results)
+                )
+            };
+            ticket.finish(!cancelled && missed == 0, report);
         });
+        self.inner.bg.attach_abort(ticket_id, join.abort_handle());
         Ok(LyricsBatchOutcome::JobStarted { total })
     }
 
@@ -159,6 +208,50 @@ impl MediaRuntime {
             Err(e) => LyricsFileResult::Unusable(format!("歌词库没连上: {e:#}")),
         }
     }
+}
+
+/// 逐文件结论 → 一段人读得懂的汇总(工具结果与后台收尾汇报共用单源;量约束 §7.2:
+/// 汇总数字 + 只点名要处理的,每类点名封顶 cap_names)。
+pub(crate) fn compose_batch_summary(results: &[(PathBuf, LyricsFileResult)]) -> String {
+    let mut done = 0usize;
+    let mut plain = 0usize;
+    let mut existed = 0usize;
+    let (mut not_found, mut missing, mut unusable) = (Vec::new(), Vec::new(), Vec::new());
+    let stem = |p: &Path| p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    for (path, r) in results {
+        match r {
+            LyricsFileResult::Got(LyricsResult::Lib | LyricsResult::Cc) => done += 1,
+            LyricsFileResult::Got(LyricsResult::LibPlain) => {
+                done += 1;
+                plain += 1;
+            }
+            LyricsFileResult::Got(LyricsResult::Existed) => existed += 1,
+            LyricsFileResult::Got(LyricsResult::NotFound) => not_found.push(stem(path)),
+            LyricsFileResult::MissingTitle => missing.push(stem(path)),
+            LyricsFileResult::Unusable(why) => unusable.push(format!("{}({why})", stem(path))),
+        }
+    }
+    let mut out = format!("配好 {done} 个");
+    if plain > 0 {
+        out.push_str(&format!("(其中 {plain} 个是纯文本歌词、无逐句时间轴)"));
+    }
+    if existed > 0 {
+        out.push_str(&format!(";{existed} 个旁边已有歌词文件,跳过没动"));
+    }
+    if !not_found.is_empty() {
+        out.push_str(&format!(";没找到歌词 {} 个:{}", not_found.len(), cap_names(&not_found)));
+    }
+    if !missing.is_empty() {
+        out.push_str(&format!(
+            ";缺歌名 {} 个(从文件名判断出歌名/歌手后,带 title/artist 对它们重试):{}",
+            missing.len(),
+            cap_names(&missing)
+        ));
+    }
+    if !unusable.is_empty() {
+        out.push_str(&format!(";处理不了:{}", cap_names(&unusable)));
+    }
+    out
 }
 
 /// 下载完成后配歌词(download 路;错误只 warn,**绝不影响下载成败**):
@@ -567,6 +660,28 @@ mod tests {
             .unwrap()
             .expect("简繁变体轨应命中");
         assert!(synced && lrc.contains("繁体库里的词"));
+    }
+
+    #[test]
+    fn batch_summary_categorizes_and_caps_names() {
+        use LyricsFileResult as R;
+        let p = |n: &str| PathBuf::from(format!("/x/{n}"));
+        let mut results = vec![
+            (p("a.m4a"), R::Got(LyricsResult::Lib)),
+            (p("b.flac"), R::Got(LyricsResult::LibPlain)),
+            (p("c.mp3"), R::Got(LyricsResult::Existed)),
+            (p("d.mp3"), R::MissingTitle),
+            (p("e.mp3"), R::Unusable("文件不存在".into())),
+        ];
+        for i in 0..15 {
+            results.push((p(&format!("没词{i}.mp3")), R::Got(LyricsResult::NotFound)));
+        }
+        let s = compose_batch_summary(&results);
+        assert!(s.contains("配好 2 个") && s.contains("其中 1 个是纯文本"), "{s}");
+        assert!(s.contains("1 个旁边已有歌词文件"), "{s}");
+        assert!(s.contains("没找到歌词 15 个") && s.contains("等 15 个"), "点名封顶: {s}");
+        assert!(s.contains("缺歌名 1 个") && s.contains("d.mp3"), "{s}");
+        assert!(s.contains("处理不了:e.mp3(文件不存在)"), "{s}");
     }
 
     #[test]

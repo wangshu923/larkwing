@@ -245,6 +245,90 @@ fn merge_polyphone_lexicon(model_dir: &Path) -> Result<std::path::PathBuf> {
     Ok(out)
 }
 
+// ---- 克隆音色输出响度归一(2026-07-27)----
+//
+// **为什么必须做**:ZipVoice(承 F5-TTS 那套)对参考音的处理是「比 `target_rms` 轻就先放大
+// 到 target 喂进模型,合成完再按同一比例缩回去」——最终响度**照抄参考音的响度**,
+// `zipvoice_config` 里的 `target_rms` 是条件化旋钮、不是音量旋钮,调它没用。真机实锤
+// (2026-07-27):参考音 −21.0 dBFS(3.35s 短参考,当初为降延迟换的)→ 全部合成落 −20 LUFS
+// 上下、语音可懂带(300Hz–3kHz)比云端音色还低 2.3 dB;BT 又是低沉男声、能量压在低频,
+// 笔记本喇叭砍掉低频后就是「声音特别小」。参考音侧救不了(峰值只剩 3 dB 余量,推高参考还会
+// 动音色条件化那半边),只能在输出侧归一。
+//
+// 目标 **−16 LUFS**(用户拍板;§4.11 常量单源在此)。**只归一克隆音色**——云端音色自带母带
+// (用户拍板不动),故 EdgeTts / SherpaVits 两条路字节零变化。链路 = 门限 RMS 定增益 →
+// 前视限幅(不是硬 clip,尖峰不出削波失真)。纯 Rust,**ffmpeg 不进 TTS 链路**(§7.5)。
+// 参数在真机缓存的 7 段真实合成上标定:落 −16.0~−16.5 LUFS、峰值 ≤ −0.4 dBFS、增益 +0.7~+4.9 dB。
+const LOUDNESS_TARGET_RMS: f32 = 0.18; // 门限 RMS 目标(标定值,≈ −16 LUFS)
+const LOUDNESS_GATE: f32 = 0.01; // ≈ −40 dBFS:算 RMS 只数出声的样本
+const LOUDNESS_MAX_GAIN: f32 = 4.0; // +12 dB 封顶:参考音录得再轻也不把噪底抬穿
+const LOUDNESS_MIN_GAIN: f32 = 0.5; // −6 dB 兜底:参考音响过头也拉回来
+const LIMITER_CEILING: f32 = 0.95; // ≈ −0.45 dBFS,留头防 i16 量化溢出
+const LIMITER_LOOKAHEAD_MS: f32 = 5.0;
+const LIMITER_RELEASE_MS: f32 = 60.0;
+
+/// 把一段合成 PCM 归一到 `LOUDNESS_TARGET_RMS`(门限 RMS)再限幅。返回施加的静态增益
+/// (进日志,真机可核「到底提了几 dB」)。**原地改**,不额外拷一份。
+fn normalize_loudness(samples: &mut [f32], rate: u32) -> f32 {
+    if samples.is_empty() || rate == 0 {
+        return 1.0;
+    }
+    // 门限:静音不参与 RMS,否则「话少静音多」的短句(应答音就这形)会被过度放大。
+    let mut sq = 0.0f64;
+    let mut voiced = 0u64;
+    for &s in samples.iter() {
+        if s.abs() >= LOUDNESS_GATE {
+            sq += (s as f64) * (s as f64);
+            voiced += 1;
+        }
+    }
+    if voiced == 0 {
+        return 1.0; // 整段近静音:不动(放大噪声毫无意义)
+    }
+    let rms = (sq / voiced as f64).sqrt() as f32;
+    if rms <= 0.0 {
+        return 1.0;
+    }
+    let gain = (LOUDNESS_TARGET_RMS / rms).clamp(LOUDNESS_MIN_GAIN, LOUDNESS_MAX_GAIN);
+    for s in samples.iter_mut() {
+        *s *= gain;
+    }
+    // 前视限幅:提前知道即将到来的尖峰 → 瞬时压下(不过冲)、指数回升(不抽气)。
+    let look = ((rate as f32 * LIMITER_LOOKAHEAD_MS / 1000.0) as usize).max(1);
+    let peaks = lookahead_peaks(samples, look);
+    let release = (-1.0 / (rate as f32 * LIMITER_RELEASE_MS / 1000.0)).exp();
+    let mut reduction = 1.0f32;
+    for (s, peak) in samples.iter_mut().zip(peaks) {
+        let need = if peak <= LIMITER_CEILING { 1.0 } else { LIMITER_CEILING / peak };
+        reduction = if need < reduction {
+            need // attack:前视已看见尖峰,立刻到位
+        } else {
+            (need + (reduction - need) * release).min(1.0) // release:指数回升
+        };
+        *s *= reduction;
+    }
+    gain
+}
+
+/// `out[i] = 窗口 [i, i+win) 内最大 |x|`(单调队列 O(n))。反着扫 = 标准「尾窗最大值」。
+fn lookahead_peaks(x: &[f32], win: usize) -> Vec<f32> {
+    let n = x.len();
+    let mut out = vec![0.0; n];
+    let mut dq: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    let at = |k: usize| x[n - 1 - k].abs(); // 反向索引 k ↔ 原索引 n-1-k
+    for k in 0..n {
+        while dq.back().is_some_and(|&j| at(j) <= at(k)) {
+            dq.pop_back();
+        }
+        dq.push_back(k);
+        if dq.front().is_some_and(|&j| j + win <= k) {
+            dq.pop_front();
+        }
+        out[n - 1 - k] = at(*dq.front().expect("刚 push 过,必非空"));
+    }
+    out
+}
+
 impl TtsEngine for ZipVoiceTts {
     fn synthesize(&self, text: &str, voice: &str, rate_pct: i32) -> Result<Vec<u8>> {
         // voice = "clone:<id>";查参考音 + 文字稿(零样本克隆的命门)。
@@ -267,12 +351,16 @@ impl TtsEngine for ZipVoiceTts {
             .tts
             .generate_with_config(text, &cfg, None::<fn(&[f32], f32) -> bool>)
             .ok_or_else(|| anyhow!("音色克隆合成失败"))?;
-        let samples = audio.samples();
-        ensure!(!samples.is_empty(), "音色克隆返回了空音频");
-        let wav = pcm_f32_to_wav(samples, audio.sample_rate() as u32);
+        ensure!(!audio.samples().is_empty(), "音色克隆返回了空音频");
+        // 响度归一(见上方注释):不做的话输出响度 = 参考音录多轻就多轻。
+        let mut samples = audio.samples().to_vec();
+        let rate = audio.sample_rate() as u32;
+        let gain = normalize_loudness(&mut samples, rate);
+        let wav = pcm_f32_to_wav(&samples, rate);
         tracing::info!(
             ms = t0.elapsed().as_millis() as u64,
             chars = text.chars().count(),
+            gain_db = format!("{:+.1}", 20.0 * gain.log10()),
             "TTS 合成完成(克隆)"
         );
         Ok(wav)
@@ -334,12 +422,22 @@ pub fn rate_pct(rate: &str) -> i32 {
 }
 
 /// 缓存键:音色|语速|文本 的 SHA-256(同句换音色 = 另一份缓存,语义正确)。
+/// 克隆音色的**渲染版本** = 掺进 cache_key 的盐。克隆产物经 `normalize_loudness` 归一,
+/// 归一参数变了旧缓存就该失效——否则改完参数,用过的句子(**含开机预合成的应答音银行**)
+/// 还照播老响度。**改任一响度常量 = 这个数字 +1**。只掺克隆音色:云端/离线音色不走归一、
+/// 字节与本版本无关,没必要连带作废它们的缓存(edge 作废还要重新联网合成)。
+const CLONE_RENDER_VERSION: u32 = 1;
+
 pub fn cache_key(voice: &str, rate_pct: i32, text: &str) -> String {
     let mut h = sha2::Sha256::new();
     h.update(voice.as_bytes());
     h.update(b"|");
     h.update(rate_pct.to_le_bytes());
     h.update(b"|");
+    if voice.starts_with("clone:") {
+        h.update(CLONE_RENDER_VERSION.to_le_bytes());
+        h.update(b"|");
+    }
     h.update(text.as_bytes());
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -375,6 +473,135 @@ mod tests {
         // 不同克隆 id → 不同缓存键;克隆与内置在线音色互不串(voice 维度已在 cache_key)。
         assert_ne!(cache_key("clone:a", 0, "你好"), cache_key("clone:b", 0, "你好"));
         assert_ne!(cache_key("clone:a", 0, "你好"), cache_key("zh-CN-XiaoxiaoNeural", 0, "你好"));
+    }
+
+    /// 克隆产物的字节随响度归一参数变 → 版本盐必须掺进克隆键(否则改完参数旧缓存照播老响度);
+    /// 云端/离线音色不走归一 → 键里**不**该有盐(不连带作废、免重新联网合成)。
+    #[test]
+    fn clone_cache_key_carries_render_version() {
+        let unsalted = |voice: &str, text: &str| {
+            let mut h = sha2::Sha256::new();
+            h.update(voice.as_bytes());
+            h.update(b"|");
+            h.update(0i32.to_le_bytes());
+            h.update(b"|");
+            h.update(text.as_bytes());
+            h.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        assert_ne!(cache_key("clone:a", 0, "你好"), unsalted("clone:a", "你好"), "克隆要带盐");
+        assert_eq!(cache_key("v1", 0, "你好"), unsalted("v1", "你好"), "非克隆不带盐");
+    }
+
+    /// 造一段「有静音有话」的测试信号:前后各 0.1s 静音,中间 240Hz 正弦(拟低沉男声)
+    /// 到指定 RMS。正弦 RMS = 幅值/√2,故幅值 = rms·√2。(注意:门限会剔掉零穿越附近的小样本,
+    /// 所以**门限** RMS 会略高于这里给的标称 rms——断言留了余量。)
+    fn speechlike(rate: u32, secs: f32, rms: f32) -> Vec<f32> {
+        let amp = rms * std::f32::consts::SQRT_2;
+        let pad = (rate as f32 * 0.1) as usize;
+        let voiced = (rate as f32 * secs) as usize;
+        let mut v = vec![0.0f32; pad];
+        for i in 0..voiced {
+            let t = i as f32 / rate as f32;
+            v.push(amp * (2.0 * std::f32::consts::PI * 240.0 * t).sin());
+        }
+        v.resize(v.len() + pad, 0.0); // 尾部静音(repeat_n 要 1.82,MSRV 是 1.77.2)
+        v
+    }
+
+    fn gated_rms_of(x: &[f32]) -> f32 {
+        let v: Vec<f32> = x.iter().copied().filter(|s| s.abs() >= LOUDNESS_GATE).collect();
+        (v.iter().map(|s| s * s).sum::<f32>() / v.len() as f32).sqrt()
+    }
+
+    /// 录得轻的参考音 → 合成轻(真机症状本尊):归一后落到目标响度,且静音段仍是静音。
+    #[test]
+    fn loudness_lifts_quiet_output() {
+        let mut x = speechlike(24_000, 1.0, 0.088); // 真机参考音就是这个量级(−21 dBFS)
+        let gain = normalize_loudness(&mut x, 24_000);
+        assert!(gain > 1.9 && gain < 2.1, "该提 ~2x,实际 {gain}");
+        let got = gated_rms_of(&x);
+        assert!(
+            (got - LOUDNESS_TARGET_RMS).abs() < 0.02,
+            "该落在目标响度附近,实际 {got}"
+        );
+        assert_eq!(x[0], 0.0, "静音段不该被抬起");
+    }
+
+    /// 限幅是软的:尖峰一律压在天花板下,**绝不**靠 clamp 削平(削波在低沉男声上尤其难听)。
+    #[test]
+    fn loudness_limits_peaks_below_ceiling() {
+        let mut x = speechlike(24_000, 0.5, 0.09);
+        let spike = x.len() / 2;
+        x[spike] = 0.95; // 一记远高于平均的瞬态,乘完增益必超 1.0
+        normalize_loudness(&mut x, 24_000);
+        let peak = x.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(peak <= LIMITER_CEILING + 1e-4, "峰值该被限住,实际 {peak}");
+        // 远离尖峰处仍有信号(限幅是压增益不是挖空)。看一个窗口的峰值——单点会撞上正弦零穿越。
+        let before = x[spike - 2200..spike - 2000].iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(before > 0.05, "限幅不该把远处的话压没,实际 {before}");
+    }
+
+    /// 响过头的参考音也拉回来(双向一致,换音色不忽大忽小);增益有上下封顶。
+    #[test]
+    fn loudness_pulls_down_too_loud_and_respects_caps() {
+        let mut loud = speechlike(24_000, 0.5, 0.6);
+        assert_eq!(normalize_loudness(&mut loud, 24_000), LOUDNESS_MIN_GAIN, "衰减触底封顶");
+        // 0.03 已在门限之上(整段低于门限走的是「近静音不动」那条,见下一个测试),
+        // 但离目标差 6x → 该被 +12 dB 封顶挡住,不把噪底一起抬穿。
+        let mut faint = speechlike(24_000, 0.5, 0.03);
+        assert_eq!(normalize_loudness(&mut faint, 24_000), LOUDNESS_MAX_GAIN, "增益触顶封顶");
+    }
+
+    /// 整段近静音 / 空音频:不动、不放大噪声、不 NaN。
+    #[test]
+    fn loudness_leaves_silence_alone() {
+        let mut silent = vec![0.0f32; 4800];
+        assert_eq!(normalize_loudness(&mut silent, 24_000), 1.0);
+        assert!(silent.iter().all(|s| *s == 0.0));
+        let mut empty: Vec<f32> = Vec::new();
+        assert_eq!(normalize_loudness(&mut empty, 24_000), 1.0);
+        let mut no_rate = vec![0.1f32; 100];
+        assert_eq!(normalize_loudness(&mut no_rate, 0), 1.0, "采样率 0 不该除零");
+    }
+
+    /// 响度归一的**真音频标定夹具**(手动跑;合成信号测不出真语音的动态)。把真实合成的 wav
+    /// 过一遍归一,产物用 `ffmpeg -af ebur128` 量 LUFS/峰值 —— 改任何响度常量都该重跑这条,
+    /// 确认还落在 −16 LUFS 档。跑法(可给多个文件):
+    /// `LW_LOUDNESS_WAVS="a.wav,b.wav" LW_LOUDNESS_OUT=/tmp/norm \
+    ///   cargo test -p larkwing-core --lib loudness_real_calibration -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn loudness_real_calibration() {
+        let list = std::env::var("LW_LOUDNESS_WAVS").expect("LW_LOUDNESS_WAVS");
+        let out_dir = std::env::var("LW_LOUDNESS_OUT").unwrap_or_else(|_| "/tmp/lw-loudness".into());
+        std::fs::create_dir_all(&out_dir).expect("建输出目录");
+        for path in list.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let wave = sherpa_onnx::Wave::read(path).expect("读 wav");
+            let mut samples = wave.samples().to_vec();
+            let before = gated_rms_of(&samples);
+            let gain = normalize_loudness(&mut samples, wave.sample_rate() as u32);
+            let after = gated_rms_of(&samples);
+            let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            let name = Path::new(path).file_name().unwrap().to_string_lossy();
+            let out = Path::new(&out_dir).join(format!("norm-{name}"));
+            std::fs::write(&out, pcm_f32_to_wav(&samples, wave.sample_rate() as u32))
+                .expect("写产物");
+            println!(
+                "{name}: 门限RMS {before:.4} → {after:.4}(目标 {LOUDNESS_TARGET_RMS})\
+                 、增益 {:+.1} dB、峰值 {peak:.3} → {}",
+                20.0 * gain.log10(),
+                out.display()
+            );
+            assert!(peak <= LIMITER_CEILING + 1e-4, "峰值越过天花板");
+        }
+    }
+
+    #[test]
+    fn lookahead_peaks_is_forward_window_max() {
+        let x = [0.1, -0.9, 0.2, 0.3, -0.4];
+        assert_eq!(lookahead_peaks(&x, 2), vec![0.9, 0.9, 0.3, 0.4, 0.4], "窗口 [i, i+2)");
+        assert_eq!(lookahead_peaks(&x, 1), vec![0.1, 0.9, 0.2, 0.3, 0.4], "窗口 1 = 自己");
+        assert_eq!(lookahead_peaks(&x, 99), vec![0.9, 0.9, 0.4, 0.4, 0.4], "窗口超长 = 后缀最大");
     }
 
     /// 真模型冒烟(手动跑,需真模型 + 16k mono 参考 wav):用真 ZipVoice 端到端合成,

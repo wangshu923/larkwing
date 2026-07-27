@@ -23,6 +23,8 @@ export default {
     media_control: '拨弄播放器…',
     media_download: '下载歌曲中…',
     lyrics_fetch: '找歌词中…',
+    task_status: '看看后台任务…',
+    task_cancel: '叫停后台任务…',
     open: '这就打开…',
     system_volume: '拧音量旋钮…',
     power: '动一下电源开关…',
@@ -81,6 +83,7 @@ export default {
     },
     err: {
       dropped: '意外中断了',
+      cancelled: '按要求停下了',
       download: '下载失败,过会儿再试试',
       resolve: '没解析出来',
       auth: '需要登录',

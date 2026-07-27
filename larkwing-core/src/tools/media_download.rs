@@ -28,8 +28,11 @@ impl MediaDownload {
                               或任务需知里记了音乐目录就传 dir;都没有就省略(落系统「下载」文件\
                               夹)。**链接是合集/分P(多首)而用户没说清楚时,先问用户「只下这一\
                               首还是整个合集」,用户明确要全部才传 all=true**——整批在后台慢慢下\
-                              (进度在屏幕任务条),本工具立即返回。本地已有的文件不需要下载\
-                              (要挪/复制用 fs_move/fs_copy)。",
+                              (进度在屏幕任务条),本工具立即返回。**下合集的一段用 all=true + \
+                              from/to**(第几首到第几首,1 起含两端):超过一次上限的大合集分几\
+                              批下(如实告诉用户分几批),「只要合集里第 N 首」= from=N to=N,\
+                              不用自己去网页扒分P链接。本地已有的文件不需要下载(要挪/复制用 \
+                              fs_move/fs_copy)。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -52,6 +55,14 @@ impl MediaDownload {
                         "all": {
                             "type": "boolean",
                             "description": "true=把整个合集/分P全部下载(仅在用户明确要全部时用;此时 artist 对整批生效、title 忽略);默认 false=只下这一首"
+                        },
+                        "from": {
+                            "type": "integer",
+                            "description": "配合 all=true:从合集第几首开始(1 起,含);省略=从头"
+                        },
+                        "to": {
+                            "type": "integer",
+                            "description": "配合 all=true:下到合集第几首(含);省略=到最后"
                         }
                     },
                     "required": ["url"]
@@ -106,8 +117,20 @@ impl Tool for MediaDownload {
         };
         let meta = crate::media::TrackMeta { title: opt_str("title"), artist: opt_str("artist") };
 
+        let from = super::arg_u64(&args, "from", 0);
+        let to = super::arg_u64(&args, "to", 0);
+        if !all && (from > 0 || to > 0) {
+            anyhow::bail!(
+                "from/to 要配 all=true 用(下合集里的第几首到第几首;只要某一首 = \
+                 all=true + from=N to=N)"
+            );
+        }
+        let range = ((from > 0).then_some(from as usize), (to > 0).then_some(to as usize));
+
         let outcome = if all {
-            ctx.media.download_all(url, &dir, meta.artist).await?
+            ctx.media
+                .download_all(url, &dir, meta.artist, (ctx.user_id, ctx.conv_id), range)
+                .await?
         } else {
             ctx.media.download_audio(url, &dir, &meta).await?
         };
@@ -144,10 +167,10 @@ impl Tool for MediaDownload {
                 "这个音源需要登录才能拿到,不是出错了。请提示用户点一下登录、用手机扫码;\
                  登录完成后再让我下载一次就行。(原因:{detail})"
             ),
-            DownloadOutcome::BatchStarted { total, dir } => format!(
-                "已开始在后台下载整个合集,共 {total} 首,存到 {}(每首顺带配歌词,配不上的\
-                 跳过)。进度在屏幕任务条上;下载完成不会另行通知,告诉用户过一会儿去文件夹里\
-                 看就好。",
+            DownloadOutcome::BatchStarted { total, dir, scope } => format!(
+                "已开始在后台下载{scope},这批 {total} 首,存到 {}(每首顺带配歌词,配不上的\
+                 跳过)。进度在屏幕任务条上;**跑完会自动回来一条结果汇报**(下好几首、没成的\
+                 点名),到时再转述。现在告诉用户已经开工、跑完会说一声就好。",
                 dir.display()
             ),
         })

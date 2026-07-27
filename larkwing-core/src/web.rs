@@ -1,8 +1,18 @@
 //! 联网问答的地基:搜索源解析 + 正文抽取 + 短 TTL 缓存。
 //! robot web 插件的病根 = 搜索只回链接堆、模型还要串行 fetch(多一轮往返、摘要看引擎
 //! 脸色)→ 这里**搜索即抓取**:工具一次调用带回正文证据片段。
-//! 源 = Bing 中文优先、DDG 兜底,按序尝试;选择器没法数据化(是代码不是数据),
-//! 站点改版坏了改这里 —— 与 bilibili 搜索同一立场,诚实记档。
+//! 源 = Bing 中文优先 → 搜狗(国内直连稳)→ DDG(有代理时好用),按序尝试;选择器没法
+//! 数据化(是代码不是数据),站点改版坏了改这里 —— 与 bilibili 搜索同一立场,诚实记档。
+//!
+//! **搜索请求必须长得像浏览器(2026-07-27 实测破案,别退回去)**:曾经只带 UA、无 cookie
+//! 地裸 GET,被 Bing 判成机器人,三种坏法——① 人机验证页(解析出 0 条);② 国内版
+//! `cc=cn&rdr=1` 市场重定向死循环;③ **最阴的一种:重定向链上把 query 弄丢,回一个
+//! 「看起来完全正常、内容却是别的」的结果页**(真机实锤:搜「周深 悬崖之上 歌词 完整版」
+//! 回来的是百度百科「周」字条目,还写着"约 175,000 个结果")。③ 会解析出一堆形似合法的
+//! 命中原样喂给模型当证据(同期实锤:模型据此编造 .lrc 时间轴)。同机同 IP 同 UA 对照:
+//! 裸 GET → 验证页;cookie 罐 + 完整浏览器头 + 跟随重定向 → 6 跳后 10 条全对(2/2 稳定)。
+//! 故 `WebClient` 的 net::Client **必须**开 cookie_store + 带 `BROWSER_HEADERS`;
+//! 光有 cookie 或光有头都不行(两者缺一都实测复现了坏法)。③ 另配 `looks_relevant` 闸。
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -17,6 +27,56 @@ const CACHE_TTL: Duration = Duration::from_secs(600);
 /// (单源,§4.11——渲染窗与抓取端 UA 一致,免得同一站点见到两副面孔)。
 pub const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                   (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+/// 真浏览器顶层导航会带的一整套头(UA 之外的另一半)。少了它们搜索源就翻脸——见模块
+/// 顶部记档。`Sec-Fetch-Site: none` = "用户自己敲的地址",与我们每次都是独立请求相符。
+const BROWSER_HEADERS: &[(&str, &str)] = &[
+    ("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"),
+    ("accept-language", "zh-CN,zh;q=0.9,en;q=0.8"),
+    ("upgrade-insecure-requests", "1"),
+    ("sec-fetch-dest", "document"),
+    ("sec-fetch-mode", "navigate"),
+    ("sec-fetch-site", "none"),
+    ("sec-fetch-user", "?1"),
+];
+
+fn browser_headers() -> reqwest::header::HeaderMap {
+    let mut h = reqwest::header::HeaderMap::new();
+    for (k, v) in BROWSER_HEADERS {
+        // 静态常量,不合法就是代码写错了(与 sel() 同款立场)
+        let name = reqwest::header::HeaderName::from_static(k);
+        h.insert(name, reqwest::header::HeaderValue::from_static(v));
+    }
+    h
+}
+
+/// 搜索源。加一个源 = 加一支枚举 + 一个 `search_*` + 一个 `parse_*`,调度不动。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Bing,
+    Sogou,
+    Ddg,
+}
+
+impl Source {
+    /// 只进日志与「都失败了」的死因串(给模型看的观察),不是用户可见文案。
+    fn name(self) -> &'static str {
+        match self {
+            Source::Bing => "Bing",
+            Source::Sogou => "搜狗",
+            Source::Ddg => "DDG",
+        }
+    }
+}
+
+/// 尝试顺序按「实测可靠度 × 快」排(2026-07-27 同机实测):搜狗 0.96s 零跳、国内直连稳、
+/// 给真实直链 → Bing 索引质量最好但**冷启要跑 6 跳 cookie 引导 ≈ 26s**(热 3.8s),当不了
+/// 第一源(每进程第一次搜索都得先白烧一次超时)→ DDG 垫底(国内常不通,通的时候 ~1s)。
+const SEARCH_SOURCES: &[Source] = &[Source::Sogou, Source::Bing, Source::Ddg];
+
+/// 搜索单请求超时(比 `WebClient` 的 15s 通用档宽):要容得下 Bing 冷启那趟 ~26s 的
+/// 重定向引导,否则它永远只会超时、白占一个源位。抓正文仍用通用档。
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct SearchHit {
@@ -58,35 +118,63 @@ impl Default for WebClient {
 
 impl WebClient {
     pub fn new() -> WebClient {
+        // cookie_store:进程内存态、不落盘;搜索源的 market 重定向要靠它才走得通(模块顶部)。
+        // 重定向放宽到 20:Bing 冷启那趟引导实测 6 跳起、偶尔一路追加 `mkt=` 冲破默认 10 跳
+        // (报 too many redirects)。抓正文也共用这条,多几跳无害。
         let net = crate::net::Client::new(|b| {
-            b.user_agent(UA).connect_timeout(Duration::from_secs(8)).timeout(Duration::from_secs(15))
+            b.user_agent(UA)
+                .cookie_store(true)
+                .redirect(reqwest::redirect::Policy::limited(20))
+                .default_headers(browser_headers())
+                .connect_timeout(Duration::from_secs(8))
+                .timeout(Duration::from_secs(15))
         });
         WebClient { net, cache: Mutex::new(HashMap::new()) }
     }
 
-    /// 搜索:Bing(中文质量好)→ DDG html 版兜底。全军覆没才报错。
+    /// 搜索:按序试各源,第一个「有结果 + 过合理性闸」的胜出;全军覆没才报错(带各源死因)。
     pub async fn search(&self, query: &str, count: usize) -> Result<Vec<SearchHit>> {
-        // 命中即返回;否则把 Bing 的死因带去兜底分支(单赋值,无 Option 摆设)
-        let bing_err: anyhow::Error = match self.search_bing(query, count).await {
-            Ok(hits) if !hits.is_empty() => return Ok(hits),
-            Ok(_) => anyhow::anyhow!("Bing 返回空结果"),
-            Err(e) => {
-                tracing::warn!("Bing 搜索失败,换 DDG: {e:#}");
-                e
+        let mut why: Vec<String> = Vec::new();
+        for &src in SEARCH_SOURCES {
+            let name = src.name();
+            match self.search_with(src, query, count).await {
+                Ok(hits) if hits.is_empty() => {
+                    tracing::warn!(source = name, "搜索没有结果,换下一个源");
+                    why.push(format!("{name}: 没有结果"));
+                }
+                // 结构完整但内容跑题 = 被反爬降级/query 被弄丢的假结果页(模块顶部 ③)
+                Ok(hits) if !looks_relevant(query, &hits) => {
+                    tracing::warn!(source = name, "结果与查询无关(疑似被降级),换下一个源");
+                    why.push(format!("{name}: 结果与查询无关(疑似被拦截)"));
+                }
+                Ok(hits) => return Ok(hits),
+                Err(e) => {
+                    tracing::warn!(source = name, "搜索失败,换下一个源: {e:#}");
+                    why.push(format!("{name}: {e}"));
+                }
             }
-        };
-        match self.search_ddg(query, count).await {
-            Ok(hits) if !hits.is_empty() => Ok(hits),
-            Ok(_) => bail!("两个搜索源都没有结果(Bing: {bing_err})"),
-            Err(e) => bail!("两个搜索源都失败(Bing: {bing_err};DDG: {e})"),
+        }
+        bail!("搜索源都没能给出可用结果({})", why.join(";"))
+    }
+
+    async fn search_with(&self, src: Source, query: &str, count: usize) -> Result<Vec<SearchHit>> {
+        match src {
+            Source::Bing => self.search_bing(query, count).await,
+            Source::Sogou => self.search_sogou(query, count).await,
+            Source::Ddg => self.search_ddg(query, count).await,
         }
     }
 
     async fn search_bing(&self, query: &str, count: usize) -> Result<Vec<SearchHit>> {
         let url = "https://www.bing.com/search";
+        // 只带真浏览器会带的参数。**别再加 `count`**:实测它会把首次请求打进重定向死循环
+        // /人机验证页(同一 cookie 罐 + 同一套头,带 count 0 跳进验证页、去掉 6 跳出 10 条),
+        // 而它本来也没用——条数是解析时 `.take(count)` 裁的。setlang 无辜,留着表意。
         let html = self
             .net
-            .send(url, |c| c.get(url).query(&[("q", query), ("setlang", "zh-hans"), ("count", "10")]))
+            .send(url, |c| {
+                c.get(url).query(&[("q", query), ("setlang", "zh-hans")]).timeout(SEARCH_TIMEOUT)
+            })
             .await?
             .error_for_status()?
             .text()
@@ -94,11 +182,23 @@ impl WebClient {
         Ok(parse_bing(&html, count))
     }
 
+    async fn search_sogou(&self, query: &str, count: usize) -> Result<Vec<SearchHit>> {
+        let url = "https://www.sogou.com/web";
+        let html = self
+            .net
+            .send(url, |c| c.get(url).query(&[("query", query)]).timeout(SEARCH_TIMEOUT))
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        Ok(parse_sogou(&html, count))
+    }
+
     async fn search_ddg(&self, query: &str, count: usize) -> Result<Vec<SearchHit>> {
         let url = "https://html.duckduckgo.com/html/";
         let html = self
             .net
-            .send(url, |c| c.get(url).query(&[("q", query)]))
+            .send(url, |c| c.get(url).query(&[("q", query)]).timeout(SEARCH_TIMEOUT))
             .await?
             .error_for_status()?
             .text()
@@ -214,6 +314,119 @@ fn parse_bing(html: &str, count: usize) -> Vec<SearchHit> {
         })
         .take(count)
         .collect()
+}
+
+/// 搜狗结果页:div.vrwrap → h3(标题)+ .fz-mid(摘要)。取地址按「与标题同源」排序:
+/// ① 标题自己的直链最准(音乐/视频垂类卡片一个块里并列好几首,块级 `data-url` 未必是
+/// 第一条那首——实锤过标题 QQ音乐、地址却是酷狗);② 标题是 `/link?url=` 跳转时,块内
+/// `data-url` 才是真实目标;③ 都没有就把跳转链补成绝对地址兜底(它 302 到真页,抓取
+/// 跟随重定向照样读得到,只是给模型看的地址不好看)。
+fn parse_sogou(html: &str, count: usize) -> Vec<SearchHit> {
+    let doc = Html::parse_document(html);
+    let (item, title, anchor, real, snip) =
+        (sel("div.vrwrap"), sel("h3"), sel("a"), sel("[data-url]"), sel("div.fz-mid"));
+    doc.select(&item)
+        .filter_map(|it| {
+            let h = it.select(&title).next()?;
+            let title_text = squeeze(&h.text().collect::<String>());
+            if title_text.is_empty() {
+                return None;
+            }
+            let block_url = || {
+                it.select(&real)
+                    .filter_map(|e| e.value().attr("data-url"))
+                    .find(|u| u.starts_with("http"))
+                    .map(str::to_string)
+            };
+            let url = match h.select(&anchor).next().and_then(|a| a.value().attr("href")) {
+                Some(href) if href.starts_with("http") => Some(href.to_string()),
+                Some(href) => block_url().or_else(|| sogou_url(href)),
+                None => block_url(),
+            }?;
+            Some(SearchHit {
+                title: title_text,
+                url,
+                snippet: it
+                    .select(&snip)
+                    .next()
+                    .map(|p| squeeze(&p.text().collect::<String>()))
+                    .unwrap_or_default(),
+            })
+        })
+        .take(count)
+        .collect()
+}
+
+/// 搜狗标题链接:绝对地址原样放行;`/link?url=…` 补成绝对;其余(javascript: 等)丢弃。
+fn sogou_url(href: &str) -> Option<String> {
+    if href.starts_with("http") {
+        return Some(href.to_string());
+    }
+    href.starts_with("/link?url=").then(|| format!("https://www.sogou.com{href}"))
+}
+
+/// 压掉换行/连续空白(结果页标题常带缩进换行)。
+fn squeeze(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// 结果合理性闸:搜索源被反爬降级时会回一个「结构完整、内容却是别的」的结果页(模块顶部
+/// ③),解析器分不出真假。这里拿查询词做一道弱校验:**刻意宽松**——只要有一条命中沾上
+/// 查询里的任意一个片段就放行。误杀的代价只是多退一个源,误放的代价是把垃圾当证据喂给
+/// 模型(实锤过模型据此编造内容),所以宁可放过略偏的结果。查询抽不出信号片段则不设闸。
+fn looks_relevant(query: &str, hits: &[SearchHit]) -> bool {
+    let signals = query_signals(query);
+    if signals.is_empty() {
+        return true;
+    }
+    hits.iter().any(|h| {
+        let hay = format!("{} {}", h.title, h.snippet).to_lowercase();
+        signals.iter().any(|s| hay.contains(s))
+    })
+}
+
+/// 查询的「信号片段」= ASCII 单词(≥2 字符,小写)+ 相邻两个汉字。中文没有词边界,双字
+/// 窗口是最省事又够用的粒度(「今天天气怎么样」能靠「天气」对上)。**单个汉字太弱、
+/// 刻意不收**——否则搜「周深 悬崖之上…」时百度百科的「周」字条目会被判成相关,而那
+/// 正是本闸要拦的东西。
+fn query_signals(query: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut run: Vec<char> = Vec::new();
+    // 末尾补一个空格,让最后一段也走到 flush 分支
+    for c in query.chars().chain(std::iter::once(' ')) {
+        if is_cjk(c) {
+            flush_word(&mut out, &mut word);
+            run.push(c);
+            continue;
+        }
+        for w in run.windows(2) {
+            out.push(w.iter().collect());
+        }
+        run.clear();
+        if c.is_ascii_alphanumeric() {
+            word.push(c.to_ascii_lowercase());
+        } else {
+            flush_word(&mut out, &mut word);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn flush_word(out: &mut Vec<String>, word: &mut String) {
+    if word.chars().count() >= 2 {
+        out.push(std::mem::take(word));
+    } else {
+        word.clear();
+    }
+}
+
+/// 基本区够用(中文查询绝大多数落这);扩展区字落到非 CJK 分支只是少几个双字片段,
+/// 与本闸「宁可放过」的取向一致。
+fn is_cjk(c: char) -> bool {
+    ('\u{4E00}'..='\u{9FFF}').contains(&c)
 }
 
 /// DDG html 版:.result → a.result__a(标题;href 藏在 uddg= 跳转参数里)+ .result__snippet。
@@ -401,6 +614,118 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].url, "https://example.com/news?id=7");
         assert_eq!(hits[0].title, "新闻标题");
+    }
+
+    #[test]
+    fn sogou_parsing_prefers_real_url_over_redirect() {
+        let html = r#"<html><body>
+          <div class="vrwrap">
+            <h3 class="vr-title"><a href="/link?url=DSOYnZeCC_roiy4">星海漫游 歌词_LRC下载_歌词网</a></h3>
+            <div class="fz-mid space-txt clamp2">星海漫游,某歌手,星海漫游歌词</div>
+            <div class="r-sech" data-url="http://www.example-lrc.com/geci_1.html"><span>推荐您搜索</span></div>
+          </div>
+          <div class="vrwrap">
+            <h3 class="vr-title _music_title"><a href="https://music-a.example.com/song/9">星海漫游_歌曲在线播放_甲音乐</a></h3>
+            <h3 class="vr-title _music_title"><a href="https://music-b.example.com/song/9">星海漫游_歌曲在线播放_乙音乐</a></h3>
+            <div class="r-sech" data-url="https://music-b.example.com/song/9"></div>
+          </div>
+          <div class="vrwrap"><h3 class="vr-title"><a href="/link?url=ABC">没有 data-url 的一条</a></h3></div>
+          <div class="vrwrap"><h3 class="vr-title"><a href="javascript:void(0)">坏链接</a></h3></div>
+          <div class="vrwrap"><div class="fz-mid">没有标题的块</div></div>
+        </body></html>"#;
+        let hits = parse_sogou(html, 10);
+        assert_eq!(hits.len(), 3, "坏链接与无标题块被滤掉: {hits:?}");
+        assert_eq!(hits[0].url, "http://www.example-lrc.com/geci_1.html", "data-url 压过 /link 跳转");
+        assert!(hits[0].title.contains("星海漫游"));
+        assert!(hits[0].snippet.contains("某歌手"));
+        // 垂类卡片一块多条:地址跟着「第一个标题自己的链接」走,不能被块级 data-url 带偏
+        assert!(hits[1].title.contains("甲音乐"));
+        assert_eq!(hits[1].url, "https://music-a.example.com/song/9", "标题与地址必须同源");
+        assert_eq!(hits[2].url, "https://www.sogou.com/link?url=ABC", "没 data-url 就补成绝对地址");
+    }
+
+    /// 闸的立身之本:真机那次「搜歌词回来百度百科『周』字条目」必须被判为不相关。
+    /// 夹具就是真机原样抓回来的那几条(标题 + 摘要开头)。
+    #[test]
+    fn relevance_gate_rejects_degraded_serp() {
+        let hit = |t: &str, s: &str| SearchHit {
+            title: t.into(),
+            url: "https://example.com/x".into(),
+            snippet: s.into(),
+        };
+        let query = "周深 悬崖之上 歌词 完整版";
+
+        let degraded = vec![
+            hit("周（汉语汉字）_百度百科", "周（读音zhōu）是汉字通用规范一级字（常用字）。此字始见于商代甲骨文。"),
+            hit("周朝（中国历史朝代）_百度百科", "周族是居于今陕甘黄土高原、渭水流域一带的古老部族。"),
+            hit("周的意思,周的解释,周的拼音,周的部首,周的笔顺-汉语国学", "〔周〕字拼音是（zhōu），部首是 口部，总笔画是 8画。"),
+        ];
+        assert!(!looks_relevant(query, &degraded), "首字退化的假结果页必须被拦下");
+
+        // 另一种真机形态:query 在跳转链上被整个丢掉,回了个毫不相干的结果页
+        let lost = vec![hit("New Microsoft Teams bulk installer is now available", "Deploy the new Teams client…")];
+        assert!(!looks_relevant(query, &lost), "query 被丢掉的结果页必须被拦下");
+
+        let good = vec![
+            hit("周深悬崖之上歌词全文 - 抖音", "悬崖之上 演唱：周深"),
+            hit("无关的一条", "随便什么"),
+        ];
+        assert!(looks_relevant(query, &good), "有一条沾上就放行(闸刻意宽松)");
+
+        // 英文查询走 ASCII 单词那条路
+        assert!(looks_relevant("rust borrow checker error", &[hit("Understanding the Rust Borrow Checker", "")]));
+        assert!(!looks_relevant("rust borrow checker error", &[hit("今日天气预报", "多云转晴")]));
+    }
+
+    #[test]
+    fn query_signals_drops_single_cjk_char() {
+        // 单字不进信号集——否则「周」字条目会被判成「周深…」的相关结果,正是要拦的
+        assert!(query_signals("周").is_empty());
+        assert!(query_signals("a").is_empty(), "单字母同理");
+        assert_eq!(query_signals("歌词"), vec!["歌词".to_string()]);
+        // 无词边界的长串:滑动双字窗口,「天气」能对上
+        assert!(query_signals("今天天气怎么样").contains(&"天气".to_string()));
+        // 纯符号 → 抽不出信号 → 上层不设闸
+        assert!(query_signals("?!  ").is_empty());
+        assert!(looks_relevant("?!", &[]), "抽不出信号时不设闸");
+    }
+
+    /// 真网回归(开发机手动跑):
+    /// `cargo test -p larkwing-core --lib web::tests::real_search -- --ignored --nocapture`
+    /// 钉的是本次破案的两件事——搜索源没再把我们当机器人、拿回来的结果确实跟查询有关。
+    #[tokio::test]
+    #[ignore = "打真网(搜索引擎),开发机手动跑"]
+    async fn real_search_returns_relevant_hits() {
+        let web = WebClient::new();
+        let query = "周深 悬崖之上 歌词";
+        let hits = web.search(query, 5).await.expect("搜索应当成功");
+        for h in &hits {
+            println!("  {} | {}", h.title, h.url);
+        }
+        assert!(!hits.is_empty(), "应当有结果");
+        assert!(looks_relevant(query, &hits), "结果必须与查询相关(不是被降级的假结果页)");
+    }
+
+    /// 真网体检(开发机手动跑):逐个源单独报告。「搜索又不对劲了」时先跑它,一眼看出
+    /// 是哪家翻脸、翻的是哪种脸(报错 / 0 条 / 有结果但没过闸 = 被降级的假结果页)。
+    /// `cargo test -p larkwing-core --lib web::tests::real_source_report -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "打真网(搜索引擎),开发机手动跑"]
+    async fn real_source_report() {
+        let web = WebClient::new();
+        let query = "周深 悬崖之上 歌词";
+        for &src in SEARCH_SOURCES {
+            match web.search_with(src, query, 5).await {
+                Ok(hits) => println!(
+                    "{:>6}: {} 条 过闸={} 首条={}",
+                    src.name(),
+                    hits.len(),
+                    looks_relevant(query, &hits),
+                    hits.first().map(|h| h.title.as_str()).unwrap_or("-")
+                ),
+                Err(e) => println!("{:>6}: 失败 {e:#}", src.name()),
+            }
+        }
     }
 
     #[test]

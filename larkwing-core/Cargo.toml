@@ -29,7 +29,14 @@ glob = "0.3"
 msedge-tts = "0.4.0"
 pinyin = "0.11.0"
 # multipart:渠道出站文件(TG sendDocument / 钉钉 media/upload 的表单上传,channels/outbound.rs)
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks", "gzip", "multipart"] }
+# cookies:搜索源必需——Bing 国内版首次请求必 302 去种 market cookie,没有 cookie 罐就在
+#   跳转链上打转,最后拿到验证页/查询被丢掉的假结果页(2026-07-27 实测,见 web.rs 顶部注释)。
+# http2:reqwest 0.12 的 HTTP/2 在这个 feature 后面,而我们 default-features=false 手列时
+#   一直漏了它 → 全程序都在跑 HTTP/1.1。**现代浏览器对 https 一律 h2,只说 h1.1 就是机器人
+#   特征**:同一 cookie 罐同一套头,curl 走 h2 出 10 条、`--http1.1` 直接进人机验证页
+#   (2026-07-27 实测)。影响面是全部出站 HTTP(LLM/媒体/渠道),h2 本就是 reqwest 默认档;
+#   真撞上只认 h1 的服务端,给那个调用点单独 `.http1_only()`,别把这个 feature 摘掉。
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks", "gzip", "multipart", "cookies", "http2"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 # web 工具的 HTML 解析(搜索结果页 + 正文抽取)
 scraper = "0.23"

@@ -3,6 +3,7 @@
 //! 加任务能力 = 本目录加一个文件 + builtin() 里一行注册,循环与 engine 永不改。
 //! job 型不另设 trait:就是一个秒回"已启动"的阻塞工具(JobRunner 后置,见 PLAN §8)。
 
+mod bgtask;
 mod briefing;
 mod desktop;
 mod end_conversation;
@@ -225,6 +226,8 @@ impl Tools {
         tools.register(Arc::new(media_control::MediaControl::new()));
         tools.register(Arc::new(media_download::MediaDownload::new()));
         tools.register(Arc::new(lyrics_fetch::LyricsFetch::new()));
+        tools.register(Arc::new(bgtask::TaskStatus::new()));
+        tools.register(Arc::new(bgtask::TaskCancel::new()));
         tools.register(Arc::new(desktop::Open::new()));
         tools.register(Arc::new(desktop::SystemVolume::new()));
         tools.register(Arc::new(desktop::Power::new()));

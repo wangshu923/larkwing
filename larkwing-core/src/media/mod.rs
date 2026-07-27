@@ -13,6 +13,7 @@ mod resolver;
 
 pub use cookies::CookieRec;
 pub use download::{DownloadOutcome, DownloadedAudio, TrackMeta};
+pub(crate) use lyrics::compose_batch_summary;
 pub use lyrics::{LyricsBatchOutcome, LyricsFileResult, LyricsItem, LyricsResult};
 
 use std::collections::HashMap;
@@ -346,6 +347,8 @@ struct Inner {
     store: Store,
     bus: Bus,
     tasks: Tasks,
+    /// 后台差事登记处(模型可见性:此刻/status/取消/收尾汇报;批量下载与批量配词注册进来)。
+    bg: crate::bgtasks::BgTasks,
     components: Components,
     relay: tokio::sync::OnceCell<relay::Relay>,
     sources: Vec<Arc<dyn MediaSource>>,
@@ -375,12 +378,14 @@ impl MediaRuntime {
     pub fn new(dir: PathBuf, store: Store, bus: Bus) -> MediaRuntime {
         let tasks = Tasks::new(bus.clone());
         let components = Components::new(dir.join("components"), tasks.clone());
+        let bg = crate::bgtasks::BgTasks::new(store.clone());
         MediaRuntime {
             inner: Arc::new(Inner {
                 dir,
                 store,
                 bus,
                 tasks,
+                bg,
                 components,
                 relay: tokio::sync::OnceCell::new(),
                 sources: vec![Arc::new(bilibili::Bilibili::new())],
@@ -403,6 +408,11 @@ impl MediaRuntime {
 
     pub fn bus(&self) -> &Bus {
         &self.inner.bus
+    }
+
+    /// 后台差事登记处(task_status/task_cancel 工具与〔此刻〕背景经此读写)。
+    pub fn bg(&self) -> &crate::bgtasks::BgTasks {
+        &self.inner.bg
     }
 
     fn publish(&self, ev: MediaEvent) {

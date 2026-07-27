@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 
 use super::{Tool, ToolCtx, ToolRisk, ToolSpec};
-use crate::media::{LyricsBatchOutcome, LyricsFileResult, LyricsItem, LyricsResult};
+use crate::media::{LyricsBatchOutcome, LyricsItem};
 
 pub(super) struct LyricsFetch {
     spec: ToolSpec,
@@ -98,64 +98,15 @@ impl Tool for LyricsFetch {
             items.push(LyricsItem { path: p, title: opt("title"), artist: opt("artist") });
         }
 
-        match ctx.media.lyrics_for_files(items).await? {
+        match ctx.media.lyrics_for_files(items, (ctx.user_id, ctx.conv_id)).await? {
             LyricsBatchOutcome::JobStarted { total } => Ok(format!(
-                "已开始在后台给 {total} 个文件找歌词,进度在屏幕任务条上;配不上的最后会在\
-                 任务条点名数目。告诉用户过一会儿就好,不用等着。"
+                "已开始在后台给 {total} 个文件找歌词,进度在屏幕任务条上;**跑完会自动回来一条\
+                 结果汇报**(成几个、哪些没配上会点名),到时再转述。现在告诉用户已经开工、\
+                 跑完会说一声就好。"
             )),
+            // 量是一等约束(§7.2):汇总数字 + 只点名要处理的(没找到/缺歌名/无效)。
             LyricsBatchOutcome::Report(report) => {
-                // 量是一等约束(§7.2):汇总数字 + 只点名要处理的(没找到/缺歌名/无效)。
-                let mut done = 0usize;
-                let mut plain = 0usize;
-                let mut existed = 0usize;
-                let (mut not_found, mut missing, mut unusable) =
-                    (Vec::new(), Vec::new(), Vec::new());
-                let stem = |p: &std::path::Path| {
-                    p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
-                };
-                for (path, r) in &report {
-                    match r {
-                        LyricsFileResult::Got(LyricsResult::Lib | LyricsResult::Cc) => done += 1,
-                        LyricsFileResult::Got(LyricsResult::LibPlain) => {
-                            done += 1;
-                            plain += 1;
-                        }
-                        LyricsFileResult::Got(LyricsResult::Existed) => existed += 1,
-                        LyricsFileResult::Got(LyricsResult::NotFound) => {
-                            not_found.push(stem(path));
-                        }
-                        LyricsFileResult::MissingTitle => missing.push(stem(path)),
-                        LyricsFileResult::Unusable(why) => {
-                            unusable.push(format!("{}({why})", stem(path)));
-                        }
-                    }
-                }
-                let mut out = format!("配好 {done} 个");
-                if plain > 0 {
-                    out.push_str(&format!("(其中 {plain} 个是纯文本歌词、无逐句时间轴)"));
-                }
-                if existed > 0 {
-                    out.push_str(&format!(";{existed} 个旁边已有歌词文件,跳过没动"));
-                }
-                if !not_found.is_empty() {
-                    out.push_str(&format!(
-                        ";没找到歌词 {} 个:{}",
-                        not_found.len(),
-                        not_found.join("、")
-                    ));
-                }
-                if !missing.is_empty() {
-                    out.push_str(&format!(
-                        ";缺歌名 {} 个(从文件名判断出歌名/歌手后,带 title/artist 对它们\
-                         重试):{}",
-                        missing.len(),
-                        missing.join("、")
-                    ));
-                }
-                if !unusable.is_empty() {
-                    out.push_str(&format!(";处理不了:{}", unusable.join("、")));
-                }
-                Ok(out)
+                Ok(crate::media::compose_batch_summary(&report))
             }
         }
     }

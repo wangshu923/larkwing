@@ -24,6 +24,8 @@ export default {
     media_control: 'Working the player…',
     media_download: 'Downloading the track…',
     lyrics_fetch: 'Finding lyrics…',
+    task_status: 'Checking background tasks…',
+    task_cancel: 'Stopping a background task…',
     open: 'Opening it up…',
     system_volume: 'Turning the volume knob…',
     power: 'Reaching for the power switch…',
@@ -82,6 +84,7 @@ export default {
     },
     err: {
       dropped: 'Interrupted unexpectedly',
+      cancelled: 'Stopped on request',
       download: 'Download failed — try again in a bit',
       resolve: 'Couldn’t resolve it',
       auth: 'Sign-in needed',

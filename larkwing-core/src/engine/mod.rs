@@ -683,6 +683,11 @@ impl Engine {
         if let Some(s) = self.media.playback_summary() {
             lines.push(s);
         }
+        // 运行中的后台差事(批量下载/配词):模型零工具调用即知进度,可直接答「到哪了」;
+        // 带编号 → 「停下」可直奔 task_cancel。没有在跑 = 不占背景。
+        if let Some(s) = self.media.bg().ambient_line() {
+            lines.push(s);
+        }
         if !lines.is_empty() {
             context::attach_ambient(request, &lines.join(";"));
         }

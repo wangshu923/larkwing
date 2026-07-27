@@ -17,7 +17,7 @@ use crate::files;
 
 use super::lyrics::{self, LyricsResult};
 use super::resolver::{self, ResolveError, Resolved, UpStream};
-use super::{cookies, MediaRuntime};
+use super::{cookies, EpisodeRef, MediaRuntime};
 
 /// 单文件闸:音频为主、放宽到 500MB(两小时高码率无损也装得下)。web_download 的
 /// 50MB 是"任意网页文件"的通用口径,不适用用户点名的曲目。
@@ -30,8 +30,9 @@ pub enum DownloadOutcome {
     Done(DownloadedAudio),
     /// 需要登录 ≠ 失败(§7.1 播放同口径):已弹扫码;下载没有自动重放,登录后再调一次。
     AwaitingLogin { detail: String },
-    /// 批量已开工(后台 job):工具立即返回,进度在任务条。
-    BatchStarted { total: usize, dir: PathBuf },
+    /// 批量已开工(后台 job):工具立即返回,进度在任务条。scope = 「整个合集」或
+    /// 「合集第 X-Y 首」(range 分段时;话术如实说下的是哪一段)。
+    BatchStarted { total: usize, dir: PathBuf, scope: String },
 }
 
 pub struct DownloadedAudio {
@@ -125,11 +126,17 @@ impl MediaRuntime {
     /// (`MediaSource::episodes`),不成系列退化成单曲;成系列 = 分离 job 后台逐首下,
     /// 立即返回。进度在任务条;有没下成的按 fail 收尾点名数目(§3.5 不静默)。
     /// `artist` 对整批生效(「某歌手精选」场景);每首的歌名用各集自己的标题。
+    /// `origin` = (user_id, conv_id):收尾把成败汇报插成 due=now 任务唤回合(lyrics 同款)。
+    /// `range` = (from, to) 第几首到第几首(1 起含两端,None 边 = 开头/结尾)——超过
+    /// BATCH_MAX 的大合集靠它分段;真机实锤:没有范围参数时话术让「分批」是空头承诺,
+    /// 模型只能绕去网页扒分P链接(承诺与机器脱节,§7.1 能力对账同款教训)。
     pub async fn download_all(
         &self,
         page_url: &str,
         dir: &Path,
         artist: Option<String>,
+        origin: (i64, i64),
+        range: (Option<usize>, Option<usize>),
     ) -> Result<DownloadOutcome> {
         let meta = TrackMeta { title: None, artist };
         let Some(source) = self.source_of_url(page_url) else {
@@ -145,13 +152,24 @@ impl MediaRuntime {
                 None
             }
         };
-        let Some((_key, entries)) = discovered.filter(|(_, e)| e.len() >= 2) else {
+        let Some((_key, mut entries)) = discovered.filter(|(_, e)| e.len() >= 2) else {
             return self.download_audio(page_url, dir, &meta).await;
         };
+        // 范围切片(1 起含两端;越界如实报「一共 X 首」= media_control episode 同口径)
+        let total_all = entries.len();
+        let (start, end) = resolve_range(total_all, range.0, range.1)?;
+        let ranged = !(start == 0 && end == total_all);
+        let entries: Vec<EpisodeRef> = entries.drain(start..end).collect();
         anyhow::ensure!(
             entries.len() <= BATCH_MAX,
-            "这个合集有 {} 首,一次最多下 {BATCH_MAX} 首——请让用户挑一部分(可以按第几首到第几首分批)",
-            entries.len()
+            "这{}有 {} 首,一次最多下 {BATCH_MAX} 首——用 from/to 分段下(比如先 from={} to={},\
+             再 from={} to={})",
+            if ranged { "一段" } else { "个合集" },
+            entries.len(),
+            start + 1,
+            start + BATCH_MAX,
+            start + BATCH_MAX + 1,
+            end
         );
         // 组件与登录态在答应之前备齐(答应了就要真开工;组件下载失败在这儿如实报错)。
         let ytdlp = self.ensure_component(Component::YtDlp).await?;
@@ -159,14 +177,37 @@ impl MediaRuntime {
         let ffmpeg = self.ensure_component(Component::Ffmpeg).await.ok();
 
         let total = entries.len();
+        let scope = if ranged {
+            format!("合集第 {}-{} 首(共 {total_all} 首)", start + 1, end)
+        } else {
+            "整个合集".to_string()
+        };
+        // 登记进后台差事登记处(此刻/status 可查、可取消、收尾/卡死必汇报);cap 满如实退回。
+        let title = if ranged {
+            format!("下载{scope}")
+        } else {
+            format!("下载合集({total} 首)")
+        };
+        let ticket = self.inner.bg.submit(title, origin, total)?;
+        let ticket_id = ticket.id();
         let this = self.clone();
         let dir_owned = dir.to_path_buf();
-        tokio::spawn(async move {
+        let scope_owned = scope.clone();
+        let join = tokio::spawn(async move {
             let client = download_client();
             let task =
                 this.inner.tasks.start("media_download", Text::new("task.media_download"));
-            let mut failed = 0usize;
+            let mut failed_titles: Vec<String> = Vec::new();
+            let mut lyr_missing = 0usize;
+            let mut halted_for_login = false;
+            let mut cancelled = false;
+            let mut processed = 0usize; // 实际跑过的首数(取消/半路停时的诚实分母)
             for (i, e) in entries.iter().enumerate() {
+                if ticket.is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
+                ticket.beat(i, format!("《{}》", e.title));
                 task.step_progress(
                     "step.audio_batch",
                     serde_json::json!({ "t": e.title, "i": i + 1, "n": total }),
@@ -185,7 +226,7 @@ impl MediaRuntime {
                         .await
                         {
                             Ok(file) => {
-                                // 逐首配歌词(静默:结论进日志;配不上不算下载失败)。
+                                // 逐首配歌词(配不上不算下载失败,只计数进收尾汇报)。
                                 let got = lyrics::lyrics_for_download(
                                     &client,
                                     &r.subtitles,
@@ -197,11 +238,13 @@ impl MediaRuntime {
                                 )
                                 .await;
                                 if got == LyricsResult::NotFound {
+                                    lyr_missing += 1;
                                     tracing::info!(title = %file.title, "批量下载:这首没找到歌词");
                                 }
                             }
                             Err(err) => {
-                                failed += 1;
+                                failed_titles.push(e.title.clone());
+                                ticket.miss(&e.title);
                                 tracing::warn!(title = %e.title, "批量下载:这首没下成: {err:#}");
                             }
                         }
@@ -213,16 +256,24 @@ impl MediaRuntime {
                             "批量下载:需要登录,剩余 {} 首搁置: {detail}",
                             total - i
                         );
-                        failed += total - i;
+                        halted_for_login = true;
+                        failed_titles.extend(entries[i..].iter().map(|e| e.title.clone()));
                         break;
                     }
                     Err(err) => {
-                        failed += 1;
+                        failed_titles.push(e.title.clone());
+                        ticket.miss(&e.title);
                         tracing::warn!(title = %e.title, "批量下载:这首没解析出来: {err:#}");
                     }
                 }
+                processed += 1;
             }
-            if failed == 0 {
+            let failed = failed_titles.len();
+            // 取消:没跑到的不算"没下成",只如实报跑到哪(processed 里去掉真失败的)
+            let done_count = processed.saturating_sub(failed);
+            if cancelled {
+                task.fail("task.err.cancelled", serde_json::Value::Null);
+            } else if failed == 0 {
                 task.done();
             } else {
                 task.fail(
@@ -230,8 +281,36 @@ impl MediaRuntime {
                     serde_json::json!({ "fail": failed, "total": total }),
                 );
             }
+            // 收尾汇报经登记处唤回合(lyrics 批量同款;§3.5 委托的活干完必须有动静)。
+            let mut report = if cancelled {
+                format!(
+                    "{scope_owned}的下载按要求停下了(这批 {total} 首,存到 {}):已下好 {done_count} 首",
+                    dir_owned.display()
+                )
+            } else {
+                format!(
+                    "{scope_owned}的下载跑完了(这批 {total} 首,存到 {}):下好 {} 首",
+                    dir_owned.display(),
+                    total - failed
+                )
+            };
+            if lyr_missing > 0 {
+                report.push_str(&format!(",其中 {lyr_missing} 首没找到歌词"));
+            }
+            if failed > 0 {
+                report.push_str(&format!(
+                    ";没下成 {failed} 首:{}",
+                    crate::bgtasks::cap_names(&failed_titles)
+                ));
+            }
+            if halted_for_login {
+                report.push_str("(登录失效,已弹扫码——登录后可以让我再下没成的那些)");
+            }
+            report.push_str("。把结果简短告诉用户。");
+            ticket.finish(!cancelled && failed == 0, report);
         });
-        Ok(DownloadOutcome::BatchStarted { total, dir: dir.to_path_buf() })
+        self.inner.bg.attach_abort(ticket_id, join.abort_handle());
+        Ok(DownloadOutcome::BatchStarted { total, dir: dir.to_path_buf(), scope })
     }
 
     /// 登录态导出成 yt-dlp 的 cookies 文件(play_entry 同逻辑;没登录 = None,匿名照下)。
@@ -395,6 +474,18 @@ async fn fetch_audio_file(
     })
 }
 
+/// 合集范围解析(1 起、含两端 → 0 起、半开):None 边回落开头/结尾;越界/倒置如实报
+/// (「一共 X 首」口径,media_control 跳集同款)。
+fn resolve_range(total: usize, from: Option<usize>, to: Option<usize>) -> Result<(usize, usize)> {
+    let from = from.unwrap_or(1);
+    let to = to.unwrap_or(total);
+    anyhow::ensure!(
+        from >= 1 && from <= to && to <= total,
+        "这个合集一共 {total} 首,第 {from} 到 {to} 首这个范围不对"
+    );
+    Ok((from - 1, to))
+}
+
 /// 两路(音视频分离)选音频那路;单路(纯音频或合并单文件)就它。下载格式串不带
 /// `+` 合并,常态单路 —— 这里宽容兜住没见过的形状。
 fn pick_audio_stream(streams: &[UpStream]) -> &UpStream {
@@ -501,6 +592,18 @@ mod tests {
             acodec: acodec.map(str::to_string),
             vcodec: vcodec.map(str::to_string),
             ..UpStream::default()
+        }
+    }
+
+    #[test]
+    fn range_resolves_defaults_and_rejects_out_of_bounds() {
+        assert_eq!(resolve_range(110, None, None).unwrap(), (0, 110), "不给 = 整个合集");
+        assert_eq!(resolve_range(110, Some(1), Some(100)).unwrap(), (0, 100), "前 100 首");
+        assert_eq!(resolve_range(110, Some(101), None).unwrap(), (100, 110), "101 到最后");
+        assert_eq!(resolve_range(110, Some(5), Some(5)).unwrap(), (4, 5), "只要第 5 首");
+        for (f, t) in [(Some(0), None), (Some(3), Some(2)), (None, Some(111))] {
+            let err = resolve_range(110, f, t).unwrap_err();
+            assert!(err.to_string().contains("一共 110 首"), "{err:#}");
         }
     }
 
