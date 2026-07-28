@@ -7,7 +7,7 @@ import { onOverheard, onTranscribed, useVoice } from '../composables/useVoice'
 import { useMicBridge } from '../composables/useMicBridge'
 import { useSpeech } from '../composables/useSpeech'
 import { useConfirm, confirmActionPhrase } from '../composables/useConfirm'
-import { useContextMenu } from '../composables/useContextMenu'
+import { useContextMenu, type MenuItem } from '../composables/useContextMenu'
 import { useCharacter } from '../composables/useCharacter'
 import { useMedia } from '../composables/useMedia'
 import { fmtMs, fmtTokens, fmtUsd } from '../lib/fmt'
@@ -34,7 +34,7 @@ const petName = computed(() => settings.get('ui.pet_name') || t('pet.name'))
 const textScale = computed(() => (settings.get('ui.text_scale') === 'large' ? '16.5px' : '14px'))
 const activeRail = ref<'chat' | 'reminders' | 'memory' | 'ops' | 'settings'>('chat')
 
-const { state: chat, send: chatSend, cancel, selectConversation, newConversation, ensureVoiceConv, overheardTargetConv, saveApiKey, dequeue, inject, renameConversation, togglePinConversation, deleteConversation, voiceConfirmTarget: chatVoiceConfirmTarget } = useChat()
+const { state: chat, send: chatSend, cancel, selectConversation, newConversation, ensureVoiceConv, overheardTargetConv, saveApiKey, dequeue, inject, renameConversation, togglePinConversation, deleteConversation, rollbackTo, forkFrom, voiceConfirmTarget: chatVoiceConfirmTarget } = useChat()
 const messages = computed(() => chat.messages)
 
 // 日期分隔条文案:今天 / 昨天 / 月-日(跨年带年份)。core 不产文案,这里走 i18n。
@@ -628,15 +628,50 @@ function copyGroup(g: StreamGroup) {
   })
 }
 
-// 气泡右键(双方):有选中文本则复制选中片段,否则整组;助手气泡再给「朗读」(念整组)
+// 气泡右键(双方):有选中文本则复制选中片段,否则整组;助手气泡再给「朗读」(念整组);
+// 用户气泡再给回溯两兄弟——「另起」无损分叉、「重说」原地截断(danger 标红;与删会话
+// 同口径不弹确认,原话已回填输入框 = 你打的字不丢,分叉是旁边的无损路)。
 function openBubbleMenu(e: MouseEvent, g: StreamGroup) {
   const sel = window.getSelection()?.toString().trim() ?? ''
   const whole = groupText(g)
-  const items = [{ label: sel ? t('ctx.copySelection') : t('ctx.copy'), action: () => copyText(sel || whole) }]
+  const items: MenuItem[] = [{ label: sel ? t('ctx.copySelection') : t('ctx.copy'), action: () => copyText(sel || whole) }]
   if (g.kind === 'wang' && whole && chat.inTauri) {
     items.push({ label: t('ctx.readAloud'), action: () => replay(whole) })
   }
+  if (g.kind === 'user') {
+    items.push({ separator: true })
+    items.push({ label: t('ctx.forkFromHere'), action: () => void forkFromHere(g) })
+    items.push({ label: t('ctx.redoFromHere'), danger: true, action: () => void redoFromHere(g) })
+  }
   openMenu(e, items)
+}
+
+/** 用户气泡里"手打的那部分":装配进内容的〔附件/图片〕段别当话带回输入框
+ *  (附件本体不自动重挂,要带图就重新拖一次)。 */
+function userSaidText(g: StreamGroup): string {
+  const raw = g.msgs[0].text
+  const cut = raw.search(/\n\n〔(附件|图片):/)
+  return (cut >= 0 ? raw.slice(0, cut) : raw).trim()
+}
+
+/** 回溯「从这里重新说」:截掉这条(含)之后的对话,原话回填输入框改一改再发。 */
+async function redoFromHere(g: StreamGroup) {
+  const m = g.msgs[0]
+  if (!(await rollbackTo(m.id, m.text))) return
+  input.value = userSaidText(g)
+  await nextTick()
+  autoGrow()
+  inputEl.value?.focus()
+}
+
+/** 分叉「从这里另起新会话」:之前的对话带进新会话接着说,原会话一字不动。 */
+async function forkFromHere(g: StreamGroup) {
+  const m = g.msgs[0]
+  if (!(await forkFrom(m.id, m.text))) return
+  input.value = userSaidText(g)
+  await nextTick()
+  autoGrow()
+  inputEl.value?.focus()
 }
 
 // —— 桌宠:漫游逻辑已抽到 ./PetRoamer.vue,形象态归 useCharacter(头像与桌宠共用)。
@@ -883,11 +918,19 @@ watch(messages, () => nextTick(() => {
             <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 4h10v16l-5-3-5 3z" /></svg>
             <span class="rc-text">{{ rc.text }}</span>
           </button>
-          <!-- 用户消息 hover:复制 + 时间(右下浮现,与 wang 的读数/重听同款克制) -->
+          <!-- 用户消息 hover:复制 + 回溯两枚快捷钮(右键菜单同款动作的直达)+ 时间(右下浮现,与 wang 的读数/重听同款克制) -->
           <span v-if="g.kind === 'user'" class="user-meta">
             <button class="copy-btn" :class="{ done: copiedId === g.msgs[0].id }" @click="copyMsg(g.msgs[0])" :title="t('chat.copy')">
               <svg v-if="copiedId === g.msgs[0].id" viewBox="0 0 24 24"><path d="M5 12l4 4 10-10" /></svg>
               <svg v-else viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M15 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h3" /></svg>
+            </button>
+            <button class="copy-btn" :title="t('ctx.forkFromHere')" @click="forkFromHere(g)">
+              <!-- 分支:从这里另起新会话(无损) -->
+              <svg viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15" /><circle cx="18" cy="6" r="3" /><circle cx="6" cy="18" r="3" /><path d="M18 9a9 9 0 0 1-9 9" /></svg>
+            </button>
+            <button class="copy-btn redo-btn" :title="t('ctx.redoFromHere')" @click="redoFromHere(g)">
+              <!-- 回退箭头:从这里重新说(截掉之后的,hover 转 danger 提示破坏性) -->
+              <svg viewBox="0 0 24 24"><path d="M9 14 4 9l5-5" /><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11" /></svg>
             </button>
             <span v-if="g.msgs[0].at" class="u-time">{{ fmtClock(g.msgs[0].at) }}</span>
           </span>
@@ -1482,6 +1525,8 @@ textarea.field { resize: none; font-family: inherit; line-height: 1.5; max-heigh
 }
 .copy-btn:hover { color: var(--accent); border-color: var(--accent); }
 .copy-btn.done { color: var(--ok); border-color: rgba(var(--ok-rgb), 0.5); }
+/* 「从这里重新说」是截断动作:hover 转 danger 色提示破坏性(与右键菜单 danger 标红同语义) */
+.redo-btn:hover { color: var(--danger); border-color: var(--danger); }
 .copy-btn svg { width: 11px; height: 11px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; display: block; }
 /* wang 回复一键复制:与 user 同款图标,贴右下、在耳机左侧,hover 浮现(右键菜单也有,这给个直达) */
 .wang-copy { position: absolute; right: 34px; bottom: -19px; z-index: 7; opacity: 0; transition: opacity .18s ease; }

@@ -945,6 +945,23 @@ impl Engine {
         Ok(())
     }
 
+    /// 会话回溯「从这里重新说」:先取消在飞(await 收尾,partial 落库后一并截掉)→
+    /// 删掉该**用户消息**(含)之后的所有行。副作用不回滚——那几轮设的提醒/记的记忆/
+    /// 动过的文件留着,各自页面可管:聊天流可以改写,世界已经发生(与「partial 落普通
+    /// 消息(像人被打断)」同一哲学)。会话槽不清(会话还活着,瞬态丢了也只是重算)。
+    pub async fn rollback_conversation(&self, conv_id: i64, msg_id: i64) -> Result<(), AppError> {
+        self.cancel(conv_id).await;
+        self.store.chat.truncate_from(conv_id, msg_id)?;
+        Ok(())
+    }
+
+    /// 会话分叉「从这里另起新会话」:切点之前的历史复制进新会话(ui 渠道、空标题),
+    /// 原会话一字不动——回溯的无损姊妹。不取消在飞:读的是切点之前的稳定前缀,
+    /// 原会话的回合继续跑它的。
+    pub fn fork_conversation(&self, conv_id: i64, msg_id: i64) -> Result<Conversation, AppError> {
+        Ok(self.store.chat.fork_before(conv_id, msg_id)?)
+    }
+
     /// 用户右键重命名会话(无条件覆盖标题;空串交给前端拦,这里只落库)。
     pub fn rename_conversation(&self, conv_id: i64, title: &str) -> Result<(), AppError> {
         Ok(self.store.chat.set_title(conv_id, title)?)

@@ -416,6 +416,8 @@ export default {
     copy: 'Copy',
     copySelection: 'Copy selection',
     readAloud: 'Read aloud',
+    forkFromHere: 'Branch into a new chat',
+    redoFromHere: 'Redo from here',
     switchChar: 'Switch look',
     openSettings: 'Settings',
     hidePet: 'Hide pet',

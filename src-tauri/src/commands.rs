@@ -216,6 +216,26 @@ pub async fn delete_conversation(
     state.engine.delete_conversation(conv_id).await
 }
 
+/// 回溯「从这里重新说」:取消在飞 → 删该用户消息(含)之后的行。副作用不回滚。
+#[tauri::command]
+pub async fn rollback_conversation(
+    state: State<'_, AppState>,
+    conv_id: i64,
+    message_id: i64,
+) -> Result<(), AppError> {
+    state.engine.rollback_conversation(conv_id, message_id).await
+}
+
+/// 分叉「从这里另起新会话」:切点之前的历史复制进新会话(ui 渠道),原会话不动。
+#[tauri::command]
+pub fn fork_conversation(
+    state: State<'_, AppState>,
+    conv_id: i64,
+    message_id: i64,
+) -> Result<Conversation, AppError> {
+    state.engine.fork_conversation(conv_id, message_id)
+}
+
 /// 用户右键重命名会话。
 #[tauri::command]
 pub fn rename_conversation(

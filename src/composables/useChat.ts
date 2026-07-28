@@ -890,6 +890,97 @@ function cancel() {
   api.cancelGeneration(state.convId).catch(() => {})
 }
 
+/** 负数 id = 发送时压入的本地占位(库 id 未对账):重拉一次本会话把整列换成库里真身,
+ *  再按「从后数第几条 user 行」对回同一颗气泡。保险闸:对回的库行必须以本地气泡文字
+ *  开头(库行可能多出装配的〔附件/图片〕段)——对不上宁可不做,绝不错删。 */
+async function resolveUserMsgId(msgId: number, localText: string): Promise<number | null> {
+  if (msgId > 0) return msgId
+  const users = state.messages.filter((m) => m.role === 'user')
+  const idxFromEnd = users.length - 1 - users.findIndex((m) => m.id === msgId)
+  if (idxFromEnd >= users.length) return null
+  const msgs = await api.loadConversation(state.convId)
+  state.messages = msgs.filter(visible).map(toUi)
+  void resolveThumbs()
+  const fresh = state.messages.filter((m) => m.role === 'user')
+  const target = fresh[fresh.length - 1 - idxFromEnd]
+  if (!target || target.id <= 0) return null
+  return target.text.startsWith(localText.trim()) ? target.id : null
+}
+
+/** 回溯「从这里重新说」:后端取消在飞并删掉该用户消息(含)之后的所有行,前端重拉本会话。
+ *  原话由调用方(MainLayout)回填输入框 = 你打的字不丢;副作用(那几轮设的提醒/记的
+ *  记忆/动过的文件)不回滚——聊天流可以改写,世界已经发生。浏览器预览:本地裁掉。 */
+async function rollbackTo(msgId: number, localText: string): Promise<boolean> {
+  useSpeech().abort() // 正在念的半截话即停(回合本体由后端 rollback 内的 cancel 收掉)
+  if (!state.inTauri) {
+    const idx = state.messages.findIndex((m) => m.id === msgId)
+    if (idx < 0) return false
+    state.messages.splice(idx)
+    if (!state.messages.length) pushOpening()
+    state.mood = 'idle'
+    return true
+  }
+  try {
+    // 接管在飞:旧回合的迟到事件按序号作废(尤其 cancelled 的收尾 pop,绝不许碰重拉后的
+    // 新列表;终态的 wakeResume 在作废路上照发,唤醒收尾通知不漏 §7.5)。排队区攒的是
+    // 被放弃方向的后续,一并清掉,不走 settleInFlight 的自动补发。
+    turnSeq++
+    turnInFlight = false
+    voiceTurnConv = null
+    state.queue.splice(0)
+    twFlush()
+    const id = await resolveUserMsgId(msgId, localText)
+    if (id == null) {
+      useToast().error(t('toast.actionFailed'))
+      state.mood = 'idle'
+      return false
+    }
+    await api.rollbackConversation(state.convId, id)
+    const msgs = await api.loadConversation(state.convId)
+    state.messages = msgs.filter(visible).map(toUi)
+    void resolveThumbs()
+    void hydrateStats(state.convId)
+    void hydrateTrace(state.convId)
+    if (!msgs.length) pushOpening() // 切在首条:会话清空,回到开场白
+    state.mood = 'idle'
+    state.toolAction = ''
+    void refreshConversations() // updated_at 已推,列表重排
+    return true
+  } catch (e) {
+    console.error('会话回溯失败', e)
+    useToast().error(t('toast.actionFailed'))
+    return false
+  }
+}
+
+/** 分叉「从这里另起新会话」:切点之前的历史复制进新会话并切过去,原会话一字不动
+ *  (在飞回合也不打断,它继续在老会话里跑,迟到事件走「已切走」的打标路)。
+ *  浏览器预览:本地留前缀,演示手感。 */
+async function forkFrom(msgId: number, localText: string): Promise<boolean> {
+  if (!state.inTauri) {
+    const idx = state.messages.findIndex((m) => m.id === msgId)
+    if (idx < 0) return false
+    state.messages = state.messages.slice(0, idx)
+    if (!state.messages.length) pushOpening()
+    return true
+  }
+  try {
+    const id = await resolveUserMsgId(msgId, localText)
+    if (id == null) {
+      useToast().error(t('toast.actionFailed'))
+      return false
+    }
+    const conv = await api.forkConversation(state.convId, id)
+    await refreshConversations()
+    await selectConversation(conv.id)
+    return true
+  } catch (e) {
+    console.error('会话分叉失败', e)
+    useToast().error(t('toast.actionFailed'))
+    return false
+  }
+}
+
 async function selectConversation(convId: number) {
   if (convId === state.convId) return
   twFlush() // 旧会话还在放字:立刻收尾,别让打字机写进看不见的孤儿气泡
@@ -1140,5 +1231,5 @@ function fakeStream(msg: UiMessage, full: string, speak = false) {
 export function useChat() {
   void boot()
   wireVoiceActivity()
-  return { state, send, cancel, selectConversation, newConversation, ensureVoiceConv, overheardTargetConv, saveApiKey, dequeue, inject, renameConversation, togglePinConversation, deleteConversation, voiceConfirmTarget: () => voiceTurnConv }
+  return { state, send, cancel, selectConversation, newConversation, ensureVoiceConv, overheardTargetConv, saveApiKey, dequeue, inject, renameConversation, togglePinConversation, deleteConversation, rollbackTo, forkFrom, voiceConfirmTarget: () => voiceTurnConv }
 }

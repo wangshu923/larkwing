@@ -240,6 +240,67 @@ impl ChatRepo {
         })
     }
 
+    /// 回溯「从这里重新说」:删掉某条**用户消息**(含)之后的所有行。切点恒为 user 行
+    /// (user 行之后必然是整轮,assistant/tool 配对不会拆散;UI 只在用户气泡给入口,
+    /// 这里再校验一道)。调用方(engine)负责先取消在飞回合——partial 落库后一并截掉,
+    /// 不留僵尸行。返回删了几条。
+    pub fn truncate_from(&self, conv: i64, msg_id: i64) -> Result<usize> {
+        self.db.tx(|tx| {
+            ensure_user_cut_point(tx, conv, msg_id)?;
+            let n = tx.execute(
+                "DELETE FROM messages WHERE conversation_id = ?1 AND id >= ?2",
+                rusqlite::params![conv, msg_id],
+            )?;
+            // 回溯也是"有新活动"(马上要重说):推 updated_at 让会话留在列表前排
+            tx.execute(
+                "UPDATE conversations SET updated_at = ?2 WHERE id = ?1",
+                rusqlite::params![conv, now_ms()],
+            )?;
+            Ok(n)
+        })
+    }
+
+    /// 分叉「从这里另起新会话」:把切点(某条用户消息)**之前**的历史原样复制进新会话,
+    /// 原会话一字不动——回溯的无损姊妹,切点语义与 truncate_from 相同。新会话恒开在
+    /// ui 渠道(这是桌面动作,渠道会话的映射/推送地址跟着老会话,分叉不冒充手机线程)、
+    /// 标题留空(用户接着重说 → append 占位定题 + LLM 正名,与新建会话同一条路)。
+    /// 复制保留原时间戳与 payload(跨天分隔/附件小票照常渲染);hover 读数/「想了想」
+    /// 轨迹按消息 id 记在观测流水里,不随复制走(新行查无即不显示,不炸)。
+    pub fn fork_before(&self, conv: i64, msg_id: i64) -> Result<Conversation> {
+        self.db.tx(|tx| {
+            ensure_user_cut_point(tx, conv, msg_id)?;
+            let (user_id, scene_id): (i64, String) = tx.query_row(
+                "SELECT user_id, scene_id FROM conversations WHERE id = ?1",
+                [conv],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let now = now_ms();
+            tx.execute(
+                "INSERT INTO conversations (user_id, scene_id, channel, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?4)",
+                rusqlite::params![user_id, scene_id, CHANNEL_UI, now],
+            )?;
+            let new_id = tx.last_insert_rowid();
+            tx.execute(
+                "INSERT INTO messages (conversation_id, role, content, created_at, payload)
+                 SELECT ?1, role, content, created_at, payload
+                 FROM messages WHERE conversation_id = ?2 AND id < ?3 ORDER BY id",
+                rusqlite::params![new_id, conv, msg_id],
+            )?;
+            Ok(Conversation {
+                id: new_id,
+                user_id,
+                scene_id,
+                title: String::new(),
+                channel: CHANNEL_UI.into(),
+                pinned: false,
+                created_at: now,
+                updated_at: now,
+                owner_name: None,
+            })
+        })
+    }
+
     /// 事务:插消息 + 推会话 updated_at + 首条用户消息兼职标题。
     pub fn append_message(&self, conv: i64, role: &str, content: &str) -> Result<Message> {
         self.append_message_full(conv, role, content, None)
@@ -514,6 +575,24 @@ fn snippet_around(content: &str, query_lower: &str, radius: usize) -> String {
     s
 }
 
+/// 回溯/分叉共用的切点校验:必须是**本会话**的 **user** 行(user 行之后必然是整轮,
+/// 在这儿下刀 assistant/tool 配对天然完整;别的行/别的会话一律拒——防御性收口,
+/// UI 正常路径不会撞到)。
+fn ensure_user_cut_point(tx: &rusqlite::Transaction, conv: i64, msg_id: i64) -> Result<()> {
+    let role: Option<String> = tx
+        .query_row(
+            "SELECT role FROM messages WHERE id = ?1 AND conversation_id = ?2",
+            rusqlite::params![msg_id, conv],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match role.as_deref() {
+        Some("user") => Ok(()),
+        Some(other) => anyhow::bail!("切点必须是用户消息(消息 {msg_id} 是 {other} 行)"),
+        None => anyhow::bail!("消息 {msg_id} 不在会话 {conv} 里"),
+    }
+}
+
 fn row_to_conversation(r: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation> {
     Ok(Conversation {
         id: r.get(0)?,
@@ -581,6 +660,69 @@ mod tests {
         // 第二条不再改题
         store.chat.append_message(conv.id, "user", "换一首。").unwrap();
         assert_eq!(store.chat.get_conversation(conv.id).unwrap().unwrap().title, "放首儿歌吧");
+    }
+
+    #[test]
+    fn truncate_from_deletes_suffix_and_guards_cut_point() {
+        let (store, user) = store("truncate");
+        let conv = store.chat.create_conversation(user, "companion").unwrap();
+        let u1 = store.chat.append_message(conv.id, "user", "放个电影").unwrap();
+        let a1 = store.chat.append_message(conv.id, "assistant", "好,放哪部?").unwrap();
+        let u2 = store.chat.append_message(conv.id, "user", "随便").unwrap();
+        store
+            .chat
+            .append_message_full(conv.id, "assistant", "", Some(r#"{"tool_calls":[]}"#))
+            .unwrap();
+        store.chat.append_message_full(conv.id, "tool", "结果", Some("{}")).unwrap();
+        store.chat.append_message(conv.id, "assistant", "那放这部").unwrap();
+
+        // 从第二条用户消息截断:含它自己 + 之后的工具轮全部消失,前一轮原样保留
+        let n = store.chat.truncate_from(conv.id, u2.id).unwrap();
+        assert_eq!(n, 4);
+        let rest = store.chat.messages_page(conv.id, 0, 100).unwrap();
+        assert_eq!(rest.iter().map(|m| m.id).collect::<Vec<_>>(), vec![u1.id, a1.id]);
+
+        // 切点校验:assistant 行 / 别的会话的行都拒(防御性收口)
+        assert!(store.chat.truncate_from(conv.id, a1.id).is_err());
+        let conv2 = store.chat.create_conversation(user, "companion").unwrap();
+        let ux = store.chat.append_message(conv2.id, "user", "别的会话").unwrap();
+        assert!(store.chat.truncate_from(conv.id, ux.id).is_err());
+        assert_eq!(store.chat.count_messages(conv2.id).unwrap(), 1); // 拒了就一根手指都不动
+    }
+
+    #[test]
+    fn fork_before_copies_prefix_into_fresh_ui_conversation() {
+        let (store, user) = store("fork");
+        // 源会话开在 voice 渠道:断言分叉恒回 ui(桌面动作,不冒充语音/手机线程)
+        let conv = store.chat.create_conversation_full(user, "companion", CHANNEL_VOICE).unwrap();
+        let u1 = store.chat.append_message(conv.id, "user", "放个电影").unwrap();
+        let a1 = store
+            .chat
+            .append_message_full(conv.id, "assistant", "好,放哪部?", Some(r#"{"k":1}"#))
+            .unwrap();
+        let u2 = store.chat.append_message(conv.id, "user", "随便").unwrap();
+        store.chat.append_message(conv.id, "assistant", "那放这部").unwrap();
+
+        let fork = store.chat.fork_before(conv.id, u2.id).unwrap();
+        assert_eq!(fork.channel, CHANNEL_UI);
+        assert_eq!(fork.scene_id, "companion");
+        assert_eq!(fork.user_id, user);
+        assert!(fork.title.is_empty()); // 空标题:重说那句走占位定题 + LLM 正名同一条路
+
+        // 前缀逐行复制(内容/角色/payload/原时间戳),新 id 归新会话
+        let copied = store.chat.messages_page(fork.id, 0, 100).unwrap();
+        assert_eq!(copied.len(), 2);
+        for (c, o) in copied.iter().zip([&u1, &a1]) {
+            assert_eq!((&c.role, &c.content), (&o.role, &o.content));
+            assert_eq!(c.created_at, o.created_at);
+            assert_eq!(c.payload, o.payload);
+            assert_eq!(c.conversation_id, fork.id);
+        }
+        // 原会话一字不动
+        assert_eq!(store.chat.count_messages(conv.id).unwrap(), 4);
+        // 切点是首条消息:合法,得到一个空前缀的新会话
+        let empty = store.chat.fork_before(conv.id, u1.id).unwrap();
+        assert_eq!(store.chat.count_messages(empty.id).unwrap(), 0);
     }
 
     #[test]

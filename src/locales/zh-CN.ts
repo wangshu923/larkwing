@@ -417,6 +417,8 @@ export default {
     copy: '复制',
     copySelection: '复制选中',
     readAloud: '朗读',
+    forkFromHere: '从这里另起新会话',
+    redoFromHere: '从这里重新说',
     switchChar: '换个形象',
     openSettings: '设置',
     hidePet: '隐藏桌宠',

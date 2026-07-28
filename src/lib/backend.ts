@@ -982,6 +982,12 @@ export const api = {
   searchMessages: (query: string, limit = 50) =>
     invoke<SearchHit[]>('search_messages', { query, limit }),
   deleteConversation: (convId: number) => invoke<void>('delete_conversation', { convId }),
+  /** 回溯「从这里重新说」:取消在飞并删掉该用户消息(含)之后的行;副作用不回滚。 */
+  rollbackConversation: (convId: number, messageId: number) =>
+    invoke<void>('rollback_conversation', { convId, messageId }),
+  /** 分叉「从这里另起新会话」:切点之前的历史复制进新会话(ui 渠道),原会话不动。 */
+  forkConversation: (convId: number, messageId: number) =>
+    invoke<Conversation>('fork_conversation', { convId, messageId }),
   renameConversation: (convId: number, title: string) =>
     invoke<void>('rename_conversation', { convId, title }),
   setConversationPinned: (convId: number, pinned: boolean) =>

@@ -389,6 +389,8 @@ pub fn run() {
       commands::list_conversations,
       commands::load_conversation,
       commands::delete_conversation,
+      commands::rollback_conversation,
+      commands::fork_conversation,
       commands::rename_conversation,
       commands::set_conversation_pinned,
       commands::set_api_key,
