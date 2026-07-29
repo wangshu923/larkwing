@@ -23,6 +23,9 @@ pub const SECRET_KEYS: &[&str] = &[
     "remote.dingtalk.app_secret",
     "remote.weixin.token",    // 旧单绑定(≤v0.2.15);留读做迁移,不再写
     "remote.weixin.accounts", // 多绑定列表(JSON 数组,含各账号 token → 整块进 keyring)
+    // WebDAV / 需要认证的直链的账号密码(JSON 数组,整块进 keyring)。**刻意不做成工具参数**
+    // ——密码走参数就会进 LLM 上下文 + 落 messages.payload + 每轮回放给供应商(§7.7 凭证不过桥)。
+    "net.http_creds",
 ];
 
 pub fn is_secret(key: &str) -> bool {

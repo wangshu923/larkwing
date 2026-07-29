@@ -152,6 +152,18 @@ impl BgTasks {
         Ok(BgTicket { reg: self.clone(), entry })
     }
 
+    /// 运行中、且标题以 `prefix` 打头的任务数。给「某一类活自己还有并发闸」用
+    /// (如 BT 下载:全局 cap 20 之外,自己再限 3 个 —— 再多只是分摊带宽)。
+    pub fn running_count_of(&self, prefix: &str) -> usize {
+        self.inner
+            .entries
+            .lock()
+            .expect("bg entries lock")
+            .iter()
+            .filter(|e| e.running() && e.title.starts_with(prefix))
+            .count()
+    }
+
     /// spawn 之后把 abort 句柄挂上(看门狗判卡后据此掐掉僵死任务)。
     pub fn attach_abort(&self, id: u64, abort: tokio::task::AbortHandle) {
         if let Some(e) = self.find(id) {

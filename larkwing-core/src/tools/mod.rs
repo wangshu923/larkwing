@@ -22,6 +22,7 @@ mod remember;
 mod reminder;
 mod send_file;
 mod todo;
+mod torrent_download;
 mod watch;
 mod weather;
 mod web;
@@ -117,6 +118,45 @@ pub(crate) fn expand_home(path: &str) -> String {
         (Some(r), Some(home)) => home.join(r).to_string_lossy().into_owned(),
         _ => path.to_string(),
     }
+}
+
+/// 「下载器专用链」拆封(§4.4 Quirks,expand_home 同族;2026-07-29)。国内论坛/资源页
+/// 常年给的是 `thunder://` / `flashget://` / `qqdl://` —— 它们**不是协议**,只是把普通
+/// URL 做了层 base64 包装(迅雷 = `base64("AA" + url + "ZZ")`,闪电狗 = 同法带
+/// `[FLASHGET]` 标记,QQ旋风 = 裸 base64)。拆开就是普通 http/ftp/ed2k/magnet 链接,
+/// 交给对应下载器即可 —— 所以这里**只做规整、不新增协议支持**。
+///
+/// 拆不开(不是这三种前缀 / base64 坏 / 拆出来不像链接)一律**原样返回**,让下游按
+/// 它自己的规则报错(宁可不动,绝不猜)。
+pub(crate) fn normalize_link(raw: &str) -> String {
+    use base64::Engine;
+    let s = raw.trim();
+    let lower = s.to_ascii_lowercase();
+    let body = ["thunder://", "flashget://", "qqdl://"]
+        .iter()
+        .find_map(|p| lower.starts_with(p).then(|| &s[p.len()..]));
+    let Some(body) = body else { return s.to_string() };
+    // 专用链里常见换行/空白污染(论坛复制)先剔掉;URL_SAFE 与 STANDARD 都试(有人用前者)
+    let cleaned: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    let decoded = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(cleaned.trim_end_matches('='))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(cleaned.trim_end_matches('=')))
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok());
+    let Some(text) = decoded else { return s.to_string() };
+    // 剥掉各家的包装标记
+    let inner = text
+        .trim()
+        .trim_start_matches("[FLASHGET]")
+        .trim_end_matches("[FLASHGET]")
+        .trim();
+    let inner = inner.strip_prefix("AA").unwrap_or(inner);
+    let inner = inner.strip_suffix("ZZ").unwrap_or(inner).trim();
+    // 拆出来得像个链接才认(否则原样退回,别把垃圾当结果)
+    let ok = ["http://", "https://", "ftp://", "ftps://", "ed2k://", "magnet:"]
+        .iter()
+        .any(|p| inner.to_ascii_lowercase().starts_with(p));
+    if ok { inner.to_string() } else { s.to_string() }
 }
 
 /// 每次执行的现场:多用户与会话归属由此带入,工具自身无状态。
@@ -226,6 +266,7 @@ impl Tools {
         tools.register(Arc::new(media_control::MediaControl::new()));
         tools.register(Arc::new(media_download::MediaDownload::new()));
         tools.register(Arc::new(lyrics_fetch::LyricsFetch::new()));
+        tools.register(Arc::new(torrent_download::TorrentDownload::new()));
         tools.register(Arc::new(bgtask::TaskStatus::new()));
         tools.register(Arc::new(bgtask::TaskCancel::new()));
         tools.register(Arc::new(desktop::Open::new()));
@@ -297,6 +338,62 @@ impl Tools {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 迅雷专用链 = base64("AA" + url + "ZZ")。用真实构造法生成再解,别手抄常量。
+    fn thunder(url: &str) -> String {
+        use base64::Engine;
+        format!(
+            "thunder://{}",
+            base64::engine::general_purpose::STANDARD.encode(format!("AA{url}ZZ"))
+        )
+    }
+
+    #[test]
+    fn normalize_unwraps_thunder_link() {
+        let want = "http://example.com/movie.mkv";
+        assert_eq!(normalize_link(&thunder(want)), want);
+    }
+
+    #[test]
+    fn normalize_unwraps_thunder_wrapping_ftp_and_magnet() {
+        for want in ["ftp://dl.example.com/a.rar", "magnet:?xt=urn:btih:abc123"] {
+            assert_eq!(normalize_link(&thunder(want)), want, "拆 {want}");
+        }
+    }
+
+    #[test]
+    fn normalize_tolerates_whitespace_and_case() {
+        let t = thunder("https://example.com/x.pdf");
+        let dirty = format!("  {}\n", t.replace("thunder://", "THUNDER://"));
+        assert_eq!(normalize_link(&dirty), "https://example.com/x.pdf");
+    }
+
+    #[test]
+    fn normalize_unwraps_flashget_and_qqdl() {
+        use base64::Engine;
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+        let want = "http://example.com/a.zip";
+        assert_eq!(
+            normalize_link(&format!("flashget://{}", b64(&format!("[FLASHGET]{want}[FLASHGET]")))),
+            want
+        );
+        assert_eq!(normalize_link(&format!("qqdl://{}", b64(want))), want);
+    }
+
+    #[test]
+    fn normalize_leaves_plain_and_broken_links_alone() {
+        // 普通链接原样(最常见的路,绝不能动)
+        assert_eq!(normalize_link("https://a.b/c.pdf"), "https://a.b/c.pdf");
+        // base64 坏掉 → 原样退回,让下游按自己的规则报错
+        assert_eq!(normalize_link("thunder://!!!not-base64!!!"), "thunder://!!!not-base64!!!");
+        // 解得开但内容不像链接 → 不认(宁可不动,绝不猜)
+        use base64::Engine;
+        let junk = format!(
+            "thunder://{}",
+            base64::engine::general_purpose::STANDARD.encode("AAjust some textZZ")
+        );
+        assert_eq!(normalize_link(&junk), junk);
+    }
 
     #[test]
     fn expand_home_forms() {

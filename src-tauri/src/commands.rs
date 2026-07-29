@@ -989,6 +989,32 @@ pub struct RemoteChannelView {
     pub last_error: Option<String>,
 }
 
+// ---- 下载认证(WebDAV / 需要账号的直链;§7.7 凭证不过桥)。密码只进得去不出得来:
+// 列表只回 host,增删由后端读改写 —— 前端全程碰不到密码,模型更碰不到。 ----
+
+/// 已配认证的 host 清单(**不含密码**)。
+#[tauri::command]
+pub fn http_creds_hosts(state: State<'_, AppState>) -> Result<Vec<String>, AppError> {
+    state.engine.http_creds_hosts()
+}
+
+/// 加/改一条(按 host 覆盖)。
+#[tauri::command]
+pub fn set_http_cred(
+    state: State<'_, AppState>,
+    host: String,
+    user: String,
+    password: String,
+) -> Result<(), AppError> {
+    state.engine.set_http_cred(&host, &user, &password)
+}
+
+/// 删一条。
+#[tauri::command]
+pub fn remove_http_cred(state: State<'_, AppState>, host: String) -> Result<(), AppError> {
+    state.engine.remove_http_cred(&host)
+}
+
 /// 远程渠道状态(设置页读):服务端读 settings + 实时连接态拼成视图,token/secret 不出 core。
 #[tauri::command]
 pub fn remote_status(state: State<'_, AppState>) -> Result<Vec<RemoteChannelView>, AppError> {

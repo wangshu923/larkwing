@@ -25,6 +25,67 @@ use scraper::{Html, Selector};
 const CACHE_TTL: Duration = Duration::from_secs(600);
 /// 像真浏览器的 UA(裸 reqwest 常被搜索页拒);web_download 与壳层 webrender 隐藏窗同款
 /// (单源,§4.11——渲染窗与抓取端 UA 一致,免得同一站点见到两副面孔)。
+/// 需要认证的下载目标(WebDAV / 带账号的直链)的一条凭证。
+///
+/// **为什么不做成工具参数**:密码走参数 = 进 LLM 上下文 + 落 `messages.payload` +
+/// 之后每轮回放给供应商(§7.7「凭证不过桥」)。所以走 settings→keyring,工具运行时按
+/// URL 的 host 现查,模型全程看不见密码。
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct HttpCred {
+    /// 主机名(如 `dav.jianguoyun.com`、`192.168.1.10:5244`);大小写不敏感。
+    pub host: String,
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub password: String,
+}
+
+/// **手写 Debug 遮住密码**(照微信 `Target` 的先例):派生 Debug 的话,任何
+/// `{:?}` / `tracing` 字段 / 被 `anyhow` 包进错误链的地方都会把明文密码吐进日志。
+impl std::fmt::Debug for HttpCred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpCred")
+            .field("host", &self.host)
+            .field("user", &self.user)
+            .field("password", &"<已隐去>")
+            .finish()
+    }
+}
+
+/// 读全部凭证(keyring 优先,mac dev 回落 settings 明文,同 §6.3)。坏 JSON = 当没配,
+/// 只 warn 不砸下载(§3.5 里「被动读取失败」允许 console-only)。
+pub fn load_http_creds(settings: &crate::store::settings::SettingsRepo) -> Vec<HttpCred> {
+    let raw = crate::secrets::get(settings, "net.http_creds").unwrap_or_default();
+    if raw.trim().is_empty() {
+        return Vec::new();
+    }
+    match serde_json::from_str::<Vec<HttpCred>>(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("下载认证配置读不出来(当作没配): {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// 给这个 URL 挑凭证:按 host 精确匹配(含端口),大小写不敏感。没有 = None(匿名下)。
+pub fn cred_for(creds: &[HttpCred], url: &str) -> Option<HttpCred> {
+    let host = reqwest::Url::parse(url).ok()?;
+    let want = match host.port() {
+        Some(p) => format!("{}:{p}", host.host_str()?),
+        None => host.host_str()?.to_string(),
+    };
+    let want = want.to_ascii_lowercase();
+    creds
+        .iter()
+        .find(|c| {
+            let h = c.host.trim().to_ascii_lowercase();
+            // 配 host 时带不带端口都认(用户填 `nas:5244` 或 `nas` 都行)
+            h == want || want.split(':').next() == Some(h.as_str())
+        })
+        .cloned()
+}
+
 pub const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                   (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 

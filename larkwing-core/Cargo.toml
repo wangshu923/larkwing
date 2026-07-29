@@ -26,6 +26,10 @@ futures-util = "0.3"
 getrandom = "0.2"
 # fs_find 的 glob 匹配(只用 Pattern 匹配器,目录行走自己来——要管深度/隐藏/上限)
 glob = "0.3"
+# BT/磁力下载(media/torrent.rs)。default-features=false 关掉 axum HTTP API + webui + sqlx
+# 持久化(我们只要下载内核);**必须走 rust-tls** —— 与全局 reqwest 的 rustls-tls 对齐,
+# 否则会平白拉进 native-tls/openssl 一整套。净增 50 个 crate(树里 218 个,168 个我们已有)。
+librqbit = { version = "8.1", default-features = false, features = ["rust-tls"] }
 msedge-tts = "0.4.0"
 pinyin = "0.11.0"
 # multipart:渠道出站文件(TG sendDocument / 钉钉 media/upload 的表单上传,channels/outbound.rs)

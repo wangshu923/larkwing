@@ -58,6 +58,7 @@ watch(tab, (v) => {
   if (v === 'system') {
     void loadAutostart()
     void loadDataLocation()
+    void loadCreds()
     if (!appVer.value) void appVersion().then((x) => (appVer.value = x))
   }
 })
@@ -525,6 +526,50 @@ async function confirmRelocate() {
 function cancelRelocate() {
   pendingMove.value = null
 }
+// 下载认证(WebDAV / 自家 NAS / 网盘挂载):web_download 按 host 自动带上账号。
+// **密码只进不出** —— 列表只回 host,所以「加一条」永远是整条重填(改密码 = 同 host 再填一次)。
+const credHosts = ref<string[]>([])
+const credBusy = ref(false)
+const credAdding = ref(false)
+const credForm = ref({ host: '', user: '', password: '' })
+async function loadCreds() {
+  if (!isTauri()) return
+  try {
+    credHosts.value = await api.httpCredsHosts()
+  } catch (e) {
+    console.error('读下载认证失败', e)
+  }
+}
+async function saveCred() {
+  const f = credForm.value
+  if (credBusy.value || !f.host.trim()) return
+  credBusy.value = true
+  try {
+    await api.setHttpCred(f.host, f.user, f.password)
+    credForm.value = { host: '', user: '', password: '' }
+    credAdding.value = false
+    await loadCreds()
+  } catch (e) {
+    console.error('存下载认证失败', e)
+    useToast().error(t('settings.system.credSaveFailed'))
+  } finally {
+    credBusy.value = false
+  }
+}
+async function dropCred(host: string) {
+  if (credBusy.value) return
+  credBusy.value = true
+  try {
+    await api.removeHttpCred(host)
+    await loadCreds()
+  } catch (e) {
+    console.error('删下载认证失败', e)
+    useToast().error(t('settings.system.credSaveFailed'))
+  } finally {
+    credBusy.value = false
+  }
+}
+
 // 一键备份:选目录 → 导出 larkwing-backup-<时间戳>.zip(DB 快照 + 克隆音色)。不重启。
 const backupBusy = ref(false)
 const backupMsg = ref('')
@@ -2004,6 +2049,49 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         </div>
         <p class="hint">{{ t('settings.system.proxyHint') }}</p>
 
+        <!-- 下载认证:给需要账号的地址(WebDAV / 自家 NAS / 网盘挂载)存账号,下载时按
+             网址自动带上。密码只进不出(存进系统密钥串),所以列表只显示网址。 -->
+        <p class="section">{{ t('settings.system.credTitle') }}</p>
+        <div v-for="h in credHosts" :key="h" class="row">
+          <span class="label s-mono-input">{{ h }}</span>
+          <span class="key-state">
+            <button class="link" :disabled="credBusy" @click="dropCred(h)">
+              {{ t('settings.system.credRemove') }}
+            </button>
+          </span>
+        </div>
+        <div v-if="credAdding" class="row cred-form">
+          <input
+            v-model="credForm.host"
+            class="s-input s-mono-input"
+            :placeholder="t('settings.system.credHostPlaceholder')"
+          />
+          <input
+            v-model="credForm.user"
+            class="s-input"
+            :placeholder="t('settings.system.credUser')"
+          />
+          <input
+            v-model="credForm.password"
+            class="s-input"
+            type="password"
+            :placeholder="t('settings.system.credPassword')"
+          />
+          <button class="link" :disabled="credBusy || !credForm.host.trim()" @click="saveCred">
+            {{ credBusy ? t('settings.system.busy') : t('settings.system.credSave') }}
+          </button>
+          <button class="link" :disabled="credBusy" @click="credAdding = false">
+            {{ t('settings.system.credCancel') }}
+          </button>
+        </div>
+        <div v-else class="row">
+          <span class="label">{{ credHosts.length ? '' : t('settings.system.credEmpty') }}</span>
+          <span class="key-state">
+            <button class="link" @click="credAdding = true">{{ t('settings.system.credAdd') }}</button>
+          </span>
+        </div>
+        <p class="hint">{{ t('settings.system.credHint') }}</p>
+
         <p class="section">{{ t('settings.system.about') }}</p>
         <div class="row">
           <span class="label">{{ t('settings.system.version') }}</span>
@@ -2090,6 +2178,9 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 /* 代理一行:开关 + 地址输入同排,输入框吃满 label 右侧空间;关掉时淡一档(状态可读,地址仍可改) */
 .proxy-line { flex: 1; justify-content: flex-end; min-width: 0; }
 .proxy-line .s-input { flex: 1; min-width: 0; max-width: 320px; }
+/* 下载认证的新增行:三个输入 + 两个按钮,窄了自然折行(§6.6 英文更长要留 wrap) */
+.cred-form { justify-content: flex-start; }
+.cred-form .s-input { flex: 1 1 150px; min-width: 0; max-width: 260px; }
 .s-input.off { opacity: .5; }
 
 .key-state, .key-edit { display: inline-flex; align-items: center; gap: 10px; }

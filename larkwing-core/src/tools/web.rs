@@ -21,8 +21,12 @@ use super::{Tool, ToolCtx, ToolRisk, ToolSpec};
 const CONTENT_TOP_N: usize = 3;
 const PIECE_MAX_CHARS: usize = 1200;
 const FETCH_MAX_CHARS: usize = 6000;
-/// web_download 体积闸(与渠道发文件的上限同数量级,守内存/磁盘两头)。
-const DOWNLOAD_MAX_BYTES: u64 = 50 * 1024 * 1024;
+/// **同步档**体积闸:回合内下完、当场返回路径。发票 PDF → pdf_to_png 那类「下完立刻接
+/// 下一步」的链子依赖这个即时性,别改大(大了会把回合卡死在下载上)。
+const DOWNLOAD_SYNC_MAX_BYTES: u64 = 50 * 1024 * 1024;
+/// **后台档**体积闸:Content-Length 超过同步档就转 job(进度/取消/收尾汇报走 bgtasks)。
+/// 数值与 `media::TORRENT_MAX_BYTES` 同口径(都是「影视量级」这一个理由,不另造第二个数)。
+const DOWNLOAD_JOB_MAX_BYTES: u64 = 50 * 1024 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // web_search
@@ -227,14 +231,22 @@ impl WebDownload {
         WebDownload {
             spec: ToolSpec {
                 name: "web_download",
-                description: "把一个链接指向的文件下载到本机(PDF/图片/压缩包等)。配合 \
+                description: "把一个链接指向的文件下载到本机(PDF/图片/压缩包/影音等)。配合 \
                               web_fetch:先读页面挑出下载链接,再用这个存盘。默认存到系统\
-                              「下载」文件夹,同名不覆盖(自动加「 (2)」);下载完把落盘路径\
-                              告诉用户。",
+                              「下载」文件夹,同名不覆盖(自动加「 (2)」)。\
+                              **也认迅雷/快车/旋风专用链**(thunder:// flashget:// qqdl://)\
+                              ——会自动拆成真实地址,原样传进来就行;拆出来若是磁力链会告诉你\
+                              改用 torrent_download。**大文件自动转后台**:小文件当场下完\
+                              回路径(可以接着 pdf_to_png 之类);超过 50MB 的转后台跑、\
+                              本工具立即返回,进度在任务条上、**跑完自动回来汇报**。\
+                              需要账号的地址(WebDAV / 自家 NAS / 网盘挂载)由用户预先在\
+                              「设置 · 系统 · 下载认证」里配好账号,这里会自动带上——\
+                              **不要向用户索要密码、也不要把密码写进参数**;遇到 401 就\
+                              让用户去那里配。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "url": { "type": "string", "description": "http(s) 文件直链" },
+                        "url": { "type": "string", "description": "http(s) 文件直链,或 thunder:// 等下载器专用链" },
                         "dir": {
                             "type": "string",
                             "description": "存到哪个文件夹(绝对路径);省略 = 系统「下载」文件夹"
@@ -246,11 +258,7 @@ impl WebDownload {
                 ui_key: "tool.web_download",
             },
             // 下载客户端与页面抓取分家:页面 15s 总超时对大文件太短。UA 同款(裸 UA 常被拒)。
-            net: crate::net::Client::new(|b| {
-                b.user_agent(crate::web::UA)
-                    .connect_timeout(Duration::from_secs(10))
-                    .timeout(Duration::from_secs(280))
-            }),
+            net: download_client(Some(Duration::from_secs(280))),
         }
     }
 }
@@ -265,13 +273,27 @@ impl Tool for WebDownload {
         ToolRisk::Mutating
     }
 
-    async fn run(&self, args: serde_json::Value, _ctx: &ToolCtx) -> anyhow::Result<String> {
-        let url = args
+    async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
+        let raw = args
             .get("url")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
-            .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
-            .context("缺少合法的 url 参数(需要 http(s) 直链)")?;
+            .filter(|s| !s.is_empty())
+            .context("缺少 url 参数")?;
+        // thunder:// / flashget:// / qqdl:// 先拆封(§4.4 同族);不是专用链就原样。
+        let normalized = super::normalize_link(raw);
+        let url = normalized.as_str();
+        if url.starts_with("magnet:") || url.starts_with("ed2k://") {
+            anyhow::bail!(
+                "这个(拆开后)是 {} 链接,不是 http 直链。磁力链用 torrent_download 下;\
+                 ed2k(电驴)我们放不了也下不了,要告诉用户。",
+                if url.starts_with("magnet:") { "磁力" } else { "电驴 ed2k" }
+            );
+        }
+        anyhow::ensure!(
+            url.starts_with("http://") || url.starts_with("https://"),
+            "url 需要 http(s) 直链(或能拆出直链的 thunder:// 专用链),收到: {raw}"
+        );
         let dir = match args.get("dir").and_then(serde_json::Value::as_str).map(str::trim) {
             Some(d) if !d.is_empty() => {
                 let p = PathBuf::from(super::expand_home(d)); // 「~/xxx」宽容展开(§4.4)
@@ -283,35 +305,48 @@ impl Tool for WebDownload {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("建不了目标文件夹 {}", dir.display()))?;
 
-        let resp = self.net.send(url, |c| c.get(url)).await.context("下载请求失败")?;
+        // 认证按 host 现查(WebDAV / 带账号的直链)。**密码不经模型**(§7.7):它既不在
+        // 工具参数里、也不出现在任何回给模型的文本里。
+        let cred = crate::web::cred_for(&crate::web::load_http_creds(&ctx.store.settings), url);
+        let resp = self.get_with_cred(url, cred.as_ref()).await?;
         let status = resp.status();
-        anyhow::ensure!(status.is_success(), "下载失败 HTTP {status}");
-        // 服务器自报体积先拦一道(实际下多少仍按流式计数硬闸)
-        if let Some(len) = resp.content_length() {
-            anyhow::ensure!(
-                len <= DOWNLOAD_MAX_BYTES,
-                "文件 {} 超过 {} 上限,不下了",
-                super::fs::human_size(len),
-                super::fs::human_size(DOWNLOAD_MAX_BYTES)
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            anyhow::bail!(
+                "这个地址要账号密码(HTTP 401){}。让用户去「设置 · 系统 · 下载认证」\
+                 加一条这个网站的账号,加完再下一次。",
+                if cred.is_some() { ",而已配的账号被拒了(密码可能不对)" } else { "" }
             );
         }
-        let name = pick_filename(&resp);
+        anyhow::ensure!(status.is_success(), "下载失败 HTTP {status}");
 
+        let len = resp.content_length();
+        // 大文件转后台:同步档的 300s 工具预算装不下(2GB 按 5MB/s 就要 400s),
+        // 转 job 后进度/取消/收尾汇报全走 bgtasks(与 torrent_download 同一套)。
+        if let Some(n) = len {
+            anyhow::ensure!(
+                n <= DOWNLOAD_JOB_MAX_BYTES,
+                "文件 {} 超过 {} 上限,不下了",
+                super::fs::human_size(n),
+                super::fs::human_size(DOWNLOAD_JOB_MAX_BYTES)
+            );
+            if n > DOWNLOAD_SYNC_MAX_BYTES {
+                let name = pick_filename(&resp);
+                drop(resp); // 断掉这条连接,job 里重开(省得把 resp 搬进 spawn)
+                return self.spawn_job(ctx, url, &dir, name, n, cred);
+            }
+        }
+
+        let name = pick_filename(&resp);
         // 先写临时件再改名:半截下载绝不顶着正式名躺在下载夹里
-        let part = dir.join(format!(
-            ".lw-download-{}-{}.part",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        ));
-        let written = stream_to_file(resp, &part).await;
-        let total = match written {
+        let part = part_path(&dir);
+        let total = match stream_to_file(resp, &part, DOWNLOAD_SYNC_MAX_BYTES, None).await {
             Ok(n) => n,
             Err(e) => {
                 let _ = std::fs::remove_file(&part);
-                return Err(e);
+                return Err(e.context(
+                    "(如果是因为超过同步下载上限:这个服务器没报文件大小,\
+                     所以没能自动转后台——可以让用户确认后重试)",
+                ));
             }
         };
         let dest = crate::files::dedupe_path(&dir.join(&name));
@@ -321,6 +356,115 @@ impl Tool for WebDownload {
         }
         Ok(format!("已下载到 {}({})", dest.display(), super::fs::human_size(total)))
     }
+}
+
+impl WebDownload {
+    /// 带认证的 GET(没凭证 = 匿名,与从前逐字节一致)。
+    async fn get_with_cred(
+        &self,
+        url: &str,
+        cred: Option<&crate::web::HttpCred>,
+    ) -> anyhow::Result<reqwest::Response> {
+        self.net
+            .send(url, |c| match cred {
+                Some(cd) => c.get(url).basic_auth(&cd.user, Some(&cd.password)),
+                None => c.get(url),
+            })
+            .await
+            .context("下载请求失败")
+    }
+
+    /// 大文件:登记进后台差事处,立即返回。
+    fn spawn_job(
+        &self,
+        ctx: &ToolCtx,
+        url: &str,
+        dir: &std::path::Path,
+        name: String,
+        total: u64,
+        cred: Option<crate::web::HttpCred>,
+    ) -> anyhow::Result<String> {
+        let size = super::fs::human_size(total);
+        let ticket = ctx.media.bg().submit(
+            format!("下载文件({name})"),
+            (ctx.user_id, ctx.conv_id),
+            100,
+        )?;
+        let ticket_id = ticket.id();
+        let net = download_client(None); // 后台档:不设总超时(见 download_client 注释)
+        let url_owned = url.to_string();
+        let dir_owned = dir.to_path_buf();
+        let name_owned = name.clone();
+        let join = tokio::spawn(async move {
+            let part = part_path(&dir_owned);
+            let report = async {
+                let resp = net
+                    .send(&url_owned, |c| match cred.as_ref() {
+                        Some(cd) => c.get(&url_owned).basic_auth(&cd.user, Some(&cd.password)),
+                        None => c.get(&url_owned),
+                    })
+                    .await
+                    .context("下载请求失败")?;
+                anyhow::ensure!(resp.status().is_success(), "下载失败 HTTP {}", resp.status());
+                let got =
+                    stream_to_file(resp, &part, DOWNLOAD_JOB_MAX_BYTES, Some((&ticket, total)))
+                        .await?;
+                let dest = crate::files::dedupe_path(&dir_owned.join(&name_owned));
+                std::fs::rename(&part, &dest).context("落盘改名失败")?;
+                // 回一个 (路径, 字节) 元组,**不要**把两者拼成一个字符串再 split ——
+                // mac/Linux 的文件名允许含 `|`,拼串会在这种路径上切错。
+                Ok::<_, anyhow::Error>((dest, got))
+            }
+            .await;
+            let (ok, text) = match report {
+                Ok((dest, got)) => (
+                    true,
+                    format!(
+                        "《{name_owned}》下好了({}),存到 {}。把结果简短告诉用户。",
+                        super::fs::human_size(got),
+                        dest.display()
+                    ),
+                ),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&part);
+                    tracing::warn!("web_download job 失败: {e:#}");
+                    (false, format!("《{name_owned}》没下成:{e:#}。把原因如实告诉用户。"))
+                }
+            };
+            ticket.finish(ok, text);
+        });
+        ctx.media.bg().attach_abort(ticket_id, join.abort_handle());
+        Ok(format!(
+            "这个文件有 {size},已经转后台下了(存到 {})。进度在屏幕任务条上;\
+             **跑完会自动回来汇报**,到时再转述。现在告诉用户已经开工就好。",
+            dir.display()
+        ))
+    }
+}
+
+/// web_download 的 HTTP 客户端。同步档与后台档共用 UA / 连接超时,**只有总超时不同**:
+/// 同步档 280s(回合内够用);后台档 `None` = 不设总超时 —— 几 GB 的文件跑几十分钟是
+/// 常态,280s 会把它腰斩;停不下来那头由票据取消 + bgtasks 的卡死看门狗兜。
+fn download_client(total_timeout: Option<Duration>) -> crate::net::Client {
+    crate::net::Client::new(move |b| {
+        let b = b.user_agent(crate::web::UA).connect_timeout(Duration::from_secs(10));
+        match total_timeout {
+            Some(t) => b.timeout(t),
+            None => b,
+        }
+    })
+}
+
+/// 临时件路径:半截下载绝不顶着正式名躺在下载夹里。
+fn part_path(dir: &std::path::Path) -> PathBuf {
+    dir.join(format!(
+        ".lw-download-{}-{}.part",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    ))
 }
 
 use crate::files::{default_download_dir, sanitize_filename};
@@ -394,19 +538,39 @@ fn ext_for_mime(ct: &str) -> Option<&'static str> {
 }
 
 /// 流式写盘 + 体积硬闸(超限即停,调用方负责清理临时件)。返回写入字节数。
-async fn stream_to_file(mut resp: reqwest::Response, dest: &std::path::Path) -> anyhow::Result<u64> {
+/// `progress` = 后台档才传:`(票据, 预期总字节)`,每 ~1MB 打一次点(顺带查取消)。
+async fn stream_to_file(
+    mut resp: reqwest::Response,
+    dest: &std::path::Path,
+    cap: u64,
+    progress: Option<(&crate::bgtasks::BgTicket, u64)>,
+) -> anyhow::Result<u64> {
     use std::io::Write;
     let mut f = std::fs::File::create(dest)
         .with_context(|| format!("建不了文件 {}", dest.display()))?;
     let mut total: u64 = 0;
+    let mut next_beat: u64 = 0;
     while let Some(chunk) = resp.chunk().await.context("下载中断")? {
         total += chunk.len() as u64;
         anyhow::ensure!(
-            total <= DOWNLOAD_MAX_BYTES,
+            total <= cap,
             "文件超过 {} 上限,已停止",
-            super::fs::human_size(DOWNLOAD_MAX_BYTES)
+            super::fs::human_size(cap)
         );
         f.write_all(&chunk)?;
+        if let Some((ticket, expect)) = progress {
+            if ticket.is_cancelled() {
+                anyhow::bail!("按要求停下了");
+            }
+            if total >= next_beat {
+                next_beat = total + 1024 * 1024;
+                let pct = total.saturating_mul(100).checked_div(expect).unwrap_or(0);
+                ticket.beat(
+                    pct as usize,
+                    format!("{} / {}", super::fs::human_size(total), super::fs::human_size(expect)),
+                );
+            }
+        }
     }
     f.flush()?;
     Ok(total)

@@ -1241,6 +1241,51 @@ impl Engine {
         }
     }
 
+    // ---- 下载认证(WebDAV / 需要账号的直链)。整块 JSON 进 keyring,**写得进读不回**
+    // (§7.7 凭证不过桥):前端拿不到数组,所以增删都由后端读改写,只回 host 清单。 ----
+
+    /// 已配了认证的 host 清单(**只回 host,绝不回密码**)。
+    pub fn http_creds_hosts(&self) -> Result<Vec<String>, AppError> {
+        Ok(crate::web::load_http_creds(&self.store.settings)
+            .into_iter()
+            .map(|c| c.host)
+            .collect())
+    }
+
+    /// 加一条 / 改一条(按 host 覆盖,大小写不敏感)。
+    pub fn set_http_cred(&self, host: &str, user: &str, password: &str) -> Result<(), AppError> {
+        let host = host.trim().trim_start_matches("http://").trim_start_matches("https://");
+        let host = host.split('/').next().unwrap_or("").trim().to_string();
+        if host.is_empty() {
+            return Err(AppError::internal("要填网站地址(host)"));
+        }
+        let mut list = crate::web::load_http_creds(&self.store.settings);
+        list.retain(|c| !c.host.eq_ignore_ascii_case(&host));
+        list.push(crate::web::HttpCred {
+            host,
+            user: user.trim().to_string(),
+            password: password.to_string(),
+        });
+        self.save_http_creds(&list)
+    }
+
+    /// 删一条。
+    pub fn remove_http_cred(&self, host: &str) -> Result<(), AppError> {
+        let mut list = crate::web::load_http_creds(&self.store.settings);
+        list.retain(|c| !c.host.eq_ignore_ascii_case(host.trim()));
+        self.save_http_creds(&list)
+    }
+
+    fn save_http_creds(&self, list: &[crate::web::HttpCred]) -> Result<(), AppError> {
+        let json = if list.is_empty() {
+            String::new()
+        } else {
+            serde_json::to_string(list).map_err(AppError::internal)?
+        };
+        crate::secrets::set(&self.store.settings, "net.http_creds", &json)
+            .map_err(AppError::internal)
+    }
+
     /// 供应商卡片列表 = 生效中的注册表 + 还没配置的内置预设模板(全部预填,用户按需改)。
     pub fn list_providers(&self) -> Result<Vec<ProviderView>, AppError> {
         Ok(self.effective_specs()?.iter().map(ProviderView::from_spec).collect())

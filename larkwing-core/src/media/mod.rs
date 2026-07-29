@@ -10,9 +10,13 @@ mod lyrics;
 mod probe;
 mod relay;
 mod resolver;
+mod torrent;
 
 pub use cookies::CookieRec;
 pub use download::{DownloadOutcome, DownloadedAudio, TrackMeta};
+pub use torrent::{
+    TorrentLink, TorrentOutcome, DEFAULT_ONLY_RE, MAX_CONCURRENT as TORRENT_MAX_CONCURRENT,
+};
 pub(crate) use lyrics::compose_batch_summary;
 pub use lyrics::{LyricsBatchOutcome, LyricsFileResult, LyricsItem, LyricsResult};
 
@@ -367,6 +371,8 @@ struct Inner {
     audio_track: Mutex<usize>,
     /// 当前本地播放现场(切音轨用;None = 没在放本地内容)。
     current_local: Mutex<Option<CurrentLocal>>,
+    /// BT 下载引擎(懒建,同 relay):不用 BT 的用户零成本,且**不会平白发 DHT 包**。
+    torrent: tokio::sync::OnceCell<torrent::TorrentEngine>,
 }
 
 #[derive(Clone)]
@@ -397,6 +403,7 @@ impl MediaRuntime {
                 loop_mode: Mutex::new(LoopMode::Off),
                 audio_track: Mutex::new(0),
                 current_local: Mutex::new(None),
+                torrent: tokio::sync::OnceCell::new(),
             }),
         }
     }

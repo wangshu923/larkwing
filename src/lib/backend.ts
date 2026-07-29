@@ -1033,6 +1033,12 @@ export const api = {
   attachmentUrl: (file: string) => invoke<string>('attachment_url', { file }),
   /** 远程渠道状态(设置页):开关/已配凭证/白名单/连接态(凭证不过桥)。 */
   remoteStatus: () => invoke<RemoteChannelView[]>('remote_status'),
+  // 下载认证(WebDAV / 需要账号的直链):**密码只进不出** —— 列表只回 host,
+  // 增删由后端读改写(前端从来拿不到密码,模型更拿不到;§7.7 凭证不过桥)。
+  httpCredsHosts: () => invoke<string[]>('http_creds_hosts'),
+  setHttpCred: (host: string, user: string, password: string) =>
+    invoke<void>('set_http_cred', { host, user, password }),
+  removeHttpCred: (host: string) => invoke<void>('remove_http_cred', { host }),
   /** 保存远程渠道配置后调:停旧起新(类比 provider 保存即重建)。 */
   reloadChannels: () => invoke<void>('reload_channels'),
   /** 微信扫码登录起手:拿二维码(SVG + 备用链接 + 轮询 qrcode)。 */
