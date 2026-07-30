@@ -12,6 +12,7 @@ pub mod datadir;
 pub mod engine;
 pub mod eval;
 pub mod files;
+pub mod ftp;
 pub mod llm;
 pub mod media;
 pub mod net;

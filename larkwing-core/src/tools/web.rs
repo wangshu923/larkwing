@@ -234,9 +234,12 @@ impl WebDownload {
                 description: "把一个链接指向的文件下载到本机(PDF/图片/压缩包/影音等)。配合 \
                               web_fetch:先读页面挑出下载链接,再用这个存盘。默认存到系统\
                               「下载」文件夹,同名不覆盖(自动加「 (2)」)。\
-                              **也认迅雷/快车/旋风专用链**(thunder:// flashget:// qqdl://)\
-                              ——会自动拆成真实地址,原样传进来就行;拆出来若是磁力链会告诉你\
-                              改用 torrent_download。**大文件自动转后台**:小文件当场下完\
+                              **也认 ftp:// 直链**(国内影视资源站常给这种,账号密码写在\
+                              地址里也没关系,原样传进来)**和迅雷/快车/旋风专用链**\
+                              (thunder:// flashget:// qqdl://)——专用链会自动拆成真实地址;\
+                              拆出来若是磁力链会告诉你改用 torrent_download。\
+                              ftp 连不上通常是那台服务器已经关了(这类资源站服务器很短命),\
+                              不是链接格式问题,如实告诉用户就好。**大文件自动转后台**:小文件当场下完\
                               回路径(可以接着 pdf_to_png 之类);超过 50MB 的转后台跑、\
                               本工具立即返回,进度在任务条上、**跑完自动回来汇报**。\
                               需要账号的地址(WebDAV / 自家 NAS / 网盘挂载)由用户预先在\
@@ -285,15 +288,11 @@ impl Tool for WebDownload {
         let url = normalized.as_str();
         if url.starts_with("magnet:") || url.starts_with("ed2k://") {
             anyhow::bail!(
-                "这个(拆开后)是 {} 链接,不是 http 直链。磁力链用 torrent_download 下;\
+                "这个(拆开后)是 {} 链接,不是能直接下的文件地址。磁力链用 torrent_download 下;\
                  ed2k(电驴)我们放不了也下不了,要告诉用户。",
                 if url.starts_with("magnet:") { "磁力" } else { "电驴 ed2k" }
             );
         }
-        anyhow::ensure!(
-            url.starts_with("http://") || url.starts_with("https://"),
-            "url 需要 http(s) 直链(或能拆出直链的 thunder:// 专用链),收到: {raw}"
-        );
         let dir = match args.get("dir").and_then(serde_json::Value::as_str).map(str::trim) {
             Some(d) if !d.is_empty() => {
                 let p = PathBuf::from(super::expand_home(d)); // 「~/xxx」宽容展开(§4.4)
@@ -305,6 +304,15 @@ impl Tool for WebDownload {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("建不了目标文件夹 {}", dir.display()))?;
 
+        // ftp:// 走单独的协议客户端(不是 HTTP,net::Client 管不着;详见 crate::ftp)。
+        // 迅雷/快车专用链拆开后大量就是 ftp,normalize_link 已经把它们拆到这里了。
+        if url.starts_with("ftp://") {
+            return self.run_ftp(ctx, url, &dir).await;
+        }
+        anyhow::ensure!(
+            url.starts_with("http://") || url.starts_with("https://"),
+            "url 需要 http(s) 或 ftp:// 文件地址(或能拆出地址的 thunder:// 专用链),收到: {raw}"
+        );
         // 认证按 host 现查(WebDAV / 带账号的直链)。**密码不经模型**(§7.7):它既不在
         // 工具参数里、也不出现在任何回给模型的文本里。
         let cred = crate::web::cred_for(&crate::web::load_http_creds(&ctx.store.settings), url);
@@ -359,6 +367,107 @@ impl Tool for WebDownload {
 }
 
 impl WebDownload {
+    /// ftp:// 分支。与 http 档位口径完全一致(小文件回合内下完、大文件转后台 job),
+    /// 只换协议客户端。凭证优先取 URL 里内嵌的(dytt 那类链接的常态),没有则按 host
+    /// 查「设置·下载认证」(自家 NAS 的 FTP 靠这条)。
+    async fn run_ftp(&self, ctx: &ToolCtx, url: &str, dir: &std::path::Path) -> anyhow::Result<String> {
+        let t = crate::ftp::parse_ftp_url(url)?;
+        let creds = crate::web::load_http_creds(&ctx.store.settings);
+        let host_key = t.cred_host();
+        let cred = creds.iter().find(|c| {
+            let h = c.host.trim().to_ascii_lowercase();
+            h == host_key.to_ascii_lowercase() || h == t.host.to_ascii_lowercase()
+        });
+        let t = t.with_cred(cred);
+
+        // 探体积决定档位。取不到(服务器不支持 SIZE)= 走同步档 + 硬闸,与 http 侧
+        // 「没有 Content-Length」同口径。
+        let size = crate::ftp::probe_size(&t).await?;
+        if let Some(n) = size {
+            anyhow::ensure!(
+                n <= DOWNLOAD_JOB_MAX_BYTES,
+                "文件 {} 超过 {} 上限,不下了",
+                super::fs::human_size(n),
+                super::fs::human_size(DOWNLOAD_JOB_MAX_BYTES)
+            );
+            if n > DOWNLOAD_SYNC_MAX_BYTES {
+                return self.spawn_ftp_job(ctx, t, dir, n);
+            }
+        }
+        let part = part_path(dir);
+        let total =
+            match crate::ftp::download_to(&t, &part, DOWNLOAD_SYNC_MAX_BYTES, None).await {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&part);
+                    return Err(e);
+                }
+            };
+        let dest = crate::files::dedupe_path(&dir.join(&t.filename));
+        if let Err(e) = std::fs::rename(&part, &dest) {
+            let _ = std::fs::remove_file(&part);
+            return Err(anyhow::anyhow!(e).context("落盘改名失败"));
+        }
+        Ok(format!("已下载到 {}({})", dest.display(), super::fs::human_size(total)))
+    }
+
+    /// 大 ftp 文件转后台(影视资源基本都走这条)。
+    fn spawn_ftp_job(
+        &self,
+        ctx: &ToolCtx,
+        t: crate::ftp::FtpTarget,
+        dir: &std::path::Path,
+        total: u64,
+    ) -> anyhow::Result<String> {
+        let size = super::fs::human_size(total);
+        let ticket = ctx.media.bg().submit(
+            format!("下载文件({})", t.filename),
+            (ctx.user_id, ctx.conv_id),
+            100,
+        )?;
+        let ticket_id = ticket.id();
+        let dir_owned = dir.to_path_buf();
+        let name = t.filename.clone();
+        let join = tokio::spawn(async move {
+            let part = part_path(&dir_owned);
+            let outcome = async {
+                let got = crate::ftp::download_to(
+                    &t,
+                    &part,
+                    DOWNLOAD_JOB_MAX_BYTES,
+                    Some((&ticket, total)),
+                )
+                .await?;
+                let dest = crate::files::dedupe_path(&dir_owned.join(&name));
+                std::fs::rename(&part, &dest).context("落盘改名失败")?;
+                Ok::<_, anyhow::Error>((dest, got))
+            }
+            .await;
+            let (ok, text) = match outcome {
+                Ok((dest, got)) => (
+                    true,
+                    format!(
+                        "《{name}》下好了({}),存到 {}。把结果简短告诉用户。",
+                        super::fs::human_size(got),
+                        dest.display()
+                    ),
+                ),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&part);
+                    tracing::warn!("ftp job 失败: {e:#}");
+                    (false, format!("《{name}》没下成:{e:#}。把原因如实告诉用户。"))
+                }
+            };
+            ticket.finish(ok, text);
+        });
+        ctx.media.bg().attach_abort(ticket_id, join.abort_handle());
+        Ok(format!(
+            "这个文件有 {size},已经转后台下了(存到 {})。进度在屏幕任务条上;\
+             **跑完会自动回来汇报**,到时再转述。现在告诉用户已经开工就好。",
+            dir.display()
+        ))
+    }
+
     /// 带认证的 GET(没凭证 = 匿名,与从前逐字节一致)。
     async fn get_with_cred(
         &self,
@@ -761,6 +870,47 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
             .collect();
         assert!(leftovers.is_empty(), "不留 .part 残件");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ftp:// 要被路由进 ftp 分支,而不是撞「需要 http(s)」的闸。
+    /// 用「目录形」ftp 地址:parse_ftp_url 会在**建连之前**就退回,所以这个测试不联网、很快。
+    #[tokio::test]
+    async fn ftp_url_routes_into_ftp_branch() {
+        let ctx = ctx("ftproute");
+        let tool = WebDownload::new();
+        let dir = std::env::temp_dir().join(format!("lw-ftproute-{}", std::process::id()));
+        let err = tool
+            .run(
+                serde_json::json!({ "url": "ftp://h.example.com/", "dir": dir.to_string_lossy() }),
+                &ctx,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("不下整个目录"), "该走 ftp 解析而非 http 闸: {err}");
+        assert!(!err.contains("需要 http(s)"), "不该被 http 闸拦下: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 迅雷专用链拆出 ftp:// 后也要能进 ftp 分支(两件事的闭环)。
+    #[tokio::test]
+    async fn thunder_link_unwrapping_to_ftp_reaches_ftp_branch() {
+        use base64::Engine;
+        let inner = "ftp://h.example.com/"; // 同上:目录形,不建连
+        let link = format!(
+            "thunder://{}",
+            base64::engine::general_purpose::STANDARD.encode(format!("AA{inner}ZZ"))
+        );
+        let ctx = ctx("ftpthunder");
+        let tool = WebDownload::new();
+        let dir = std::env::temp_dir().join(format!("lw-ftpth-{}", std::process::id()));
+        let err = tool
+            .run(serde_json::json!({ "url": link, "dir": dir.to_string_lossy() }), &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("不下整个目录"), "thunder→ftp 该闭环: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

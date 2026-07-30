@@ -31,6 +31,10 @@ glob = "0.3"
 # 否则会平白拉进 native-tls/openssl 一整套。净增 50 个 crate(树里 218 个,168 个我们已有)。
 librqbit = { version = "8.1", default-features = false, features = ["rust-tls"] }
 msedge-tts = "0.4.0"
+# FTP 下载(ftp.rs)。国内影视资源圈仍大量用 ftp:// 直链(迅雷专用链拆开也多是它),
+# 浏览器删掉 FTP 支持不代表这些服务器没了。只开 `tokio`(不带 TLS —— FTPS 这边用不上,
+# 要用再加 tokio-rustls-ring)。净增仅 4 个 crate(树里 42 个,38 个我们已有)。
+suppaftp = { version = "10", default-features = false, features = ["tokio"] }
 pinyin = "0.11.0"
 # multipart:渠道出站文件(TG sendDocument / 钉钉 media/upload 的表单上传,channels/outbound.rs)
 # cookies:搜索源必需——Bing 国内版首次请求必 302 去种 market cookie,没有 cookie 罐就在
