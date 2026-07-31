@@ -152,7 +152,7 @@ impl Turn {
         let _inject_guard = InjectGuard(inject.clone());
         let meta = usage::RoundMeta { user_id, conv_id, user_msg_id, provider_id, model };
         let mut round_start = first_round_start;
-        let ctx = ToolCtx { user_id, conv_id, store: store.clone(), media, web, confirm };
+        let ctx = ToolCtx { user_id, conv_id, store: store.clone(), media, web, confirm, grants: Default::default() };
         let label_of = |name: &str| -> String {
             tools
                 .iter()

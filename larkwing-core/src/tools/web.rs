@@ -301,6 +301,13 @@ impl Tool for WebDownload {
             }
             _ => default_download_dir(),
         };
+        // 落盘 = 存入(§7.2 授权圈;缺省「下载」夹在出厂基线内,零打扰)。授权过了才建目录。
+        super::guard::ensure(
+            ctx,
+            super::guard::Access::Create,
+            &[dir.to_string_lossy().into_owned()],
+        )
+        .await?;
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("建不了目标文件夹 {}", dir.display()))?;
 
@@ -696,7 +703,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let _ = std::fs::remove_file(dir.join("t.db"));
         let store = Store::open(&dir.join("t.db")).unwrap();
-        ToolCtx { user_id: 1, conv_id: 1, media: MediaRuntime::detached(store.clone()), store, web: None, confirm: None }
+        ToolCtx { user_id: 1, conv_id: 1, media: MediaRuntime::detached(store.clone()), store, web: None, confirm: None, grants: Default::default() }
     }
 
     #[tokio::test]

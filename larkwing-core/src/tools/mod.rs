@@ -8,6 +8,7 @@ mod briefing;
 mod desktop;
 mod end_conversation;
 mod fs;
+pub mod guard;
 mod lyrics_fetch;
 mod media_control;
 mod media_download;
@@ -170,8 +171,10 @@ pub struct ToolCtx {
     /// 工具如实说没有渲染组件,§3.5)。
     pub web: Option<Arc<dyn crate::webrender::WebRenderer>>,
     /// 动作确认中枢(§7.8 确认闸,通用件):动作后果「出圈且收不回」的工具执行前经它
-    /// 请用户点头。None(单测)= 没有确认通道,当拒处理。现状唯一消费者 = web_render。
+    /// 请用户点头。None(单测)= 没有确认通道,当拒处理。消费者 = web_render + 文件授权圈。
     pub confirm: Option<Arc<crate::confirm::Confirmer>>,
+    /// 文件授权圈的回合级缓存(§7.2):「仅这次」放行与本回合已拒记录,回合结束即丢。
+    pub grants: guard::Grants,
 }
 
 /// 工具风险分级(预留 slot,PLAN §8):`Safe` = 读/记类;`Mutating` = 会改动用户文件

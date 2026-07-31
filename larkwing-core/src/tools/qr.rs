@@ -67,6 +67,8 @@ impl Tool for QrDecode {
                     .collect()
             })
             .unwrap_or_default();
+        // 显式路径过授权圈(§7.2);缺省「刚发的那批图」在数据根(attachments),天然免
+        super::guard::ensure(ctx, super::guard::Access::Read, &explicit).await?;
 
         // (显示名, 文件路径):缺省走「刚发的那批图」(相对名 → attachments 目录)
         let targets: Vec<(String, PathBuf)> = if explicit.is_empty() {
@@ -246,7 +248,7 @@ mod tests {
         let store = Store::open(&dir.join("t.db")).unwrap();
         let me = store.users.ensure_default_user().unwrap();
         let media = MediaRuntime::new(dir.clone(), store.clone(), crate::bus::Bus::new());
-        (ToolCtx { user_id: me.id, conv_id: 1, media, store, web: None, confirm: None }, dir)
+        (ToolCtx { user_id: me.id, conv_id: 1, media, store, web: None, confirm: None, grants: Default::default() }, dir)
     }
 
     fn write_qr_png(path: &std::path::Path, content: &str) {

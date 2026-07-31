@@ -106,6 +106,8 @@ pub fn run() {
       let data_dir = resolution.root.clone();
       std::fs::create_dir_all(&data_dir)?;
       std::fs::create_dir_all(data_dir.join("logs"))?;
+      // 文件授权圈(§7.2):数据根整棵树免授权,boot 装配一次
+      larkwing_core::tools::guard::set_data_root(data_dir.clone());
 
       let file_appender = tracing_appender::rolling::daily(data_dir.join("logs"), "larkwing.log");
       let (writer, guard) = tracing_appender::non_blocking(file_appender);
@@ -474,6 +476,9 @@ pub fn run() {
       commands::fsops_undo,
       commands::fsops_redo,
       commands::confirm_action,
+      commands::fs_scopes_list,
+      commands::fs_scope_set,
+      commands::fs_scope_remove,
       commands::list_confirms,
       commands::autostart_enabled,
       commands::set_autostart,

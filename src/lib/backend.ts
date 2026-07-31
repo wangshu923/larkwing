@@ -594,11 +594,25 @@ export interface ConfirmCard {
   conv_id: number
   origin: string // 'ui' | 'system' | 渠道名(渠道来源的卡桌面也显示、也可点——先到先得)
   host: string
-  action: string
-  kind: string // 'click' | 'submit'
+  action: string // web 卡 = 按钮原文;fs_* 卡 = 目录列表(顿号连)
+  kind: string // 'click' | 'submit' | 'press' | 'self_report' | 'fs_read' | 'fs_create' | 'fs_modify' | 'fs_delete'
   state: 'pending' | 'allowed' | 'denied' | 'expired'
   deadline_ms: number
   via?: string
+}
+
+/** 文件授权圈(§7.2):一条「能碰的文件夹」授权。 */
+export type ScopeMode = 'read' | 'create' | 'full'
+export interface ScopeEntry {
+  path: string
+  mode: ScopeMode
+}
+/** 设置页视图:用户授权表 + 内置区实际路径。 */
+export interface FsScopesView {
+  entries: ScopeEntry[]
+  downloads: string | null
+  desktop: string | null
+  data_root: string
 }
 
 /** 确认流水一行(操作记录页「确认过的操作」分组)。 */
@@ -610,7 +624,7 @@ export interface ConfirmLog {
   host: string
   action: string
   kind: string
-  decision: 'allowed' | 'denied'
+  decision: 'allowed' | 'allowed_always' | 'denied' // allowed_always = §7.2 一直允许(入表)
   via: string // desktop | float | voice | channel | timeout | no_ui | unreachable
   created_at: number
 }
@@ -1138,9 +1152,18 @@ export const api = {
   listFsops: () => invoke<FsOp[]>('list_fsops'),
   fsopsUndo: (id: number) => invoke<void>('fsops_undo', { id }),
   fsopsRedo: (id: number) => invoke<void>('fsops_redo', { id }),
-  /** 确认卡应答(§7.8):HUD 卡/悬浮窗按钮直连;false = 卡已收尾(过期/别处先点)。 */
-  confirmAction: (id: number, allow: boolean, via: string) =>
-    invoke<boolean>('confirm_action', { id, allow, via }),
+  /** 确认卡应答(§7.8):HUD 卡/悬浮窗按钮直连;false = 卡已收尾(过期/别处先点)。
+   *  choice:'always' = 一直允许(文件授权圈入表)| 'once' = 仅这次 | 'deny' = 先不要。 */
+  confirmAction: (id: number, choice: 'always' | 'once' | 'deny', via: string) =>
+    invoke<boolean>('confirm_action', { id, choice, via }),
+  // ---- 文件授权圈(§7.2「能碰的文件夹」) ----
+  /** 设置页视图:用户授权表 + 内置区路径(数据目录/下载/桌面)。 */
+  fsScopes: () => invoke<FsScopesView>('fs_scopes_list'),
+  /** 添加/改档(mode: read=只读 | create=可存入 | full=完全访问),返回合并后的表。 */
+  fsScopeSet: (path: string, mode: ScopeMode) =>
+    invoke<ScopeEntry[]>('fs_scope_set', { path, mode }),
+  /** 删一条授权(下载/桌面的升档记录删掉 = 回落出厂「可存入」基线)。 */
+  fsScopeRemove: (path: string) => invoke<ScopeEntry[]>('fs_scope_remove', { path }),
   /** 操作记录页「确认过的操作」分组:最近确认流水(全家,主人管理面)。 */
   listConfirms: () => invoke<ConfirmLog[]>('list_confirms'),
   /** 口头确认(§7.8):卡属于当前语音回合时开一段听音;false = 没开听(cpal 源/唤醒没跑)。 */

@@ -53,7 +53,7 @@ impl Tool for Open {
         &self.spec
     }
 
-    async fn run(&self, args: serde_json::Value, _ctx: &ToolCtx) -> anyhow::Result<String> {
+    async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
         let target = args
             .get("target")
             .and_then(serde_json::Value::as_str)
@@ -61,6 +61,11 @@ impl Tool for Open {
             .filter(|s| !s.is_empty())
             .map(super::expand_home) // 「~/xxx」路径形宽容展开(§4.4;应用名/网址原样)
             .ok_or_else(|| anyhow::anyhow!("缺少 target 参数(要打开什么)"))?;
+        // 文件/文件夹臂过授权圈(§7.2,= 读);网址/应用名不涉及
+        let is_url = target.starts_with("http://") || target.starts_with("https://");
+        if !is_url && looks_like_path(&target) {
+            super::guard::ensure(ctx, super::guard::Access::Read, std::slice::from_ref(&target)).await?;
+        }
         open_target(&target).await?;
         // 结果是喂给模型的观察(不是 UI 文案),模型用当前人格的语言转述
         Ok(format!("已打开 {target}"))

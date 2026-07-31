@@ -10,11 +10,20 @@ import { i18n } from '../i18n'
 /** 动作短语(kind + 目标原文 → 人话):卡片/悬浮窗/记录页/语音问句共用,动词在字典(§6.6)。 */
 export function confirmActionPhrase(card: Pick<ConfirmCard, 'kind' | 'action'>): string {
   const t = i18n.global.t
+  if (card.kind === 'fs_read') return t('confirm.act.fsRead', { text: card.action })
+  if (card.kind === 'fs_create') return t('confirm.act.fsCreate', { text: card.action })
+  if (card.kind === 'fs_modify') return t('confirm.act.fsModify', { text: card.action })
+  if (card.kind === 'fs_delete') return t('confirm.act.fsDelete', { text: card.action })
   if (card.kind === 'submit') {
     return card.action ? t('confirm.act.submit', { text: card.action }) : t('confirm.act.submitBare')
   }
   if (card.kind === 'press') return t('confirm.act.press', { text: card.action })
   return t('confirm.act.click', { text: card.action })
+}
+
+/** 文件授权圈的卡(§7.2)= 三钮(一直允许/仅这次/先不要);web 动作卡维持两钮。 */
+export function isScopeCard(card: Pick<ConfirmCard, 'kind'>): boolean {
+  return card.kind.startsWith('fs_')
 }
 
 const state = reactive({
@@ -54,15 +63,16 @@ function remove(id: number) {
   syncTicker()
 }
 
-/** 点头/摇头(via = desktop | float,记进审计「谁点的」)。卡已收尾(过期/别处先点)则直接收卡。 */
-async function resolve(id: number, allow: boolean, via: string) {
+/** 应答(via = desktop | float,记进审计「谁点的」)。choice:always = 一直允许(授权圈
+ *  入表)| once = 仅这次 | deny = 先不要。卡已收尾(过期/别处先点)则直接收卡。 */
+async function resolve(id: number, choice: 'always' | 'once' | 'deny', via: string) {
   if (!isTauri()) {
     // 浏览器预览:本地模拟终态(能看到「继续了/没执行」的收尾观感)
     const cur = state.cards.find((c) => c.id === id)
-    if (cur) upsert({ ...cur, state: allow ? 'allowed' : 'denied', via })
+    if (cur) upsert({ ...cur, state: choice === 'deny' ? 'denied' : 'allowed', via })
     return
   }
-  const ok = await api.confirmAction(id, allow, via).catch(() => false)
+  const ok = await api.confirmAction(id, choice, via).catch(() => false)
   if (!ok) remove(id) // 权威终态卡也会来,这是双保险
 }
 
@@ -113,6 +123,17 @@ function wire() {
       kind: 'submit',
       state: 'pending',
       deadline_ms: Date.now() + 45_000,
+    })
+    upsert({
+      id: 3,
+      user_id: 1,
+      conv_id: 1,
+      origin: 'ui',
+      host: '',
+      action: 'E:\\nas\\movies',
+      kind: 'fs_modify',
+      state: 'pending',
+      deadline_ms: Date.now() + 55_000,
     })
   }
 }

@@ -105,18 +105,27 @@ export default {
     floatBar: '有一步等你确认',
     atHost: '在 {host}',
     allow: '继续',
+    // 文件授权圈(§7.2)三钮:一直允许 = 记住这个文件夹,以后不再问;仅这次 = 只放行本回合
+    allowAlways: '一直允许',
+    allowOnce: '仅这次',
+    allowAlwaysShort: '总是',
+    allowOnceShort: '一次',
     deny: '先不要',
     done: {
       allowed: '继续了',
       denied: '没执行',
       expired: '过时了,没执行',
     },
-    // 动作短语(kind + 页面按钮原文;动词在这儿组,core 只过桥数据 §6.6)
+    // 动作短语(kind + 页面按钮原文/目录列表;动词在这儿组,core 只过桥数据 §6.6)
     act: {
       click: '点「{text}」',
       submit: '提交「{text}」',
       submitBare: '提交这个表单',
       press: '按 {text} 键',
+      fsRead: '查看文件夹 {text}',
+      fsCreate: '在 {text} 存入文件',
+      fsModify: '修改 {text} 里的文件',
+      fsDelete: '删除 {text} 里的文件',
     },
     // 语音回合撞确认时念的问句(刻意避开口头否定词「不要/别/算了」,防自播漏网自答)
     speak: '要{action},可以吗?',
@@ -199,6 +208,7 @@ export default {
     confirm: {
       title: '确认过的操作 · {n} 条',
       allowed: '继续了',
+      allowedAlways: '允许了,以后不再问',
       denied: '没执行',
       via: {
         desktop: '在电脑上点的',
@@ -766,6 +776,21 @@ export default {
         linkPre: '扫不了?',
         linkText: '打开链接',
       },
+    },
+    // 文件授权圈(§7.2「能碰的文件夹」):只有允许的文件夹模型才能读写;圈外先问
+    scopes: {
+      title: '能碰的文件夹',
+      hint: '{name} 只能查看和整理下面允许的文件夹;要动别的地方会先问你。',
+      dataDir: '程序数据',
+      dataDirNote: '自己的数据,始终可用',
+      downloads: '下载文件夹',
+      desktop: '桌面',
+      modeRead: '只读',
+      modeCreate: '可存入',
+      modeFull: '完全访问',
+      add: '添加文件夹…',
+      remove: '移除',
+      askHint: '「只读」= 只能看;「可存入」= 能看、能往里存新文件;「完全访问」= 还能修改和删除。对话里点「一直允许」的文件夹也会出现在这里。',
     },
     system: {
       desktop: '开机与桌面',

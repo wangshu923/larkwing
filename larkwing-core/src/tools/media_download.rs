@@ -107,6 +107,13 @@ impl Tool for MediaDownload {
             }
             _ => default_download_dir(),
         };
+        // 落盘 = 存入(§7.2 授权圈;批量转后台前判完,job 里没有交互点)
+        super::guard::ensure(
+            ctx,
+            super::guard::Access::Create,
+            &[dir.to_string_lossy().into_owned()],
+        )
+        .await?;
         let all = super::arg_bool(&args, "all", false);
         let opt_str = |key: &str| {
             args.get(key)

@@ -166,10 +166,21 @@ pub struct ConfirmAsk {
     pub kind: String,
 }
 
-/// 确认结局。`via`:desktop | float | voice | channel(谁点的头,审计用)。
+/// 应答三态(2026-07-30 随文件授权圈扩,原 bool):`AllowAlways` = 允许并记住
+/// (文件授权圈据此入表;web_render 动作卡不出这个钮,语义上等同 AllowOnce)。
+/// 渠道回话/语音口头一律按 `AllowOnce` —— 永久授权是改机器配置,只留给有 UI 的地方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmReply {
+    AllowAlways,
+    AllowOnce,
+    Deny,
+}
+
+/// 确认结局。`via`:desktop | float | voice | channel(谁点的头,审计用);
+/// `always` = 用户点的是「一直允许」(消费者据此持久化;不需要的忽略它)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfirmDecision {
-    Allowed { via: String },
+    Allowed { via: String, always: bool },
     Denied { via: String },
     /// 等满超时没人应(桌面 60s / 渠道 120s)。
     TimedOut,
@@ -208,7 +219,7 @@ pub const DESKTOP_TIMEOUT: Duration = Duration::from_secs(60);
 pub const CHANNEL_TIMEOUT: Duration = Duration::from_secs(120);
 
 struct PendingEntry {
-    tx: oneshot::Sender<(bool, String)>,
+    tx: oneshot::Sender<(ConfirmReply, String)>,
     card: ConfirmCard,
 }
 
@@ -258,34 +269,43 @@ impl Confirmer {
         let mut guard = guard;
         guard.armed = false; // 正常路径自己收尾,guard 退膛
         let decision = match outcome {
-            Ok(Ok((true, via))) => ConfirmDecision::Allowed { via },
-            Ok(Ok((false, via))) => ConfirmDecision::Denied { via },
+            Ok(Ok((ConfirmReply::AllowAlways, via))) => {
+                ConfirmDecision::Allowed { via, always: true }
+            }
+            Ok(Ok((ConfirmReply::AllowOnce, via))) => {
+                ConfirmDecision::Allowed { via, always: false }
+            }
+            Ok(Ok((ConfirmReply::Deny, via))) => ConfirmDecision::Denied { via },
             // sender 全 drop(理论不可达:resolve 摘走才 send)按超时收
             Ok(Err(_)) | Err(_) => ConfirmDecision::TimedOut,
         };
         // 终态广播 + 摘表(resolve 路已摘,这里兜超时路)
         self.pending.lock().unwrap().remove(&id);
-        let (state, via) = match &decision {
-            ConfirmDecision::Allowed { via } => ("allowed", via.clone()),
-            ConfirmDecision::Denied { via } => ("denied", via.clone()),
-            _ => ("expired", String::new()),
+        // 卡片终态只有 allowed/denied/expired(前端状态机不管 always);审计 decision
+        // 分 allowed / allowed_always / denied,「一直允许」在流水里看得出来。
+        let (state, log_decision, via) = match &decision {
+            ConfirmDecision::Allowed { via, always: true } => {
+                ("allowed", "allowed_always", via.clone())
+            }
+            ConfirmDecision::Allowed { via, .. } => ("allowed", "allowed", via.clone()),
+            ConfirmDecision::Denied { via } => ("denied", "denied", via.clone()),
+            _ => ("expired", "denied", String::new()),
         };
         let mut done = card;
         done.state = state.into();
         done.via = if via.is_empty() { None } else { Some(via.clone()) };
         self.bus.publish(AppEvent::Confirm(done));
         // 审计口径:超时也是「没允许」→ decision=denied、via=timeout(卡片态才叫 expired)
-        let log_decision = if state == "expired" { "denied" } else { state };
         self.record(&ask, log_decision, if via.is_empty() { "timeout" } else { &via });
         decision
     }
 
     /// 应答入口(前端命令/渠道回话/语音听音)。先到先得;id 不在 pending(已过期/已应)
     /// 返回 false,调用方据此告知「已经过期了」。
-    pub fn resolve(&self, id: u64, allow: bool, via: &str) -> bool {
+    pub fn resolve(&self, id: u64, reply: ConfirmReply, via: &str) -> bool {
         let entry = self.pending.lock().unwrap().remove(&id);
         match entry {
-            Some(e) => e.tx.send((allow, via.to_string())).is_ok(),
+            Some(e) => e.tx.send((reply, via.to_string())).is_ok(),
             None => false,
         }
     }
@@ -438,9 +458,9 @@ mod tests {
         };
         assert_eq!(card.state, "pending");
         assert!(c.pending_for_conv(1).is_some());
-        assert!(c.resolve(card.id, true, "desktop"));
+        assert!(c.resolve(card.id, ConfirmReply::AllowOnce, "desktop"));
         let d = task.await.unwrap();
-        assert_eq!(d, ConfirmDecision::Allowed { via: "desktop".into() });
+        assert_eq!(d, ConfirmDecision::Allowed { via: "desktop".into(), always: false });
         // 终态卡
         let done = loop {
             if let AppEvent::Confirm(card) = rx.recv().await.unwrap() {
@@ -450,11 +470,36 @@ mod tests {
         assert_eq!((done.state.as_str(), done.via.as_deref()), ("allowed", Some("desktop")));
         assert!(c.pending_for_conv(1).is_none());
         // 二次 resolve = 已收尾
-        assert!(!c.resolve(card.id, false, "float"));
+        assert!(!c.resolve(card.id, ConfirmReply::Deny, "float"));
         // 审计落了一行
         let log = c.store.confirms.list_recent(10).unwrap();
         assert_eq!(log.len(), 1);
         assert_eq!((log[0].decision.as_str(), log[0].via.as_str()), ("allowed", "desktop"));
+    }
+
+    #[tokio::test]
+    async fn allow_always_reaches_decision_and_audit() {
+        let (c, bus) = test_confirmer("always");
+        let mut rx = bus.subscribe();
+        let c2 = c.clone();
+        let task = tokio::spawn(async move { c2.ask(ask(), Duration::from_secs(30)).await });
+        let card = loop {
+            if let AppEvent::Confirm(card) = rx.recv().await.unwrap() {
+                break card;
+            }
+        };
+        assert!(c.resolve(card.id, ConfirmReply::AllowAlways, "desktop"));
+        let d = task.await.unwrap();
+        assert_eq!(d, ConfirmDecision::Allowed { via: "desktop".into(), always: true });
+        // 卡片终态仍是 allowed(前端状态机不变);审计分出 allowed_always
+        let done = loop {
+            if let AppEvent::Confirm(card) = rx.recv().await.unwrap() {
+                break card;
+            }
+        };
+        assert_eq!(done.state, "allowed");
+        let log = c.store.confirms.list_recent(10).unwrap();
+        assert_eq!((log[0].decision.as_str(), log[0].via.as_str()), ("allowed_always", "desktop"));
     }
 
     #[tokio::test]

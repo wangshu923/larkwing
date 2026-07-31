@@ -95,12 +95,20 @@ impl Tool for PdfToPng {
             Some(d) if !d.is_empty() => {
                 let p = PathBuf::from(super::expand_home(d)); // 「~/xxx」宽容展开(§4.4)
                 anyhow::ensure!(p.is_absolute(), "dir 需要绝对路径,收到: {d}");
-                std::fs::create_dir_all(&p)
-                    .with_context(|| format!("建不了目标文件夹 {}", p.display()))?;
                 p
             }
             _ => pdf.parent().map(Path::to_path_buf).unwrap_or_else(std::env::temp_dir),
         };
+        // 授权圈(§7.2):读源 PDF + 往产物目录落新文件;授权过了才建目标文件夹
+        super::guard::ensure(ctx, super::guard::Access::Read, std::slice::from_ref(&path)).await?;
+        super::guard::ensure(
+            ctx,
+            super::guard::Access::Create,
+            &[out_dir.to_string_lossy().into_owned()],
+        )
+        .await?;
+        std::fs::create_dir_all(&out_dir)
+            .with_context(|| format!("建不了目标文件夹 {}", out_dir.display()))?;
 
         // 组件就位(已下载即秒回;首次下载进度冒 HUD 卡)
         let lib = ctx.media.ensure_pdfium().await.context("PDF 渲染组件没准备好")?;
@@ -195,7 +203,7 @@ mod tests {
         let store = Store::open(&dir.join("t.db")).unwrap();
         let me = store.users.ensure_default_user().unwrap();
         let media = MediaRuntime::new(dir.clone(), store.clone(), crate::bus::Bus::new());
-        (ToolCtx { user_id: me.id, conv_id: 1, media, store, web: None, confirm: None }, dir)
+        (ToolCtx { user_id: me.id, conv_id: 1, media, store, web: None, confirm: None, grants: Default::default() }, dir)
     }
 
     /// 最小合法单页 PDF(程序算 xref 偏移,pdfium 能开):e2e 用。

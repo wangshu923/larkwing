@@ -97,6 +97,10 @@ impl Tool for LyricsFetch {
             };
             items.push(LyricsItem { path: p, title: opt("title"), artist: opt("artist") });
         }
+        // 读音频标签 + 旁挂同名 .lrc = 存入档(§7.2 授权圈,含读;音频原件不动)
+        let item_paths: Vec<String> =
+            items.iter().map(|it| it.path.to_string_lossy().into_owned()).collect();
+        super::guard::ensure(ctx, super::guard::Access::Create, &item_paths).await?;
 
         match ctx.media.lyrics_for_files(items, (ctx.user_id, ctx.conv_id)).await? {
             LyricsBatchOutcome::JobStarted { total } => Ok(format!(

@@ -427,7 +427,13 @@ fn wake_loop(d: &WakeDeps, cmd: &Receiver<WakeCmd>) -> Result<()> {
                         let verdict = crate::confirm::voice_reply(&text);
                         tracing::info!(%text, ?verdict, "口头确认转写");
                         if let (Some(allow), Some(c)) = (verdict, confirmer.as_ref()) {
-                            let _ = c.resolve(id, allow, "voice");
+                            // 口头肯定恒按「仅这次」(永久授权只留给有 UI 的地方,§7.2)
+                            let reply = if allow {
+                                crate::confirm::ConfirmReply::AllowOnce
+                            } else {
+                                crate::confirm::ConfirmReply::Deny
+                            };
+                            let _ = c.resolve(id, reply, "voice");
                         }
                         // verdict=None(含糊)= 不算数:不 resolve,卡片路继续等
                     }

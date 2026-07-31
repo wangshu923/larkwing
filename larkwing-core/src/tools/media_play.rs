@@ -71,6 +71,10 @@ impl Tool for MediaPlay {
                 || crate::media::is_local_path(&url),
             "url 不合法(要 http(s) 链接或本地文件/文件夹绝对路径),收到: {url}"
         );
+        // 本地播放 = 读文件(§7.2 授权圈;网络 URL 不涉及)
+        if crate::media::is_local_path(&url) {
+            super::guard::ensure(ctx, super::guard::Access::Read, std::slice::from_ref(&url)).await?;
+        }
         let url = url.as_str();
         // 宽容解析:模型常把 audio_only 发成字符串 "true"(裸 as_bool 认不出 → 回落 false →
         // 放歌弹全屏视频框)。走共享 arg_bool 兜底(§4.4 Quirks)。

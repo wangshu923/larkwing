@@ -6,7 +6,7 @@ import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useTasks } from '../composables/useTasks'
 import { useMedia } from '../composables/useMedia'
-import { confirmActionPhrase, useConfirm } from '../composables/useConfirm'
+import { confirmActionPhrase, isScopeCard, useConfirm } from '../composables/useConfirm'
 import { api, type ConfirmCard, type TaskView, type TextRef } from '../lib/backend'
 
 const { t, te } = useI18n()
@@ -62,9 +62,15 @@ function txt(ref?: TextRef, fallback = 'task.unknown'): string {
         </div>
         <div class="c-action">{{ confirmActionPhrase(c) }}</div>
         <div v-if="c.host" class="step">{{ t('confirm.atHost', { host: c.host }) }}</div>
+        <!-- 授权圈卡(fs_*)三钮:一直允许(入表记住)/仅这次/先不要;web 动作卡两钮 -->
         <div v-if="c.state === 'pending'" class="c-btns">
-          <button class="c-go" @click="confirm.resolve(c.id, true, confirm.via)">{{ t('confirm.allow') }}</button>
-          <button class="c-no" @click="confirm.resolve(c.id, false, confirm.via)">{{ t('confirm.deny') }}</button>
+          <button v-if="isScopeCard(c)" class="c-go" @click="confirm.resolve(c.id, 'always', confirm.via)">
+            {{ t('confirm.allowAlways') }}
+          </button>
+          <button class="c-go" :class="{ dim: isScopeCard(c) }" @click="confirm.resolve(c.id, 'once', confirm.via)">
+            {{ isScopeCard(c) ? t('confirm.allowOnce') : t('confirm.allow') }}
+          </button>
+          <button class="c-no" @click="confirm.resolve(c.id, 'deny', confirm.via)">{{ t('confirm.deny') }}</button>
         </div>
       </div>
     </TransitionGroup>
@@ -154,6 +160,9 @@ function txt(ref?: TextRef, fallback = 'task.unknown'): string {
   border: 1px solid rgba(var(--accent-rgb), 0.4);
 }
 .c-go:hover { background: rgba(var(--accent-rgb), 0.22); border-color: var(--accent); }
+/* 授权圈卡的「仅这次」= 次钮(主钮是「一直允许」) */
+.c-go.dim { color: var(--text); background: none; border-color: var(--line); }
+.c-go.dim:hover { border-color: var(--text-dim); background: rgba(var(--accent-rgb), 0.08); }
 .c-no {
   color: var(--text-dim); background: none; border: 1px solid var(--line);
 }

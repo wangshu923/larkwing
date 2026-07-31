@@ -7,7 +7,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useAgentMood } from '../composables/useAgentMood'
-import { confirmActionPhrase, useConfirm } from '../composables/useConfirm'
+import { confirmActionPhrase, isScopeCard, useConfirm } from '../composables/useConfirm'
 import { useFloat } from '../composables/useFloat'
 import { useFloatIdle } from '../composables/useFloatIdle'
 import { useSettings } from '../composables/useSettings'
@@ -235,8 +235,14 @@ onUnmounted(() => stopMoved())
           <div class="ptag">{{ t('confirm.title') }}</div>
           <div v-for="c in confirm.pending.value" :key="'cfm-' + c.id" class="cfm">
             <span class="n-text">{{ confirmActionPhrase(c) }}<em v-if="c.host" class="cfm-host">{{ c.host }}</em></span>
-            <button class="cfm-go" @click.stop="confirm.resolve(c.id, true, 'float')">{{ t('confirm.allow') }}</button>
-            <button class="n-x" :title="t('confirm.deny')" @click.stop="confirm.resolve(c.id, false, 'float')">✕</button>
+            <!-- 授权圈卡(fs_*)多一枚「一直允许」;空间紧,用短文案 -->
+            <button v-if="isScopeCard(c)" class="cfm-go" @click.stop="confirm.resolve(c.id, 'always', 'float')">
+              {{ t('confirm.allowAlwaysShort') }}
+            </button>
+            <button class="cfm-go" @click.stop="confirm.resolve(c.id, 'once', 'float')">
+              {{ isScopeCard(c) ? t('confirm.allowOnceShort') : t('confirm.allow') }}
+            </button>
+            <button class="n-x" :title="t('confirm.deny')" @click.stop="confirm.resolve(c.id, 'deny', 'float')">✕</button>
           </div>
         </template>
 

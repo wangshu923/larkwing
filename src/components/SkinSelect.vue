@@ -117,7 +117,10 @@ onBeforeUnmount(() => document.removeEventListener('pointerdown', onDocDown, tru
 .skinsel.open .skinsel-arrow { color: var(--accent); }
 /* 弹层:与 ContextMenu 同款玻璃(translucent surface + blur → 隔行也读得清),全语义 token */
 .skinsel-list {
-  position: absolute; z-index: 40; top: calc(100% + 4px); left: 0; right: 0;
+  /* 锚右缘、内容自适应宽(≥按钮宽):选项比按钮长(如「完全访问」)向左撑开不截断;
+     本组件都用在行尾,向左长安全(向右会出视口) */
+  position: absolute; z-index: 40; top: calc(100% + 4px); right: 0; left: auto;
+  min-width: 100%; width: max-content; max-width: 280px;
   margin: 0; padding: 4px; list-style: none;
   background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
   backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);

@@ -60,6 +60,13 @@ function confirmBadge(c: ConfirmLog): string {
   return te(key) ? t(key) : c.via
 }
 
+/** decision → 文案:allowed_always(§7.2 一直允许)单独一档,未知值兜回「没执行」。 */
+function confirmDecisionLabel(c: ConfirmLog): string {
+  if (c.decision === 'allowed_always') return t('ops.confirm.allowedAlways')
+  if (c.decision === 'allowed') return t('ops.confirm.allowed')
+  return t('ops.confirm.denied')
+}
+
 async function undo(o: FsOp) {
   if (busy.value != null) return
   busy.value = o.id
@@ -159,10 +166,11 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
       <template v-if="confirms.length">
         <p class="lp-count">{{ t('ops.confirm.title', { n: confirms.length }) }}</p>
         <TransitionGroup name="lp" tag="div">
-          <div v-for="c in confirms" :key="'cfm-' + c.id" class="lp-card" :class="{ muted: c.decision !== 'allowed' }">
-            <span class="lp-dot" :class="c.decision === 'allowed' ? '' : 'warn'"></span>
+          <!-- decision:allowed / allowed_always(§7.2 一直允许)/ denied -->
+          <div v-for="c in confirms" :key="'cfm-' + c.id" class="lp-card" :class="{ muted: !c.decision.startsWith('allowed') }">
+            <span class="lp-dot" :class="c.decision.startsWith('allowed') ? '' : 'warn'"></span>
             <span class="lp-text">{{ confirmActionPhrase(c) }}<small v-if="c.host" class="cfm-host"> · {{ c.host }}</small></span>
-            <span class="lp-badge">{{ c.decision === 'allowed' ? t('ops.confirm.allowed') : t('ops.confirm.denied') }} · {{ confirmBadge(c) }}</span>
+            <span class="lp-badge">{{ confirmDecisionLabel(c) }} · {{ confirmBadge(c) }}</span>
             <span class="lp-date">{{ fmtDate(c.created_at) }}</span>
           </div>
         </TransitionGroup>

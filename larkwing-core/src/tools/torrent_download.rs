@@ -91,6 +91,13 @@ impl Tool for TorrentDownload {
             }
             _ => default_download_dir(),
         };
+        // 落盘 = 存入(§7.2 授权圈;恒后台 job,进 job 前判完)
+        super::guard::ensure(
+            ctx,
+            super::guard::Access::Create,
+            &[dir.to_string_lossy().into_owned()],
+        )
+        .await?;
 
         // 省略 only = 缺省视频白名单;显式传了就用用户/模型给的(空串当没传)
         let only = match args.get("only").and_then(serde_json::Value::as_str).map(str::trim) {

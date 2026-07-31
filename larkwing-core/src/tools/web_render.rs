@@ -359,6 +359,10 @@ impl WebRender {
                 super::fs::human_size(total),
                 super::fs::human_size(crate::webrender::UPLOAD_MAX_BYTES)
             );
+            // 传给网页 = 读文件(§7.2 授权圈)
+            let up: Vec<String> =
+                upload_paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+            super::guard::ensure(ctx, super::guard::Access::Read, &up).await?;
         }
         let submit = super::arg_bool(&args, "submit", false);
         let press_key = str_arg(&args, "press_key");
@@ -374,6 +378,13 @@ impl WebRender {
             }
             _ => crate::files::default_download_dir(),
         };
+        // 页面点出的下载落这里 = 存入(§7.2 授权圈;缺省「下载」夹在基线内,零打扰)
+        super::guard::ensure(
+            ctx,
+            super::guard::Access::Create,
+            &[download_dir.to_string_lossy().into_owned()],
+        )
+        .await?;
         let renderer = ctx
             .web
             .clone()
@@ -649,6 +660,7 @@ mod tests {
             store,
             web: None,
             confirm: None,
+            grants: Default::default(),
         }
     }
 
@@ -690,7 +702,12 @@ mod tests {
             while let Ok(ev) = rx.recv().await {
                 if let crate::bus::AppEvent::Confirm(card) = ev {
                     if card.state == "pending" {
-                        c2.resolve(card.id, allow, "desktop");
+                        let reply = if allow {
+                            crate::confirm::ConfirmReply::AllowOnce
+                        } else {
+                            crate::confirm::ConfirmReply::Deny
+                        };
+                        c2.resolve(card.id, reply, "desktop");
                     }
                 }
             }

@@ -401,9 +401,61 @@ pub fn fsops_redo(state: State<'_, AppState>, id: i64) -> Result<(), AppError> {
 
 /// 确认卡应答(§7.8 确认闸):HUD 卡 / 悬浮窗按钮直连。via 记谁点的(desktop/float),
 /// 审计随 resolve 落库。返回 false = 这张卡已收尾(过期/别处先点了),前端据此收卡。
+/// choice:always = 一直允许(文件授权圈据此入表)| once = 仅这次 | 其余 = 拒。
 #[tauri::command]
-pub fn confirm_action(state: State<'_, AppState>, id: u64, allow: bool, via: String) -> bool {
-    state.engine.confirmer().resolve(id, allow, &via)
+pub fn confirm_action(state: State<'_, AppState>, id: u64, choice: String, via: String) -> bool {
+    use larkwing_core::confirm::ConfirmReply;
+    let reply = match choice.as_str() {
+        "always" => ConfirmReply::AllowAlways,
+        "once" | "allow" => ConfirmReply::AllowOnce,
+        _ => ConfirmReply::Deny,
+    };
+    state.engine.confirmer().resolve(id, reply, &via)
+}
+
+/// 文件授权圈(§7.2)设置页视图:用户授权表 + 内置区实际路径(数据目录/下载/桌面,
+/// 前端固定显示为说明行;下载/桌面升档后表里会出现对应条目)。
+#[derive(serde::Serialize)]
+pub struct FsScopesView {
+    pub entries: Vec<larkwing_core::tools::guard::ScopeEntry>,
+    pub downloads: Option<String>,
+    pub desktop: Option<String>,
+    pub data_root: String,
+}
+
+#[tauri::command]
+pub fn fs_scopes_list(state: State<'_, AppState>) -> FsScopesView {
+    let (downloads, desktop) = larkwing_core::tools::guard::builtin_baselines();
+    FsScopesView {
+        entries: larkwing_core::tools::guard::list_scopes(state.engine.store()),
+        downloads,
+        desktop,
+        data_root: state.data_root.to_string_lossy().into_owned(),
+    }
+}
+
+/// 添加/改档一条授权(mode: read | create | full)。入表走 guard 单源合并逻辑
+/// (授权父目录自动吸收被覆盖的低档子孙,档位更高的子条目保留)。
+#[tauri::command]
+pub fn fs_scope_set(
+    state: State<'_, AppState>,
+    path: String,
+    mode: String,
+) -> Result<Vec<larkwing_core::tools::guard::ScopeEntry>, AppError> {
+    let mode = larkwing_core::tools::guard::Mode::parse(&mode)
+        .ok_or_else(|| AppError::internal("mode 只认 read/create/full"))?;
+    larkwing_core::tools::guard::upsert_scope(state.engine.store(), &path, mode)
+        .map_err(AppError::internal)
+}
+
+/// 删一条授权(下载/桌面的升档记录删掉 = 回落出厂基线)。
+#[tauri::command]
+pub fn fs_scope_remove(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Vec<larkwing_core::tools::guard::ScopeEntry>, AppError> {
+    larkwing_core::tools::guard::remove_scope(state.engine.store(), &path)
+        .map_err(AppError::internal)
 }
 
 /// 操作记录页「确认过的操作」分组:最近的确认流水(全家的都列,主人管理面同提醒页)。

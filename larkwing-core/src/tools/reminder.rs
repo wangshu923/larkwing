@@ -356,6 +356,7 @@ mod tests {
             store,
             web: None,
             confirm: None,
+            grants: Default::default(),
         }
     }
 

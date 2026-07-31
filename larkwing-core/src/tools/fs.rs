@@ -66,7 +66,7 @@ impl Tool for FsList {
         &self.spec
     }
 
-    async fn run(&self, args: serde_json::Value, _ctx: &ToolCtx) -> anyhow::Result<String> {
+    async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
         let path = args
             .get("path")
             .and_then(serde_json::Value::as_str)
@@ -74,6 +74,7 @@ impl Tool for FsList {
             .filter(|s| !s.is_empty())
             .map(super::expand_home) // 「~/xxx」宽容展开(§4.4)
             .context("缺少 path 参数")?;
+        super::guard::ensure(ctx, super::guard::Access::Read, std::slice::from_ref(&path)).await?;
         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let dir = Path::new(&path);
             anyhow::ensure!(dir.is_dir(), "{path} 不是文件夹或不存在");
@@ -215,7 +216,7 @@ impl Tool for FsFind {
         &self.spec
     }
 
-    async fn run(&self, args: serde_json::Value, _ctx: &ToolCtx) -> anyhow::Result<String> {
+    async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
         let root = args
             .get("root")
             .and_then(serde_json::Value::as_str)
@@ -223,6 +224,7 @@ impl Tool for FsFind {
             .filter(|s| !s.is_empty())
             .map(super::expand_home) // 「~/xxx」宽容展开(§4.4)
             .context("缺少 root 参数")?;
+        super::guard::ensure(ctx, super::guard::Access::Read, std::slice::from_ref(&root)).await?;
         let raw = args
             .get("pattern")
             .and_then(serde_json::Value::as_str)
@@ -381,8 +383,9 @@ impl Tool for FsReadText {
         &self.spec
     }
 
-    async fn run(&self, args: serde_json::Value, _ctx: &ToolCtx) -> anyhow::Result<String> {
+    async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
         let path = arg_path(&args, "path")?;
+        super::guard::ensure(ctx, super::guard::Access::Read, std::slice::from_ref(&path)).await?;
         let offset = super::arg_u64(&args, "offset", 0) as usize;
         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let p = Path::new(&path);
@@ -482,6 +485,11 @@ impl Tool for FsMove {
 
     async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
         let moves = arg_pairs(&args, "moves")?;
+        // 移动 = 源头拿走(改动已有)+ 目标落新(§7.2 授权圈:两侧各按其档判)
+        let srcs: Vec<String> = moves.iter().map(|(s, _)| s.clone()).collect();
+        let dsts: Vec<String> = moves.iter().map(|(_, d)| d.clone()).collect();
+        super::guard::ensure(ctx, super::guard::Access::Modify, &srcs).await?;
+        super::guard::ensure(ctx, super::guard::Access::Create, &dsts).await?;
         let store = ctx.store.clone();
         let user_id = ctx.user_id;
         tokio::task::spawn_blocking(move || {
@@ -548,6 +556,11 @@ impl Tool for FsCopy {
 
     async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
         let copies = arg_pairs(&args, "copies")?;
+        // 复制 = 源头只读 + 目标落新
+        let srcs: Vec<String> = copies.iter().map(|(s, _)| s.clone()).collect();
+        let dsts: Vec<String> = copies.iter().map(|(_, d)| d.clone()).collect();
+        super::guard::ensure(ctx, super::guard::Access::Read, &srcs).await?;
+        super::guard::ensure(ctx, super::guard::Access::Create, &dsts).await?;
         let store = ctx.store.clone();
         let user_id = ctx.user_id;
         tokio::task::spawn_blocking(move || {
@@ -610,6 +623,7 @@ impl Tool for FsMkdir {
 
     async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
         let paths = arg_paths(&args, "paths")?;
+        super::guard::ensure(ctx, super::guard::Access::Create, &paths).await?;
         let store = ctx.store.clone();
         let user_id = ctx.user_id;
         tokio::task::spawn_blocking(move || {
@@ -665,6 +679,7 @@ impl Tool for FsTrash {
 
     async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
         let paths = arg_paths(&args, "paths")?;
+        super::guard::ensure(ctx, super::guard::Access::Delete, &paths).await?;
         let store = ctx.store.clone();
         let user_id = ctx.user_id;
         tokio::task::spawn_blocking(move || {
@@ -722,6 +737,13 @@ impl Tool for FsWriteText {
 
     async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
         let path = arg_path(&args, "path")?;
+        // 新文件 = 存入;覆盖已有 = 修改(档位要求更高,§7.2)
+        let access = if Path::new(&path).exists() {
+            super::guard::Access::Modify
+        } else {
+            super::guard::Access::Create
+        };
+        super::guard::ensure(ctx, access, std::slice::from_ref(&path)).await?;
         let content = args
             .get("content")
             .and_then(serde_json::Value::as_str)
@@ -776,6 +798,13 @@ impl Tool for FsAppend {
 
     async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
         let path = arg_path(&args, "path")?;
+        // 追加到已有文件 = 修改;文件不存在(顺手新建)= 存入
+        let access = if Path::new(&path).exists() {
+            super::guard::Access::Modify
+        } else {
+            super::guard::Access::Create
+        };
+        super::guard::ensure(ctx, access, std::slice::from_ref(&path)).await?;
         let text = args
             .get("text")
             .and_then(serde_json::Value::as_str)
@@ -832,6 +861,7 @@ impl Tool for FsEdit {
 
     async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
         let path = arg_path(&args, "path")?;
+        super::guard::ensure(ctx, super::guard::Access::Modify, std::slice::from_ref(&path)).await?;
         let find = arg_str(&args, "find")?;
         let replace = args.get("replace").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
         let store = ctx.store.clone();
@@ -881,12 +911,33 @@ impl Tool for FsUndo {
     async fn run(&self, _args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
         let store = ctx.store.clone();
         let user_id = ctx.user_id;
+        // 先读记录、过授权圈,再执行(记录里的路径当初操作时授过,但授权可能已被撤 → 同闸)
+        let row = tokio::task::spawn_blocking({
+            let store = store.clone();
+            move || store.fsops.latest(user_id, "applied")
+        })
+        .await
+        .context("撤销任务挂了")??;
+        let Some(row) = row else {
+            return Ok("最近没有可以撤销的文件操作".into());
+        };
+        let items: Vec<files::FsOpItem> =
+            serde_json::from_str(&row.ops).context("操作记录读不出来")?;
+        let touched: Vec<String> = items
+            .iter()
+            .flat_map(|it| match it {
+                files::FsOpItem::Move { src, dst } | files::FsOpItem::Copy { src, dst } => {
+                    vec![src.clone(), dst.clone()]
+                }
+                files::FsOpItem::Mkdir { path }
+                | files::FsOpItem::Trash { path }
+                | files::FsOpItem::Write { path, .. }
+                | files::FsOpItem::Append { path, .. }
+                | files::FsOpItem::Edit { path, .. } => vec![path.clone()],
+            })
+            .collect();
+        super::guard::ensure(ctx, super::guard::Access::Modify, &touched).await?;
         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-            let Some(row) = store.fsops.latest(user_id, "applied")? else {
-                return Ok("最近没有可以撤销的文件操作".into());
-            };
-            let items: Vec<files::FsOpItem> =
-                serde_json::from_str(&row.ops).context("操作记录读不出来")?;
             let r = files::undo_batch(&items);
             store.fsops.set_state(row.id, "undone")?;
             let mut msg = format!("撤销好了,还原了 {} 项", r.done);
@@ -928,7 +979,7 @@ mod tests {
         std::fs::write(dir.join(".hidden"), b"x").unwrap();
         let store = Store::open(&dir.join("t.db")).unwrap();
         let ctx =
-            ToolCtx { user_id: 1, conv_id: 1, media: MediaRuntime::detached(store.clone()), store, web: None, confirm: None };
+            ToolCtx { user_id: 1, conv_id: 1, media: MediaRuntime::detached(store.clone()), store, web: None, confirm: None, grants: Default::default() };
         (ctx, dir)
     }
 

@@ -1,116 +1,94 @@
-# Larkwing
+# Larkwing · 旺财
 
-> 面向普通人 / 家庭的桌面 AI 助手 —— Rust 核心 + Tauri 壳。
+> 面向普通人和家庭的桌面 AI 助手。开窗就能聊,说话就能唤,关了再开它还记得你。
 
-开窗就能看见它、打字就能聊、关了再开它还记得你。
-不同于开发者向、强调自由配置的同类,Larkwing **强默认、开箱即用、收口** —— 用户只面对一个助手,不碰 agent / 插件 / prompt / 配置。
+它默认叫 **BT**(你可以随时给它改名,喊它就用这个名字)。不同于开发者向、强调自由配置的同类,Larkwing **强默认、开箱即用**:你面对的只是一个助手,没有 agent、插件、prompt、模式这些概念——想让它干什么,说就行了。
 
-底座**人格中立**:引擎、回合循环、工具、记忆、I/O 都不内嵌具体人格;名字、性格、外观是可换的**场景数据 + 皮肤**(英文代号 Larkwing;默认观感科幻、默认称呼 7274,暖萌皮「旺财」等为后续可选)。
+目标平台 **Windows**(macOS 可开发运行)。安装包在 [Releases](../../releases) 下载,装好后填一个 DeepSeek API key(唯一必需的设置)就能用。
 
 ---
 
-## 技术栈
+## 它能干什么
+
+### 聊天,而且记得住
+
+- 流式对话,答得快;你说过的喜好、家里的事,它记在「小本本」上,跨会话、跨重启都在(回忆页可看可改可删)。
+- 聊偏了能回头:在你说的某句话上「从这里重新说」,或「从这里另起新会话」保留原对话换个方向。
+- 聊天记录全文搜索;长文有专门的大编辑框,粘贴大段文字自动折成小票不刷屏。
+
+### 说话就行
+
+- **免手唤醒**:喊它的名字就应(改名 = 换喊法),应一声就能连续对话,不用反复喊;说「没事了」就安静退下。
+- 听得准:中文识别可选「更准」档(小孩、口音友好);答话用自然人声,还能**克隆一把你喜欢的嗓子**。
+- **声纹认人**:录三句话,它就知道现在说话的是谁,记忆各归各人;拿不准时宁可不认,绝不错认。
+- 回声消除:它自己在放歌、说话时喊它,照样听得见你。
+
+### 看片、听歌
+
+- 「放个电影」「来点儿歌」:本地硬盘、NAS、B 站都能放;记住每部片看到哪,下次接着看。
+- 动画片自动连播下一集;歌单整夹连播,循环、随机、单曲循环嘴上说了算;双语片能切国语/原声音轨。
+- 本地放不了的格式(HEVC、mkv、AC3 音轨……)自动转,能用显卡加速;拖进度条音画不错位。
+
+### 下载
+
+- **网络歌曲存进电脑**:有无损拿无损(.flac),文件名和标签是干净的「歌手 - 歌名」,顺带配好歌词(.lrc);存量老歌也能批量补词,绝不动你的音频原件。
+- **磁力链 / 种子、FTP、迅雷专用链、需要账号的网盘直链(WebDAV)**都能下;大文件自动转后台——随口问「到哪了」、说「停下」就停,跑完自动回来汇报。
+- 下载默认进系统「下载」文件夹,下完的片和歌直接就能放。
+
+### 文件小助手
+
+- 「把下载文件夹的电影整理一下」「这堆歌按歌手归类」:批量移动、改名、建文件夹、删到回收站,**每一步可撤销**,同名永不覆盖。
+- 读得懂文档:PDF、Word、Excel、PPT 发给它就能总结、问答;PDF 能转成图片;图里的二维码能认。
+- **能碰的文件夹**:只有你允许过的文件夹它才能读写——下载和桌面出厂就能看能存(改/删要先问),别的地方首次要动会弹卡问你,「一直允许」记住、「仅这次」只放行这回。设置里随时看和管。
+
+### 提醒和惦记
+
+- 「明晚八点提醒我」「每周三提醒倒垃圾」,到点它开口;「提醒爸爸明天体检」——跨人提醒直接落到对方手机上。
+- 「明天要是下雨提醒我带伞」:盯着天气,条件满足才叫你。
+- 你忙别的时,它会在悬浮窗轻轻惦记一句没看完的剧、没办完的事;夜里不打扰。
+
+### 手机上也找得到它
+
+- **微信、Telegram、钉钉**都能连:发文字、图片、语音、文档给它,和在电脑前一样;家里人各自扫码,各聊各的。
+- 「把这个文件发我手机」「发给妈妈」——电脑和手机之间传文件,一句话的事。
+- 手机上让它干的活(下载、提醒),结果也推回手机。
+
+### 一家人用
+
+- 家人页加上家里人,微信/钉钉的对话指认给 TA、或靠声纹认出 TA——TA 说的「我喜欢」「提醒我」就记在 TA 名下。
+- 出厂性格中性,想要暖萌、贫嘴、高冷,设置里一句话改;界面有科幻、暖萌等多套皮肤,每人记住自己的。
+
+### 放心用
+
+- 网页上要花钱、要发布、要删东西的操作,先弹卡问你;文件夹要授权才能碰;每次确认都留痕(足迹页可查)。
+- 文件操作可撤销、删除走回收站;数据全在一个本地文件夹里,一键备份/恢复/搬家(换盘)。
+- 密码、API key 存系统密钥串,绝不经过对话、不进聊天记录。
+
+---
+
+## 技术一瞥
 
 | 层 | 选型 |
 | --- | --- |
-| 壳 | **Tauri v2**(Rust + WebView,小体积;不用 Electron) |
-| 核心 | **Rust**(`tokio` 异步,单 crate `larkwing-core`) |
-| 前端 | **Vue 3 + TypeScript**,MVVM(不用 vanilla JS) |
-| 存储 | **SQLite**(记忆 / 历史 / 用户) |
-| LLM | **DeepSeek 优先**(OpenAI 兼容,流式 SSE,自动前缀缓存);trait 化,多供应商 |
-| 语音 | **sherpa-onnx**(ASR / VAD / 唤醒 / 声纹)+ msedge-tts / 本地 VITS;cpal 采集 |
-| 影音 | **yt-dlp** 解析 + ffmpeg 混流 + localhost 中继(用时下载,不打包) |
+| 壳 | **Tauri v2**(Rust + WebView,不用 Electron) |
+| 核心 | **Rust**(`tokio`,单 crate `larkwing-core`) |
+| 前端 | **Vue 3 + TypeScript**(MVVM) |
+| 存储 | **SQLite** 单文件(备份 = 拷文件) |
+| LLM | **DeepSeek 优先**(流式、前缀缓存);多供应商 trait 化,Gemini / OpenAI / Anthropic / Ollama 均可接 |
+| 语音 | **sherpa-onnx**(识别 / 唤醒 / 声纹)+ msedge-tts / ZipVoice 克隆音色 |
+| 影音 | yt-dlp 解析 + ffmpeg 按需转码 + localhost 中继(组件用时下载,安装包不含) |
 
-> 目标平台 = **Windows**(家里那台机器);**Mac 上开发迭代,最终出 Windows 包**。离线非目标,不打包 Python。
-
----
-
-## 能力现状
-
-后端 MVP 与多个能力期已落地,核心 **133 测试全绿**:
-
-- **流式对话 + 持久记忆** —— LLM 流式输出 + SQLite 记忆,关了再开仍在
-- **Agent / 工具运行时** —— 通用回合循环 + `Tool` trait + 工具白名单 / few-shot + 双方言(OpenAI / Anthropic 风格)工具协议
-- **影音** —— 任务进度总线 / HUD + media 三工具(搜 / 放 / 控)+ 扫码登录取 cookie + 音频直转 / 视频混流
-- **任务需知** —— briefings 域 + 三工具(环境知识按需注入,与人格解耦)
-- **工具批次** —— jobs 域 + 调度器 + 自启回合 + web 二件套(搜索即抓取)
-- **语音 I/O** —— 按住说话 / 开口回应 / 免手唤醒 / 本地离线 TTS + mic watchdog
-
-**已备未启用**(core 完成、测试绿,暂未接 UI):多用户、声纹识别、家人 CRUD;本地文件 fs 原语。
-
----
-
-## 项目结构
-
-```
-larkwing/
-├─ src/                  前端(Vue 3 + TS;View + composables 作 ViewModel)
-│  ├─ views/             ChatView / MemoryView / SettingsView
-│  ├─ components/        形象 / HUD / 播放器 / 任务浮层 / 各皮肤背景…
-│  ├─ composables/       useChat / useVoice / useMedia / useTasks …(ViewModel)
-│  ├─ lib/               backend.ts(Tauri commands / events 封装)、fmt.ts
-│  └─ i18n.ts, locales/  前端文案字典(人格 / 皮肤文案只在前端)
-│
-├─ larkwing-core/src/    Rust 引擎(单 crate,tokio 异步)
-│  ├─ engine/            通用回合循环(turn)、上下文装配、用量统计
-│  ├─ llm/               LlmProvider:openai_compat / anthropic_compat / 目录 / SSE
-│  ├─ store/             SQLite:记忆 / 历史 / 设置 / 用量 / 任务 / 需知 / 用户 / 声纹
-│  ├─ tools/             Tool trait:now / remember / reminder / web / media* / fs / briefing
-│  ├─ voice/             ASR / VAD / 唤醒 / 声纹 / TTS
-│  ├─ media/             影音:bilibili 源 / 解析 / cookie / 中继
-│  ├─ scenes.rs          场景 = 数据(人格 + 开场白 + 工具白名单 + few-shot)
-│  ├─ scheduler.rs       工具批次调度器        tasks.rs   任务 / job 域
-│  ├─ bus.rs             事件总线(进度 / HUD)  components.rs  用时下载的外部组件
-│
-├─ src-tauri/            Tauri v2 壳(commands.rs 暴露给前端、lib.rs、main.rs)
-└─ scripts/              资产生成脚本(如形象帧)
-```
-
----
+设计上的三条硬原则:**人格中立底座**(名字、性格、皮肤全是数据,换一套数据 = 另一个助手,引擎零改动)、**通用回合循环**(没有意图分类器、没有 per-task 流程,工具是正交原语、路由靠模型)、**core 不产用户文案**(文案全在前端字典,i18n 中英同步)。
 
 ## 开发
 
-### 前置
-
-- **Rust**(stable,≥ 1.77.2)
-- **Node.js** + **pnpm**
-- **Tauri v2 系统依赖**:macOS 装 Xcode Command Line Tools;Linux 见 [`.github/workflows/release.yml`](.github/workflows/release.yml) 里的 apt 清单;Windows 本地编译见 [docs/BUILD-WINDOWS.md](docs/BUILD-WINDOWS.md)(VS Build Tools + WebView2 等,附 winget 一键)
-
-### 跑起来
-
 ```bash
-pnpm install          # 装前端依赖
-
-pnpm tauri dev        # 启动桌面 App(Rust + WebView,首次会编译 Rust,稍久)
-pnpm dev              # 仅前端(Vite @ :1420,纯视觉迭代用,浏览器里看)
-
-cargo test            # Rust 核心测试(workspace 全量)
+pnpm install
+pnpm tauri dev        # 桌面 App(首次编译 Rust 稍久)
+pnpm dev              # 仅前端(Vite @ :1420,纯视觉迭代)
+cargo test            # Rust 核心测试
 ```
 
-### 出包
-
-```bash
-pnpm tauri build      # 在当前平台出当前平台的包(产物在 target/release/bundle/)
-```
-
-> ⚠️ **不能跨平台出包**:Mac 上编不出 Windows 包(Tauri 不支持跨平台打包,且语音栈 sherpa-onnx 的预编译库按平台分发)。出 Windows 包走以下任一:
-> - **(a) GitHub Actions** —— [`.github/workflows/release.yml`](.github/workflows/release.yml),Actions 页面手动 Run 或打 `v*` tag,一次出 Windows/macOS/Linux 三平台。
-> - **(b) 一台 Windows 机器** —— 按 [docs/BUILD-WINDOWS.md](docs/BUILD-WINDOWS.md) 装好后 `pnpm tauri build`。
-
-> **首次运行会按需下载外部组件**(yt-dlp / ffmpeg / 语音模型)到数据目录 —— 安装包里不含它们,性质同浏览器下载文件。
-
----
-
-## 配置
-
-- **LLM key**:唯一不可免的首次设置。首次在设置里友好地填一次 DeepSeek API key,或读环境变量。
-- key / 接入点支持 `${ENV}` 引用(明文或环境变量随用户,取值时解析、存储留原文)。
-- "用脑策略"三档(省着用 / 均衡 / 聪明优先)对应内部路由,用户不见模型细节。
-
----
-
-## 设计原则
-
-- **人格中立底座** —— 引擎 / 回合循环 / 工具 / 事件 / UI 基建一律人格中立;人格只从**场景数据**与**皮肤层**进入。换一套场景数据 + 皮肤 = 另一个助手,底座零改动。
-- **通用回合循环** —— 没有意图分类器、没有 per-task workflow;任务路由 = 模型本身,工具按能力轴做正交原语。加能力 = 加一个工具文件或一份场景数据,循环不改。
-- **场景 / 人格 / 皮肤 = 数据**,不是代码插件;core 只给文案 key,渲染在前端字典。
+- 前置:Rust(≥ 1.77.2)、Node + pnpm、Tauri v2 系统依赖(Windows 见 [docs/BUILD-WINDOWS.md](docs/BUILD-WINDOWS.md))。
+- 出包:`pnpm tauri build`(不能跨平台;Windows 包走 GitHub Actions [`release.yml`](.github/workflows/release.yml) 或在 Windows 机上编)。
+- 代码地图:前端 `src/`(views / components / composables)、引擎 `larkwing-core/src/`(engine / llm / store / tools / voice / media / channels)、壳 `src-tauri/`。开发规范见 [AGENT.md](AGENT.md)。

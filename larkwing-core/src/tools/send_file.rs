@@ -96,6 +96,10 @@ impl Tool for SendFile {
         for p in &paths {
             anyhow::ensure!(p.is_absolute(), "需要绝对路径,收到: {}", p.display());
         }
+        // 发出去 = 读文件(§7.2 授权圈)
+        let path_strs: Vec<String> =
+            paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        super::guard::ensure(ctx, super::guard::Access::Read, &path_strs).await?;
         let note = args
             .get("note")
             .and_then(serde_json::Value::as_str)
@@ -202,6 +206,7 @@ mod tests {
             store,
             web: None,
             confirm: None,
+            grants: Default::default(),
         }
     }
 

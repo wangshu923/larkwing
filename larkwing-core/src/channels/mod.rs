@@ -126,8 +126,13 @@ pub(crate) const CONFIRM_PROMPT_SITE: &str = "要在 {host} {action},回「确�
 pub(crate) const CONFIRM_PROMPT_BARE: &str = "要{action},回「确认」就继续;回别的或不理,这步就不做。";
 
 /// 确认卡的动作短语(kind + 目标原文 → 人话;桌面卡走前端字典组同款,这里是渠道静态话术半边)。
+/// `fs_*` = 文件授权圈(§7.2):action 是目录列表;渠道回「允许/确认」恒按仅这次放行。
 fn confirm_action_phrase(kind: &str, action: &str) -> String {
     match (kind, action.is_empty()) {
+        ("fs_read", _) => format!("查看文件夹 {action}"),
+        ("fs_create", _) => format!("在 {action} 里存文件"),
+        ("fs_modify", _) => format!("修改 {action} 里的文件"),
+        ("fs_delete", _) => format!("删除 {action} 里的文件"),
         ("submit", true) => "提交这个表单".to_string(),
         ("submit", false) => format!("提交『{action}』"),
         ("press", _) => format!("按 {action} 键"),
@@ -202,14 +207,15 @@ impl ChannelCtx {
         let id = *self.confirm_waits.lock().expect("confirm_waits poisoned").get(&key)?;
         self.confirm_waits.lock().expect("confirm_waits poisoned").remove(&key);
         if crate::confirm::channel_reply_allows(text) {
-            if self.engine.confirmer().resolve(id, true, "channel") {
+            // 渠道回话恒按「仅这次」:永久授权是改机器配置,只留给有 UI 的地方(§7.2)
+            if self.engine.confirmer().resolve(id, crate::confirm::ConfirmReply::AllowOnce, "channel") {
                 Some(CONFIRM_ACK)
             } else {
                 Some(CONFIRM_EXPIRED) // 已超时/别处先答:这句只是「确认」,不值得进回合
             }
         } else {
             // 其他任何回复 = 拒;resolve 失败(已收尾)也无妨——消息照常进回合
-            let _ = self.engine.confirmer().resolve(id, false, "channel");
+            let _ = self.engine.confirmer().resolve(id, crate::confirm::ConfirmReply::Deny, "channel");
             None
         }
     }
@@ -344,7 +350,7 @@ async fn handle_confirm_card(ctx: &Arc<ChannelCtx>, net: &net::Client, card: cra
         .flatten();
     let Some(thread) = thread else {
         tracing::warn!(conv = conv_id, "确认请求反查不到渠道映射,按送达失败收");
-        let _ = ctx.engine.confirmer().resolve(card.id, false, "unreachable");
+        let _ = ctx.engine.confirmer().resolve(card.id, crate::confirm::ConfirmReply::Deny, "unreachable");
         return;
     };
     let phrase = confirm_action_phrase(&card.kind, &card.action);
@@ -358,7 +364,7 @@ async fn handle_confirm_card(ctx: &Arc<ChannelCtx>, net: &net::Client, card: cra
     if let Err(e) = push_text_to_thread(ctx, net, &thread, &prompt).await {
         tracing::warn!(err = %format!("{e:#}"), conv = conv_id, "确认请求推不到手机,按送达失败收");
         ctx.confirm_wait_clear(card.id);
-        let _ = ctx.engine.confirmer().resolve(card.id, false, "unreachable");
+        let _ = ctx.engine.confirmer().resolve(card.id, crate::confirm::ConfirmReply::Deny, "unreachable");
     }
 }
 
@@ -692,7 +698,8 @@ mod tests {
         assert_eq!(ctx.confirm_reply("weixin", "u1", "确认"), Some(CONFIRM_ACK));
         assert_eq!(
             task.await.unwrap(),
-            crate::confirm::ConfirmDecision::Allowed { via: "channel".into() }
+            // 渠道回话恒「仅这次」(always 恒 false)
+            crate::confirm::ConfirmDecision::Allowed { via: "channel".into(), always: false }
         );
         // 挂一个已经收尾的 id(超时/桌面先点):回「确认」如实说过期,不进回合
         ctx.confirm_wait_set("weixin", "u1", id);

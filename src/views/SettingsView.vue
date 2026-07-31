@@ -3,7 +3,7 @@
 // 暗 tab 可点、进 teaser 页 —— 能点的必有反应(铁律3),绝不放灰掉的死控件。
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { api, appVersion, emitWakeChanged, isTauri, openExternal, setFloatVisible, type ChannelChat, type FamilyMember, type ModelMeta, type ModelOverride, type ModelTier, type ProviderView, type RemoteChannelView, type VoiceStatus } from '../lib/backend'
+import { api, appVersion, emitWakeChanged, isTauri, openExternal, setFloatVisible, type ChannelChat, type FamilyMember, type ModelMeta, type ModelOverride, type ModelTier, type ProviderView, type RemoteChannelView, type ScopeEntry, type ScopeMode, type VoiceStatus } from '../lib/backend'
 import { applyLocale } from '../i18n'
 import { useChat } from '../composables/useChat'
 import { hydrateUser, useSettings } from '../composables/useSettings'
@@ -58,6 +58,7 @@ watch(tab, (v) => {
   if (v === 'system') {
     void loadAutostart()
     void loadDataLocation()
+    void loadScopes()
     void loadCreds()
     if (!appVer.value) void appVersion().then((x) => (appVer.value = x))
   }
@@ -648,6 +649,84 @@ async function keepOld() {
     console.error(e)
   } finally {
     oldDataRoot.value = null
+  }
+}
+
+// —— 文件授权圈(§7.2「能碰的文件夹」):模型只能读写这里允许的文件夹,圈外先问。 ——
+// 内置区:程序数据(恒可用,说明行)+ 下载/桌面(出厂「可存入」,升「完全访问」= 落一条
+// 表记录、降回 = 删记录);用户条目三档可调、可删。添加复用 pick_data_folder 原生选择器。
+const scopes = ref<ScopeEntry[]>([])
+const scopeDownloads = ref<string | null>(null)
+const scopeDesktop = ref<string | null>(null)
+async function loadScopes() {
+  if (!isTauri()) {
+    // 浏览器预览:假数据看交互
+    scopeDownloads.value = '/Users/demo/Downloads'
+    scopeDesktop.value = '/Users/demo/Desktop'
+    scopes.value = [{ path: '/Volumes/nas/电影', mode: 'full' }]
+    return
+  }
+  try {
+    const v = await api.fsScopes()
+    scopes.value = v.entries
+    scopeDownloads.value = v.downloads
+    scopeDesktop.value = v.desktop
+  } catch (e) {
+    console.error('读取文件授权失败', e)
+  }
+}
+/** 内置基线行(下载/桌面)当前档:表里有升档记录显其档,否则出厂「可存入」。 */
+function baselineMode(path: string | null): ScopeMode {
+  if (!path) return 'create'
+  return scopes.value.find((e) => e.path === path)?.mode ?? 'create'
+}
+/** 用户条目 = 表里剔除「内置基线的升档记录」(那俩显示在固定行的档位上,不重复列)。 */
+const userScopes = computed(() =>
+  scopes.value.filter((e) => e.path !== scopeDownloads.value && e.path !== scopeDesktop.value),
+)
+const scopeModeOpts = computed(() => [
+  { value: 'read', label: t('settings.scopes.modeRead') },
+  { value: 'create', label: t('settings.scopes.modeCreate') },
+  { value: 'full', label: t('settings.scopes.modeFull') },
+])
+/** 内置行不给「只读」——最低就是出厂基线「可存入」。 */
+const baselineModeOpts = computed(() => [
+  { value: 'create', label: t('settings.scopes.modeCreate') },
+  { value: 'full', label: t('settings.scopes.modeFull') },
+])
+async function setScopeMode(path: string, mode: string) {
+  if (!isTauri()) return
+  try {
+    scopes.value = await api.fsScopeSet(path, mode as ScopeMode)
+  } catch (e) {
+    console.error('改文件授权失败', e)
+    useToast().error(t('toast.actionFailed'))
+  }
+}
+async function setBaselineMode(path: string | null, mode: string) {
+  if (!path) return
+  // 降回「可存入」= 删升档记录(回落出厂基线);升档 = 普通入表
+  if (mode === 'create') await removeScopeRow(path)
+  else await setScopeMode(path, mode)
+}
+async function removeScopeRow(path: string) {
+  if (!isTauri()) return
+  try {
+    scopes.value = await api.fsScopeRemove(path)
+  } catch (e) {
+    console.error('删文件授权失败', e)
+    useToast().error(t('toast.actionFailed'))
+  }
+}
+async function addScopeFolder() {
+  if (!isTauri()) return
+  try {
+    const picked = await api.pickDataFolder()
+    if (!picked) return
+    scopes.value = await api.fsScopeSet(picked, 'read') // 新加默认只读,列表里再升档
+  } catch (e) {
+    console.error('添加文件授权失败', e)
+    useToast().error(t('toast.actionFailed'))
   }
 }
 
@@ -1994,6 +2073,56 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         </div>
         <p class="hint">{{ t('settings.system.careHint', { name: petName }) }}</p>
 
+        <p class="section">{{ t('settings.scopes.title') }}</p>
+        <p class="hint">{{ t('settings.scopes.hint', { name: petName }) }}</p>
+        <!-- 内置区:程序数据(说明行)+ 下载/桌面(出厂「可存入」,可升「完全访问」) -->
+        <div class="row">
+          <span class="label">{{ t('settings.scopes.dataDir') }}</span>
+          <span class="key-state scope-note">{{ t('settings.scopes.dataDirNote') }}</span>
+        </div>
+        <div v-if="scopeDownloads" class="row">
+          <span class="label" :title="scopeDownloads">{{ t('settings.scopes.downloads') }}</span>
+          <span class="key-state">
+            <SkinSelect
+              :model-value="baselineMode(scopeDownloads)"
+              :options="baselineModeOpts"
+              :aria-label="t('settings.scopes.title')"
+              @update:model-value="(v: string) => setBaselineMode(scopeDownloads, v)"
+            />
+          </span>
+        </div>
+        <div v-if="scopeDesktop" class="row">
+          <span class="label" :title="scopeDesktop">{{ t('settings.scopes.desktop') }}</span>
+          <span class="key-state">
+            <SkinSelect
+              :model-value="baselineMode(scopeDesktop)"
+              :options="baselineModeOpts"
+              :aria-label="t('settings.scopes.title')"
+              @update:model-value="(v: string) => setBaselineMode(scopeDesktop, v)"
+            />
+          </span>
+        </div>
+        <!-- 用户授权的文件夹:三档可调、可移除 -->
+        <div v-for="e in userScopes" :key="e.path" class="row">
+          <span class="label scope-path" :title="e.path">{{ e.path }}</span>
+          <span class="key-state">
+            <SkinSelect
+              :model-value="e.mode"
+              :options="scopeModeOpts"
+              :aria-label="t('settings.scopes.title')"
+              @update:model-value="(v: string) => setScopeMode(e.path, v)"
+            />
+            <button class="link" @click="removeScopeRow(e.path)">{{ t('settings.scopes.remove') }}</button>
+          </span>
+        </div>
+        <div class="row">
+          <span class="label"></span>
+          <span class="key-state">
+            <button class="link" @click="addScopeFolder">{{ t('settings.scopes.add') }}</button>
+          </span>
+        </div>
+        <p class="hint">{{ t('settings.scopes.askHint', { name: petName }) }}</p>
+
         <p class="section">{{ t('settings.system.storage') }}</p>
         <div class="row">
           <span class="label">{{ t('settings.system.dataLocation') }}</span>
@@ -2209,6 +2338,9 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .chip.preset.on { border-color: rgba(var(--accent-rgb), 0.55); color: var(--accent); background: rgba(var(--accent-rgb), 0.1); }
 .chip.preset.mini { padding: 2px 8px; font-size: 11px; border-radius: 7px; }
 .hint { font-size: 12px; color: var(--text-dim); line-height: 1.7; display: flex; align-items: center; gap: 10px; padding-top: 13px; }
+/* 授权圈(§7.2):路径行等宽 + 截断;数据目录说明行弱化 */
+.scope-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, "SF Mono", monospace; font-size: 12px; }
+.scope-note { font-size: 12px; color: var(--text-dim); }
 .hint.err { color: var(--danger); }
 .hint.warn { color: var(--warn); }
 .hint.ok { color: var(--ok); }

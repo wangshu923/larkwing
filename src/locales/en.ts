@@ -106,6 +106,11 @@ export default {
     floatBar: 'A step needs your OK',
     atHost: 'On {host}',
     allow: 'Go ahead',
+    // Folder-access cards (§7.2): Always = remember this folder, Once = this turn only
+    allowAlways: 'Always allow',
+    allowOnce: 'Just this once',
+    allowAlwaysShort: 'Always',
+    allowOnceShort: 'Once',
     deny: 'Not now',
     done: {
       allowed: 'Went ahead',
@@ -117,6 +122,10 @@ export default {
       submit: 'Submit “{text}”',
       submitBare: 'Submit this form',
       press: 'Press {text}',
+      fsRead: 'Look inside {text}',
+      fsCreate: 'Save files into {text}',
+      fsModify: 'Change files in {text}',
+      fsDelete: 'Delete files in {text}',
     },
     speak: 'It wants to {action} — is that OK?',
   },
@@ -198,6 +207,7 @@ export default {
     confirm: {
       title: 'Confirmed actions · {n}',
       allowed: 'Went ahead',
+      allowedAlways: 'Allowed — won’t ask again',
       denied: 'Skipped',
       via: {
         desktop: 'confirmed on desktop',
@@ -764,6 +774,21 @@ export default {
         linkPre: 'Can\'t scan?',
         linkText: 'Open link',
       },
+    },
+    // Folder access (§7.2): the model can only read/write folders allowed here; anything else asks first
+    scopes: {
+      title: 'Folders it can touch',
+      hint: '{name} can only look through and organize the folders allowed below; touching anywhere else will ask you first.',
+      dataDir: 'App data',
+      dataDirNote: 'Its own data — always available',
+      downloads: 'Downloads folder',
+      desktop: 'Desktop',
+      modeRead: 'Read only',
+      modeCreate: 'Can save into',
+      modeFull: 'Full access',
+      add: 'Add a folder…',
+      remove: 'Remove',
+      askHint: '“Read only” = can look; “Can save into” = can look and save new files; “Full access” = can also change and delete. Folders you approve with “Always allow” in chat show up here too.',
     },
     system: {
       desktop: 'Startup & desktop',
