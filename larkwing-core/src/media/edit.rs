@@ -27,6 +27,9 @@ const IN_TURN_WAIT: Duration = Duration::from_secs(30);
 /// 报错尾巴留存(行数/字符):stderr 可能很长,喂回模型自纠只要末尾这点(量约束 §7.2)。
 const STDERR_TAIL_LINES: usize = 40;
 const STDERR_TAIL_CHARS: usize = 2000;
+/// 探测形(只探不产)的超时与输出上限:横幅通常 1–3KB,截断保**头部**(信息在前)。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+const PROBE_OUT_MAX: usize = 4000;
 
 /// 工具层校验/过闸后的一次加工请求。
 pub struct EditRequest {
@@ -236,6 +239,42 @@ impl MediaRuntime {
     }
 }
 
+impl MediaRuntime {
+    /// 探测形(工具层 `output` 缺省时走这):照人在终端里的习惯跑 `ffmpeg -i …` 只看不产,
+    /// **原样返回 ffmpeg 的信息输出**(stderr 横幅:时长/编码/音轨/标签)——模型本来就读得懂,
+    /// 不做解析层。`-i` 无输出必然非零退出,不看退出码(probe_with_ffmpeg 同款);没有输出
+    /// 落盘动作(孤裸值/旁路 flag 已在工具层拒掉),天然只读且秒回,不进后台机器。
+    pub async fn ffmpeg_probe(&self, args: Vec<String>) -> anyhow::Result<String> {
+        let ffmpeg = self.ensure_component(Component::Ffmpeg).await?;
+        let mut cmd = tokio::process::Command::new(&ffmpeg);
+        cmd.args(["-hide_banner", "-nostdin"]);
+        cmd.args(&args);
+        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+        cmd.kill_on_drop(true);
+        super::no_console(&mut cmd);
+        let out = tokio::time::timeout(PROBE_TIMEOUT, cmd.output())
+            .await
+            .map_err(|_| anyhow::anyhow!("ffmpeg 探测超时"))?
+            .context("ffmpeg 起不来")?;
+        let text = String::from_utf8_lossy(&out.stderr);
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok("(ffmpeg 没有输出任何信息)".into());
+        }
+        Ok(cap_head(text, PROBE_OUT_MAX))
+    }
+}
+
+/// 截断保头部(探测横幅信息在前,与报错尾巴的 tail 方向相反),超长如实说明(§3.5)。
+fn cap_head(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    let head: String = chars[..max].iter().collect();
+    format!("{head}\n…(输出太长,后面截了)")
+}
+
 /// 半路死(回合取消 / 看门狗 abort / panic)时收走临时件;成功改名后解除。
 struct TempGuard(Option<PathBuf>);
 
@@ -372,6 +411,16 @@ mod tests {
         // -vcodec 形也认
         let vcodec: Vec<String> = ["-vcodec", "h264"].iter().map(|s| s.to_string()).collect();
         assert!(substitute_h264(&vcodec, enc).iter().any(|t| t == enc[1]));
+    }
+
+    #[test]
+    fn probe_output_caps_head_not_tail() {
+        assert_eq!(cap_head("短的", 100), "短的");
+        let long: String = "横幅在前".chars().cycle().take(200).collect();
+        let capped = cap_head(&long, 50);
+        assert!(capped.starts_with("横幅在前"), "保头部: {capped}");
+        assert!(capped.ends_with("…(输出太长,后面截了)"), "如实说明: {capped}");
+        assert_eq!(capped.chars().take_while(|c| *c != '\n').count(), 50);
     }
 
     #[test]

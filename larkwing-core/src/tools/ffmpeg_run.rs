@@ -31,11 +31,14 @@ impl FfmpegRun {
                               决定)和 dir(缺省 = 第一个输入旁边)指定,程序落盘:绝不覆盖\
                               已有文件(重名自动加序号),也绝不改动输入原件。要重编码视频\
                               就写 -c:v h264,程序会换成这台机器最快的编码器(有显卡走显卡);\
-                              想精确控画质才写具体编码器名(那样不替换)。只吃本机文件:\
-                              网址、-y、-f concat/lavfi 都不收;多段拼接 = 多个 -i 加 \
-                              filter_complex 的 concat。快活当场返回;超过半分钟自动转后台\
-                              (任务条可见、可叫停,跑完自动回来汇报)。长片重编码前先剪\
-                              十几秒试参数。失败会带 ffmpeg 报错回来,照着改参数重试。",
+                              想精确控画质才写具体编码器名(那样不替换)。**不给 output = \
+                              只探不产**:像终端里 `-i 文件` 一样返回 ffmpeg 的信息输出\
+                              (时长/编码/音轨),要按「距结尾 N 秒」剪就先这么探出总时长、\
+                              自己算成绝对时间点再剪。只吃本机文件:网址、-y、-f concat/\
+                              lavfi 都不收;多段拼接 = 多个 -i 加 filter_complex 的 concat。\
+                              快活当场返回;超过半分钟自动转后台(任务条可见、可叫停,跑完\
+                              自动回来汇报)。长片重编码前先剪十几秒试参数。失败会带 ffmpeg \
+                              报错回来,照着改参数重试。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -46,14 +49,14 @@ impl FfmpegRun {
                         },
                         "output": {
                             "type": "string",
-                            "description": "输出文件名,带扩展名(输出格式由它决定);只是名字,不带目录"
+                            "description": "输出文件名,带扩展名(输出格式由它决定);只是名字,不带目录。不给 = 只探不产,返回媒体信息"
                         },
                         "dir": {
                             "type": "string",
                             "description": "输出目录绝对路径(可选;缺省放在第一个输入文件旁边)"
                         }
                     },
-                    "required": ["args", "output"]
+                    "required": ["args"]
                 }),
                 // 回合内窗 30s + 首次 ffmpeg 组件下载的余量(lyrics_fetch 同口径)
                 timeout: std::time::Duration::from_secs(180),
@@ -95,8 +98,24 @@ impl Tool for FfmpegRun {
             .get("output")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("缺少 output 参数(输出文件名,带扩展名)"))?;
+            .filter(|s| !s.is_empty());
+        // 探测形:不给 output = 只探不产(终端习惯的 `ffmpeg -i 文件`)。输入照过 read 闸;
+        // 没有输出落盘动作(孤裸值/旁路写文件 flag 已拒),天然只读、秒回。
+        let Some(output) = output else {
+            // (map_or 不用 is_none_or:MSRV 1.77.2,§7.8 自审教训)
+            anyhow::ensure!(
+                args.get("dir")
+                    .and_then(serde_json::Value::as_str)
+                    .map_or(true, |s| s.trim().is_empty()),
+                "给了 dir 没给 output——要产文件就给 output;只探测就都别给"
+            );
+            let mut reads: Vec<String> =
+                scan.inputs.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+            reads.extend(scan.filter_reads.iter().cloned());
+            super::guard::ensure(ctx, super::guard::Access::Read, &reads).await?;
+            let info = ctx.media.ffmpeg_probe(scan.args).await?;
+            return Ok(format!("ffmpeg 媒体信息(只探测,没产文件):\n{info}"));
+        };
         anyhow::ensure!(
             !output.contains('/') && !output.contains('\\'),
             "output 只要文件名;目录用 dir 参数"
