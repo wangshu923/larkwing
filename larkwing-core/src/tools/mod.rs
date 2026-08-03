@@ -7,6 +7,7 @@ mod bgtask;
 mod briefing;
 mod desktop;
 mod end_conversation;
+mod ffmpeg_run;
 mod fs;
 pub mod guard;
 mod lyrics_fetch;
@@ -270,6 +271,7 @@ impl Tools {
         tools.register(Arc::new(media_download::MediaDownload::new()));
         tools.register(Arc::new(lyrics_fetch::LyricsFetch::new()));
         tools.register(Arc::new(torrent_download::TorrentDownload::new()));
+        tools.register(Arc::new(ffmpeg_run::FfmpegRun::new()));
         tools.register(Arc::new(bgtask::TaskStatus::new()));
         tools.register(Arc::new(bgtask::TaskCancel::new()));
         tools.register(Arc::new(desktop::Open::new()));

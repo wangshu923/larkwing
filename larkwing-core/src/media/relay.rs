@@ -45,33 +45,35 @@ pub enum VideoEncoder {
 /// 能解;`-pix_fmt yuv420p` 强制 8bit(10bit HEVC 一并压回,浏览器只认 8bit)。
 /// **Software 分支保持与旧代码逐字节一致**(veryfast+crf23+yuv420p),不碰已验证的软件路。
 fn apply_video_encode(cmd: &mut tokio::process::Command, enc: VideoEncoder) {
+    cmd.args(video_encode_args(enc));
+}
+
+/// 每档编码器的完整参数序列(含收尾的 `-pix_fmt yuv420p`)。apply_video_encode(播放转码链)
+/// 与 ffmpeg_run 的「`-c:v h264` 占位替换」(media/edit.rs)共用这一份 —— 改质量旋钮只改
+/// 这里(§4.8 单源);序列顺序与历史逐字节一致,老单测钉着。`[1]` 恒为编码器名(报告用)。
+pub fn video_encode_args(enc: VideoEncoder) -> &'static [&'static str] {
     match enc {
         VideoEncoder::Software => {
-            cmd.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]);
+            &["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p"]
         }
         // p5 = 速度/画质折中(p1 最快~p7 最慢);vbr+cq 恒定质量(-b:v 0 让 cq 纯控质量不设码率)。
-        VideoEncoder::Nvenc => {
-            cmd.args([
-                "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", "23",
-                "-b:v", "0", "-profile:v", "high",
-            ]);
-        }
-        VideoEncoder::Qsv => {
-            cmd.args([
-                "-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "23",
-                "-profile:v", "high",
-            ]);
-        }
-        VideoEncoder::Amf => {
-            cmd.args([
-                "-c:v", "h264_amf", "-rc", "cqp", "-qp_i", "23", "-qp_p", "23", "-profile:v", "high",
-            ]);
-        }
-        VideoEncoder::VideoToolbox => {
-            cmd.args(["-c:v", "h264_videotoolbox", "-q:v", "60", "-profile:v", "high"]);
-        }
+        VideoEncoder::Nvenc => &[
+            "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", "23",
+            "-b:v", "0", "-profile:v", "high", "-pix_fmt", "yuv420p",
+        ],
+        VideoEncoder::Qsv => &[
+            "-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "23",
+            "-profile:v", "high", "-pix_fmt", "yuv420p",
+        ],
+        VideoEncoder::Amf => &[
+            "-c:v", "h264_amf", "-rc", "cqp", "-qp_i", "23", "-qp_p", "23", "-profile:v", "high",
+            "-pix_fmt", "yuv420p",
+        ],
+        VideoEncoder::VideoToolbox => &[
+            "-c:v", "h264_videotoolbox", "-q:v", "60", "-profile:v", "high",
+            "-pix_fmt", "yuv420p",
+        ],
     }
-    cmd.args(["-pix_fmt", "yuv420p"]);
 }
 
 /// 试编码一帧探这台机器能不能真用某编码器:编译进 ≠ 能用(如 h264_nvenc 编进了但没 N 卡 →

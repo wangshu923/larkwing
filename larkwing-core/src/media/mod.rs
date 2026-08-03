@@ -6,6 +6,7 @@
 mod bilibili;
 pub mod cookies;
 mod download;
+mod edit;
 mod lyrics;
 mod probe;
 mod relay;
@@ -14,6 +15,7 @@ mod torrent;
 
 pub use cookies::CookieRec;
 pub use download::{DownloadOutcome, DownloadedAudio, TrackMeta};
+pub use edit::{EditOutcome, EditRequest};
 pub use torrent::{
     TorrentLink, TorrentOutcome, DEFAULT_ONLY_RE, MAX_CONCURRENT as TORRENT_MAX_CONCURRENT,
 };
@@ -37,7 +39,7 @@ use crate::tasks::Tasks;
 
 /// Windows 下给子进程加 CREATE_NO_WINDOW:主进程是 GUI 子系统(windows_subsystem="windows"),
 /// 但它 spawn 的控制台程序(yt-dlp / ffmpeg)默认仍会弹一个黑框 —— 这里抑制掉。其它平台空操作。
-/// 出站只有 resolver(yt-dlp)和 relay(ffmpeg)两处 spawn,都必须走这里。
+/// 凡 media 里 spawn 子进程(resolver 的 yt-dlp、relay/edit/探测的 ffmpeg)都必须走这里。
 fn no_console(cmd: &mut tokio::process::Command) {
     #[cfg(windows)]
     {
