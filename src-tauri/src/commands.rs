@@ -336,6 +336,28 @@ pub fn delete_briefing(state: State<'_, AppState>, id: i64) -> Result<(), AppErr
     state.engine.delete_briefing(id)
 }
 
+/// 技能页:全部技能(内置 + 用户教的)+ 触发统计。技能是 agent 的、恒全局,无用户参数。
+#[tauri::command]
+pub fn list_skills(
+    state: State<'_, AppState>,
+) -> Result<Vec<larkwing_core::store::SkillWithStats>, AppError> {
+    state.engine.list_skills()
+}
+
+#[tauri::command]
+pub fn set_skill_enabled(
+    state: State<'_, AppState>,
+    id: i64,
+    enabled: bool,
+) -> Result<(), AppError> {
+    state.engine.set_skill_enabled(id, enabled)
+}
+
+#[tauri::command]
+pub fn delete_skill(state: State<'_, AppState>, id: i64) -> Result<(), AppError> {
+    state.engine.delete_skill(id)
+}
+
 /// 回忆页「没办完的事」分组:开着的待办。user_id 省略 = 当前主人;传家人 id = 主人查看 TA 的。
 #[tauri::command]
 pub fn list_todos(

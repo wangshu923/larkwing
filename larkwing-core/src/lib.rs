@@ -19,6 +19,7 @@ pub mod net;
 pub mod scenes;
 pub mod secrets;
 pub mod scheduler;
+pub mod skills_builtin;
 pub mod store;
 pub mod tasks;
 pub mod tools;

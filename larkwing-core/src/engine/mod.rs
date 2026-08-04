@@ -625,6 +625,11 @@ impl Engine {
         for scene in scenes.all() {
             scene.validate(&tools).expect("内置场景未通过工具校验");
         }
+        // 出厂技能刷进库(内容以出厂为准、enabled 保留用户状态;§7 技能)。
+        // 数据坏在 builtin_skills() 里 panic(编译者错误);写库失败只 warn 不挡开机。
+        if let Err(e) = store.skills.sync_builtins(&crate::skills_builtin::builtin_skills()) {
+            tracing::warn!(err = %e, "出厂技能同步失败(技能索引可能不全)");
+        }
         // 代理总开关落全局(启动即生效;之后 set_setting 改了会刷新)。net 模块不碰
         // store/llm,故解析(读设置 + ${ENV} + env 回落)的合流放在 engine——唯一合流点。
         crate::net::set_proxy(Self::resolve_proxy(&store));
@@ -1765,6 +1770,28 @@ impl Engine {
         Ok(())
     }
 
+    /// 技能页:全部技能(内置 + 用户教的)+ 触发统计三数字(总/近7天/最近)+ 附录节名。
+    /// 技能是 agent 的、恒全局 —— 不分用户,无视角参数。
+    pub fn list_skills(&self) -> Result<Vec<crate::store::SkillWithStats>, AppError> {
+        Ok(self.store.skills.list_with_stats()?)
+    }
+
+    /// 技能页开关:停用即从索引消失(下一回合生效),内置技能的「不想用」走这里。
+    pub fn set_skill_enabled(&self, id: i64, enabled: bool) -> Result<(), AppError> {
+        if !self.store.skills.set_enabled(id, enabled)? {
+            return Err(AppError { kind: ErrorKind::NotFound, message: format!("技能 {id} 不存在") });
+        }
+        Ok(())
+    }
+
+    /// 技能页删除(仅用户教的;内置拒 —— repo 层报错,前端对内置也不出删钮)。
+    pub fn delete_skill(&self, id: i64) -> Result<(), AppError> {
+        if !self.store.skills.delete_by_id(id)? {
+            return Err(AppError { kind: ErrorKind::NotFound, message: format!("技能 {id} 不存在") });
+        }
+        Ok(())
+    }
+
     /// 提醒页 = 主人的管理面:**全家**待触发提醒(按 due_at 升序;真相在库、回合无状态)。
     /// 家人经渠道归人设的提醒也在列,`owner` 标注是谁的(自己的 = None,前端不显标签)——
     /// 2026-07-03 真机困惑实锤:家人对话里设的提醒在提醒页「消失」,其实是按当前用户过滤掉了。
@@ -2507,6 +2534,7 @@ impl Engine {
                 let event_msg = store.chat.append_message(conv_id, "event", &content)?;
                 // 只取常驻·画像层(§13.3 ②);任务回合与聊天回合共用同款前缀
                 let memories = store.memory.list_resident(user_id)?;
+                let skills = store.skills.list_enabled_index()?;
                 let briefings: Vec<crate::store::Briefing> = store
                     .briefings
                     .list_for(user_id)?
@@ -2532,6 +2560,7 @@ impl Engine {
                     pet_name.as_deref(),
                     Some(&style),
                     care_enabled,
+                    &skills,
                     &memories,
                     &briefings,
                     &care_todos,
@@ -2638,6 +2667,8 @@ fn assemble_request(
         "turn ctx → {}",
         memories.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join(" | ")
     );
+    // 技能索引(L1):agent 的、恒全局;启用条目恒常驻无折叠,正文归 skill_lookup 按需取
+    let skills = store.skills.list_enabled_index()?;
     // 任务需知:只有常驻条目进前缀(预算在写入时执法,这里无条件全装);
     // 非常驻的归 briefing_lookup 工具按需取
     let briefings: Vec<crate::store::Briefing> =
@@ -2673,6 +2704,7 @@ fn assemble_request(
         pet_name.as_deref(),
         Some(&style),
         care_enabled,
+        &skills,
         &memories,
         &briefings,
         &care_todos,

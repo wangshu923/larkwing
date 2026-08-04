@@ -16,6 +16,7 @@ import { renderMarkdown } from '../lib/md'
 import { copyText } from '../lib/clipboard'
 import MemoryView from '../views/MemoryView.vue'
 import OpsView from '../views/OpsView.vue'
+import SkillsView from '../views/SkillsView.vue'
 import RemindersView from '../views/RemindersView.vue'
 import SettingsView from '../views/SettingsView.vue'
 import PlayerBar from './PlayerBar.vue'
@@ -32,7 +33,7 @@ const panelOpen = ref(true)
 const shape = computed(() => (settings.get('ui.bubble_shape') === 'cut' ? 'cut' : 'round'))
 const petName = computed(() => settings.get('ui.pet_name') || t('pet.name'))
 const textScale = computed(() => (settings.get('ui.text_scale') === 'large' ? '16.5px' : '14px'))
-const activeRail = ref<'chat' | 'reminders' | 'memory' | 'ops' | 'settings'>('chat')
+const activeRail = ref<'chat' | 'reminders' | 'memory' | 'skills' | 'ops' | 'settings'>('chat')
 
 const { state: chat, send: chatSend, cancel, selectConversation, newConversation, ensureVoiceConv, overheardTargetConv, saveApiKey, dequeue, inject, renameConversation, togglePinConversation, deleteConversation, rollbackTo, forkFrom, voiceConfirmTarget: chatVoiceConfirmTarget } = useChat()
 const messages = computed(() => chat.messages)
@@ -720,6 +721,11 @@ watch(messages, () => nextTick(() => {
           <svg viewBox="0 0 24 24"><path d="M7 4h10v16l-5-3-5 3z" /></svg>
           <span>{{ t('nav.memory') }}</span>
         </button>
+        <button class="rb" :class="{ on: activeRail === 'skills' }" @click="activeRail = 'skills'" :title="t('nav.skills')">
+          <!-- 技能:五角星(会的本事) -->
+          <svg viewBox="0 0 24 24"><path d="M12 3.5l2.4 5 5.4 0.7-4 3.8 1 5.4-4.8-2.6-4.8 2.6 1-5.4-4-3.8 5.4-0.7z" /></svg>
+          <span>{{ t('nav.skills') }}</span>
+        </button>
         <button class="rb" :class="{ on: activeRail === 'ops' }" @click="activeRail = 'ops'" :title="t('nav.ops')">
           <!-- 足迹:两只脚印(斜向walk),不再用钟表——免与上面「提醒」的闹钟撞图 -->
           <svg viewBox="0 0 24 24"><g transform="translate(8 13.5) rotate(-16)"><ellipse cx="0" cy="-1.9" rx="2.1" ry="2.6" /><ellipse cx="-0.1" cy="2.5" rx="1.2" ry="1.5" /></g><g transform="translate(15.6 9) rotate(-16)"><ellipse cx="0" cy="-1.9" rx="2.1" ry="2.6" /><ellipse cx="-0.1" cy="2.5" rx="1.2" ry="1.5" /></g></svg>
@@ -735,7 +741,7 @@ watch(messages, () => nextTick(() => {
     </nav>
 
     <!-- 中:最近(可关;设置/回忆/记录/提醒页打开时整列让位) -->
-    <aside class="recents" v-show="panelOpen && activeRail !== 'settings' && activeRail !== 'memory' && activeRail !== 'ops' && activeRail !== 'reminders'">
+    <aside class="recents" v-show="panelOpen && activeRail !== 'settings' && activeRail !== 'memory' && activeRail !== 'skills' && activeRail !== 'ops' && activeRail !== 'reminders'">
       <header class="rc-head">
         <span>{{ t('recents.title') }}</span>
         <button class="collapse" @click="panelOpen = false" :title="t('recents.collapse')">‹</button>
@@ -830,13 +836,14 @@ watch(messages, () => nextTick(() => {
     <!-- 设置台/回忆页:rail 目的地,整区接管(聊天 v-show 保活,状态无损) -->
     <SettingsView v-if="activeRail === 'settings'" @close="activeRail = 'chat'" />
     <MemoryView v-if="activeRail === 'memory'" @close="activeRail = 'chat'" />
+    <SkillsView v-if="activeRail === 'skills'" @close="activeRail = 'chat'" />
     <OpsView v-if="activeRail === 'ops'" @close="activeRail = 'chat'" />
     <RemindersView v-if="activeRail === 'reminders'" @close="activeRail = 'chat'" />
 
     <!-- 右:对话主体 -->
     <main
       class="chat"
-      v-show="activeRail !== 'settings' && activeRail !== 'memory' && activeRail !== 'ops' && activeRail !== 'reminders'"
+      v-show="activeRail !== 'settings' && activeRail !== 'memory' && activeRail !== 'skills' && activeRail !== 'ops' && activeRail !== 'reminders'"
       @dragenter.prevent="onDragEnter"
       @dragover.prevent
       @dragleave="onDragLeave"

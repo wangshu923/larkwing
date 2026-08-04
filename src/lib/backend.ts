@@ -109,6 +109,24 @@ export interface Briefing {
   updated_at: number
 }
 
+/** 一条技能(技能页):agent 的工作手册,恒全局。source 'builtin'(内置,可关不可删)|
+ *  'user'(用户教的);统计三数字由触发流水现算(触发 = 模型 skill_lookup 命中一次)。 */
+export interface SkillItem {
+  id: number
+  slug: string | null
+  name: string
+  when_to_use: string
+  content: string
+  enabled: boolean
+  source: string
+  created_at: number
+  updated_at: number
+  total_hits: number
+  recent_hits: number
+  last_hit_at: number | null
+  sections: string[]
+}
+
 /** 一批文件操作(操作记录页,PLAN §9 文件能力)。功能性历史,非安全承诺。
  *  kind: move|copy|mkdir|trash|write|append|edit;state: 'applied'(已生效)|'undone'(已撤销,可重做);
  *  ops = FsOpItem[] 的 JSON 串(前端不解析,只用 kind/n 展示)。 */
@@ -1138,6 +1156,10 @@ export const api = {
   /** 家里的事(家庭备忘)。userId 省略 = 当前主人;传家人 id = TA 视角(home 共享那份都在)。 */
   listBriefings: (userId?: number) => invoke<Briefing[]>('list_briefings', { userId }),
   deleteBriefing: (id: number) => invoke<void>('delete_briefing', { id }),
+  /** 技能页:全部技能(内置 + 用户教的)+ 触发统计;恒全局,无用户参数。 */
+  listSkills: () => invoke<SkillItem[]>('list_skills'),
+  setSkillEnabled: (id: number, enabled: boolean) => invoke<void>('set_skill_enabled', { id, enabled }),
+  deleteSkill: (id: number) => invoke<void>('delete_skill', { id }),
   /** 没办完的事(切片2 小账)。userId 语义同 listMemories(主人管理面)。 */
   listTodos: (userId?: number) => invoke<Todo[]>('list_todos', { userId }),
   /** 勾掉一件待办(办完 / 不用了):了结不删行,之后不再进前缀。 */

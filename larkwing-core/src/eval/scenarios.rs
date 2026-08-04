@@ -140,6 +140,29 @@ pub fn suite() -> Vec<Scenario> {
                             .unwrap_or(false)
                 })
             })),
+        // 教技能:用户明确说「记住这个流程」→ skill_write(§7 技能,三本账第三路)。
+        Scenario::turn("skill-teach")
+            .note("用户明说记住一套做法 → skill_write 存技能(§技能:明说才记)")
+            .say("以后我说「收拾下载」,你就把下载文件夹里的视频挪到影片文件夹、安装包删掉,记住这个流程")
+            .check(tool_called("skill_write")),
+        // 教技能·反例:随手办完一件事,用户没说要记 → 不许自作主张存技能
+        // (LAWS「只有用户明说才记」;乱沉淀是 Devin/Manus 都拿批准闸防的头号坑)。
+        Scenario::turn("skill-no-teach")
+            .note("没明说记住就不许 skill_write(§技能:别把随手做完的事记成技能)")
+            .say("帮我看看今天天气怎么样")
+            .check(tool_not_called("skill_write")),
+        // 技能触发遵循度:索引里有对得上的手册 → 干活前先 skill_lookup 取(undertrigger 回归守卫)。
+        Scenario::turn("skill-trigger")
+            .note("手头的活对上技能索引 → 先 skill_lookup 再动手(§技能法条遵循度)")
+            .seed(|s, _u| {
+                let _ = s.skills.upsert_user(
+                    "洗照片",
+                    "用户要把照片整理成相册、按时间归类照片时",
+                    "1. 先列出照片文件;2. 按月份建文件夹;3. 挪进去后汇报数量。",
+                );
+            })
+            .say("帮我把这批照片整理成相册吧")
+            .check(tool_called("skill_lookup")),
         // 旧事重提该用 recall 去取,而不是装不记得 / 瞎答(§13.7)。
         Scenario::turn("recall-triggers")
             .note("旧事重提、信息在按需层(episodic 非常驻)→ 该调 recall(§13.7)")

@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::llm::{ChatMessage, ChatRequest, ToolDef};
 use crate::scenes::Scene;
-use crate::store::{Briefing, Memory, Message, Todo};
+use crate::store::{Briefing, Memory, Message, SkillIndex, Todo};
 
 use super::{AssistantPayload, ToolRowPayload, UserMeta};
 
@@ -29,17 +29,21 @@ pub(super) const DEFAULT_NAME: &str = "BT";
 /// 与性格无关,住这里不住场景数据;第二个场景出现时自动继承。
 /// 点名的工具全部是常驻基础工具(tools::BASE_TOOLS),每场景必在。静态 → 字节稳定吃缓存。
 pub(super) const LAWS: &str = "\
-## 怎么记事(两本账)
-用户告诉你的事,分三种处理:
-- 关于「人」的长期事实(名字、家人、喜好、忌口、纪念日)→ 用 remember 记小本本。
+## 怎么记事(三本账)
+用户告诉你的事,分四种处理:
+- 关于「人」的长期事实(名字、家人、喜好、忌口、纪念日)→ 用 remember 记小本本;一句话的做事偏好(比如整理音乐按歌手分)也归这里。
 - 关于「这个家的环境」(资源放在哪、目录路径、设备、家里的惯例)→ 用 briefing_write 记家庭备忘;同一主题(domain)整存整取、再写会整体覆盖。所以不管是更正(换了/搬了/不对)还是补充新信息,都要把该主题已有的内容连同新内容一起写全,绝不只写新增那点、把旧的覆盖没了;只有旧信息确实过期作废,才用新内容整段替掉。拿不准旧内容是什么,先 briefing_lookup 查一遍再写。
+- 用户**明确教你一套多步骤的做法**并表示以后都这么办(「以后就这么办」「记住这个流程」)→ 用 skill_write 存成技能手册,记完把名称和做法要点复述一遍让用户确认。只有用户明说才记,别把随手做完的事自作主张记成技能。
 - 情绪、闲聊、一次性安排 → 不记。拿不准就先不记:记错了用户能删,乱记很烦人。
+
+## 技能(工作手册)
+系统提示里「技能(索引)」一节列着你会的活儿:每行是一份工作手册的名称和适用时机。**手头的事对得上哪条,就先用 skill_lookup 取那份手册,照着里面的做法干,再开始动手**——手册是验证过的路,比现想的稳。但手册是参考不是死命令:现场情况和用户这句话的要求优先。手册正文末尾列了附录的,需要那部分细节再带 section 取。
 
 ## 用你知道的,别反问
 下方「你记得关于用户的这些事」和「任务需知」里写着的,就是你已经知道的,直接用,别去反问你手上已经有的信息。像是以前聊到过、但「你记得的事」里没写的(某个习惯、说过的偏好、家人或宠物),先用 recall 查一遍;像是家里登记过、但「任务需知」里没写的(资源/目录/设备),先用 briefing_lookup 查一遍;都查不到再说不知道。
 
 ## 说人话
-工具安静地用,结果自然织进话里,不念原始数据。记完用一句话确认你理解的内容,让用户有机会当场纠正。永远不向用户提「工具」「调用」「数据库」「需知」这些词;「小本本」可以说——那是用户看得见的本子。
+工具安静地用,结果自然织进话里,不念原始数据。记完用一句话确认你理解的内容,让用户有机会当场纠正。永远不向用户提「工具」「调用」「数据库」「需知」这些词;「小本本」「技能」可以说——那是用户看得见的本子和页面。
 
 ## 说话守则
 用户消息开头带〔语音〕= 这一轮你是在跟人**说话**,不是写字:短句口语,先说结论,一句话说得清就别铺垫;不用表格、列表、代码块、链接、emoji 和任何 Markdown 记号;少用没信息量的语气词,也别自己脑补内容简介(剧情、背景这些没人问就别加);数字和时间说人话(「三点一刻」而不是「15:15」);内容多就挑两三个要点说,再问要不要继续。没有〔语音〕= 正常排版,该用列表用列表,该带点 emoji 也行。〔语音〕是系统加的输入形态标记,不是用户打的字,绝不复述它。
@@ -231,11 +235,13 @@ const CARE_FOLLOWUP: &str = "\n\n## 主动关心(自然、克制)\n\
 /// 起步值,真用可调(§13.7)。
 pub(super) const TODO_PREFIX_LIMIT: usize = 5;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_context(
     scene: &Scene,
     user_name: Option<&str>,
     user_style: Option<&str>,
     care_enabled: bool,
+    skills: &[SkillIndex],
     memories: &[Memory],
     briefings: &[Briefing],
     todos: &[Todo],
@@ -255,6 +261,16 @@ pub(super) fn build_context(
     system.push_str(&scene.persona.replace("{name}", name));
     system.push_str("\n\n");
     system.push_str(LAWS);
+    // 技能(索引):agent 的工作手册,恒全局(与用户无关)—— L1 层 = 名称 + 何时用,
+    // 正文由 skill_lookup 按需取(L2/L3)。启用条目恒常驻、**无折叠**(用户拍板「路径不产生
+    // 折叠」,量由写入 backstop 管);紧跟 LAWS = 全局静态区,所有用户共享同一字节;
+    // id 稳定序由 repo 保证 → 前缀字节稳定。
+    if !skills.is_empty() {
+        system.push_str("\n\n## 技能(索引)\n");
+        for s in skills {
+            system.push_str(&format!("- {}:{}\n", s.name, s.when_to_use));
+        }
+    }
     // 主动关怀·对话跟进(切片2):受 care.enabled 收口的克制倾向;关掉即整段不进前缀(前缀随设置变)。
     if care_enabled {
         system.push_str(CARE_FOLLOWUP);
@@ -438,6 +454,7 @@ mod tests {
             name,
             style,
             false, // care 跟进倾向:结构测试默认不带(on/off 由 care_followup_gated_by_flag 专项覆盖)
+            &[], // skills 索引:结构测试默认不带(专项测试覆盖)
             mems,
             briefs,
             &[], // todos:结构测试默认不带(open_todos 段由专项测试覆盖)
@@ -476,12 +493,45 @@ mod tests {
     }
 
     #[test]
+    fn skills_index_joins_system_after_laws() {
+        let scenes = Scenes::builtin();
+        let scene = scenes.default_scene();
+        let skills = vec![
+            SkillIndex { name: "放歌放视频".into(), when_to_use: "点播影音时".into() },
+            SkillIndex { name: "整理文件".into(), when_to_use: "归类文件夹时".into() },
+        ];
+        let req = build_context(
+            scene, None, None, false, &skills, &[], &[], &[], &[], 0, MAX_TAIL_BUDGET_CHARS,
+            &[], &HashMap::new(),
+        );
+        // 索引节:L1 = 名称 + 何时用,一条一行;顺序 = 传入序(repo 的 id 稳定序)
+        let idx = req.system.find("## 技能(索引)").expect("技能索引必须进 system");
+        let a = req.system.find("- 放歌放视频:点播影音时").unwrap();
+        let b = req.system.find("- 整理文件:归类文件夹时").unwrap();
+        assert!(idx < a && a < b, "索引行按传入序");
+        // 位置:紧跟 LAWS(全局静态区)—— 在法条之后、性格/记忆/需知之前
+        let laws_at = req.system.find("## 怎么记事").unwrap();
+        assert!(laws_at < idx, "索引在法条之后");
+        // LAWS「技能」节点名 lookup;三本账点名 skill_write
+        assert!(req.system.contains("skill_lookup"), "法条点名 skill_lookup");
+        assert!(req.system.contains("skill_write"), "三本账点名 skill_write");
+        // 空技能 = 无该节,且构造字节级稳定(golden)
+        let none = bc(scene, None, None, &[], &[], &[], &[]);
+        assert!(!none.system.contains("## 技能(索引)"));
+        let again = build_context(
+            scene, None, None, false, &skills, &[], &[], &[], &[], 0, MAX_TAIL_BUDGET_CHARS,
+            &[], &HashMap::new(),
+        );
+        assert_eq!(req.system, again.system, "同索引再构造字节级一致");
+    }
+
+    #[test]
     fn care_followup_gated_by_flag() {
         let scenes = Scenes::builtin();
         let scene = scenes.default_scene();
         // care 开 → 克制跟进倾向进前缀
         let on = build_context(
-            scene, None, None, true, &[], &[], &[], &[], 0, MAX_TAIL_BUDGET_CHARS, &[],
+            scene, None, None, true, &[], &[], &[], &[], &[], 0, MAX_TAIL_BUDGET_CHARS, &[],
             &HashMap::new(),
         );
         assert!(on.system.contains("## 主动关心"), "care 开 → 跟进倾向进前缀");
@@ -497,13 +547,13 @@ mod tests {
         let todos = vec![Todo { id: 1, content: "给妈妈买生日礼物".into(), created_at: 0 }];
         // care 开 + 有待办 → 段进前缀、内容在
         let on = build_context(
-            scene, None, None, true, &[], &[], &todos, &[], 0, MAX_TAIL_BUDGET_CHARS, &[],
+            scene, None, None, true, &[], &[], &[], &todos, &[], 0, MAX_TAIL_BUDGET_CHARS, &[],
             &HashMap::new(),
         );
         assert!(on.system.contains("还惦记着") && on.system.contains("给妈妈买生日礼物"));
         // care 关 → 不进(哪怕有待办)
         let off = build_context(
-            scene, None, None, false, &[], &[], &todos, &[], 0, MAX_TAIL_BUDGET_CHARS, &[],
+            scene, None, None, false, &[], &[], &[], &todos, &[], 0, MAX_TAIL_BUDGET_CHARS, &[],
             &HashMap::new(),
         );
         assert!(!off.system.contains("还惦记着"));
@@ -795,6 +845,7 @@ mod tests {
             None,
             None,
             false,
+            &[],
             &[],
             &[],
             &[],

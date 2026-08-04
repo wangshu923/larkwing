@@ -23,6 +23,7 @@ mod recall;
 mod remember;
 mod reminder;
 mod send_file;
+mod skill;
 mod todo;
 mod torrent_download;
 mod watch;
@@ -42,13 +43,16 @@ use crate::store::Store;
 /// 常驻基础工具(PLAN §9):信息纪律件套 + 会话收尾原语,**每个场景自动在场**,白名单无需
 /// 声明 —— 运行时法条(engine/context::LAWS)点名了它们,法条全场景生效,工具就得全场景在。
 /// end_conversation = 免唤醒连续对话的显式关闭信号(LAWS「聊完了就收尾」点名),同 remember 一族
-/// 全场景可用。
+/// 全场景可用。skill 三件 = 技能(工作手册)取/教/删(LAWS「技能」节点名),同族全场景在。
 pub const BASE_TOOLS: &[&str] = &[
     "remember",
     "recall",
     "briefing_write",
     "briefing_lookup",
     "briefing_remove",
+    "skill_lookup",
+    "skill_write",
+    "skill_remove",
     "end_conversation",
 ];
 
@@ -265,6 +269,9 @@ impl Tools {
         tools.register(Arc::new(briefing::BriefingWrite::new()));
         tools.register(Arc::new(briefing::BriefingLookup::new()));
         tools.register(Arc::new(briefing::BriefingRemove::new()));
+        tools.register(Arc::new(skill::SkillLookup::new()));
+        tools.register(Arc::new(skill::SkillWrite::new()));
+        tools.register(Arc::new(skill::SkillRemove::new()));
         tools.register(Arc::new(media_search::MediaSearch::new()));
         tools.register(Arc::new(media_play::MediaPlay::new()));
         tools.register(Arc::new(media_control::MediaControl::new()));
@@ -436,6 +443,9 @@ mod tests {
                 "briefing_write",
                 "briefing_lookup",
                 "briefing_remove",
+                "skill_lookup",
+                "skill_write",
+                "skill_remove",
                 "end_conversation",
                 "now"
             ],

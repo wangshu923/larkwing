@@ -14,6 +14,7 @@ pub mod jobs;
 pub mod media_progress;
 pub mod memory;
 pub mod settings;
+pub mod skills;
 pub mod todos;
 pub mod usage;
 pub mod users;
@@ -38,6 +39,7 @@ pub use jobs::{Job, JobRepo};
 pub use media_progress::{MediaProgressRepo, Progress};
 pub use memory::{MaintenanceLog, Memory, MemoryRepo};
 pub use settings::SettingsRepo;
+pub use skills::{Skill, SkillIndex, SkillRepo, SkillWithStats};
 pub use todos::{Todo, TodoRepo};
 pub use usage::{UsageRepo, UsageRound, UsageTotals};
 pub use users::{User, UserRepo};
@@ -61,6 +63,7 @@ pub struct Store {
     pub todos: TodoRepo,
     pub diary: DiaryRepo,
     pub confirms: ConfirmRepo,
+    pub skills: SkillRepo,
 }
 
 /// 全部域迁移(Store::open 执行;恢复备份预检拿它判「备份是否来自更新版本」)。
@@ -81,6 +84,7 @@ fn all_migrations() -> Vec<db::Migration> {
         todos::MIGRATIONS,
         diary::MIGRATIONS,
         confirms::MIGRATIONS,
+        skills::MIGRATIONS,
     ]
     .concat()
 }
@@ -110,7 +114,8 @@ impl Store {
             media_progress: MediaProgressRepo::new(db.clone()),
             todos: TodoRepo::new(db.clone()),
             diary: DiaryRepo::new(db.clone()),
-            confirms: ConfirmRepo::new(db),
+            confirms: ConfirmRepo::new(db.clone()),
+            skills: SkillRepo::new(db),
         })
     }
 }
