@@ -62,10 +62,95 @@ pub struct AudioTrack {
     /// 元数据标题(mkv 常见「国语 DD5.1」这类;BMFF 少见)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// 声道数(P3 判定用)。`None` = 拿不准 → 调用方一律按「转码」处理(宁可多转不可无声)。
+    /// **多声道是硬墙**:多声道 AAC 布局不明确会被 MSE 拒 append(0.2.6 实锤,整个 init 进不去),
+    /// 所以只有单/双声道才谈得上原样 copy。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channels: Option<u8>,
 }
 
-/// 本地 MP4 探测结论。解析不出(非 MP4 / 畸形 / 读不到)→ 全 `false` + 无时长,上层据此
-/// 退回原生直传(保当前行为,绝不因探测失败挡住播放)。
+/// 一条字幕轨(P4)。过桥进 `NowPlaying.subtitles`,UI 出选择钮、〔此刻〕喂模型。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SubtitleTrack {
+    /// `-map 0:s:{n}` 的 n(**按字幕轨自己数,不是流号**)。
+    pub index: usize,
+    /// 编码名(subrip/ass/mov_text/hdmv_pgs_subtitle…)。
+    pub codec: String,
+    /// ISO-639-2 三字语言码;core 不翻译(§6.6),前端字典映射成「中文/英语」。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
+    /// **文本轨才转得成 WebVTT**;图形轨(PGS/VobSub 是位图)转不了 —— 如实标出来,
+    /// 让 UI/模型说「这条是图片格式的字幕,显示不了」,而不是挂上去一片空白(§3.5)。
+    pub text: bool,
+}
+
+/// 外挂字幕文件的扩展名(**只收文本格式**;`.sup`/`.idx`/`.sub` 是图形字幕,转不了就不收 ——
+/// 收进来只会让用户开了一片空白)。
+const SIDECAR_SUB_EXTS: &[&str] = &["srt", "ass", "ssa", "vtt"];
+
+/// 扫同目录的外挂字幕:`片子.mkv` → `片子.srt` / `片子.chi.srt` / `片子.eng.ass`。
+/// 返回 `(路径, 语言码)`;语言 = 文件名里紧挨扩展名的那节三字母(认不出 = `None`,不猜)。
+/// 目录读不了(权限/网络盘抖动)= 空表,绝不因此挡住播放。
+pub fn sidecar_subtitles(video: &Path) -> Vec<(std::path::PathBuf, Option<String>)> {
+    let (Some(dir), Some(stem)) = (video.parent(), video.file_stem().map(|s| s.to_string_lossy()))
+    else {
+        return Vec::new();
+    };
+    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut out = Vec::new();
+    for ent in rd.flatten() {
+        let p = ent.path();
+        let Some(ext) = p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()) else {
+            continue;
+        };
+        if !SIDECAR_SUB_EXTS.contains(&ext.as_str()) {
+            continue;
+        }
+        let Some(name_stem) = p.file_stem().map(|s| s.to_string_lossy().to_string()) else {
+            continue;
+        };
+        // `片子` 本身,或 `片子.chi` 这种带语言后缀的
+        let lang = if name_stem == *stem {
+            None
+        } else if let Some(suffix) = name_stem.strip_prefix(&format!("{stem}.")) {
+            // 只认三字母小写(ISO-639-2);别的后缀(`片子.导演评论`)当没标语言但仍收
+            let s = suffix.to_ascii_lowercase();
+            (s.len() == 3 && s.chars().all(|c| c.is_ascii_lowercase())).then_some(s)
+        } else {
+            continue; // 片名对不上,不是这部片的字幕
+        };
+        out.push((p, lang));
+    }
+    out.sort();
+    out
+}
+
+/// 文本字幕编码名(能转 WebVTT 的)。认不出的一律当**图形轨**处理 —— 这里保守的方向与别处相反:
+/// 挂一条转不出东西的字幕 = 用户以为开了却什么都没有,比明说「这条显示不了」糟。
+const TEXT_SUBTITLE_CODECS: &[&str] =
+    &["subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text", "microdvd", "subviewer"];
+
+/// ffmpeg 那行里的声道布局词 → 声道数。认不出 → `None`(**不猜**)。
+/// 形如 `stereo` / `mono` / `5.1(side)` / `7.1` / `quad`。
+fn channels_from_layout(word: &str) -> Option<u8> {
+    let w = word.trim();
+    let w = w.split('(').next().unwrap_or(w).trim(); // "5.1(side)" → "5.1"
+    match w {
+        "mono" => Some(1),
+        "stereo" | "downmix" => Some(2),
+        "quad" => Some(4),
+        _ => {
+            // "5.1" / "7.1" / "2.1" / "5.0" 这类:主声道 + 低频
+            let (main, lfe) = w.split_once('.')?;
+            let m: u8 = main.parse().ok()?;
+            let l: u8 = lfe.parse().ok()?;
+            m.checked_add(l)
+        }
+    }
+}
+
+/// 本地 MP4 探测结论(**探出来才有**;解析不出 → `probe_local` 回 `None`,见那里的注释:
+/// 「探不出」绝不能再被当成「全兼容」)。单个字段解析不出仍按兼容/无降级,不挡播放。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LocalProbe {
     /// 音轨是 AC3/DTS 等 WebView2 解不了的编码 → 需转码 AAC。
@@ -82,6 +167,8 @@ pub struct LocalProbe {
     pub video_codec: Option<String>,
     /// 全部音轨(文件顺序 = `-map 0:a:{n}` 的 n)。空 = 解析不出/无音轨(选轨功能不出现)。
     pub audio_tracks: Vec<AudioTrack>,
+    /// 全部字幕轨(P4;顺序 = `-map 0:s:{n}` 的 n)。空 = 没有/解析不出。
+    pub subtitles: Vec<SubtitleTrack>,
     /// 容器全局标签「歌名 / 歌手」(`ffmpeg -i` 首个 Stream 行之前的全局 Metadata 块;
     /// FLAC/m4a/mp3 通吃,键大小写不限)。给本地音频配歌词用;None = 文件没标 →
     /// 让模型从文件名判断后带参重试。只在 `ffmpeg -i` 路径有值(BMFF 轻量探测不解析 ilst)。
@@ -130,6 +217,103 @@ pub fn needs_ffmpeg_container(path: &Path) -> bool {
     )
 }
 
+/// 嗅探用的文件头长度:MPEG-TS 要看第 3 个包的同步字节(188×2 = 376),512 够且只读一次。
+const SNIFF_LEN: usize = 512;
+
+/// 文件头认出来的**真实容器**(只看内容、不看扩展名)。
+///
+/// **为什么必须按内容分流**(2026-08-07 真机实锤):下载来的片子常顶着 `.mp4` 的名字、里面
+/// 其实是 **MPEG-TS**(h264 + aac,编码浏览器完全吃得下,卡的是容器)。按扩展名分流时它进
+/// BMFF 那条快车道 → `read_moov` 读不出 → 老代码把「解析不出」降级成「全兼容」→ 原样直传
+/// 给 `<video>` → Mac / Windows 一起黑屏 0:00(而 VLC 这类播放器一律嗅文件头,所以「播放器
+/// 都没问题」)。扩展名只配用来**列目录挑同类文件**(`is_video_ext`),不配决定怎么播。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Container {
+    /// ISO BMFF(mp4/m4v/mov/m4a):可读 moov → 走免 ffmpeg 的轻量探测快车道。
+    Bmff,
+    /// 认出来的、浏览器 `<video>` **放不了**的容器(带名字,给日志用):mpegts / matroska /
+    /// avi / flv / asf / rm / mpeg-ps。必经 ffmpeg 转封装 —— 哪怕里面的编码浏览器吃得下。
+    Foreign(&'static str),
+    /// WebM / Ogg 等浏览器原生容器,**以及认不出的** —— 沿用 §7.1「认不出的默认当兼容」:
+    /// 直传交给浏览器,不平白拖 ffmpeg 进来(误判只是多转一次码,漏判才是黑屏)。
+    Native,
+}
+
+/// 读文件头认容器。读不到(权限/空文件)→ `Native`(维持原行为,绝不因嗅探失败挡住播放)。
+pub fn sniff_container(path: &Path) -> Container {
+    let mut head = [0u8; SNIFF_LEN];
+    let n = File::open(path).and_then(|mut f| read_head(&mut f, &mut head)).unwrap_or(0);
+    sniff_head(&head[..n])
+}
+
+/// 一口气尽量读满(单次 `read` 可能短读)。
+fn read_head(f: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut got = 0;
+    while got < buf.len() {
+        match f.read(&mut buf[got..])? {
+            0 => break,
+            n => got += n,
+        }
+    }
+    Ok(got)
+}
+
+/// 认容器的纯函数(只看头几百字节,可测)。顺序要紧:先认结构最明确的。
+fn sniff_head(head: &[u8]) -> Container {
+    // ISO BMFF:首盒类型在 [4..8]。绝大多数是 `ftyp`;老 QuickTime 也可能直接以
+    // moov/mdat/wide/free/skip 开头,分片流用 styp。
+    if matches!(
+        head.get(4..8),
+        Some(b"ftyp" | b"moov" | b"mdat" | b"free" | b"skip" | b"wide" | b"styp" | b"pnot")
+    ) {
+        return Container::Bmff;
+    }
+    // EBML 家族:魔数一样,靠 DocType 分家 —— "webm" 浏览器原生,"matroska" 要转封装。
+    // 精确解 DocType 元素(ID 0x4282 + 一字节长度 + 字符串),不做全文搜 "webm":
+    // mkv 头里的写入器名字("Lavf…libwebm" 之类)会把子串匹配骗过去 → 误当原生直传。
+    if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        let doctype = find_subslice(head, &[0x42, 0x82]).and_then(|i| {
+            let len = (*head.get(i + 2)? & 0x7F) as usize; // 短 VINT:最高位是长度标记
+            head.get(i + 3..i + 3 + len)
+        });
+        return match doctype {
+            Some(b"webm") => Container::Native,
+            _ => Container::Foreign("matroska"),
+        };
+    }
+    // MPEG-TS:188 字节定长包,每包首字节 0x47。连查三个包位才算数(单字节 0x47 太容易撞)。
+    // BDAV/M2TS 每包前多 4 字节时间戳头 → 包长 192,同样查三个包位。
+    let sync_at = |o: usize| head.get(o) == Some(&0x47);
+    if sync_at(0) && sync_at(188) && sync_at(376) {
+        return Container::Foreign("mpegts");
+    }
+    if sync_at(4) && sync_at(196) && sync_at(388) {
+        return Container::Foreign("mpegts");
+    }
+    if head.starts_with(b"RIFF") {
+        // RIFF 是个壳:AVI 要转封装,WAVE 浏览器自己能放。
+        return match head.get(8..12) {
+            Some(b"AVI ") => Container::Foreign("avi"),
+            _ => Container::Native,
+        };
+    }
+    if head.starts_with(b"FLV\x01") {
+        return Container::Foreign("flv");
+    }
+    // ASF/WMV 的固定 GUID 头
+    if head.starts_with(&[0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11]) {
+        return Container::Foreign("asf");
+    }
+    if head.starts_with(b".RMF") {
+        return Container::Foreign("rm");
+    }
+    // MPEG program stream(vob/mpg):pack header 起始码
+    if head.starts_with(&[0x00, 0x00, 0x01, 0xBA]) {
+        return Container::Foreign("mpeg-ps");
+    }
+    Container::Native
+}
+
 /// 解析 `ffmpeg -i <file>` 打到 stderr 的探测信息(纯函数、可测):取首条视频/音频流的编码名
 /// 判兼容 + 总时长。`ffmpeg -i` 无输出会以非零码退出(“At least one output file…”),但流信息照样
 /// 打在 stderr → 调用方不看退出码、只喂 stderr 进来。任何字段解析不出都按"兼容/无"降级,绝不挡播放。
@@ -174,6 +358,26 @@ fn parse_ffmpeg_stderr_with(stderr: &str, mac_native: bool) -> LocalProbe {
                 p.video_incompatible = true;
             }
         }
+        // "Stream #0:2(chi): Subtitle: subrip" —— 语言码取法与音轨同一套
+        if let Some(rest) = line.split("Subtitle: ").nth(1) {
+            let codec = rest.split([' ', ',', '(']).next().unwrap_or("").trim();
+            let lang = line
+                .split(": Subtitle:")
+                .next()
+                .and_then(|head| head.rsplit_once('(').map(|(_, r)| r))
+                .and_then(|r| r.split(')').next())
+                .map(str::trim)
+                .filter(|s| s.len() == 3 && s.chars().all(|c| c.is_ascii_lowercase()) && *s != "und")
+                .map(str::to_string);
+            p.subtitles.push(SubtitleTrack {
+                index: p.subtitles.len(), // 按字幕轨自己数 = -map 0:s:{n} 的 n
+                codec: codec.to_string(),
+                lang,
+                text: TEXT_SUBTITLE_CODECS.contains(&codec),
+            });
+            title_pending = false; // 字幕的 title 不并进音轨(别把字幕名挂到上一条音轨上)
+            continue;
+        }
         // "Stream #0:1(chi): Audio: dts (DTS-HD MA), 48000 Hz, 5.1 …" —— 括号里是语言码
         if let Some(rest) = line.split("Audio: ").nth(1) {
             let codec = rest.split([' ', ',', '(']).next().unwrap_or("");
@@ -188,10 +392,15 @@ fn parse_ffmpeg_stderr_with(stderr: &str, mac_native: bool) -> LocalProbe {
                 .map(str::trim)
                 .filter(|s| s.len() == 3 && s.chars().all(|c| c.is_ascii_lowercase()) && *s != "und")
                 .map(str::to_string);
+            // 逗号分段:`aac (LC), 48000 Hz, stereo, fltp, 128 kb/s` —— 布局词在采样率之后,
+            // 逐段试着认(位置不保证:有的编码少一段),认不出就是 None、不猜。
+            let channels =
+                rest.split(',').skip(1).find_map(|seg| channels_from_layout(seg)).or(None);
             p.audio_tracks.push(AudioTrack {
                 codec: if codec.is_empty() { "?".into() } else { codec.to_string() },
                 lang,
                 title: None,
+                channels,
             });
             title_pending = true;
         } else if title_pending && line.starts_with("title") {
@@ -297,25 +506,169 @@ fn mac_native_ffname(name: &str, mac_native: bool) -> bool {
 /// **这一条音轨**要不要转码(选轨播放的逐轨判定;fourcc 与 ffmpeg 名两套词汇都认,
 /// mac 白名单同口径)。认不出的编码默认兼容(§7.1「只转处理不了的」)。
 pub fn audio_codec_needs_transcode(codec: &str) -> bool {
-    audio_codec_needs_transcode_with(codec, cfg!(target_os = "macos"))
+    let caps = super::capability::codecs();
+    audio_codec_needs_transcode_with(codec, cfg!(target_os = "macos"), caps.as_ref())
 }
 
-fn audio_codec_needs_transcode_with(codec: &str, mac_native: bool) -> bool {
+/// `caps` = 浏览器能力快照(P1;`None` = 还没探到 → 走白名单 = 2026-08-07 之前的行为)。
+fn audio_codec_needs_transcode_with(
+    codec: &str,
+    mac_native: bool,
+    caps: Option<&super::capability::Codecs>,
+) -> bool {
     let c = codec.trim();
+    // 真机事实优先:这台机器的 MSE 真吃得下就不转(省重编)、真吃不下就转(免无声)——
+    // 比我们在这里猜准得多,还顺带吃到「装了 HEVC 扩展」「WebView 升级」这类白拿。
+    if let Some(ok) = super::capability::mse_supports(caps, c) {
+        return !ok;
+    }
+    // 没快照 / 矩阵没探过这个编码 → 白名单兜底(逐条 = 2026-08-07 之前的行为,含 mac 放宽)。
     let bad = INCOMPATIBLE_AUDIO.contains(&c.as_bytes()) || FFNAME_BAD_AUDIO.contains(&c);
     bad && !(mac_native_fourcc(c.as_bytes(), mac_native) || mac_native_ffname(c, mac_native))
 }
 
+/// 段的**真实时长**(秒):moof 里所有 traf 的样本时长求和 ÷ timescale。P2 运行时接缝抽查的量具
+/// —— **零子进程**(段字节本来就在手上),所以敢在注册时抽查、也敢在服务每段时顺手记一笔。
+///
+/// 时长有两处可能:trun 逐样本给(flags 0x000100,ffmpeg 常态),或 tfhd 给一个 default
+/// (flags 0x000008)。两处都不给 = 这段的时长无从得知 → `None`(调用方跳过抽查,
+/// **绝不拿 0 当真实段长**去误判成"漂了")。多轨 moof 取第一条 traf(我们的段是单轨的)。
+pub fn fragment_duration(seg: &[u8], timescale: u32) -> Option<f64> {
+    if timescale == 0 {
+        return None;
+    }
+    let (mf_s, mf_e) = find_box(seg, b"moof", 0, seg.len())?;
+    let mut total: Option<u64> = None;
+    for_each_box(seg, mf_s, mf_e, |t, hdr, bs, be| {
+        if t != b"traf" || total.is_some() {
+            return;
+        }
+        let (ts, te) = (bs + hdr, be);
+        let mut default_dur: Option<u32> = None;
+        let mut sum: Option<u64> = None;
+        for_each_box(seg, ts, te, |bt, bhdr, bbs, bbe| {
+            let p = &seg[bbs + bhdr..bbe];
+            match bt {
+                b"tfhd" => {
+                    // fullbox:version(1)+flags(3),track_ID(4),再按 flags 依次是可选字段
+                    let flags = u32::from_be_bytes([0, p[1], p[2], p[3]]);
+                    let mut off = 8usize; // version/flags + track_ID
+                    if flags & 0x01 != 0 {
+                        off += 8; // base_data_offset
+                    }
+                    if flags & 0x02 != 0 {
+                        off += 4; // sample_description_index
+                    }
+                    if flags & 0x08 != 0 {
+                        default_dur = p
+                            .get(off..off + 4)
+                            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+                    }
+                }
+                b"trun" => {
+                    let flags = u32::from_be_bytes([0, p[1], p[2], p[3]]);
+                    let Some(cnt) = p.get(4..8).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+                    else {
+                        return;
+                    };
+                    let mut off = 8usize;
+                    if flags & 0x0001 != 0 {
+                        off += 4; // data_offset
+                    }
+                    if flags & 0x0004 != 0 {
+                        off += 4; // first_sample_flags
+                    }
+                    // 每样本按 flags 依次:duration / size / flags / composition_time_offset
+                    let per = (flags & 0x0100 != 0) as usize * 4
+                        + (flags & 0x0200 != 0) as usize * 4
+                        + (flags & 0x0400 != 0) as usize * 4
+                        + (flags & 0x0800 != 0) as usize * 4;
+                    let mut acc = 0u64;
+                    for i in 0..cnt as usize {
+                        if flags & 0x0100 != 0 {
+                            let at = off + i * per;
+                            let Some(b) = p.get(at..at + 4) else { return };
+                            acc += u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as u64;
+                        } else if let Some(d) = default_dur {
+                            acc += d as u64;
+                        } else {
+                            return; // 两处都没有时长 → 这段量不出来
+                        }
+                    }
+                    sum = Some(acc);
+                }
+                _ => {}
+            }
+        });
+        total = sum;
+    });
+    total.map(|t| t as f64 / timescale as f64)
+}
+
+/// 关键帧表可信度的两条闸(P2)。首关键帧太靠后 = 表不完整(片头那段没法 copy 切),
+/// 宁可整条退回转码路也不拿半张表去切段;超出时长 = 时间轴根本对不上。
+/// 这两个数是**技术门限**(同 `COPY_SS_EPS` / `SEAM_TOL`),不是产品默认值。
+const KF_FIRST_MAX: f64 = 10.0;
+const KF_OVERRUN_TOL: f64 = 1.0;
+
+/// 解析 `ffmpeg -skip_frame nokey -vf showinfo` 打在 stderr 的每帧信息 → 关键帧时间(秒)。
+///
+/// **为什么是 ffmpeg 不是 ffprobe**:ffprobe **没随包**(components 只解出 `ffmpeg` 一个文件)。
+/// 本机实测 10 分钟 720p mkv:300 个关键帧 / 0.31s,与 ffprobe 同档 → 不值得为它多下一个组件。
+/// `-skip_frame nokey` 让解码器只解关键帧,demux 全程但不解 P/B 帧。
+///
+/// 只收 `iskey:1` 的行(防守:某些 ffmpeg 版本在 `-skip_frame nokey` 下仍会打非关键帧行)。
+pub fn parse_showinfo_keyframes(stderr: &str) -> Vec<f64> {
+    let mut out = Vec::new();
+    for line in stderr.lines() {
+        if !line.contains("iskey:1") {
+            continue;
+        }
+        let Some(rest) = line.split("pts_time:").nth(1) else { continue };
+        let tok: String =
+            rest.chars().take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-').collect();
+        if let Ok(t) = tok.parse::<f64>() {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// 关键帧表能不能信。**异常一律退回不猜**(§7.1 保守偏向):拿不准就走转码路,
+/// 那条路已验证多年;拿半张错表去 copy 切段 = 段边界错位 = 音画事故。
+/// 返回的字符串直接进日志(§3.5 不静默)。
+pub fn validate_keyframes(kf: &[f64], duration: f64) -> Result<(), &'static str> {
+    if kf.is_empty() {
+        return Err("一个关键帧都没扫到");
+    }
+    if kf.windows(2).any(|w| w[1] <= w[0]) {
+        // 非单调 = 时间戳回卷(TS 的 33bit 90kHz 约 26.5 小时回一圈)或表本身坏了
+        return Err("关键帧时间非单调(时间戳回卷或表损坏)");
+    }
+    if kf[0] > KF_FIRST_MAX {
+        return Err("首关键帧太靠后,片头切不出来");
+    }
+    if duration > 0.0 && kf[kf.len() - 1] > duration + KF_OVERRUN_TOL {
+        return Err("关键帧超出片长,时间轴对不上");
+    }
+    Ok(())
+}
+
 /// 探测本地 MP4 文件的音/视频编码与时长(同步 IO;异步调用方用 `spawn_blocking` 包)。
 /// 兼容判定按**当前编译目标**(mac 开发壳放宽白名单内的编码,见 `mac_native_fourcc`)。
-pub fn probe_local(path: &Path) -> LocalProbe {
+///
+/// **`None` = 读不出 `moov`,这不是一个能自己解析的 BMFF 文件**(残缺 / 截断 / 头对了内容不对)。
+/// 从前这里回的是 `LocalProbe::default()`,而默认值的语义恰好是「音视频全兼容、无时长」→
+/// 上层据此直传给浏览器 → 浏览器同样解不了 → 黑屏 0:00 且一条日志都没有(2026-08-07 实锤)。
+/// 现在如实说「探不出」,由上层改交 ffmpeg 现探现转。
+pub fn probe_local(path: &Path) -> Option<LocalProbe> {
     probe_local_with(path, cfg!(target_os = "macos"))
 }
 
 /// `mac_native` 注入可测(Windows/mac 两套矩阵都有测试钉住;运行时由 `probe_local` 按编译目标传)。
-fn probe_local_with(path: &Path, mac_native: bool) -> LocalProbe {
-    let Some(moov) = read_moov(path) else { return LocalProbe::default() };
-    LocalProbe {
+fn probe_local_with(path: &Path, mac_native: bool) -> Option<LocalProbe> {
+    let moov = read_moov(path)?;
+    Some(LocalProbe {
         audio_incompatible: INCOMPATIBLE_AUDIO
             .iter()
             .any(|tag| !mac_native_fourcc(tag, mac_native) && contains(&moov, tag)),
@@ -326,10 +679,12 @@ fn probe_local_with(path: &Path, mac_native: bool) -> LocalProbe {
         video_keyframes: video_keyframes(&moov).unwrap_or_default(),
         video_codec: video_h264_codec(&moov),
         audio_tracks: audio_tracks_of_moov(&moov),
+        // BMFF 的字幕轨(tx3g)少见,轻量探测不解;真有字幕的片走 ffmpeg 路那条(mkv 为主)。
+        subtitles: Vec::new(),
         // 歌名/歌手标签只在 `ffmpeg -i` 路解析(ilst 不在轻量探测范围,播放路用不上)
         tag_title: None,
         tag_artist: None,
-    }
+    })
 }
 
 /// 列出全部音轨(hdlr='soun' 的 trak,按文件顺序 = `-map 0:a:{n}` 的 n):
@@ -383,7 +738,18 @@ fn audio_track_of_trak(moov: &[u8], tr_s: usize, tr_e: usize) -> Option<AudioTra
         let text = String::from_utf8_lossy(raw).trim_matches(char::from(0)).trim().to_string();
         (!text.is_empty() && text.chars().count() <= 60).then_some(text)
     })();
-    Some(AudioTrack { codec, lang, title })
+    // stsd 的 AudioSampleEntry 里有 channelcount:entry 起点 = stsd payload+8(size 字段),
+    // 其内 +24 处是 channelcount(SampleEntry 16 字节 + version/revision/vendor 8 字节)。
+    // ⚠️ AC-3/E-AC-3 这里常写 2、真实布局在 dac3 盒 —— 但那类编码浏览器本来就解不了、恒转码,
+    // 所以这处不准不影响判定;真正吃这个数的是 AAC 这类能 copy 的编码。
+    let channels = (|| {
+        let (mn_s, mn_e) = find_box(moov, b"minf", md_s, md_e)?;
+        let (st_s, st_e) = find_box(moov, b"stbl", mn_s, mn_e)?;
+        let (sd_s, _) = find_box(moov, b"stsd", st_s, st_e)?;
+        let b = moov.get(sd_s + 32..sd_s + 34)?;
+        u8::try_from(u16::from_be_bytes([b[0], b[1]])).ok().filter(|c| *c > 0)
+    })();
+    Some(AudioTrack { codec, lang, title, channels })
 }
 
 /// mdhd 打包语言 → ISO-639-2 三字码;全零/"und"/解出非小写字母 → None(未标注)。
@@ -831,6 +1197,11 @@ mod tests {
         p
     }
 
+    /// 夹具便捷:这些用例喂的都是构造好的 BMFF,理应探得出;「探不出」另有专门用例钉。
+    fn probed(path: &Path, mac_native: bool) -> LocalProbe {
+        probe_local_with(path, mac_native).expect("夹具是合法 BMFF,应能读出 moov")
+    }
+
     fn write_temp(tag: &str, bytes: &[u8]) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("lw-probe-{}-{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -850,12 +1221,12 @@ mod tests {
         file.extend_from_slice(&mp4_box(b"moov", &moov_payload));
 
         let path = write_temp("ac3", &file);
-        let probe = probe_local_with(&path, false); // Windows(目标平台)矩阵
+        let probe = probed(&path, false); // Windows(目标平台)矩阵
         assert!(probe.audio_incompatible, "应识别出 ac-3 音轨需转码");
         assert!(!probe.video_incompatible);
         assert_eq!(probe.duration_seconds, Some(5.0), "mvhd 时长 5000/1000=5.0s");
         // mac 音频放宽已回滚(混播/切轨/响度三亏,「音频都转」):AC3 在 mac 也转
-        assert!(probe_local_with(&path, true).audio_incompatible, "mac 对 AC3 同样转码");
+        assert!(probed(&path, true).audio_incompatible, "mac 对 AC3 同样转码");
     }
 
     #[test]
@@ -866,7 +1237,7 @@ mod tests {
         file.extend_from_slice(&mp4_box(b"moov", &moov_payload)); // faststart:moov 在前
         file.extend_from_slice(&mp4_box(b"mdat", b"media"));
 
-        let probe = probe_local(&write_temp("aac", &file));
+        let probe = probed(&write_temp("aac", &file), cfg!(target_os = "macos"));
         assert!(!probe.audio_incompatible, "AAC(mp4a)兼容,不该转码");
         assert_eq!(probe.duration_seconds, Some(3.0));
     }
@@ -878,10 +1249,10 @@ mod tests {
         let mut file = mp4_box(b"ftyp", b"isomhvc1");
         file.extend_from_slice(&mp4_box(b"moov", &moov_payload));
         let path = write_temp("hevc", &file);
-        let probe = probe_local_with(&path, false); // Windows(目标平台)矩阵
+        let probe = probed(&path, false); // Windows(目标平台)矩阵
         assert!(probe.video_incompatible, "hvc1 → 视频不兼容(诊断)");
         assert!(!probe.audio_incompatible, "音轨是 mp4a,不需转码");
-        assert!(!probe_local_with(&path, true).video_incompatible, "mac 原生解 HEVC,不标");
+        assert!(!probed(&path, true).video_incompatible, "mac 原生解 HEVC,不标");
     }
 
     #[test]
@@ -893,8 +1264,8 @@ mod tests {
         let mut file = mp4_box(b"ftyp", b"isomiso2avc1mp41");
         file.extend_from_slice(&mp4_box(b"moov", &moov_payload));
         let path = write_temp("dts-mac", &file);
-        assert!(probe_local_with(&path, false).audio_incompatible);
-        assert!(probe_local_with(&path, true).audio_incompatible, "DTS 在 mac 也要转");
+        assert!(probed(&path, false).audio_incompatible);
+        assert!(probed(&path, true).audio_incompatible, "DTS 在 mac 也要转");
 
         // ffmpeg 名字表同口径(mkv 路):视频 hevc mac 放行 -c copy;音频 ac3 两边都转
         let s = "  Stream #0:0: Video: hevc (Main 10)\n  Stream #0:1: Audio: ac3, 48000 Hz";
@@ -943,18 +1314,251 @@ mod tests {
         let mut file = mp4_box(b"ftyp", b"isomiso2avc1mp41");
         file.extend_from_slice(&mp4_box(b"moov", &moov_payload));
         let path = write_temp("atracks", &file);
-        let p = probe_local_with(&path, false);
+        let p = probed(&path, false);
         assert_eq!(p.audio_tracks.len(), 2, "两条音轨按文件顺序列出");
         assert_eq!(p.audio_tracks[0].codec, "ac-3");
         assert_eq!(p.audio_tracks[0].lang.as_deref(), Some("chi"));
         assert_eq!(p.audio_tracks[1].codec, "mp4a");
         assert_eq!(p.audio_tracks[1].lang.as_deref(), Some("eng"));
         // 逐轨判定:ac-3 两平台都转(mac 音频放宽已回滚);mp4a(AAC)两边都不转
-        assert!(audio_codec_needs_transcode_with("ac-3", false));
-        assert!(audio_codec_needs_transcode_with("ac-3", true), "mac 音频同一张矩阵");
-        assert!(!audio_codec_needs_transcode_with("mp4a", false));
-        assert!(audio_codec_needs_transcode_with("dtsc", true));
-        assert!(audio_codec_needs_transcode_with("dts", true), "ffmpeg 名同口径");
+        assert!(audio_codec_needs_transcode_with("ac-3", false, None));
+        assert!(audio_codec_needs_transcode_with("ac-3", true, None), "mac 音频同一张矩阵");
+        assert!(!audio_codec_needs_transcode_with("mp4a", false, None));
+        assert!(audio_codec_needs_transcode_with("dtsc", true, None));
+        assert!(audio_codec_needs_transcode_with("dts", true, None), "ffmpeg 名同口径");
+    }
+
+    /// 外挂字幕扫描(P4):`片子.mkv` 旁边的 `片子.srt` / `片子.chi.srt` / `片子.eng.ass` 都要认。
+    /// 这是「外挂字幕百分之百不显示」那条缺口的正面兑现。
+    #[test]
+    fn sidecar_subtitles_match_by_stem_and_pick_lang() {
+        let dir = std::env::temp_dir().join(format!("lw-sub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let video = dir.join("我的片子.mkv");
+        std::fs::write(&video, b"x").unwrap();
+        for n in [
+            "我的片子.srt",          // 同名裸字幕
+            "我的片子.chi.srt",      // 带语言后缀
+            "我的片子.eng.ass",      // 另一种格式 + 语言
+            "别的片子.srt",          // 不同片名 —— 不该收
+            "我的片子.txt",          // 不是字幕格式 —— 不该收
+            "我的片子.sup",          // 图形字幕(PGS)—— 转不了,不收
+        ] {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        let found = sidecar_subtitles(&video);
+        let names: Vec<String> =
+            found.iter().map(|(p, _)| p.file_name().unwrap().to_string_lossy().into()).collect();
+        assert_eq!(names.len(), 3, "只收同名的文本字幕,实际 {names:?}");
+        assert!(names.contains(&"我的片子.srt".to_string()));
+        assert!(names.contains(&"我的片子.chi.srt".to_string()));
+        assert!(names.contains(&"我的片子.eng.ass".to_string()));
+        // 语言后缀要认出来(认不出 = None,不猜)
+        let lang_of = |n: &str| {
+            found
+                .iter()
+                .find(|(p, _)| p.file_name().unwrap() == n)
+                .and_then(|(_, l)| l.clone())
+        };
+        assert_eq!(lang_of("我的片子.chi.srt").as_deref(), Some("chi"));
+        assert_eq!(lang_of("我的片子.eng.ass").as_deref(), Some("eng"));
+        assert_eq!(lang_of("我的片子.srt"), None, "没后缀就是没标语言");
+    }
+
+    /// 字幕轨解析(P4)。**文本与图形必须分开**:文本轨(srt/ass/mov_text…)能转 WebVTT 挂上去,
+    /// 图形轨(PGS/VobSub 是位图)转不了 —— 得如实说,不能装作有(§3.5)。
+    #[test]
+    fn subtitle_tracks_split_text_from_graphic() {
+        let s = "\
+  Stream #0:0: Video: h264, yuv420p, 1920x1080
+  Stream #0:1(chi): Audio: aac, 48000 Hz, stereo
+  Stream #0:2(chi): Subtitle: subrip
+  Stream #0:3(eng): Subtitle: ass (default)
+  Stream #0:4(chi): Subtitle: hdmv_pgs_subtitle
+  Stream #0:5: Subtitle: dvd_subtitle";
+        let p = parse_ffmpeg_stderr_with(s, false);
+        assert_eq!(p.subtitles.len(), 4, "四条字幕轨都要列出来(图形的也列,但标成不可用)");
+        // 序号 = `-map 0:s:{n}` 的 n(**按字幕轨自己数,不是流号**),搞错就挂错轨
+        assert_eq!(p.subtitles[0].index, 0);
+        assert_eq!(p.subtitles[0].codec, "subrip");
+        assert_eq!(p.subtitles[0].lang.as_deref(), Some("chi"));
+        assert!(p.subtitles[0].text, "subrip 是文本轨,能转 WebVTT");
+        assert_eq!(p.subtitles[1].index, 1);
+        assert!(p.subtitles[1].text, "ass 也是文本轨(样式会丢,时间轴与文字保得住)");
+        assert_eq!(p.subtitles[2].index, 2);
+        assert!(!p.subtitles[2].text, "PGS 是位图,转不了 —— 如实标出来");
+        assert!(!p.subtitles[3].text, "VobSub 同上");
+    }
+
+    /// BMFF 的 channelcount 偏移量对不对,**只能拿真文件验** —— 这类"数出来的偏移"错了不会报错,
+    /// 只会安静地给个错数字,然后 P3 的 copy 判定跟着错。需 PATH 有 ffmpeg:
+    /// `cargo test -p larkwing-core --lib media::probe::tests::bmff_channel -- --ignored`
+    #[test]
+    #[ignore]
+    fn bmff_channelcount_offset_matches_real_files() {
+        let dir = std::env::temp_dir().join(format!("lw-ch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (layout, want) in [("stereo", 2u8), ("mono", 1), ("5.1", 6)] {
+            let f = dir.join(format!("{}.mp4", want));
+            let ok = std::process::Command::new("ffmpeg")
+                .args(["-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+                .arg(format!("sine=frequency=440:duration=1:sample_rate=48000"))
+                .args(["-ac", &channel_arg(layout), "-c:a", "aac"])
+                .arg(&f)
+                .status()
+                .expect("run ffmpeg")
+                .success();
+            assert!(ok, "生成 {layout} 夹具失败");
+            let p = probe_local(&f).expect("真 mp4 该读得出 moov");
+            assert_eq!(
+                p.audio_tracks[0].channels,
+                Some(want),
+                "{layout} 应解出 {want} 声道(stsd channelcount 偏移量对不上就是这里红)"
+            );
+        }
+    }
+
+    fn channel_arg(layout: &str) -> String {
+        match layout {
+            "mono" => "1".into(),
+            "stereo" => "2".into(),
+            _ => "6".into(),
+        }
+    }
+
+    /// 声道数解析(P3 的判定事实):**多声道是硬墙** —— 多声道 AAC 声道布局不明确会被 MSE
+    /// 拒 append(0.2.6 实锤,整个 init 都进不去),所以必须下混转码;单/双声道才谈得上 copy。
+    #[test]
+    fn audio_channel_layout_parsed_from_ffmpeg_line() {
+        let cases = [
+            ("  Stream #0:1(chi): Audio: aac (LC), 48000 Hz, stereo, fltp, 128 kb/s", Some(2)),
+            ("  Stream #0:1: Audio: aac, 44100 Hz, mono", Some(1)),
+            ("  Stream #0:1(eng): Audio: ac3, 48000 Hz, 5.1(side), fltp, 640 kb/s", Some(6)),
+            ("  Stream #0:2: Audio: dts (DTS-HD MA), 48000 Hz, 7.1, s32p", Some(8)),
+            ("  Stream #0:1: Audio: aac, 48000 Hz, 5.1", Some(6)),
+            ("  Stream #0:1: Audio: flac, 48000 Hz, quad", Some(4)),
+            // 认不出的布局词 → None(**不猜**:调用方按"拿不准就转码"处理,宁可多转不可无声)
+            ("  Stream #0:1: Audio: aac, 48000 Hz, 某种没见过的布局", None),
+            ("  Stream #0:1: Audio: aac", None),
+        ];
+        for (line, want) in cases {
+            let p = parse_ffmpeg_stderr_with(line, false);
+            assert_eq!(p.audio_tracks[0].channels, want, "{line}");
+        }
+    }
+
+    /// 段**真实时长**的解析(P2 运行时接缝抽查的量具):moof→traf→trun 逐样本时长求和,
+    /// 缺省则用 tfhd 的 default_sample_duration。零子进程 —— 段字节本来就在手上。
+    #[test]
+    fn fragment_duration_sums_samples() {
+        // ① 时长在 trun 里逐样本给(ffmpeg 常态):3 个样本 × 512 / ts 1024 = 1.5s
+        let trun_per_sample = {
+            let mut p = vec![0u8, 0, 0x01, 0x00]; // version 0 + flags 0x000100(sample-duration-present)
+            p.extend_from_slice(&3u32.to_be_bytes()); // sample_count
+            for _ in 0..3 {
+                p.extend_from_slice(&512u32.to_be_bytes());
+            }
+            mp4_box(b"trun", &p)
+        };
+        let traf = {
+            let mut tfhd_p = vec![0u8, 0, 0, 0]; // 无可选字段
+            tfhd_p.extend_from_slice(&1u32.to_be_bytes()); // track_ID
+            let mut v = mp4_box(b"tfhd", &tfhd_p);
+            v.extend_from_slice(&trun_per_sample);
+            mp4_box(b"traf", &v) // 真分片是 moof→traf→tfhd/trun,这层不能少
+        };
+        let seg = mp4_box(b"moof", &{
+            let mut v = mp4_box(b"mfhd", &[0, 0, 0, 0, 0, 0, 0, 1]);
+            v.extend_from_slice(&traf);
+            v
+        });
+        assert_eq!(fragment_duration(&seg, 1024), Some(1.5));
+
+        // ② 时长走 tfhd 的 default_sample_duration(trun 不带 duration 位):4 × 256 / 1024 = 1.0s
+        let trun_bare = {
+            let mut p = vec![0u8, 0, 0, 0]; // flags 全 0 = 逐样本什么都不带
+            p.extend_from_slice(&4u32.to_be_bytes());
+            mp4_box(b"trun", &p)
+        };
+        let traf_default = {
+            let mut tfhd_p = vec![0u8, 0, 0, 0x08]; // flags 0x000008 = default-sample-duration
+            tfhd_p.extend_from_slice(&1u32.to_be_bytes()); // track_ID
+            tfhd_p.extend_from_slice(&256u32.to_be_bytes()); // default_sample_duration
+            let mut v = mp4_box(b"tfhd", &tfhd_p);
+            v.extend_from_slice(&trun_bare);
+            mp4_box(b"traf", &v)
+        };
+        let seg2 = mp4_box(b"moof", &traf_default);
+        assert_eq!(fragment_duration(&seg2, 1024), Some(1.0));
+
+        // ③ 认不出 → None(调用方据此跳过抽查,绝不拿 0 当真实段长去误判漂移)
+        assert_eq!(fragment_duration(b"not a fragment at all", 1024), None);
+        assert_eq!(fragment_duration(&seg, 0), None, "timescale 0 = 除零,拒");
+    }
+
+    /// showinfo 解析(P2)。夹具是**本机真跑出来的原文**(`ffmpeg -skip_frame nokey -vf showinfo`,
+    /// 2026-08-07),不是照文档编的格式 —— 这类解析器最容易死在「以为它长这样」上。
+    #[test]
+    fn showinfo_keyframes_parsed_from_real_output() {
+        let real = "\
+[Parsed_showinfo_0 @ 0xa990555c0] n:   0 pts:     23 pts_time:0.023   duration:     40 duration_time:0.04    fmt:yuv420p cl:left sar:1/1 s:1280x720 i:P iskey:1 type:I checksum:9322016E plane_checksum:[FB9747AA 65634260 2D017755] mean:[125 129 125] stdev:[71.8 70.1 72.0]
+[Parsed_showinfo_0 @ 0xa990555c0] n:   1 pts:   2023 pts_time:2.023   duration:     40 duration_time:0.04    fmt:yuv420p cl:left sar:1/1 s:1280x720 i:P iskey:1 type:I checksum:96E4746B plane_checksum:[1A299E76 1840E336 BF63F2A1] mean:[125 129 126] stdev:[71.9 70.0 72.1]
+[Parsed_showinfo_0 @ 0xa990555c0] n:   2 pts:   4023 pts_time:4.023   duration:     40 duration_time:0.04    fmt:yuv420p cl:left sar:1/1 s:1280x720 i:P iskey:1 type:I checksum:33DF18FB";
+        assert_eq!(parse_showinfo_keyframes(real), vec![0.023, 2.023, 4.023]);
+        // 非关键帧行不收(某些版本在 -skip_frame nokey 下仍会打)
+        let mixed = "[showinfo] pts_time:1.000 iskey:0 type:P\n[showinfo] pts_time:2.000 iskey:1 type:I";
+        assert_eq!(parse_showinfo_keyframes(mixed), vec![2.0]);
+        // 没有可认的行 → 空表(调用方据此退回转码路,不 panic)
+        assert!(parse_showinfo_keyframes("ffmpeg version 7.1\nStream #0:0: Video: h264").is_empty());
+    }
+
+    /// 关键帧表的可信度闸:**异常一律退回不猜**,拿半张错表去 copy 切段 = 段边界错位 = 音画事故。
+    #[test]
+    fn keyframe_table_sanity_gates() {
+        assert!(validate_keyframes(&[0.0, 2.0, 4.0, 6.0], 8.0).is_ok());
+        assert!(validate_keyframes(&[0.023, 2.023], 600.0).is_ok(), "首帧非 0 是常态(mkv 实测)");
+        assert!(validate_keyframes(&[], 600.0).is_err(), "空表");
+        // 非单调 = TS 时间戳回卷(33bit 90kHz 约 26.5 小时一圈)或表坏了
+        assert!(validate_keyframes(&[0.0, 6.0, 3.0], 600.0).is_err(), "回退");
+        assert!(validate_keyframes(&[0.0, 6.0, 6.0], 600.0).is_err(), "重复值也算非单调");
+        // 片头拿不到关键帧 = 表不完整,那段没法 copy 切
+        assert!(validate_keyframes(&[45.0, 51.0], 600.0).is_err(), "首关键帧太靠后");
+        // 关键帧跑到片长之外 = 时间轴对不上(容差内的浮点误差不算)
+        assert!(validate_keyframes(&[0.0, 6.0, 999.0], 600.0).is_err(), "超出片长");
+        assert!(validate_keyframes(&[0.0, 600.5], 600.0).is_ok(), "容差内不误杀");
+        // 时长未知(0)时不查这一条,只查前三条
+        assert!(validate_keyframes(&[0.0, 999.0], 0.0).is_ok());
+    }
+
+    /// 快照优先级(P1):**真机探来的事实压过白名单,但只在它真探过的地方**;没探过一律回落白名单
+    /// (= 今天的行为逐条不变)。这条规则是「白名单 → 问浏览器」这次换血的安全带。
+    #[test]
+    fn snapshot_beats_whitelist_but_only_where_it_probed() {
+        use super::super::capability::Codecs;
+        let set = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<std::collections::BTreeSet<_>>();
+        // 这台机器:ac3/aac 都探过,MSE 吃得下 ac3、反而吃不下 aac
+        //(极端但合法的组合——就是要验「听真机的」而不是「听我们猜的」)。
+        let caps = Codecs {
+            probed: set(&["ac3", "aac"]),
+            mse: set(&["ac3"]),
+            direct: set(&["ac3"]),
+        };
+        assert!(
+            !audio_codec_needs_transcode_with("ac-3", false, Some(&caps)),
+            "白名单说不行、真机说行 → 听真机的,不转(省一次重编)"
+        );
+        assert!(
+            audio_codec_needs_transcode_with("mp4a", false, Some(&caps)),
+            "白名单说行、真机说不行 → 同样听真机的,转(否则无声)"
+        );
+        assert!(
+            audio_codec_needs_transcode_with("dtsc", false, Some(&caps)),
+            "dts 不在 probed 里 = 没探过 → 回落白名单"
+        );
+        // 完全没有快照(boot 前第一次播放 / headless / 单测)→ 逐条维持今天的结论
+        assert!(audio_codec_needs_transcode_with("ac-3", false, None));
+        assert!(!audio_codec_needs_transcode_with("mp4a", false, None));
     }
 
     #[test]
@@ -969,7 +1573,7 @@ mod tests {
         moov_payload.extend_from_slice(&mp4_box(b"trak", &trak_payload));
         let mut file = mp4_box(b"ftyp", b"isomiso2avc1mp41");
         file.extend_from_slice(&mp4_box(b"moov", &moov_payload));
-        let p = probe_local_with(&write_temp("udta-name", &file), false);
+        let p = probed(&write_temp("udta-name", &file), false);
         assert_eq!(p.audio_tracks.len(), 1);
         assert_eq!(p.audio_tracks[0].title.as_deref(), Some("国语 5.1"));
         assert!(p.audio_tracks[0].lang.is_none(), "语言 0 = 未标注");
@@ -1016,9 +1620,78 @@ mod tests {
     }
 
     #[test]
-    fn garbage_or_non_mp4_yields_default() {
-        let probe = probe_local(&write_temp("junk", b"this is definitely not an MP4 file at all"));
-        assert_eq!(probe, LocalProbe::default(), "解析不出 → 默认(放行直传,不挡播放)");
+    fn unparseable_file_reports_none_not_all_compatible() {
+        // 「探不出」绝不能再退化成 `LocalProbe::default()`(= 全兼容、无时长)—— 那正是
+        // 2026-08-07 黑屏的根:上层照着「全兼容」把文件原样直传,浏览器同样解不了。
+        assert!(
+            probe_local(&write_temp("junk", b"this is definitely not an MP4 file at all")).is_none()
+        );
+        // 头是 ftyp、但 moov 缺席(下载残缺/被截断)→ 同样如实说探不出,交给 ffmpeg 去啃
+        let mut truncated = mp4_box(b"ftyp", b"isomiso2avc1mp41");
+        truncated.extend_from_slice(&mp4_box(b"mdat", b"only media, moov never arrived"));
+        assert!(probe_local(&write_temp("truncated", &truncated)).is_none(), "残缺 mp4");
+    }
+
+    /// 分流的判据是**文件内容**,不是扩展名 —— 2026-08-07 真机:`米奇妙妙屋第1季01.mp4` 其实是
+    /// MPEG-TS(h264+aac),按扩展名走 BMFF 快车道 → 探不出 → 直传 → Mac/Windows 一起黑屏 0:00。
+    #[test]
+    fn sniff_reads_content_not_extension() {
+        // pkt = 包长,lead = 包前多出来的头(BDAV 的 4 字节时间戳);同步字节按包长打点
+        let ts = |pkt: usize, lead: usize| {
+            let mut v = vec![0x11u8; lead + 4 * pkt];
+            for i in 0..4 {
+                v[lead + i * pkt] = 0x47;
+            }
+            v
+        };
+        // 真机那个文件的形状:188 字节定长包、首字节 0x47
+        assert_eq!(sniff_head(&ts(188, 0)), Container::Foreign("mpegts"));
+        // BDAV/M2TS:每包前多 4 字节时间戳头 → 包长 192
+        assert_eq!(sniff_head(&ts(192, 4)), Container::Foreign("mpegts"));
+        // 单个 0x47 撞不出 mpegts(要连查三个包位)
+        assert_eq!(sniff_head(b"\x47 just some text that happens to start with G"), Container::Native);
+
+        let bmff = mp4_box(b"ftyp", b"isomiso2avc1mp41");
+        assert_eq!(sniff_head(&bmff), Container::Bmff);
+        assert_eq!(sniff_head(&mp4_box(b"moov", b"x")), Container::Bmff, "老 mov 可能以 moov 开头");
+        assert_eq!(sniff_head(&mp4_box(b"wide", b"x")), Container::Bmff);
+
+        // EBML 同一个魔数,DocType 分家:webm 浏览器原生 / matroska 要转封装
+        let ebml = |doctype: &[u8], tail: &[u8]| {
+            let mut v = vec![0x1A, 0x45, 0xDF, 0xA3, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F];
+            v.extend_from_slice(&[0x42, 0x86, 0x81, 0x01]); // EBMLVersion,占位干扰项
+            v.extend_from_slice(&[0x42, 0x82]); // DocType
+            v.push(0x80 | doctype.len() as u8);
+            v.extend_from_slice(doctype);
+            v.extend_from_slice(tail);
+            v
+        };
+        assert_eq!(sniff_head(&ebml(b"webm", b"")), Container::Native);
+        assert_eq!(sniff_head(&ebml(b"matroska", b"")), Container::Foreign("matroska"));
+        // 写入器名字里带 "webm" 骗不过 DocType(全文搜子串就会在这翻车)
+        assert_eq!(
+            sniff_head(&ebml(b"matroska", b"\x4d\x80\x8blibwebm-1.0")),
+            Container::Foreign("matroska"),
+            "只认 DocType,不搜全文"
+        );
+
+        // RIFF 是个壳:AVI 要转、WAVE 浏览器自己能放
+        assert_eq!(sniff_head(b"RIFF\x00\x00\x00\x00AVI LIST"), Container::Foreign("avi"));
+        assert_eq!(sniff_head(b"RIFF\x00\x00\x00\x00WAVEfmt "), Container::Native);
+
+        assert_eq!(sniff_head(b"FLV\x01\x05\x00\x00\x00\x09"), Container::Foreign("flv"));
+        assert_eq!(sniff_head(b"\x30\x26\xB2\x75\x8E\x66\xCF\x11rest"), Container::Foreign("asf"));
+        assert_eq!(sniff_head(b".RMF\x00\x00\x00\x12"), Container::Foreign("rm"));
+        assert_eq!(sniff_head(b"\x00\x00\x01\xBA\x44\x00"), Container::Foreign("mpeg-ps"));
+
+        // 认不出的沿用「默认当兼容」(§7.1):直传交给浏览器,不平白拖 ffmpeg 进来
+        assert_eq!(sniff_head(b"OggS\x00\x02"), Container::Native);
+        assert_eq!(sniff_head(b"who knows what this is"), Container::Native);
+        assert_eq!(sniff_head(b""), Container::Native, "读不到 = 不挡播放");
+
+        // 落到文件上:扩展名叫 .mp4 也照样认出是 TS(write_temp 一律写成 .mp4)
+        assert_eq!(sniff_container(&write_temp("ts-named-mp4", &ts(188, 0))), Container::Foreign("mpegts"));
+        assert_eq!(sniff_container(&write_temp("real-mp4", &bmff)), Container::Bmff);
     }
 
     #[test]

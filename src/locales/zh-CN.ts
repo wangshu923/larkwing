@@ -272,6 +272,10 @@ export default {
     // 音轨切换(双语片):按钮显示当前轨的友好名;语言码词典没收录的显示原码
     audioTrack: '音轨:{label}(点击切换)',
     trackN: '音轨 {n}',
+    subtitleN: '字幕 {n}',
+    subtitleSidecar: '{name}(外挂)',
+    subtitleOff: '字幕:关',
+    subtitleOn: '字幕:{name}',
     lang: {
       chi: '国语',
       zho: '国语',
@@ -395,6 +399,8 @@ export default {
     captureFallback: '浏览器采集没起来,已切回系统麦克风',
     restoreOk: '已从备份恢复',
     restoreFailed: '从备份恢复没成功,数据保持原样',
+    // 放不了别干黑着(§3.5):以前只是把状态翻成暂停,用户看到的就是一块黑屏 + 0:00
+    mediaFailed: '《{title}》放不了,这个文件可能损坏或者格式不支持',
   },
   // 一键更新(清单 ⑤·A):发现新版的卡片 + 手动检查的反馈
   update: {

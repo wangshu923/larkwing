@@ -174,6 +174,9 @@ enum Entry {
         path: PathBuf,
         ffmpeg: PathBuf,
         copy_video: bool,
+        /// 音频原样搬(P3「原声优先」):`-c:a copy`,不过响度滤镜、不重编 —— 原声道原动态。
+        /// 只在「浏览器解得动 + 单/双声道 + AAC」三条全过时为真(见 capability::audio_track_plan)。
+        copy_audio: bool,
         /// 视频编码器(转码段用;copy 段不理会)。与 `video_init` 同编码器,故段的 avcC 与 init 一致。
         enc: VideoEncoder,
         /// 完整 MSE type:`video/mp4; codecs="avc1.xxxxxx"`(从视频 init 的 avcC 解出)。
@@ -185,7 +188,19 @@ enum Entry {
         duration: f64,
         /// 选中的音轨(0 起;音频段/init 都按它 `-map`)。
         audio_track: usize,
+        /// 字幕来源清单(P4):内嵌轨号或外挂文件,按需转 WebVTT 从 `/la/{token}/sub{N}.vtt` 出。
+        subs: Vec<SubSource>,
     },
+}
+
+/// 一条字幕的来源(P4):要么是文件内嵌的第 n 条字幕轨,要么是旁边的外挂文件。
+/// 两者转 WebVTT 的命令只差输入,故合成一个类型、端点一视同仁。
+#[derive(Debug, Clone)]
+pub enum SubSource {
+    /// 内嵌:`-map 0:s:{n}`。
+    Embedded(usize),
+    /// 外挂文件(`片子.chi.srt` 这类)。
+    Sidecar(PathBuf),
 }
 
 /// HLS 切片时长(秒):段越短 seek 越细但请求越多;6s 是常见折中。自适应路(mod.rs)也用它当段目标。
@@ -387,12 +402,14 @@ impl Relay {
         path: PathBuf,
         ffmpeg: PathBuf,
         copy_video: bool,
+        copy_audio: bool,
         video_mime: String,
         video_init: Vec<u8>,
         segments: Vec<(f64, f64)>,
         duration: f64,
         enc: VideoEncoder,
         audio_track: usize,
+        subs: Vec<SubSource>,
     ) -> String {
         let token = self.token();
         self.inner.streams.lock().expect("relay streams lock poisoned").insert(
@@ -401,12 +418,14 @@ impl Relay {
                 path,
                 ffmpeg,
                 copy_video,
+                copy_audio,
                 enc,
                 video_mime,
                 video_init,
                 segments,
                 duration,
                 audio_track,
+                subs,
             }),
         );
         format!("http://127.0.0.1:{}/la/{token}/desc", self.inner.port)
@@ -426,6 +445,24 @@ pub async fn gen_video_init(
     let full = run_ffmpeg_collect(cmd, 8 * 1024 * 1024).await?;
     let moof = super::probe::first_moof_offset(&full)?;
     Some(full[..moof].to_vec())
+}
+
+/// 切一段视频出来(moof+mdat,不含 init)。P2 的**运行时接缝抽查**用它:注册时拿第一段量一下
+/// 真实时长,与计划对不上就整条降级 —— 段字节本来就要产出,量它是纯解析(`fragment_duration`)、
+/// 不额外起进程。与 `/la/v{N}` 端点走同一条 `build_frag_cmd`,量的就是真会播的那份字节。
+pub async fn gen_video_segment(
+    ffmpeg: &Path,
+    path: &Path,
+    start: f64,
+    dur: f64,
+    copy_video: bool,
+    enc: VideoEncoder,
+) -> Option<Vec<u8>> {
+    let cmd = build_frag_cmd(ffmpeg, path, start, dur, copy_video, true, enc, 0);
+    let full = run_ffmpeg_collect(cmd, 256 * 1024 * 1024).await?;
+    let moof = super::probe::first_moof_offset(&full)?;
+    let end = super::probe::moof_segment_end(&full, moof);
+    Some(full[moof..end].to_vec())
 }
 
 /// 取一条上游流的前段(≤cap 字节)用于探 sidx:带防盗链头 + Range;上游若忽略 Range 回 200 全量,
@@ -753,12 +790,14 @@ async fn local_adaptive(
         path,
         ffmpeg,
         copy_video,
+        copy_audio,
         enc,
         video_mime,
         video_init,
         segments,
         duration,
         audio_track,
+        subs,
     } = entry.as_ref()
     else {
         return bad(StatusCode::NOT_FOUND);
@@ -773,10 +812,11 @@ async fn local_adaptive(
             })
             .collect();
         let json = format!(
-            "{{\"videoMime\":{vm},\"audioMime\":\"audio/mp4; codecs=\\\"mp4a.40.2\\\"\",\"duration\":{dur:.6},\"copyVideo\":{cv},\"audioSeg\":{aseg},\"audioPreroll\":{apre},\"segments\":[{segs}]}}",
+            "{{\"videoMime\":{vm},\"audioMime\":\"audio/mp4; codecs=\\\"mp4a.40.2\\\"\",\"duration\":{dur:.6},\"copyVideo\":{cv},\"copyAudio\":{ca},\"audioSeg\":{aseg},\"audioPreroll\":{apre},\"segments\":[{segs}]}}",
             vm = json_string(video_mime),
             dur = duration,
             cv = copy_video,
+            ca = copy_audio,
             aseg = AUDIO_SEG,
             apre = AUDIO_PREROLL,
         );
@@ -785,11 +825,35 @@ async fn local_adaptive(
     if seg == "vinit" {
         return bytes_response(video_init.clone(), "video/mp4");
     }
+    // 字幕(P4):`sub{N}.vtt` 按需把第 N 条来源转成 WebVTT(内嵌轨 `-map 0:s:{n}` / 外挂文件直接读)。
+    // 现转现回、不落盘;转不出(图形轨混进来、编码坏了)→ 404,前端那条 track 不出现,绝不空挂。
+    if let Some(n) = seg.strip_prefix("sub").and_then(|s| s.strip_suffix(".vtt")) {
+        let Some(src) = n.parse::<usize>().ok().and_then(|i| subs.get(i)) else {
+            return bad(StatusCode::NOT_FOUND);
+        };
+        let mut cmd = tokio::process::Command::new(ffmpeg);
+        cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin");
+        match src {
+            SubSource::Embedded(idx) => {
+                cmd.arg("-i").arg(path).arg("-map").arg(format!("0:s:{idx}"));
+            }
+            SubSource::Sidecar(file) => {
+                cmd.arg("-i").arg(file);
+            }
+        }
+        cmd.arg("-f").arg("webvtt").arg("pipe:1");
+        let Some(vtt) = run_ffmpeg_collect(cmd, 8 * 1024 * 1024).await else {
+            tracing::warn!(seg, "字幕转 WebVTT 失败(可能是图形字幕或编码有问题)");
+            return bad(StatusCode::NOT_FOUND);
+        };
+        // `<track>` 是跨源取的(app 源 ≠ relay 回环口)→ 必须带 CORS,否则前端拿不到。
+        return bytes_response(vtt, "text/vtt");
+    }
     // 音频改**离散段**(不再流式 —— WebView2 的 fetch 不吐流式 body,实锤 abuf=[空] 卡死;离散完整
     // 响应 WebView2 收得下,同视频段)。ainit=音频 init;a{N}=第 N 段(固定 6s 网格,带左预卷供前端
     // appendWindow 裁掉 priming → gapless 无漂移)。段内 tfdt=0,前端靠 timestampOffset+appendWindow 定位。
     if seg == "ainit" {
-        let cmd = build_audio_frag_cmd(ffmpeg, path, 0.0, 0.1, *audio_track);
+        let cmd = build_audio_frag_cmd(ffmpeg, path, 0.0, 0.1, *audio_track, *copy_audio);
         let Some(full) = run_ffmpeg_collect(cmd, 4 * 1024 * 1024).await else {
             return bad(StatusCode::BAD_GATEWAY);
         };
@@ -808,7 +872,7 @@ async fn local_adaptive(
         let (ss, cut) =
             if n > 0 { (grid - AUDIO_PREROLL, seg_dur + AUDIO_PREROLL) } else { (0.0, seg_dur) };
         tracing::info!(seg = n, grid, "自适应:现切音频段");
-        let cmd = build_audio_frag_cmd(ffmpeg, path, ss, cut, *audio_track);
+        let cmd = build_audio_frag_cmd(ffmpeg, path, ss, cut, *audio_track, *copy_audio);
         let Some(full) = run_ffmpeg_collect(cmd, 16 * 1024 * 1024).await else {
             return bad(StatusCode::BAD_GATEWAY);
         };
@@ -952,6 +1016,9 @@ fn build_audio_frag_cmd(
     ss: f64,
     dur: f64,
     audio_track: usize,
+    // P3「原声优先」:true = `-c:a copy` 原样搬(**不能带 `-af`** —— 滤镜要解码,与 copy 互斥),
+    // 原声道原动态一个字节不动;响度改由播放端 WebAudio 补。false = 老路(转 AAC + 响度链)。
+    copy_audio: bool,
 ) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(ffmpeg);
     cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin");
@@ -960,8 +1027,13 @@ fn build_audio_frag_cmd(
     }
     cmd.arg("-i").arg(path).arg("-t").arg(format!("{dur:.6}")).arg("-vn")
         .arg("-map").arg(format!("0:a:{audio_track}?")) // 显式选轨(原 -vn 默认挑轨,多音轨不可控)
-        .arg("-c:a").arg("aac").arg("-af").arg(AUDIO_LOUDNESS_AF).arg("-b:a").arg("256k")
-        .arg("-movflags").arg("empty_moov+default_base_moof")
+        .arg("-c:a");
+    if copy_audio {
+        cmd.arg("copy"); // 原样搬:不带 -af(滤镜要解码,与 copy 互斥)、不设码率
+    } else {
+        cmd.arg("aac").arg("-af").arg(AUDIO_LOUDNESS_AF).arg("-b:a").arg("256k");
+    }
+    cmd.arg("-movflags").arg("empty_moov+default_base_moof")
         .arg("-frag_duration").arg("600000000")
         .arg("-f").arg("mp4").arg("pipe:1");
     cmd
@@ -1459,7 +1531,7 @@ mod tests {
         assert!(ok, "生成测试源失败");
 
         let ffmpeg = PathBuf::from("ffmpeg");
-        let pr = super::super::probe::probe_local(&src);
+        let pr = super::super::probe::probe_local(&src).expect("ffmpeg 造的是合法 mp4");
         let dur = pr.duration_seconds.expect("时长");
         let codec = pr.video_codec.clone().expect("H.264 codec");
         assert!(!pr.video_keyframes.is_empty(), "应有关键帧");
@@ -1474,12 +1546,14 @@ mod tests {
             src.clone(),
             ffmpeg,
             true,
+            false, // copy_audio:这条老用例验的是视频 copy 链,音频照旧转码
             format!("video/mp4; codecs=\"{codec}\""),
             init,
             segments,
             dur,
             VideoEncoder::Software,
             0,
+            Vec::new(), // 这条老用例不验字幕
         );
         let base = desc_url.strip_suffix("/desc").unwrap().to_string();
         let http = reqwest::Client::new();

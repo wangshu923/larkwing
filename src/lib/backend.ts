@@ -404,6 +404,15 @@ export interface AudioTrackInfo {
   title?: string
 }
 
+/** 一条可显示的字幕(P4)。core 现转现回 WebVTT,前端只管挂 `<track>` 与切换。 */
+export interface SubtitleRef {
+  url: string
+  /** ISO-639-2 语言码;没标 = 缺省,显示成「字幕 N」。 */
+  lang?: string
+  /** 来自旁边的外挂文件(vs 文件内嵌)。 */
+  sidecar: boolean
+}
+
 export interface NowPlaying {
   kind: 'audio' | 'video'
   title: string
@@ -427,6 +436,9 @@ export interface NowPlaying {
   shuffle?: boolean
   /** 全部音轨(本地探测;≥2 条才出切换钮)。缺省/空 = 单音轨或网络流。 */
   audio_tracks?: AudioTrackInfo[]
+  /** 可显示的字幕(P4;空/缺 = 这片没有)。url 指向 relay 的 WebVTT 端点,挂成 `<track>`。
+   *  内嵌轨排前、外挂文件在后(sidecar=true);lang 是 ISO 码,前端字典译成人话。 */
+  subtitles?: SubtitleRef[]
   /** 当前音轨(0 起下标)。 */
   audio_track?: number
   /** 有值 = 从这个位置(秒)接着播(切音轨重建管线时 core 带上,加载完 seek 过去)。 */
@@ -452,6 +464,16 @@ export interface PlaybackReport {
   duration?: number | null
   /** 倍速(缺省当 1)。 */
   rate?: number
+}
+
+/** 这台机器的解码能力快照(boot 探一次给 core;P1)。名字是归一后的编码名(`h264`/`ac3`…)。
+ *  **两路分开**:直传问 `canPlayType`、管线里能不能 copy 问 `MediaSource.isTypeSupported` ——
+ *  同一台机上两者真的会不一样(mac 直传放得了 AC3,MSE 未必)。
+ *  `probed` = 矩阵覆盖到的,少了它就分不清「探过且不支持」与「压根没探过」。 */
+export interface MediaCodecs {
+  probed: string[]
+  direct: string[]
+  mse: string[]
 }
 
 // ---- 语音车道(PLAN §11):听写会话的状态与产出 ----
@@ -1061,6 +1083,10 @@ export const api = {
     invoke<void>('media_replay_compat', { pageUrl, audioOnly }),
   /** 前端播放层诊断 → 写进 larkwing.log(正式版无 JS console,真机定位自适应问题靠它)。 */
   mediaLog: (msg: string) => invoke<void>('media_log', { msg }).catch(() => {}),
+  /** boot 时把**这台机器的解码能力**告诉 core(P1):解得动什么由 WebView 自己回答,
+   *  不再由 Rust 按白名单猜。灌不进去 = core 回落白名单(行为同从前),故 fire-and-forget。 */
+  setMediaCodecs: (codecs: MediaCodecs) =>
+    invoke<void>('set_media_codecs', { codecs }).catch(() => {}),
   /** 历史图片小票(相对名)→ 可显缩略图的 localhost URL(重开会话回看发过的图)。 */
   attachmentUrl: (file: string) => invoke<string>('attachment_url', { file }),
   /** 远程渠道状态(设置页):开关/已配凭证/白名单/连接态(凭证不过桥)。 */

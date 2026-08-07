@@ -19,6 +19,7 @@ import {
 import { i18n } from '../i18n'
 import { attachMedia, detachAudio } from './useAudioGraph'
 import { isAdaptiveUrl, playAdaptive, type AdaptiveController } from './localAdaptive'
+import { useToast } from './useToast'
 
 export type PlayStatus = 'idle' | 'loading' | 'playing' | 'paused'
 
@@ -37,6 +38,8 @@ const state = reactive({
   loopMode: 'off' as 'off' | 'one' | 'all',
   /** 随机播放镜像(多集队列才可能 true;挑歌在 core)。 */
   shuffle: false,
+  /** 当前字幕:0 = 关(默认),1 起 = NowPlaying.subtitles 的第几条。纯显示层,新播放复位。 */
+  subtitle: 0,
   /** 视频全屏中(HUD 缩成迷你胶囊的信号)。 */
   fullscreen: false,
   /** 建议气泡:扫码登录(首次播放后 core 提示一次;登录成功自动撤)。 */
@@ -255,6 +258,35 @@ async function loadVideoInto(el: HTMLVideoElement) {
   }
 }
 
+/** 媒体元素报错 → 写进 larkwing.log(正式版无 JS console,`media_log` 桥同 [adaptive] 那套)。
+ *  从前直传路失败是**全静默**的:黑屏 0:00,core 与前端都不留一个字 —— 2026-08-07 那次
+ *  「.mp4 其实是 mpegts」只能靠翻聊天库的工具回执倒推(§3.5 不静默失败)。code 是
+ *  MediaError:1=中止 2=网络 3=解码 4=这个源放不了(容器/编码不支持,最常见)。 */
+function logMediaError(kind: string, el: HTMLMediaElement) {
+  const cur = state.current
+  const src = cur?.manifest_url || cur?.stream_url || el.currentSrc || '(空)'
+  const line =
+    `[${kind}] 播放出错 code=${el.error?.code ?? '?'} route=${cur?.route ?? '?'} ` +
+    `msg=${el.error?.message || '(无)'} src=${src}`
+  console.error('[lw]' + line)
+  if (isTauri()) void api.mediaLog(line)
+  if (cur) notifyMediaFailed(cur)
+}
+
+/** 已为哪个 page_url 弹过"放不了"(error 事件一次失败常连发几条;新 play() 复位)。 */
+let failToastedFor: string | null = null
+/** 放不了要说一句,别只把状态翻成暂停让人对着黑屏猜(§3.5)。**自适应路先不说** ——
+ *  它失败后会自动回落 muxed HLS 重放一次,那一次多半能放;真放不了时那条新的会再报,
+ *  到时候才弹(不然用户先被吓一跳、片子又好好放起来了)。 */
+function notifyMediaFailed(cur: NowPlaying) {
+  if (windowLabel() === 'float') return // 悬浮窗不挂 ToastHost(§6.6)
+  if (!cur.manifest_url && !cur.stream_url) return // 压根没地址 = 没真尝试过(?demo 的假条目)
+  if (cur.manifest_url && isAdaptiveUrl(cur.manifest_url)) return // 等兜底重放的结果
+  if (failToastedFor === cur.page_url) return
+  failToastedFor = cur.page_url
+  useToast().error(i18n.global.t('toast.mediaFailed', { title: cur.title }))
+}
+
 function ensureAudio(): HTMLAudioElement {
   if (!audio) {
     audio = new Audio()
@@ -277,7 +309,9 @@ function ensureAudio(): HTMLAudioElement {
     })
     audio.addEventListener('ended', onEnded)
     audio.addEventListener('error', () => {
-      if (state.current?.kind === 'audio') state.status = 'paused'
+      if (state.current?.kind !== 'audio') return
+      state.status = 'paused'
+      logMediaError('audio', audio!)
     })
     // 多音轨收敛(≥2 轨才动作;单轨/无 API 是 no-op)
     audio.addEventListener('loadedmetadata', () => applyAudioTrackToEl(audio!))
@@ -321,7 +355,9 @@ export function registerVideoEl(el: HTMLVideoElement | null) {
   el.addEventListener('ended', onEnded)
   // 出错别卡在 loading(否则换台/混流 seek 失败时 spinner 转不停)
   el.addEventListener('error', () => {
-    if (state.current?.kind === 'video') state.status = 'paused'
+    if (state.current?.kind !== 'video') return
+    state.status = 'paused'
+    logMediaError('video', el)
   })
   // 多音轨收敛:直传的多音轨片只留选中那条(治 WKWebView 全轨混播;≥2 轨才动作)
   el.addEventListener('loadedmetadata', () => applyAudioTrackToEl(el))
@@ -334,6 +370,7 @@ export function registerVideoEl(el: HTMLVideoElement | null) {
 }
 
 function play(np: NowPlaying) {
+  state.subtitle = 0 // 字幕每次新播放复位「关」(与倍速同口径;用户/模型再开)
   // 悬浮窗(独立 WebView)只显示"正在放",不实际出声 —— 否则与主窗双播(robot 双播坑的多窗变体)
   if (windowLabel() === 'float') {
     state.current = np
@@ -350,6 +387,7 @@ function play(np: NowPlaying) {
   const continuation = state.current?.kind === 'video' && np.kind === 'video'
   stopElements()
   adaptiveFellBackFor = null // 新播放:清兜底记忆(muxed 回落走 /hls/ 不再进自适应,不会循环)
+  failToastedFor = null // 同上:兜底重放也从这过,那一次再失败就该说话了
   state.current = np
   state.status = 'loading'
   state.position = 0
@@ -605,7 +643,42 @@ function applyControl(action: string, value?: number) {
     if (state.current) state.current.audio_track = Math.max(0, Math.round(value) - 1)
     const el = activeEl()
     if (el) applyAudioTrackToEl(el)
+  } else if (action === 'subtitle' && value != null) {
+    setSubtitle(Math.round(value)) // 0 = 关,1 起 = 第几条(core 已校验形状)
   }
+}
+
+/** 当前显示的字幕:0 = 关,1 起 = `NowPlaying.subtitles` 的第几条。**纯显示层**,不碰管线。 */
+function setSubtitle(n: number) {
+  const total = state.current?.subtitles?.length ?? 0
+  state.subtitle = n >= 1 && n <= total ? n : 0
+  const el = activeEl()
+  if (!el) return
+  // `<track>` 是声明式挂的,这里只切 mode:showing 一条、其余 disabled(不能只 hidden —— 那样
+  // 浏览器仍在解析、切换时会闪);元素还没解析出 textTracks 时不管,onLoadedMetadata 会再来一次。
+  for (let i = 0; i < el.textTracks.length; i++) {
+    el.textTracks[i].mode = i === state.subtitle - 1 ? 'showing' : 'disabled'
+  }
+}
+
+/** 字幕按钮:关 → 第一条 → … → 最后一条 → 关。没有字幕时按钮不出现(见 VideoOverlay)。 */
+function cycleSubtitle() {
+  const total = state.current?.subtitles?.length ?? 0
+  if (total < 1) return
+  setSubtitle(state.subtitle >= total ? 0 : state.subtitle + 1)
+}
+
+/** 字幕的显示名:有语言码就译成人话(复用音轨那套字典),否则「字幕 N」;外挂的标出来源。 */
+function subtitleLabel(i: number): string {
+  const s = state.current?.subtitles?.[i]
+  if (!s) return ''
+  // 语言码译人话复用音轨那套词典(media.lang.*);没标语言就「字幕 N」。外挂来源用词典标注。
+  let name = i18n.global.t("media.subtitleN", { n: i + 1 })
+  if (s.lang) {
+    const key = `media.lang.${s.lang}`
+    name = i18n.global.te(key) ? i18n.global.t(key) : s.lang
+  }
+  return s.sidecar ? i18n.global.t("media.subtitleSidecar", { name }) : name
 }
 
 /** 音轨按钮:循环切到下一条(1 起的轨号交 core;mac 直传就地启停、其余重建管线原位续播)。 */
@@ -688,6 +761,11 @@ function wire() {
         { codec: 'ac-3', lang: 'eng' },
       ],
       audio_track: 0,
+      // 字幕预览(P4):一条内嵌 + 一条外挂 —— 看 CC 按钮与它的循环切换
+      subtitles: [
+        { url: '', lang: 'chi', sidecar: false },
+        { url: '', lang: 'eng', sidecar: true },
+      ],
     }
     state.status = 'playing'
     state.duration = 320
@@ -735,6 +813,9 @@ export function useMedia() {
     toggleShuffle,
     cycleAudioTrack,
     audioTrackLabel,
+    cycleSubtitle,
+    subtitleLabel,
+    setSubtitle,
     loginNow,
     dismissLoginHint,
   }

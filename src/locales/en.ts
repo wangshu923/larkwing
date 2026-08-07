@@ -271,6 +271,10 @@ export default {
     // Audio track switching (dual-language rips): button shows the current track's friendly name
     audioTrack: 'Audio track: {label} (click to switch)',
     trackN: 'Track {n}',
+    subtitleN: 'Subtitle {n}',
+    subtitleSidecar: '{name} (external)',
+    subtitleOff: 'Subtitles: off',
+    subtitleOn: 'Subtitles: {name}',
     lang: {
       chi: 'Chinese',
       zho: 'Chinese',
@@ -394,6 +398,8 @@ export default {
     captureFallback: 'Browser capture didn’t start — switched back to the system microphone',
     restoreOk: 'Restored from backup',
     restoreFailed: 'The restore didn’t finish — your data is unchanged',
+    // don't just sit there black (§3.5): this used to only flip the status to paused
+    mediaFailed: 'Can’t play “{title}” — the file may be damaged or in a format we can’t handle',
   },
   // one-click update (backlog ⑤·A): the "new version" card + manual-check feedback
   update: {

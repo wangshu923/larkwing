@@ -13,6 +13,7 @@ import FloatWindow from './components/FloatWindow.vue'
 import ContextMenu from './components/ContextMenu.vue'
 import ToastHost from './components/ToastHost.vue'
 import UpdateCard from './components/UpdateCard.vue'
+import { reportCodecs } from './composables/codecProbe'
 import { useBoot } from './composables/useBoot'
 import { useChat } from './composables/useChat'
 import { useSettings } from './composables/useSettings'
@@ -132,6 +133,8 @@ if (!isFloat && isTauri()) {
   // boot 后查一次数据位置:失效 → 恢复弹窗;有旧数据残留 → 清理弹窗(主动来找用户,不用回设置页)。
   // 本次启动若应用过「从备份恢复」的负载,把结果弹一句(成功给底、失败绝不静默 §3.5)。
   onMounted(async () => {
+    // 这台机器解得动什么,由 WebView 自己回答一次给 core(P1);失败静默 = 回落白名单。
+    reportCodecs()
     try {
       const loc = await api.dataLocation()
       if (loc.missing) {

@@ -421,6 +421,7 @@ pub fn run() {
       commands::media_auto_next,
       commands::media_mode,
       commands::report_media_state,
+      commands::set_media_codecs,
       commands::media_log,
       commands::media_replay_compat,
       commands::attachment_url,

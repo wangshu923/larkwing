@@ -1024,6 +1024,23 @@ pub fn report_media_state(
     state.media.set_playback(report);
 }
 
+/// 前端 boot 探来的**解码能力快照**(P1):这台机器的 WebView 到底解得动什么,由它自己回答,
+/// 不再由我们在 Rust 里按白名单猜。两路分开探(直传 `canPlayType` / 管线 `MediaSource
+/// .isTypeSupported`)—— 同一台机上两者真的会不一样。灌不进来(前端老版本 / 探测失败)= 快照
+/// 缺席 → 判定回落白名单,行为与从前逐条一致,绝不因此挡住播放。
+///
+/// 只进内存(§6.4 派生可丢):重启重探,不落库 —— 探一次是毫秒级的事,不值当为它开设置键。
+#[tauri::command]
+pub fn set_media_codecs(codecs: larkwing_core::media::capability::Codecs) {
+    tracing::info!(
+        probed = codecs.probed.len(),
+        mse = codecs.mse.len(),
+        direct = codecs.direct.len(),
+        "解码能力快照已就位"
+    );
+    larkwing_core::media::capability::set_codecs(codecs);
+}
+
 /// 历史图片小票 → 可显缩略图的 localhost URL(重开会话回看发过的图,§1/§9)。
 /// 前端 hydrate 历史时按需取;图 bytes 走文件不进库、不再喂 LLM。
 #[tauri::command]

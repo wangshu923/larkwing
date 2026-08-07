@@ -11,6 +11,10 @@ use super::{EpisodeRef, MediaHit, MediaSource, SearchError};
 const SEARCH_URL: &str = "https://api.bilibili.com/x/web-interface/search/type";
 /// 视频详情(分P `pages` + 合集 `ugc_season`):非 WBI 端点,UA+Referer 即可,多集发现走它。
 const VIEW_URL: &str = "https://api.bilibili.com/x/web-interface/view";
+/// 番剧(PGC)整季详情:`ep_id=` / `season_id=` 二选一,一次回整季 `episodes`。番剧与 UGC 稿件
+/// 是**两套内容体系**——番剧集的 bvid 拿去问 VIEW_URL 是 -404,多集发现只能走这个端点。
+/// 免 WBI 签名(与 VIEW_URL 同)。
+const PGC_SEASON_URL: &str = "https://api.bilibili.com/pgc/view/web/season";
 /// 裸 UA 常被 412,挂一个像真浏览器的(robot 同款手法,版本号更新)。
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                   (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
@@ -26,6 +30,40 @@ impl Bilibili {
                 .timeout(std::time::Duration::from_secs(15))
         });
         Bilibili { net }
+    }
+
+    /// 番剧整季发现。与 UGC 那条同款「尽力件」纪律:任何一步不顺一律 `Ok(None)` 退化成单集。
+    async fn pgc_episodes(
+        &self,
+        pgc: &PgcRef,
+        cookie_header: Option<&str>,
+    ) -> Result<Option<(String, Vec<EpisodeRef>)>> {
+        let (param, value) = pgc.query();
+        let resp = self
+            .net
+            .send(PGC_SEASON_URL, |c| {
+                let req = c
+                    .get(PGC_SEASON_URL)
+                    .query(&[(param, value)])
+                    .header("User-Agent", UA)
+                    .header("Referer", "https://www.bilibili.com/");
+                match cookie_header {
+                    Some(cookie) => req.header("Cookie", cookie),
+                    None => req,
+                }
+            })
+            .await
+            .map_err(|e| anyhow!("番剧 season 请求失败: {e}"))?;
+        if resp.status().as_u16() != 200 {
+            return Ok(None); // 含 412/403 风控:静默退化单集(播放路径会引导扫码登录)
+        }
+        let payload: serde_json::Value =
+            resp.json().await.map_err(|e| anyhow!("番剧 season 响应不是 JSON: {e}"))?;
+        if payload["code"].as_i64().unwrap_or(-1) != 0 {
+            return Ok(None);
+        }
+        // 番剧的载荷在 `result`(UGC 在 `data`),别抄错。
+        Ok(parse_season(&payload["result"]))
     }
 }
 
@@ -97,16 +135,21 @@ impl MediaSource for Bilibili {
         Ok(parse_results(&payload, limit))
     }
 
-    /// 多集发现:view API 一次拿回 `pages`(分P)与 `ugc_season`(合集)。**尽力件**——
-    /// 拿不到(短链 / 风控 / 非视频)一律 `Ok(None)` 退化成单集,绝不挡播放(风控后续由 resolve
-    /// 的 AuthRequired 引导登录,登录重放时带 cookie 再发现一次)。
+    /// 多集发现,**两条端点各管一套内容体系**:番剧(ep/ss)走 PGC season;UGC 稿件(BV)走 view
+    /// API 的 `pages`(分P)与 `ugc_season`(合集)。**尽力件**——拿不到(短链 / 风控 / 非视频)
+    /// 一律 `Ok(None)` 退化成单集,绝不挡播放(风控后续由 resolve 的 AuthRequired 引导登录,
+    /// 登录重放时带 cookie 再发现一次)。
     async fn episodes(
         &self,
         page_url: &str,
         cookie_header: Option<&str>,
     ) -> Result<Option<(String, Vec<EpisodeRef>)>> {
+        // 番剧优先判:它的 URL 里没有 BV 号,落到下面的 extract_bvid 只会一路 None。
+        if let Some(pgc) = extract_pgc(page_url) {
+            return self.pgc_episodes(&pgc, cookie_header).await;
+        }
         let Some(bvid) = extract_bvid(page_url) else {
-            return Ok(None); // b23.tv 短链 / av 号 / 番剧 ep → 不在分P/合集发现范围
+            return Ok(None); // b23.tv 短链 / av 号 → 不在分P/合集发现范围
         };
         let resp = self
             .net
@@ -145,6 +188,90 @@ fn extract_bvid(url: &str) -> Option<String> {
         .unwrap_or(rest.len());
     let bvid = &rest[..end];
     (bvid.len() >= 5).then(|| bvid.to_string())
+}
+
+/// 番剧(PGC)链接的两种形态。UGC 稿件(BV 号)不在此列 —— 两套内容体系、两套端点。
+#[derive(Debug, PartialEq)]
+enum PgcRef {
+    /// `/bangumi/play/ep742483` → 单集
+    Ep(String),
+    /// `/bangumi/play/ss44871` → 整季
+    Season(String),
+}
+
+impl PgcRef {
+    /// 两种形态查同一个 season 端点,只是参数名不同。
+    fn query(&self) -> (&'static str, &str) {
+        match self {
+            PgcRef::Ep(id) => ("ep_id", id),
+            PgcRef::Season(id) => ("season_id", id),
+        }
+    }
+}
+
+/// 从页面 URL 抽番剧的 ep / ss 号。**必须落在 `/bangumi/play/` 路径下**——否则别处
+/// 碰巧出现的 "ep"/"ss" 字样会被误认(`extract_bvid` 按 `BV` 大写字样找不会撞,这里两个
+/// 小写字母太常见,得靠路径约束)。
+fn extract_pgc(url: &str) -> Option<PgcRef> {
+    let rest = url.split("/bangumi/play/").nth(1)?;
+    // 号后面常跟 ?spm_id_from=… 之类跟踪参数,取到第一个非数字为止。
+    let digits = |s: &str| -> Option<String> {
+        let n: String = s.chars().take_while(char::is_ascii_digit).collect();
+        (!n.is_empty()).then_some(n)
+    };
+    if let Some(s) = rest.strip_prefix("ep") {
+        return digits(s).map(PgcRef::Ep);
+    }
+    if let Some(s) = rest.strip_prefix("ss") {
+        return digits(s).map(PgcRef::Season);
+    }
+    None
+}
+
+/// 解析 `pgc/view/web/season` 的 `result`(注意番剧走 `result`、UGC 走 `data`)。纯函数、可测。
+/// 只收 `episodes`(正片);`section`(PV / 特别篇 / 预告)刻意不并进队列——「自动播下一集」
+/// 要的是正片顺序,混进花絮会把连播打乱。<2 集 → None(不成系列,同 `parse_view`)。
+fn parse_season(result: &serde_json::Value) -> Option<(String, Vec<EpisodeRef>)> {
+    let mut eps = Vec::new();
+    for (i, ep) in result["episodes"].as_array()?.iter().enumerate() {
+        // ep 号既是集身份也是可播地址的唯一来源,缺了就拼不出地址 → 跳过(同 ugc_season 滤 bvid)。
+        let Some(id) = ep["ep_id"].as_i64().or_else(|| ep["id"].as_i64()) else { continue };
+        eps.push(EpisodeRef {
+            id: format!("ep{id}"),
+            // **必须是 bangumi/play/ep 形**:番剧集自带的 bvid 在 UGC view 端点是 -404、
+            // yt-dlp 也放不了,存 bvid 等于存了个放不出来的地址。
+            url: format!("https://www.bilibili.com/bangumi/play/ep{id}"),
+            title: episode_title(ep, i),
+        });
+    }
+    if eps.len() < 2 {
+        return None;
+    }
+    let key = result["season_id"]
+        .as_i64()
+        .map(|i| format!("bili:pgc:{i}"))
+        // 缺 season_id 也别丢掉队列:拿首集 ep 号当季身份(首集不会变)。
+        .unwrap_or_else(|| format!("bili:pgc:{}", eps[0].id));
+    Some((key, eps))
+}
+
+/// 集名:番剧的 `title` 是集号("1" / "OVA" / "特别篇"),`long_title` 才是副标题。
+/// 数字集号补成「第N集」,非数字原样留(别把 "OVA" 硬套成「第OVA集」);都空 → 按序号兜底。
+fn episode_title(ep: &serde_json::Value, i: usize) -> String {
+    let num = ep["title"].as_str().unwrap_or("").trim();
+    let sub = ep["long_title"].as_str().unwrap_or("").trim();
+    let head = if num.is_empty() {
+        format!("第{}集", i + 1)
+    } else if num.chars().all(|c| c.is_ascii_digit()) {
+        format!("第{num}集")
+    } else {
+        num.to_string()
+    };
+    if sub.is_empty() {
+        head
+    } else {
+        format!("{head} {sub}")
+    }
 }
 
 /// 解析 view API 的 `data`:**合集优先**(ugc_season,整季多个 BV),其次**分P**(单 BV 多 P)。
@@ -393,5 +520,122 @@ mod tests {
         assert!(parse_view(&data, "BV1solo").is_none());
         // 啥都没有也 None
         assert!(parse_view(&serde_json::json!({}), "BV1x").is_none());
+    }
+
+    #[test]
+    fn extract_pgc_from_bangumi_urls() {
+        assert_eq!(
+            extract_pgc("https://www.bilibili.com/bangumi/play/ep742483"),
+            Some(PgcRef::Ep("742483".into()))
+        );
+        assert_eq!(
+            extract_pgc("https://www.bilibili.com/bangumi/play/ss44871"),
+            Some(PgcRef::Season("44871".into()))
+        );
+        // 分享链常带跟踪参数,照样认得出号
+        assert_eq!(
+            extract_pgc("https://www.bilibili.com/bangumi/play/ep742483?spm_id_from=333.1007"),
+            Some(PgcRef::Ep("742483".into()))
+        );
+        // UGC 稿件 / 短链 / bangumi 路径但没号 → 不是番剧
+        assert_eq!(extract_pgc("https://www.bilibili.com/video/BV1xx411c7mD"), None);
+        assert_eq!(extract_pgc("https://b23.tv/abcdef"), None);
+        assert_eq!(extract_pgc("https://www.bilibili.com/bangumi/play/"), None);
+        // 「ep」「ss」这两个字母组合出现在别处不该误认(必须在 bangumi 路径下)
+        assert_eq!(extract_pgc("https://example.com/deep/ep123"), None);
+    }
+
+    /// 夹具形状照真实 `pgc/view/web/season` 返回(季 44871「安全警长啦咘啦哆」,52 集)。
+    #[test]
+    fn parse_season_builds_queue_from_pgc_episodes() {
+        let result = serde_json::json!({
+            "season_id": 44871,
+            "season_title": "安全警长啦咘啦哆",
+            "episodes": [
+                {"id": 742483, "ep_id": 742483, "bvid": "BV1aM4y1B7L9",
+                 "title": "1", "long_title": "小鸡弟弟失踪案",
+                 "link": "https://www.bilibili.com/bangumi/play/ep742483"},
+                {"id": 742484, "ep_id": 742484, "title": "2", "long_title": "犀牛弟弟被抓走了"},
+                {"id": 742485, "ep_id": 742485, "title": "3", "long_title": ""}
+            ]
+        });
+        let (key, eps) = parse_season(&result).unwrap();
+        assert_eq!(key, "bili:pgc:44871", "季 key 用 pgc 前缀,绝不与 ugc_season 的 bili:season: 撞车");
+        assert_eq!(eps.len(), 3);
+        // 集身份 = ep 号;url 必须用 bangumi/play/ep 形 —— 番剧集自带的 bvid 在 UGC view
+        // 端点是 -404、yt-dlp 也放不了,存 bvid 形等于存了个放不出来的地址。
+        assert_eq!(eps[0].id, "ep742483");
+        assert_eq!(eps[0].url, "https://www.bilibili.com/bangumi/play/ep742483");
+        assert_eq!(eps[0].title, "第1集 小鸡弟弟失踪案");
+        assert_eq!(eps[1].url, "https://www.bilibili.com/bangumi/play/ep742484");
+        assert_eq!(eps[2].title, "第3集", "没副标题就只报集号");
+    }
+
+    #[test]
+    fn parse_season_keeps_non_numeric_episode_labels() {
+        let (_, eps) = parse_season(&serde_json::json!({
+            "season_id": 3,
+            "episodes": [
+                {"ep_id": 1, "title": "OVA", "long_title": "特别篇"},
+                {"ep_id": 2, "title": "", "long_title": ""}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(eps[0].title, "OVA 特别篇", "非数字集号原样保留,别硬套「第X集」");
+        assert_eq!(eps[1].title, "第2集", "两边都空 → 按序号兜底");
+    }
+
+    #[test]
+    fn parse_season_edge_cases() {
+        // 只有 1 集 / 没有 episodes → 不成系列
+        assert!(parse_season(&serde_json::json!({
+            "season_id": 1, "episodes": [{"ep_id": 9, "title": "1"}]
+        }))
+        .is_none());
+        assert!(parse_season(&serde_json::json!({ "season_id": 1 })).is_none());
+        // 拼不出可播地址的条目跳过(缺 ep 号)
+        let (_, eps) = parse_season(&serde_json::json!({
+            "season_id": 2,
+            "episodes": [{"ep_id": 11, "title": "1"}, {"title": "坏条目"}, {"ep_id": 13, "title": "3"}]
+        }))
+        .unwrap();
+        assert_eq!(eps.len(), 2, "缺 ep 号的条目跳过,不生成放不了的地址");
+        // 缺 season_id 也别丢掉队列 —— 拿首集 ep 号当季身份(首集不会变)
+        let (key, _) = parse_season(&serde_json::json!({
+            "episodes": [{"ep_id": 5, "title": "1"}, {"ep_id": 6, "title": "2"}]
+        }))
+        .unwrap();
+        assert_eq!(key, "bili:pgc:ep5");
+    }
+
+    /// 单测只管纯函数,而接线(端点 / 参数名 / 番剧载荷在 `result` 不在 `data`)才是最容易错的
+    /// 一层 —— 这条打真网把 `episodes()` 整条链验穿。「番剧放一集就停」的回归守卫。
+    /// `cargo test -p larkwing-core --lib media::bilibili::tests::real_bangumi_season -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "打真网(B 站 PGC 端点),开发机手动跑"]
+    async fn real_bangumi_season() {
+        let bili = Bilibili::new();
+        // 安全警长啦咘啦哆(旧名「拉布拉多警长」)第 1 集,52 集的季。
+        let ep_url = "https://www.bilibili.com/bangumi/play/ep742483";
+        let (key, eps) = bili
+            .episodes(ep_url, None)
+            .await
+            .expect("请求不该报错")
+            .expect("番剧应发现出整季,不该退化成单集");
+        println!("key={key} 共 {} 集", eps.len());
+        for e in eps.iter().take(3) {
+            println!("   {} | {} | {}", e.id, e.title, e.url);
+        }
+        assert_eq!(key, "bili:pgc:44871");
+        assert!(eps.len() >= 50, "这季有 52 集,拿到 {} 集", eps.len());
+        // 用户贴进来的那一集必须能在队列里精确匹配上 —— 否则 build_queue 认不出「点的是第几集」。
+        assert!(eps.iter().any(|e| e.url == ep_url), "首集 url 应与用户贴的形态逐字一致");
+        // ss 形(整季链接)走同一个端点、应得同一个季。
+        let (key2, eps2) = bili
+            .episodes("https://www.bilibili.com/bangumi/play/ss44871", None)
+            .await
+            .expect("请求不该报错")
+            .expect("ss 形也该发现出整季");
+        assert_eq!((key2, eps2.len()), (key, eps.len()), "ep 形与 ss 形应指向同一季");
     }
 }

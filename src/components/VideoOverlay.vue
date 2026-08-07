@@ -12,7 +12,7 @@ import { win } from '../lib/backend'
 import { fmtClock } from '../lib/fmt'
 
 const { t } = useI18n()
-const { state, toggle, stop, seek, setVolume, setRate, next, prev, cycleAudioTrack, audioTrackLabel } =
+const { state, toggle, stop, seek, setVolume, setRate, next, prev, cycleAudioTrack, audioTrackLabel, cycleSubtitle, subtitleLabel } =
   useMedia()
 
 /** 多集剧集才出集数指示 + 上/下一集按钮(单集/电影为 null,不出现)。 */
@@ -20,6 +20,13 @@ const playlist = computed(() => state.current?.playlist ?? null)
 /** ≥2 条音轨才出切换钮(双语片);label = 当前轨的友好名(国语/英语/元数据标题)。 */
 const audioTrackCount = computed(() => state.current?.audio_tracks?.length ?? 0)
 const audioLabel = computed(() => audioTrackLabel(state.current?.audio_track ?? 0))
+const subtitles = computed(() => state.current?.subtitles ?? [])
+// 字幕按钮的文案:关/第几条(纯显示层,不碰管线)
+const subtitleText = computed(() =>
+  state.subtitle >= 1
+    ? t("media.subtitleOn", { name: subtitleLabel(state.subtitle - 1) })
+    : t("media.subtitleOff"),
+)
 
 /** 「怎么放的」徽章:直连/自适应/免转码=省(ok 绿),转码中=吃 CPU(attn 琥珀),混流=中性(accent)。
  *  route 缺省(浏览器预览假数据 / 老数据)→ 不显。key 由 core PlaybackRoute snake → camel 对齐字典。 */
@@ -328,7 +335,10 @@ onUnmounted(() => {
       }}</span>
       <button class="vbtn" @click="stop" :title="t('media.closeVideo')">✕</button>
     </header>
-    <video :key="videoKey" ref="video" class="screen" playsinline @dblclick="toggleFullscreen"></video>
+    <video :key="videoKey" ref="video" class="screen" playsinline @dblclick="toggleFullscreen">
+      <!-- 字幕:core 现转现回 WebVTT;默认全 disabled,按钮/嘴控切 mode(见 useMedia.setSubtitle) -->
+      <track v-for="(s, i) in subtitles" :key="s.url" kind="subtitles" :src="s.url" :srclang="s.lang" :label="subtitleLabel(i)" />
+    </video>
     <div v-if="state.status === 'loading'" class="spinner" aria-hidden="true"></div>
     <footer class="bar bottom">
       <button
@@ -373,6 +383,16 @@ onUnmounted(() => {
         :title="t('media.audioTrack', { label: audioLabel })"
       >
         {{ audioLabel }}
+      </button>
+      <!-- 字幕:有才出现(没字幕的片不该多一个点了没反应的按钮);关 → 第一条 → … → 关 -->
+      <button
+        v-if="subtitles.length >= 1 && !compact"
+        class="vbtn rate"
+        :class="{ on: state.subtitle >= 1 }"
+        @click="cycleSubtitle"
+        :title="subtitleText"
+      >
+        CC
       </button>
       <button v-if="!compact" class="vbtn rate" @click="cycleRate" :title="t('media.speed')">
         {{ state.rate }}x
