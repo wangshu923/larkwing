@@ -1,4 +1,4 @@
-//! 渠道出站文件(send_file 工具的机器件):把本机文件发到某个人的手机渠道。
+//! 渠道出站(send_file / send_text 工具的机器件):把本机文件或一段文字发到某个人的手机渠道。
 //! 与提醒推送(mod.rs outbound_loop)同族「出站」,但目标按**人**解析——渠道归人的
 //! 映射反着用:指认给 TA 的线程算 TA 的;TA 是主人时,未指认(NULL = 会话归属者)的
 //! 线程也算 TA 的。多条命中取最新绑定(id 大)。
@@ -72,9 +72,41 @@ pub(crate) async fn queue_weixin_pending(
     super::weixin::queue_pending_send(&store.settings, to_user_id, path, caption).await
 }
 
+/// 微信挂起补发入列(文字版;send_text 撞 StaleContext 用)。
+pub(crate) async fn queue_weixin_pending_text(
+    store: &Store,
+    target: &Target,
+    text: &str,
+) -> Result<()> {
+    let Target::Weixin { to_user_id, .. } = target else {
+        bail!("挂起补发只支持微信目标")
+    };
+    super::weixin::queue_pending_text(&store.settings, to_user_id, text).await
+}
+
 /// 挂起有效期(小时),给工具话术用(单源在 weixin.rs,§4.11 不留副本)。
 pub(crate) fn weixin_pending_ttl_hours() -> i64 {
     super::weixin::PENDING_TTL_HOURS
+}
+
+/// 发一段文字(send_text 工具的机器件):与回合回复/提醒推送同一批渠道出口——
+/// TG 富格式+分片(telegram::push)、钉钉 batchSend(dingtalk::push)、微信带过期令牌
+/// 降级(weixin::push,窗口关死冒 StaleContext 供调用方转挂起)。
+pub(crate) async fn send_text(net: &net::Client, target: &Target, text: &str) -> Result<()> {
+    match target {
+        Target::Telegram { token, chat_id } => {
+            let id: i64 = chat_id
+                .parse()
+                .with_context(|| format!("Telegram chat_id 不是数字: {chat_id}"))?;
+            super::telegram::push(net, token, id, text).await
+        }
+        Target::Dingtalk { app_key, app_secret, staff_id } => {
+            super::dingtalk::push(net, app_key, app_secret, staff_id, text).await
+        }
+        Target::Weixin { token, base_url, to_user_id, context_token } => {
+            super::weixin::push(net, base_url, token, to_user_id, context_token, text).await
+        }
+    }
 }
 
 /// 按名字找家人(跨人投递的收件人解析:send_file 的 to / reminder_set 的 for 共用)。

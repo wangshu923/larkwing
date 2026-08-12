@@ -11,6 +11,7 @@ mod ffmpeg_run;
 mod fs;
 pub mod guard;
 mod lyrics_fetch;
+mod archive;
 mod media_control;
 mod media_download;
 mod media_play;
@@ -23,6 +24,7 @@ mod recall;
 mod remember;
 mod reminder;
 mod send_file;
+mod send_text;
 mod skill;
 mod todo;
 mod torrent_download;
@@ -295,6 +297,8 @@ impl Tools {
         tools.register(Arc::new(fs::FsAppend::new()));
         tools.register(Arc::new(fs::FsEdit::new()));
         tools.register(Arc::new(fs::FsUndo::new()));
+        tools.register(Arc::new(archive::FsUnzip::new()));
+        tools.register(Arc::new(archive::FsZip::new()));
         tools.register(Arc::new(reminder::ReminderSet::new()));
         tools.register(Arc::new(reminder::ReminderList::new()));
         tools.register(Arc::new(reminder::ReminderCancel::new()));
@@ -311,6 +315,7 @@ impl Tools {
         tools.register(Arc::new(pdf::PdfToPng::new()));
         tools.register(Arc::new(read_image::ReadImage::new()));
         tools.register(Arc::new(send_file::SendFile::new()));
+        tools.register(Arc::new(send_text::SendText::new()));
         tools.register(Arc::new(web_render::WebRender::new()));
         tools
     }

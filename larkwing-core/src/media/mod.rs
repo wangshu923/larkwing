@@ -3,6 +3,7 @@
 //! 真正按源分化的只有**搜索**和**登录态**,接缝(`MediaSource` trait)就开在这;
 //! 加源 = 加一个实现文件,工具面与模型无感知。MVP 只有 bilibili。
 
+mod archive;
 mod bilibili;
 pub mod capability;
 pub mod cookies;
@@ -15,6 +16,7 @@ mod resolver;
 pub mod timeline;
 mod torrent;
 
+pub use archive::{ExtractOutcome, ZipOutcome};
 pub use cookies::CookieRec;
 pub use download::{DownloadOutcome, DownloadedAudio, TrackMeta};
 pub use edit::{EditOutcome, EditRequest};
@@ -182,6 +184,10 @@ pub struct NowPlaying {
     /// `<track>`;**默认不开**,用户/模型选了才显示。lang 是 ISO 码,core 不翻译(§6.6)。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subtitles: Vec<SubtitleRef>,
+    /// 本地音频旁挂 .lrc 的原文(有词才带,原样过桥——歌词是数据不是我们产的文案):
+    /// 前端播放条上方滚当前句。视频不带(字幕走 subtitles);网络流没有词源,恒 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lyrics: Option<String>,
     /// 本次播放走的链路(见 `PlaybackRoute`):前端在播放条上出一枚「怎么放的」小徽章。
     pub route: PlaybackRoute,
     pub page_url: String,
@@ -931,6 +937,7 @@ impl MediaRuntime {
         let np = NowPlaying {
             // 网络流的字幕另有来源(resolver 已解出平台字幕,配歌词在用),播放路本期不接。
             subtitles: Vec::new(),
+            lyrics: None,
             kind: if audio_only { MediaKind::Audio } else { MediaKind::Video },
             title: resolved.title,
             author: resolved.uploader,
@@ -1544,6 +1551,8 @@ impl MediaRuntime {
         });
         let np = NowPlaying {
             subtitles: subtitle_refs.clone(),
+            // 放歌带旁挂歌词;切集/连播每次重进这里 → 换曲自动换词
+            lyrics: if audio_only { lyrics::sidecar_lyrics(&path) } else { None },
             kind: if audio_only { MediaKind::Audio } else { MediaKind::Video },
             title,
             author: None,

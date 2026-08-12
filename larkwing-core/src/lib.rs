@@ -1,6 +1,7 @@
 //! Larkwing 引擎(纯 Rust,不依赖 tauri —— 硬边界)。
 //! 模块边界 = 未来的 crate 切割线:llm 不依赖 store,engine 是唯一合流点。
 
+pub mod archive;
 pub mod attach;
 pub mod bgtasks;
 pub mod bus;

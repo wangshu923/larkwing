@@ -3,10 +3,13 @@
 // 按钮直连 VM,不绕 LLM。登录建议气泡也长在这排(有提示就出,与是否在放无关)。
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { useLyrics } from '../composables/useLyrics'
 import { useMedia } from '../composables/useMedia'
+import { useSettings } from '../composables/useSettings'
 import { fmtClock } from '../lib/fmt'
 
 const { t } = useI18n()
+const settings = useSettings()
 const {
   state,
   toggle,
@@ -41,6 +44,15 @@ const loopTitle = computed(() =>
 const pct = computed(() =>
   state.duration > 0 ? Math.min(100, (state.position / state.duration) * 100) : 0,
 )
+/** 滚歌词(本地音频旁挂 .lrc):有带时间轴的词才出「词」按钮;默认显示、可关(记住)。 */
+const { available: lyricsAvailable, current: lyricLine } = useLyrics(
+  computed(() => state.current?.lyrics),
+  computed(() => state.position),
+)
+const lyricsOn = computed(() => settings.get('ui.lyrics') !== '0')
+function toggleLyrics() {
+  settings.set('ui.lyrics', lyricsOn.value ? '0' : '1')
+}
 
 function onSeek(e: Event) {
   const v = Number((e.target as HTMLInputElement).value)
@@ -57,6 +69,12 @@ function onVolume(e: Event) {
     <button class="chip" @click="loginNow">{{ t('media.loginChip') }}</button>
     <button class="chip ghost" @click="dismissLoginHint">{{ t('media.loginDismiss') }}</button>
   </div>
+
+  <Transition name="lyrline" mode="out-in">
+    <div v-if="showBar && lyricsOn && lyricLine" :key="lyricLine" class="lyric-line">
+      {{ lyricLine }}
+    </div>
+  </Transition>
 
   <div v-if="showBar" class="player">
     <button
@@ -103,6 +121,15 @@ function onVolume(e: Event) {
       :title="t('media.audioTrack', { label: audioLabel })"
     >
       {{ audioLabel }}
+    </button>
+    <button
+      v-if="lyricsAvailable"
+      class="pbtn track"
+      :class="{ on: lyricsOn }"
+      @click="toggleLyrics"
+      :title="lyricsOn ? t('media.lyricsHide') : t('media.lyricsShow')"
+    >
+      词
     </button>
     <div class="mid">
       <div class="title-row">
@@ -201,6 +228,15 @@ function onVolume(e: Event) {
   width: 9px; height: 9px; border-radius: 50%;
   background: var(--accent); box-shadow: 0 0 6px rgba(var(--accent-rgb), 0.8);
 }
+
+.lyric-line {
+  text-align: center; font-size: 13px; color: var(--accent);
+  padding: 2px 12px 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  text-shadow: 0 0 12px rgba(var(--accent-rgb), 0.35);
+}
+.lyrline-enter-active, .lyrline-leave-active { transition: opacity .18s, transform .18s; }
+.lyrline-enter-from { opacity: 0; transform: translateY(6px); }
+.lyrline-leave-to { opacity: 0; transform: translateY(-6px); }
 
 .login-chip { display: flex; gap: 8px; }
 .chip {

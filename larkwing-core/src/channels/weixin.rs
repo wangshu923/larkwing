@@ -861,9 +861,14 @@ static PENDING_MU: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct PendingSend {
     ext_id: String,
+    /// 文件挂起 = 待补发文件的绝对路径;文字挂起 = 空串(text 有值)。老条目无 text 字段照常解析。
+    #[serde(default)]
     path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     caption: Option<String>,
+    /// 文字挂起(send_text 的「一句话/链接」):有值 = 补发文字,忽略 path。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
     created_at: i64,
 }
 
@@ -897,6 +902,28 @@ pub(super) async fn queue_pending_send(
         ext_id: ext_id.to_string(),
         path: path_s,
         caption: caption.map(str::to_string),
+        text: None,
+        created_at: now,
+    });
+    save_pending(settings, &list)
+}
+
+/// 挂一段待补发文字(send_text 的微信臂;同目标同内容去重,顺手清过期项)。
+pub(super) async fn queue_pending_text(
+    settings: &crate::store::SettingsRepo,
+    ext_id: &str,
+    text: &str,
+) -> Result<()> {
+    let now = crate::store::now_ms();
+    let _g = PENDING_MU.lock().await;
+    let mut list = load_pending(settings);
+    list.retain(|e| now - e.created_at <= PENDING_TTL_MS);
+    list.retain(|e| !(e.ext_id == ext_id && e.text.as_deref() == Some(text)));
+    list.push(PendingSend {
+        ext_id: ext_id.to_string(),
+        path: String::new(),
+        caption: None,
+        text: Some(text.to_string()),
         created_at: now,
     });
     save_pending(settings, &list)
@@ -935,6 +962,20 @@ async fn flush_pending_sends(
         mine
     };
     for e in mine {
+        // 文字挂起(send_text):原样补发;失败回炉,与文件同款
+        if let Some(text) = e.text.clone() {
+            match push(net, base, token, ext_id, context_token, &text).await {
+                Ok(()) => tracing::info!("挂起的消息已补发(对方开口刷新了会话)"),
+                Err(err) => {
+                    tracing::warn!(err = %format!("{err:#}"), "消息补发失败,回炉等下一条消息");
+                    let _g = PENDING_MU.lock().await;
+                    let mut list = load_pending(settings);
+                    list.push(e);
+                    let _ = save_pending(settings, &list);
+                }
+            }
+            continue;
+        }
         let path = std::path::PathBuf::from(&e.path);
         if !path.is_file() {
             tracing::warn!(path = %e.path, "挂起的文件已不在,放弃补发");
@@ -1603,6 +1644,7 @@ mod tests {
             ext_id: "u9".into(),
             path: "/tmp/old.txt".into(),
             caption: None,
+            text: None,
             created_at: crate::store::now_ms() - PENDING_TTL_MS - 1,
         });
         save_pending(&s.settings, &list).unwrap();
@@ -1612,6 +1654,28 @@ mod tests {
         let left = load_pending(&s.settings);
         assert_eq!(left.len(), 2, "过期件已清:{left:?}");
         assert!(left.iter().all(|e| e.ext_id == "u1"));
+    }
+
+    /// 文字挂起去重(同目标同内容只留一份)+ 老格式条目(没有 text 字段)照常解析。
+    #[tokio::test]
+    async fn pending_text_dedupes_and_old_format_parses() {
+        let dir = std::env::temp_dir().join(format!("lw-wx-pendtxt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(dir.join("t.db"));
+        let s = crate::store::Store::open(&dir.join("t.db")).unwrap();
+
+        queue_pending_text(&s.settings, "u1", "https://example.com").await.unwrap();
+        queue_pending_text(&s.settings, "u1", "https://example.com").await.unwrap();
+        queue_pending_text(&s.settings, "u1", "另一句").await.unwrap();
+        let list = load_pending(&s.settings);
+        assert_eq!(list.len(), 2, "同内容顶替不追加:{list:?}");
+        assert!(list.iter().all(|e| e.text.is_some() && e.path.is_empty()));
+
+        // 升级前挂起的老条目(无 text 字段)必须照常解析——序列化格式向后兼容
+        let old = r#"[{"ext_id":"u1","path":"/tmp/a.txt","created_at":123}]"#;
+        let parsed: Vec<PendingSend> = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed[0].path, "/tmp/a.txt");
+        assert!(parsed[0].text.is_none());
     }
 
     /// 挂起补发端到端:TA 开口(新令牌)→ 附言 + 文件按序补发并出列;文件已删的丢弃;
@@ -1663,17 +1727,19 @@ mod tests {
         queue_pending_send(&s.settings, "u1", &file, Some("给你")).await.unwrap();
         queue_pending_send(&s.settings, "u1", &dir.join("gone.txt"), None).await.unwrap();
         queue_pending_send(&s.settings, "u2", &file, None).await.unwrap();
+        queue_pending_text(&s.settings, "u1", "地址在这").await.unwrap();
 
         let net = net::Client::new(|b| b);
         let base = format!("http://127.0.0.1:{port}");
         flush_pending_sends(&net, &base, "tok", "u1", "fresh-ctx", &s.settings).await;
 
-        // u1 真文件送达:附言文本项在前、file_item 在后,都带新令牌
+        // u1 真文件送达:附言文本项在前、file_item 在后,都带新令牌;文字挂起随后补发
         let sent = SENT.lock().unwrap();
-        assert_eq!(sent.len(), 2, "附言 + 文件两条:{sent:?}");
+        assert_eq!(sent.len(), 3, "附言 + 文件 + 文字三条:{sent:?}");
         assert_eq!(sent[0]["msg"]["item_list"][0]["text_item"]["text"], "给你");
         assert_eq!(sent[0]["msg"]["context_token"], "fresh-ctx");
         assert_eq!(sent[1]["msg"]["item_list"][0]["file_item"]["file_name"], "攻略.txt");
+        assert_eq!(sent[2]["msg"]["item_list"][0]["text_item"]["text"], "地址在这");
         // 列表只剩 u2 的(u1 真文件送达出列、已删路径丢弃)
         let left = load_pending(&s.settings);
         assert_eq!(left.len(), 1, "{left:?}");

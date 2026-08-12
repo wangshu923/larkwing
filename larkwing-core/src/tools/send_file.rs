@@ -31,7 +31,8 @@ impl SendFile {
                               「传给我」);「把XX发给妈妈」这类就把 to 填成那位家人的名字。\
                               用户点名了渠道(「发我微信」)才填 channel,没点名就不填。\
                               发之前文件得已经在本机(要下载先 web_download,要转图先 \
-                              pdf_to_png)。对方没连手机会明说。微信会话过期发不进去时会\
+                              pdf_to_png);只发文字/链接不带文件,用 send_text。\
+                              对方没连手机会明说。微信会话过期发不进去时会\
                               自动挂起、对方一开口就补送(结果里会说明),不要重发。",
                 parameters: serde_json::json!({
                     "type": "object",

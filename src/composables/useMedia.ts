@@ -787,6 +787,9 @@ function wire() {
         { codec: 'mp4a', lang: 'yue' },
       ],
       audio_track: 0,
+      // 滚歌词预览:position=67 时应显示「当前这句」;点「词」按钮可藏
+      lyrics:
+        '[00:58.00]示例歌词·上一句已经过去\n[01:05.50]示例歌词·当前这句正滚着\n[01:15.00]示例歌词·下一句还没到',
     }
     state.status = 'playing'
     state.duration = 225

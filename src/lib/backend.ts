@@ -439,6 +439,8 @@ export interface NowPlaying {
   /** 可显示的字幕(P4;空/缺 = 这片没有)。url 指向 relay 的 WebVTT 端点,挂成 `<track>`。
    *  内嵌轨排前、外挂文件在后(sidecar=true);lang 是 ISO 码,前端字典译成人话。 */
   subtitles?: SubtitleRef[]
+  /** 本地音频旁挂 .lrc 原文(有词才带):播放条上方滚当前句(useLyrics 解析)。 */
+  lyrics?: string
   /** 当前音轨(0 起下标)。 */
   audio_track?: number
   /** 有值 = 从这个位置(秒)接着播(切音轨重建管线时 core 带上,加载完 seek 过去)。 */
@@ -553,6 +555,14 @@ export interface VoiceStatus {
   speakers: { id: string; name: string; isClone?: boolean; builtin?: boolean }[]
   /** 出厂默认音色 id(单源 = 后端 tts::DEFAULT_SPEAKER);前端未设音色时用它高亮默认项,不写死副本(§4.11)。 */
   defaultSpeaker: string
+}
+
+/** 采集路由(voice_route):偏好(auto/browser/cpal)+ auto 解析后的生效值 +
+ *  「默认输出是不是耳机」(null = 探不出)。useCaptureRoute 轮询 + 设置页提示用。 */
+export interface CaptureRoute {
+  pref: string
+  effective: 'browser' | 'cpal' | string
+  headphones: boolean | null
 }
 
 /** 输入形态(语音会话模式,PLAN §11):发送瞬间物化,真相在库。省略 = 打字默认形。 */
@@ -1113,6 +1123,8 @@ export const api = {
   /** 停听写:accept = 立即定稿(已听到的送识别);false = 取消丢弃。幂等。 */
   voiceListenStop: (accept: boolean) => invoke<void>('voice_listen_stop', { accept }),
   voiceStatus: () => invoke<VoiceStatus>('voice_status'),
+  /** 采集路由(auto 档解析 + 耳机检测;§7.5 2026-08-12)。 */
+  voiceRoute: () => invoke<CaptureRoute>('voice_route'),
   /** 免手唤醒开关(写设置+起停一体;首次开会下 KWS 模型 + 预合成应答音,较慢)。 */
   voiceWakeSet: (enabled: boolean) => invoke<VoiceStatus>('voice_wake_set', { enabled }),
   /** 旁听仲裁(唤醒确认层「呼名+续句」):临时回合无 Channel,终态经全局车道 kind=overheard*。 */

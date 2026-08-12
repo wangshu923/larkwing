@@ -1092,7 +1092,8 @@ impl Engine {
                 Ok(())
             }
             "voice.capture.source" => {
-                if !["cpal", "browser"].contains(&value) {
+                // auto(默认,2026-08-12)= 按「默认输出是不是耳机」现解析,voice::capture_route
+                if !["auto", "cpal", "browser"].contains(&value) {
                     return Err(invalid("未知的采集源"));
                 }
                 self.store.settings.set(None, key, value)?;

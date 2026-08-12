@@ -22,8 +22,9 @@ use crate::components::Component;
 
 use super::MediaRuntime;
 
-/// 回合内等待窗:起跑后等这么久,没跑完就转后台接着跑(§4.11 常量单源;方案已确认)。
-const IN_TURN_WAIT: Duration = Duration::from_secs(30);
+/// 回合内等待窗:起跑后等这么久,没跑完就转后台接着跑(§4.11 常量单源;方案已确认。
+/// pub(super):压缩包差事〔media/archive.rs〕同一个节奏,不另造第二个数)。
+pub(super) const IN_TURN_WAIT: Duration = Duration::from_secs(30);
 /// 报错尾巴留存(行数/字符):stderr 可能很长,喂回模型自纠只要末尾这点(量约束 §7.2)。
 const STDERR_TAIL_LINES: usize = 40;
 const STDERR_TAIL_CHARS: usize = 2000;

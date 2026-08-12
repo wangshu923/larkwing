@@ -7,6 +7,7 @@
 
 import { reactive } from 'vue'
 import { api, isTauri } from '../lib/backend'
+import { useCaptureRoute } from './useCaptureRoute'
 import { useSettings } from './useSettings'
 import { attachTts } from './useAudioGraph'
 
@@ -60,18 +61,23 @@ let playerFlip = 0
 let fakeEndTimer: ReturnType<typeof setTimeout> | undefined
 let playWatchdog: ReturnType<typeof setTimeout> | undefined // 播放看门狗:ended 没触发时强制推进
 const settings = useSettings()
+const captureRoute = useCaptureRoute()
 
 function syncBusy() {
   state.busy = turnActive || current != null || queue.length > 0
 }
 
 /** 念话期间唤醒循环丢帧(自激防护:KWS 别把 TTS 的声音当唤醒词);去重只发翻转沿。
- *  **只在 cpal 采集下需要**(2026-07-06 收尾):浏览器采集(默认)的麦自带 AEC,TTS 是
- *  它自己播的、天然被消 → 不挂起 = 念话中喊它可打断(barge-in 解锁);切回 cpal 闸门自动回来。 */
+ *  **只在 cpal 采集下需要**(2026-07-06 收尾):浏览器采集的麦自带 AEC,TTS 是它自己播的、
+ *  天然被消 → 不挂起 = 念话中喊它可打断(barge-in 解锁);cpal 生效时闸门自动回来。
+ *  auto 档(2026-08-12)吃解析后的生效值;还没解析出来('')按 browser 处理(不挂起)——
+ *  窗口极短,误触有确认层兜,比常态误挂起(念话不能打断)划算。 */
 let suspendSent = false
 function syncWakeSuspend() {
   if (!isTauri()) return
-  const want = state.playing && settings.get('voice.capture.source') !== 'browser'
+  const pref = settings.get('voice.capture.source') || 'auto'
+  const src = pref === 'auto' ? captureRoute.state.effective || 'browser' : pref
+  const want = state.playing && src !== 'browser'
   if (want !== suspendSent) {
     suspendSent = want
     api.voiceWakeSuspend(want).catch(() => {})

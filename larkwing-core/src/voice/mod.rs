@@ -6,6 +6,7 @@
 mod asr;
 mod calib;
 mod models;
+mod output_route;
 mod prompts;
 mod speaker;
 mod tts;
@@ -165,8 +166,32 @@ pub struct VoiceStatus {
     pub default_speaker: String,
 }
 
+/// 采集路由(`voice_route` 命令的载荷):偏好(auto/browser/cpal)+ 解析后的生效值 +
+/// 「默认输出是不是耳机」(None = 探不出)。设置页提示与 MicBridge auto 档轮询用。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureRoute {
+    pub pref: String,
+    pub effective: String,
+    pub headphones: Option<bool>,
+}
+
 impl VoiceRuntime {
     pub fn new(dir: PathBuf, store: Store, bus: Bus, scenes: Scenes) -> VoiceRuntime {
+        // 「默认自动」一次性迁移(2026-08-12 用户拍板):三态上线前的存量显式值
+        // (browser/cpal = 老两态时代的手动开关)统一重置成 auto——耳机/扬声器自动判
+        // 从此对所有人生效;标记只迁一次(autostart .v2 同款),之后用户显式选开/关
+        // 照常粘住。cpal 自愈路不受损:迁完若 auto 解析成 browser 又起不来,自愈会
+        // 再写 cpal,标记挡住二次重置。
+        const AUTO_MIGRATED: &str = "voice.capture.auto_defaulted";
+        if store.settings.get(None, AUTO_MIGRATED).ok().flatten().is_none() {
+            if let Ok(Some(v)) = store.settings.get(None, "voice.capture.source") {
+                if v == "browser" || v == "cpal" {
+                    let _ = store.settings.set(None, "voice.capture.source", "auto");
+                }
+            }
+            let _ = store.settings.set(None, AUTO_MIGRATED, "1");
+        }
         let tasks = Tasks::new(bus.clone());
         let models = VoiceModels::new(dir.join("models"), tasks);
         VoiceRuntime {
@@ -209,7 +234,7 @@ impl VoiceRuntime {
     /// 返回 false = 没开听(cpal 采集源关了回声消除,TTS 问句会进麦自答风险大,只走卡片;
     /// 或唤醒循环没在跑/没注入 confirmer),前端不用等语音结果。
     pub fn confirm_listen(&self, id: u64) -> bool {
-        if self.capture_source() != "browser" {
+        if self.capture_route().effective != "browser" {
             tracing::info!("口头确认不开:采集源非 browser(无 AEC,防 TTS 问句自答)");
             return false;
         }
@@ -1391,9 +1416,10 @@ impl VoiceRuntime {
     // (WebView2=Chromium AEC3;参考=它自己在播的全部音频)。默认 cpal 零回归,
     // 真机验过再转正默认(watch-items 见 PLAN §11)。
 
-    /// 当前采集源(`voice.capture.source`,app 级):browser = 前端推流;其余 = cpal。
-    /// **默认 browser(2026-07-06 转正)**:getUserMedia 消完自播回声的耳朵是治自我唤醒
-    /// 的根;显式设过 cpal 的沿用。前端 useSettings DEFAULTS 镜像同值(§6.8/§4.11)。
+    /// 采集偏好(`voice.capture.source`,app 级):auto(默认,2026-08-12)/ browser / cpal。
+    /// **默认 auto**:按「默认输出是不是耳机」现解析(耳机 → cpal:自播进不了麦,AEC 零收益,
+    /// mac 上还会被系统通话处理弄糊自家播放;扬声器 → browser:AEC 治自我唤醒的根)。
+    /// 显式设过 browser/cpal 的沿用。前端 useSettings DEFAULTS 镜像同值(§6.8/§4.11)。
     fn capture_source(&self) -> String {
         self.inner
             .store
@@ -1401,15 +1427,26 @@ impl VoiceRuntime {
             .get(None, "voice.capture.source")
             .ok()
             .flatten()
-            .unwrap_or_else(|| "browser".into())
+            .unwrap_or_else(|| "auto".into())
+    }
+
+    /// 采集路由(偏好 + 解析后的生效值 + 是不是耳机在出声):设置页提示与 MicBridge
+    /// 轮询都吃它;每次现查现解析(平台调用微秒级,免缓存一致性)。
+    pub fn capture_route(&self) -> CaptureRoute {
+        let pref = self.capture_source();
+        let headphones = output_route::default_output_is_headphones();
+        let effective = output_route::resolve(&pref, headphones).to_string();
+        CaptureRoute { pref, effective, headphones }
     }
 
     /// 按采集源开管:唤醒/听写/标定/录声纹统一走这个口(接缝换源,下游零感知)。
     pub(super) fn open_capture_auto(&self) -> Result<CapturePipe> {
-        if self.capture_source() == "browser" {
-            tracing::info!("采集源 = 浏览器推流(AEC 采集端)");
+        let route = self.capture_route();
+        if route.effective == "browser" {
+            tracing::info!(pref = %route.pref, "采集源 = 浏览器推流(AEC 采集端)");
             return Ok(self.open_push_pipe());
         }
+        tracing::info!(pref = %route.pref, headphones = ?route.headphones, "采集源 = 系统采集(cpal)");
         open_capture(self.input_device())
     }
 
@@ -1777,9 +1814,22 @@ mod tests {
     #[test]
     fn capture_source_defaults_to_browser_and_dispatches_push() {
         let rt = test_rt("capsrc");
-        assert_eq!(rt.capture_source(), "browser", "默认 browser(2026-07-06 转正:AEC 耳朵)");
+        assert_eq!(rt.capture_source(), "auto", "默认 auto(2026-08-12:按输出形态现解析)");
         rt.inner.store.settings.set(None, "voice.capture.source", "cpal").unwrap();
         assert_eq!(rt.capture_source(), "cpal", "显式设过 cpal 的沿用");
+        assert_eq!(rt.capture_route().effective, "cpal", "显式值解析原样放行");
+        // 一次性迁移:三态上线前的存量显式值 → auto(只迁一次,之后显式选择粘住)。
+        // 全新库模拟「老版本升级上来」:先落 browser、无迁移标记,再建运行时。
+        let dir2 = std::env::temp_dir().join(format!("lw-voice-mig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir2);
+        std::fs::create_dir_all(&dir2).unwrap();
+        let store2 = crate::store::Store::open(&dir2.join("t.db")).unwrap();
+        store2.settings.set(None, "voice.capture.source", "browser").unwrap();
+        let rt2 = VoiceRuntime::new(dir2.clone(), store2.clone(), Bus::new(), Scenes::builtin());
+        assert_eq!(rt2.capture_source(), "auto", "升级首启:存量 browser 重置成 auto");
+        store2.settings.set(None, "voice.capture.source", "cpal").unwrap();
+        let rt3 = VoiceRuntime::new(dir2, store2, Bus::new(), Scenes::builtin());
+        assert_eq!(rt3.capture_source(), "cpal", "标记已落:之后的显式选择粘住不再重置");
         rt.inner.store.settings.set(None, "voice.capture.source", "browser").unwrap();
         // browser 源开管不碰麦克风硬件,永远成功
         let pipe = rt.open_capture_auto().expect("push pipe 打开");

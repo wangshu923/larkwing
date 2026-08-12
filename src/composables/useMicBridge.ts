@@ -10,6 +10,7 @@
 import { watchEffect } from 'vue'
 import { api, isTauri } from '../lib/backend'
 import { i18n } from '../i18n'
+import { useCaptureRoute } from './useCaptureRoute'
 import { useSettings } from './useSettings'
 import { useToast } from './useToast'
 import { useVoice } from './useVoice'
@@ -140,10 +141,15 @@ export function useMicBridge() {
   const settings = useSettings()
   const voice = useVoice()
   const calib = useWakeCalib()
+  const route = useCaptureRoute()
   watchEffect(() => {
     const dev = settings.get('voice.input_device_web') || '' // 依赖跟踪:设置页换麦即热重启
+    // auto 档吃 core 解析的生效值;还没问到('')不开——宁可晚几百毫秒,不误占麦
+    // (auto 解析成 cpal 时若先开了 getUserMedia,mac 会白挂一层通话处理,§7.5 2026-08-12)
+    const pref = settings.get('voice.capture.source') || 'auto'
+    const src = pref === 'auto' ? route.state.effective : pref
     const need =
-      settings.get('voice.capture.source') === 'browser' &&
+      src === 'browser' &&
       (voice.state.wakeArmed ||
         voice.state.phase !== 'idle' ||
         ['preparing', 'recording'].includes(voice.state.enroll.stage) ||

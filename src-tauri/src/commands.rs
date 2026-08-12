@@ -596,6 +596,15 @@ pub fn voice_status(state: State<'_, AppState>) -> Result<VoiceStatus, AppError>
     Ok(state.voice.status())
 }
 
+/// 采集路由(auto 档,§7.5 2026-08-12):偏好 + 解析后的生效值 + 是不是耳机在出声。
+/// 设置页提示与 MicBridge 的 auto 档轮询(跟随戴上/摘下耳机)都吃它。
+#[tauri::command]
+pub fn voice_route(
+    state: State<'_, AppState>,
+) -> Result<larkwing_core::voice::CaptureRoute, AppError> {
+    Ok(state.voice.capture_route())
+}
+
 /// 免手唤醒开关(PLAN §11 C):写设置 + 起停一体(首次开会下 KWS 模型 + 预合成应答音)。
 /// 返回最新状态(wake_running 是事实,settings 只是意向)。
 #[tauri::command]

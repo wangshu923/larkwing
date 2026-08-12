@@ -437,6 +437,7 @@ pub fn run() {
       commands::voice_listen_start,
       commands::voice_listen_stop,
       commands::voice_status,
+      commands::voice_route,
       commands::voice_wake_set,
       commands::voice_follow_up,
       commands::voice_refresh_prompts,

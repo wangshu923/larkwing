@@ -531,9 +531,63 @@ async fn fetch_json(
     resp.json().await.context("字幕不是 JSON")
 }
 
+/// 旁挂 .lrc 上限:正常歌词几 KB,超大的当异常不带(防怪文件撑爆 IPC 事件)。
+const SIDECAR_MAX_BYTES: u64 = 200 * 1024;
+
+/// 本地音频旁边的同名 .lrc(lyrics_fetch / 下载链的产物,或用户自己攒的):有就整份
+/// 原文带给前端滚当前句(歌词是数据不是我们产的文案,§6.6)。老 .lrc 常是 GBK →
+/// 非 UTF-8 按 GB18030 回退解码(乱码 = 白做);解不出/超大/为空一律 None,绝不半截。
+pub(super) fn sidecar_lyrics(path: &std::path::Path) -> Option<String> {
+    let lrc = path.with_extension("lrc");
+    let meta = std::fs::metadata(&lrc).ok()?;
+    if !meta.is_file() || meta.len() > SIDECAR_MAX_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(&lrc).ok()?;
+    let text = match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            let (s, _, bad) = encoding_rs::GB18030.decode(e.as_bytes());
+            if bad {
+                return None;
+            }
+            s.into_owned()
+        }
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sidecar_lyrics_reads_utf8_and_gbk_skips_odd() {
+        let dir = std::env::temp_dir().join(format!("lw-lrc-side-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let song = dir.join("歌.m4a");
+        std::fs::write(&song, b"x").unwrap();
+        // 没有 .lrc → None
+        assert!(sidecar_lyrics(&song).is_none());
+        // UTF-8 原样
+        std::fs::write(dir.join("歌.lrc"), "[00:01.00]第一句").unwrap();
+        assert_eq!(sidecar_lyrics(&song).unwrap(), "[00:01.00]第一句");
+        // GBK 老编码解得回中文
+        let (gbk, _, _) = encoding_rs::GB18030.encode("[00:02.00]老编码歌词");
+        std::fs::write(dir.join("歌.lrc"), &gbk[..]).unwrap();
+        assert_eq!(sidecar_lyrics(&song).unwrap(), "[00:02.00]老编码歌词");
+        // 空白 → None;超大 → None
+        std::fs::write(dir.join("歌.lrc"), "  \n ").unwrap();
+        assert!(sidecar_lyrics(&song).is_none());
+        std::fs::write(dir.join("歌.lrc"), vec![b'x'; (SIDECAR_MAX_BYTES + 1) as usize]).unwrap();
+        assert!(sidecar_lyrics(&song).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn sub_to_lrc_formats_timestamps() {

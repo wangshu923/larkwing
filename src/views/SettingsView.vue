@@ -11,6 +11,7 @@ import { useUpdater } from '../composables/useUpdater'
 import { useToast } from '../composables/useToast'
 import { refreshAudioMode } from '../composables/useAudioGraph'
 import { useWakeCalib } from '../composables/useWakeCalib'
+import { useCaptureRoute } from '../composables/useCaptureRoute'
 import { useVoice, onEnrollDone } from '../composables/useVoice'
 import { audioFileToWavBase64 } from '../composables/useAudioDecode'
 import SkinSelect from '../components/SkinSelect.vue'
@@ -233,15 +234,25 @@ const asrOpts = computed(() => [
 // deviceId(存 voice.input_device_web);cpal 源 = 人类可读设备名(存 voice.input_device)。
 // 两套命名空间分键,切源各回各的选择。浏览器设备的 label 要麦克风权限到手后才有
 // (桥起过一次即有),没有就编号兜底。
-const captureSource = computed(() => settings.get('voice.capture.source') || 'browser')
-// 回声消除开关 = 采集源的用户语言(§7.5 正式位,2026-07-10 从试验块挪来;试验块已删):
-// 开 = browser 采集(getUserMedia AEC3,消掉自己放的电影/说话声);关 = cpal 原始采集。
-// 切换即写 + 重启唤醒换管;browser 起不来时 useMicBridge 自愈回落 cpal + toast,
-// 这颗开关是显式的一键回退。NS/AGC 不暴露(实验定案:NS 双开啃双讲人声,锁死在代码)。
+const captureSource = computed(() => settings.get('voice.capture.source') || 'auto')
+const captureRoute = useCaptureRoute()
+/** auto 档解析后的生效源(core 按「输出是不是耳机」定;还没问到按 browser);
+ *  显式档 = 偏好本身。麦选择器按它切列表。 */
+const effectiveCapture = computed(() =>
+  captureSource.value === 'auto'
+    ? captureRoute.state.effective || 'browser'
+    : captureSource.value,
+)
+// 回声消除三态 = 采集源的用户语言(§7.5;2026-08-12 加「自动」并转默认):
+// 自动 = 按默认输出定(耳机 → 关:自播进不了麦零收益,mac 上开着还会被系统通话处理弄糊
+// 自家播放;扬声器 → 开);开 = browser 采集(getUserMedia AEC3);关 = cpal 原始采集。
+// 切换即写 + 重启唤醒换管;browser 起不来时 useMicBridge 自愈回落 cpal + toast。
+// NS/AGC 不暴露(实验定案:NS 双开啃双讲人声,锁死在代码)。
 async function onEchoCancel(v: string) {
-  await settings.set('voice.capture.source', v === '1' ? 'browser' : 'cpal')
+  await settings.set('voice.capture.source', v) // 'auto' | 'browser' | 'cpal'
+  await captureRoute.refresh() // auto:立即解析生效值(别等轮询);显式:镜像同步
   await restartWakeIfRunning()
-  if (v === '1') void loadWebMics() // 切回 browser 源顺手刷新设备列表
+  if (effectiveCapture.value === 'browser') void loadWebMics() // 生效 browser 顺手刷设备列表
 }
 const webMics = ref<{ value: string; label: string }[]>([])
 async function loadWebMics() {
@@ -258,7 +269,7 @@ async function loadWebMics() {
   }
 }
 const micOpts = computed(() =>
-  captureSource.value === 'browser'
+  effectiveCapture.value === 'browser'
     ? [{ value: '', label: t('settings.voice.micDefault') }, ...webMics.value]
     : [
         { value: '', label: t('settings.voice.micDefault') },
@@ -266,7 +277,7 @@ const micOpts = computed(() =>
       ],
 )
 const micValue = computed(() =>
-  captureSource.value === 'browser'
+  effectiveCapture.value === 'browser'
     ? settings.get('voice.input_device_web')
     : settings.get('voice.input_device'),
 )
@@ -410,7 +421,7 @@ async function previewSpeaker(id: string) {
   }
 }
 function setMic(v: string) {
-  if (captureSource.value === 'browser') {
+  if (effectiveCapture.value === 'browser') {
     // 浏览器采集:换麦由 useMicBridge 热重启(停旧流起新流),core 推流管不动 → 不用重启唤醒
     void settings.set('voice.input_device_web', v)
     return
@@ -1731,14 +1742,31 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           <span class="label">{{ t('settings.voice.echoCancel') }}</span>
           <span class="seg">
             <button
-              v-for="v in ['1', '0']"
+              v-for="v in ['auto', 'browser', 'cpal']"
               :key="v"
-              :class="{ on: captureSource === (v === '1' ? 'browser' : 'cpal') }"
+              :class="{ on: captureSource === v }"
               @click="onEchoCancel(v)"
-            >{{ t(v === '1' ? 'settings.audio.on' : 'settings.audio.off') }}</button>
+            >{{
+              t(
+                v === 'auto'
+                  ? 'settings.voice.aecAuto'
+                  : v === 'browser'
+                    ? 'settings.audio.on'
+                    : 'settings.audio.off',
+              )
+            }}</button>
           </span>
         </div>
         <p class="hint">{{ t('settings.voice.echoCancelHint') }}</p>
+        <p v-if="captureSource === 'auto'" class="hint">
+          {{
+            captureRoute.state.headphones === true
+              ? t('settings.voice.aecAutoHp')
+              : captureRoute.state.headphones === false
+                ? t('settings.voice.aecAutoSpk')
+                : t('settings.voice.aecAutoUnknown')
+          }}
+        </p>
         <div class="row">
           <span class="label">{{ t('settings.voice.micDevice') }}</span>
           <SkinSelect
