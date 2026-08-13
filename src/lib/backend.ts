@@ -345,6 +345,8 @@ export type TurnEvent =
   | { type: 'usage'; data: { round: UsageDigest; today: DayUsage; conv: UsageTotals } }
   // 插队(PLAN §9 B):回合在飞时注入的 user 消息已落库,之后的回复另起一段
   | { type: 'injected'; data: { message_id: number; text: string; attachments: AttachmentRef[] } }
+  // show_image 亮图:图卡插进当前在飞气泡组(同批 refs 已随 tool 行 payload 落库,重开会话由行派生)
+  | { type: 'shown'; data: { attachments: AttachmentRef[] } }
   // 带文字的工具轮:这段回复在落库里是独立 assistant 行;前端封口当前气泡、另起新泡(结构对齐落库)
   | { type: 'segment'; data: { message_id: number } }
   // end_session = 本轮模型调过 end_conversation(§7.5 会话收尾):唤醒回合据此收窗回待唤醒、

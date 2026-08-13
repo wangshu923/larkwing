@@ -15,6 +15,7 @@ mod relay;
 mod resolver;
 pub mod timeline;
 mod torrent;
+mod usage;
 
 pub use archive::{ExtractOutcome, ZipOutcome};
 pub use cookies::CookieRec;
@@ -25,6 +26,7 @@ pub use torrent::{
 };
 pub(crate) use lyrics::compose_batch_summary;
 pub use lyrics::{LyricsBatchOutcome, LyricsFileResult, LyricsItem, LyricsResult};
+pub use usage::UsageOutcome;
 
 use std::collections::HashMap;
 use std::path::PathBuf;

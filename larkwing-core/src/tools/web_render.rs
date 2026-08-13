@@ -281,7 +281,7 @@ impl Tool for WebRender {
         ctx: &ToolCtx,
     ) -> anyhow::Result<ToolOutput> {
         let (text, shot) = self.browse(args, ctx).await?;
-        Ok(ToolOutput { text, images: shot.into_iter().collect() })
+        Ok(ToolOutput { text, images: shot.into_iter().collect(), ..Default::default() })
     }
 }
 

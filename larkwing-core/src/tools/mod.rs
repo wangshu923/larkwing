@@ -25,9 +25,11 @@ mod remember;
 mod reminder;
 mod send_file;
 mod send_text;
+mod show_image;
 mod skill;
 mod todo;
 mod torrent_download;
+mod usage;
 mod watch;
 mod weather;
 mod web;
@@ -207,24 +209,38 @@ pub struct ToolOutput {
     pub text: String,
     /// 附带图片,data: URL(`data:image/png;base64,…`);空 = 纯文本(常态)。
     pub images: Vec<String>,
+    /// 亮给**用户**看的图(聊天图卡;show_image 专用):`attachments/` 内容寻址仓的
+    /// 相对文件名。与 `images` 分道 —— 这份经 turn loop 进 tool 行 payload + TurnEvent
+    /// 给前端渲染,**一个字节都不喂模型**(零视觉费);`images` 才是给模型看的那份。
+    pub shown: Vec<ShownImage>,
+}
+
+/// 一张亮给用户的图(tools 层词汇;tools 不反依赖 engine::AttachmentRef,
+/// 转换归 turn loop)。
+#[derive(Debug, Clone)]
+pub struct ShownImage {
+    pub name: String,
+    pub mime: String,
+    /// `attachments/` 下的相对文件名(内容寻址,与用户发图同仓)。
+    pub file: String,
 }
 
 impl ToolOutput {
     /// 纯文本产出(等价于 `From<String>`,给显式构造用)。
     pub fn text(t: impl Into<String>) -> ToolOutput {
-        ToolOutput { text: t.into(), images: Vec::new() }
+        ToolOutput { text: t.into(), ..Default::default() }
     }
 }
 
 impl From<String> for ToolOutput {
     fn from(text: String) -> ToolOutput {
-        ToolOutput { text, images: Vec::new() }
+        ToolOutput { text, ..Default::default() }
     }
 }
 
 impl From<&str> for ToolOutput {
     fn from(text: &str) -> ToolOutput {
-        ToolOutput { text: text.to_string(), images: Vec::new() }
+        ToolOutput { text: text.to_string(), ..Default::default() }
     }
 }
 
@@ -299,6 +315,7 @@ impl Tools {
         tools.register(Arc::new(fs::FsUndo::new()));
         tools.register(Arc::new(archive::FsUnzip::new()));
         tools.register(Arc::new(archive::FsZip::new()));
+        tools.register(Arc::new(usage::FsUsage::new()));
         tools.register(Arc::new(reminder::ReminderSet::new()));
         tools.register(Arc::new(reminder::ReminderList::new()));
         tools.register(Arc::new(reminder::ReminderCancel::new()));
@@ -312,8 +329,10 @@ impl Tools {
         tools.register(Arc::new(web::WebFetch::new(web_client)));
         tools.register(Arc::new(web::WebDownload::new()));
         tools.register(Arc::new(qr::QrDecode::new()));
+        tools.register(Arc::new(qr::QrEncode::new()));
         tools.register(Arc::new(pdf::PdfToPng::new()));
         tools.register(Arc::new(read_image::ReadImage::new()));
+        tools.register(Arc::new(show_image::ShowImage::new()));
         tools.register(Arc::new(send_file::SendFile::new()));
         tools.register(Arc::new(send_text::SendText::new()));
         tools.register(Arc::new(web_render::WebRender::new()));

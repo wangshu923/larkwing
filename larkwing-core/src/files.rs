@@ -125,6 +125,39 @@ pub fn human_size(bytes: u64) -> String {
     }
 }
 
+/// mime → 图片扩展名(认不出的 image/* 都当 jpg;非图给 bin)。
+/// save_image_blob 的命名半边;engine 收件区补光秃名也用它。
+pub fn image_ext(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        m if m.starts_with("image/") => "jpg", // jpeg / 其它都当 jpg
+        _ => "bin",
+    }
+}
+
+/// 把图片 bytes 落到 `atts_dir`(内容寻址命名,天然去重),返回相对文件名;失败 → None
+/// (调用方按「缺那份落盘」降级,不炸)。§6.2 blob 走文件不进库;用户发图(engine
+/// process_attachments)与 show_image 亮图共用同一个仓 —— 同图只存一份。
+pub fn save_image_blob(atts_dir: &Path, bytes: &[u8], mime: &str) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    let name = format!("{:016x}.{}", h.finish(), image_ext(mime));
+    if std::fs::create_dir_all(atts_dir).is_err() {
+        return None;
+    }
+    let path = atts_dir.join(&name);
+    // 内容寻址:已存在(同图重发)就不重写
+    if path.exists() || std::fs::write(&path, bytes).is_ok() {
+        Some(name)
+    } else {
+        None
+    }
+}
+
 /// 系统「下载」文件夹(Windows Known Folder / mac ~/Downloads);找不到回落用户主目录。
 /// web_download 缺省落点 / webrender 下载接管共用。
 pub fn default_download_dir() -> PathBuf {

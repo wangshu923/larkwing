@@ -16,7 +16,10 @@ use crate::bus::{AppEvent, Mood};
 use crate::store::Store;
 use crate::tools::{Tool, ToolCtx, ToolOutput};
 
-use super::{usage, AppError, AssistantPayload, ErrorKind, ToolRowPayload, ToolUseState, TurnEvent};
+use super::{
+    usage, AppError, AssistantPayload, AttachmentRef, ErrorKind, ToolRowPayload, ToolUseState,
+    TurnEvent,
+};
 
 // 工具轮控制(PLAN §8):不是单个魔法数 —— 深度是任务属性,固定数调大放走失控、调小卡死深任务。
 // 拆成三层:模型自检(智能判官)+ 空转兜底网(自检失灵时)+ 硬上限(纯 backstop)。
@@ -347,7 +350,7 @@ impl Turn {
                 Some(r) => r,
                 None => {
                     for call in &tool_calls {
-                        let p = tool_payload(call, "cancelled");
+                        let p = tool_payload(call, "cancelled", &[]);
                         persist_row(&store, conv_id, "tool", "已取消", p.as_deref()).await;
                     }
                     let _ = tx.send(TurnEvent::Cancelled).await;
@@ -363,7 +366,10 @@ impl Turn {
                 reasoning_state,
             });
             for (call, status, out) in &results {
-                let p = tool_payload(call, status);
+                // show_image 亮的图:refs 随 tool 行 payload 落库(重开会话派生图卡)+
+                // live 事件推前端(在飞气泡组当场出卡)。字节早已在 attachments/ 内容寻址仓。
+                let shown = shown_refs(&out.shown);
+                let p = tool_payload(call, status, &shown);
                 // 落库只落文本:图不进 DB、不回放(与用户发图「当轮不落库」同源 §9)。
                 persist_row(&store, conv_id, "tool", &out.text, p.as_deref()).await;
                 let _ = tx
@@ -372,6 +378,9 @@ impl Turn {
                         state: ToolUseState::Finished,
                     })
                     .await;
+                if !shown.is_empty() {
+                    let _ = tx.send(TurnEvent::Shown { attachments: shown }).await;
+                }
                 // 图当轮注入:随本回合后续开流喂给模型(视觉模型真收、非视觉降级),不落 DB。
                 let parts: Vec<ContentPart> = out
                     .images
@@ -706,13 +715,27 @@ async fn run_tools(
     futures_util::future::join_all(futs).await
 }
 
-fn tool_payload(call: &ToolCall, status: &str) -> Option<String> {
+fn tool_payload(call: &ToolCall, status: &str, attachments: &[AttachmentRef]) -> Option<String> {
     serde_json::to_string(&ToolRowPayload {
         call_id: call.id.clone(),
         name: call.name.clone(),
         status: status.into(),
+        attachments: attachments.to_vec(),
     })
     .ok()
+}
+
+/// show_image 的 tools 层词汇 → engine 词汇(tools 不反依赖 engine,转换归这里)。
+fn shown_refs(shown: &[crate::tools::ShownImage]) -> Vec<AttachmentRef> {
+    shown
+        .iter()
+        .map(|s| AttachmentRef {
+            kind: "image".into(),
+            name: s.name.clone(),
+            mime: s.mime.clone(),
+            file: Some(s.file.clone()),
+        })
+        .collect()
 }
 
 /// 工具调用指纹(进展守卫用):同名 + 同参 = 同一调用。args 的 Display 即紧凑 JSON,

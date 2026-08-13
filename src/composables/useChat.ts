@@ -167,6 +167,50 @@ function visible(m: Message): boolean {
   )
 }
 
+/** tool 行 payload 里 show_image 亮的图(空 = 常态)。 */
+function mineToolAttachments(m: Message): UiAttachment[] {
+  if (!m.payload) return []
+  try {
+    const refs = (JSON.parse(m.payload) as { attachments?: AttachmentRef[] }).attachments
+    return (refs ?? []).map((a) => ({
+      kind: a.kind === 'image' ? ('image' as const) : ('doc' as const),
+      name: a.name,
+      mime: a.mime,
+      file: a.file,
+    }))
+  } catch {
+    return []
+  }
+}
+
+/** 行列表 → 聊天流:过滤内部行,顺手把 show_image 亮的图(tool 行 payload.attachments)
+ *  挂到邻近的回复段——前面这段可见就挂它,静默工具轮(前段被滤)挂到下一段;组渲染
+ *  合并同轮各段,两种落点视觉上都在段间同一处。图卡的持有点恒 = wang 消息的
+ *  attachments(在飞路的 'shown' 事件也写这里),单一持有点不双渲染。 */
+function toUiList(msgs: Message[]): UiMessage[] {
+  const out: UiMessage[] = []
+  let orphans: UiAttachment[] = []
+  for (const m of msgs) {
+    if (m.role === 'tool') {
+      const refs = mineToolAttachments(m)
+      if (refs.length) {
+        const prev = out.at(-1)
+        if (prev && prev.role === 'wang') prev.attachments = [...(prev.attachments ?? []), ...refs]
+        else orphans.push(...refs)
+      }
+      continue
+    }
+    if (!visible(m)) continue
+    const ui = toUi(m)
+    if (orphans.length && ui.role === 'wang') {
+      ui.attachments = [...orphans, ...(ui.attachments ?? [])]
+      orphans = []
+    }
+    out.push(ui)
+  }
+  return out
+}
+
 /** 错误 kind → 旺财口吻的友好文案(铁律 §3.5:message 进日志,不给普通人看)。 */
 function friendly(kind?: ErrorKind): string {
   const known: ErrorKind[] = ['no_api_key', 'bad_api_key', 'network']
@@ -225,6 +269,28 @@ function pushReminderDemo() {
     trace: {
       steps: [
         { name: 'remember', ui_key: 'tool.remember', args: '{"fact":"用户不吃香菜","kind":"fact"}', result: '已记下', status: 'ok' },
+      ],
+    },
+  })
+  // show_image 图卡样例:工具亮的图挂在回复段上(dataUrl 直填,预览不走 relay)
+  const qrSvg =
+    'data:image/svg+xml;utf8,' +
+    encodeURIComponent(
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8" width="240" height="240" shape-rendering="crispEdges">' +
+        '<rect width="8" height="8" fill="#fff"/>' +
+        '<path fill="#000" d="M0 0h3v1H0zM0 1h1v2H0zM2 1h1v2H2zM0 3h3v1H0zM5 0h3v1H5zM5 1h1v2H5zM7 1h1v2H7zM5 3h3v1H5zM4 1h1v1H4zM1 4h1v1H1zM3 4h2v1H3zM6 4h1v1H6zM0 5h1v3H0zM2 5h1v1H2zM4 5h1v2H4zM6 5h2v1H6zM2 7h3v1H2zM6 7h2v1H6z"/></svg>'
+    )
+  state.messages.push({ id: localId--, role: 'user', text: '把家里 WiFi 生成个二维码', at: now })
+  state.messages.push({
+    id: localId--,
+    role: 'wang',
+    text: '生成好了,手机对着屏幕扫就能连:',
+    at: now,
+    attachments: [{ kind: 'image', name: 'qrcode.png', dataUrl: qrSvg }],
+    trace: {
+      steps: [
+        { name: 'qr_encode', ui_key: 'tool.qr_encode', args: '{"text":"WIFI:S:某某家;T:WPA;P:******;;"}', result: '二维码已生成', status: 'ok' },
+        { name: 'show_image', ui_key: 'tool.show_image', args: '{"paths":["qrcode.png"]}', result: '已把 1 张图亮在对话里', status: 'ok' },
       ],
     },
   })
@@ -498,7 +564,7 @@ async function boot() {
       api
         .loadConversation(state.convId)
         .then((msgs) => {
-          state.messages = msgs.filter(visible).map(toUi)
+          state.messages = toUiList(msgs)
           void hydrateStats(state.convId) // 提醒/自启回合的气泡也带上 hover 读数
           void hydrateTrace(state.convId) // …和「想了想」轨迹
           void resolveThumbs() // 历史图缩略图回填
@@ -531,7 +597,7 @@ async function boot() {
     // 皮肤改由 useSettings.load() 经 api.skin() 拉取并应用(主窗 & 悬浮窗同一路径,不再走 boot 过桥)
     state.hasApiKey = snap.hasApiKey
     state.convId = snap.conversation.id
-    state.messages = snap.messages.filter(visible).map(toUi)
+    state.messages = toUiList(snap.messages)
     void resolveThumbs() // 历史图缩略图回填
     if (snap.openingLine) {
       state.openingLine = snap.openingLine
@@ -749,6 +815,19 @@ function send(
           }
           state.mood = 'thinking'
           break
+        case 'shown': {
+          // show_image 亮图:图卡挂当前在飞段(持有点 = wang.attachments,与重开会话时
+          // toUiList 从 tool 行派生的是同一个持有点,不双渲染);缩略图当场拉。
+          const refs: UiAttachment[] = ev.data.attachments.map((a) => ({
+            kind: a.kind === 'image' ? ('image' as const) : ('doc' as const),
+            name: a.name,
+            mime: a.mime,
+            file: a.file,
+          }))
+          wang.attachments = [...(wang.attachments ?? []), ...refs]
+          void resolveThumbs()
+          break
+        }
         case 'thinking':
           // CoT 实时漏出:思考增量直接累进当前气泡的 trace.reasoning(药丸默认折叠 → 不走打字机平滑,糊上即可)。
           // 这也是「最终轮」CoT 的唯一来源:纯文本收尾轮 payload=None,done 时 hydrateTrace 取不到该气泡条目、
@@ -899,7 +978,7 @@ async function resolveUserMsgId(msgId: number, localText: string): Promise<numbe
   const idxFromEnd = users.length - 1 - users.findIndex((m) => m.id === msgId)
   if (idxFromEnd >= users.length) return null
   const msgs = await api.loadConversation(state.convId)
-  state.messages = msgs.filter(visible).map(toUi)
+  state.messages = toUiList(msgs)
   void resolveThumbs()
   const fresh = state.messages.filter((m) => m.role === 'user')
   const target = fresh[fresh.length - 1 - idxFromEnd]
@@ -937,7 +1016,7 @@ async function rollbackTo(msgId: number, localText: string): Promise<boolean> {
     }
     await api.rollbackConversation(state.convId, id)
     const msgs = await api.loadConversation(state.convId)
-    state.messages = msgs.filter(visible).map(toUi)
+    state.messages = toUiList(msgs)
     void resolveThumbs()
     void hydrateStats(state.convId)
     void hydrateTrace(state.convId)
@@ -993,7 +1072,7 @@ async function selectConversation(convId: number) {
   if (!state.inTauri) return
   try {
     const msgs = await api.loadConversation(convId)
-    state.messages = msgs.filter(visible).map(toUi)
+    state.messages = toUiList(msgs)
     void resolveThumbs() // 历史图缩略图回填
     void hydrateStats(convId) // 切回的历史会话:气泡 hover 读数从库回填
     void hydrateTrace(convId) // …和「想了想」轨迹

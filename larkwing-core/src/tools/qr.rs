@@ -1,15 +1,17 @@
-//! 能力轴:图里的二维码 → 文本(rxing 纯 Rust,全本地)。正交原语:只认码不办事——
-//! 认出的链接交给 web_fetch/web_download、文本交模型自己用(下载页码、WiFi 码、
-//! 名片码都是同一个动作;组合链缘起见 AGENT §7.8,词汇不进本原语)。缺省吃「刚发的
-//! 那批图」(手机拍单据连发数张的形状,ChatRepo::recent_image_attachments),
-//! 也收显式路径(桌面文件夹批量)。
+//! 能力轴:二维码 ↔ 文本,认码(rxing 纯 Rust,全本地)+ 出码(qrcode → PNG)。
+//! 正交原语:只管码与文本互转、不办事——认出的链接交给 web_fetch/web_download、
+//! 文本交模型自己用;生成的码图交 show_image 亮屏 / send_file 发手机(下载页码、
+//! WiFi 码、名片码都是同一个动作;组合链缘起见 AGENT §7.8,词汇不进本原语)。
+//! 认码缺省吃「刚发的那批图」(手机拍单据连发数张的形状,ChatRepo::
+//! recent_image_attachments),也收显式路径(桌面文件夹批量)。
 
 use std::path::PathBuf;
 
 use anyhow::Context;
 use async_trait::async_trait;
 
-use super::{Tool, ToolCtx, ToolSpec};
+use super::{Tool, ToolCtx, ToolRisk, ToolSpec};
+use crate::files::{dedupe_path, default_download_dir};
 
 /// 单次封顶(fs 批量纪律同款:超额如实告知,不静默截断)。
 const QR_MAX_IMAGES: usize = 10;
@@ -141,6 +143,113 @@ impl Tool for QrDecode {
     }
 }
 
+/// 出码内容上限(字节):出码用 M 纠错档,版本 40 容量 2331 字节,取保守整数;
+/// 超了如实退回——链接/短文本才是二维码的合理载荷。
+const QR_ENCODE_MAX_BYTES: usize = 2000;
+/// 出图最小边长(px):电脑屏幕隔几十厘米给手机扫,码太小识别率掉。
+const QR_PNG_MIN_SIDE: u32 = 480;
+
+pub(super) struct QrEncode {
+    spec: ToolSpec,
+}
+
+impl QrEncode {
+    pub(super) fn new() -> QrEncode {
+        QrEncode {
+            spec: ToolSpec {
+                name: "qr_encode",
+                description: "把文字/链接生成二维码 PNG 图片(落在下载文件夹,或 dir 指定\
+                              目录)。生成后用 show_image 把码亮在对话里,手机对着屏幕就能扫;\
+                              要传到手机上用 send_file。WiFi 分享这类格式串\
+                              (WIFI:S:名称;T:WPA;P:密码;;)按标准拼好当 text 传入。",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "description": "要装进码里的内容,原样进码(链接/文本/格式串)"
+                        },
+                        "dir": {
+                            "type": "string",
+                            "description": "图片落到哪个目录(可选;缺省 = 系统下载文件夹)"
+                        }
+                    },
+                    "required": ["text"]
+                }),
+                timeout: std::time::Duration::from_secs(30),
+                ui_key: "tool.qr_encode",
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for QrEncode {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    /// 往磁盘落新文件(永不覆盖,dedupe 加序号)。
+    fn risk(&self) -> ToolRisk {
+        ToolRisk::Mutating
+    }
+
+    async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
+        let text = args
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("缺少 text 参数(要进码的内容)"))?
+            .to_string();
+        anyhow::ensure!(
+            text.len() <= QR_ENCODE_MAX_BYTES,
+            "内容太长装不进二维码(上限约 {QR_ENCODE_MAX_BYTES} 字节,现在 {} 字节)——\
+             码里适合放链接/短文本;长内容存成文件用 send_file 发",
+            text.len()
+        );
+        let dir = match args.get("dir").and_then(serde_json::Value::as_str).map(str::trim) {
+            Some(d) if !d.is_empty() => {
+                let p = PathBuf::from(super::expand_home(d)); // 「~/xxx」宽容展开(§4.4)
+                anyhow::ensure!(p.is_absolute(), "dir 需要绝对路径,收到: {d}");
+                p
+            }
+            _ => default_download_dir(),
+        };
+        // 落盘 = 存入(§7.2 授权圈;缺省「下载」夹在出厂基线内,零打扰)。授权过了才建目录。
+        super::guard::ensure(
+            ctx,
+            super::guard::Access::Create,
+            &[dir.to_string_lossy().into_owned()],
+        )
+        .await?;
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("建不了目标文件夹 {}", dir.display()))?;
+
+        let out_path = dedupe_path(&dir.join("qrcode.png"));
+        let path2 = out_path.clone();
+        // 编码 + PNG 写盘是 CPU/IO 活,挪出 tokio 工作线程
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let code = qrcode::QrCode::new(text.as_bytes())
+                .context("生成二维码失败(内容装不下)")?;
+            let img = code
+                .render::<image::Luma<u8>>()
+                .min_dimensions(QR_PNG_MIN_SIDE, QR_PNG_MIN_SIDE)
+                .build();
+            img.save(&path2)
+                .with_context(|| format!("二维码图片写不出去: {}", path2.display()))?;
+            Ok(())
+        })
+        .await
+        .context("二维码生成任务没跑完")??;
+
+        Ok(format!(
+            "二维码已生成:{}。用 show_image 亮在对话里就能拿手机扫;要传到手机上用 send_file。",
+            out_path.display()
+        ))
+    }
+}
+
 /// 单图解码:预处理阶梯,便宜→重,认出即停(2026-07-10 真图矩阵实验定的配方,
 /// 见 tests::probe_matrix)。热敏打印单据照(墨迹晕染/光照不均)是分水岭:原样喂
 /// rxing 都认不出,**Otsu 全局二值化在各尺度全过、缩到 800px 连原样都过**——
@@ -212,8 +321,8 @@ fn otsu_binarize(luma: &image::GrayImage) -> image::GrayImage {
     let total: u64 = (luma.width() * luma.height()) as u64;
     let sum_all: u64 = hist.iter().enumerate().map(|(i, n)| i as u64 * n).sum();
     let (mut best_t, mut best_var, mut w0, mut sum0) = (127u8, 0f64, 0u64, 0u64);
-    for t in 0..256usize {
-        w0 += hist[t];
+    for (t, &h) in hist.iter().enumerate() {
+        w0 += h;
         if w0 == 0 {
             continue;
         }
@@ -221,7 +330,7 @@ fn otsu_binarize(luma: &image::GrayImage) -> image::GrayImage {
         if w1 == 0 {
             break;
         }
-        sum0 += t as u64 * hist[t];
+        sum0 += t as u64 * h;
         let m0 = sum0 as f64 / w0 as f64;
         let m1 = (sum_all - sum0) as f64 / w1 as f64;
         let var = w0 as f64 * w1 as f64 * (m0 - m1) * (m0 - m1);
@@ -376,5 +485,40 @@ mod tests {
         ctx.conv_id = conv.id;
         let err = QrDecode::new().run(serde_json::json!({}), &ctx).await.unwrap_err();
         assert!(err.to_string().contains("没找到最近发的图片"));
+    }
+
+    /// 出码 e2e:落 PNG、dedupe 不覆盖,且自家 decode 能把内容原样认回来(回环)。
+    #[tokio::test]
+    async fn encode_writes_png_dedupes_and_roundtrips() {
+        let (ctx, dir) = ctx("encode");
+        let content = "https://example.com/share?q=%E4%B8%AD%E6%96%87";
+        let tool = QrEncode::new();
+        let out = tool
+            .run(serde_json::json!({"text": content, "dir": dir.to_string_lossy()}), &ctx)
+            .await
+            .unwrap();
+        let png = dir.join("qrcode.png");
+        assert!(out.contains("qrcode.png"), "结果要报路径: {out}");
+        assert!(png.is_file(), "PNG 没落盘");
+        let decoded = decode_image(&png).unwrap();
+        assert_eq!(decoded, vec![content.to_string()], "回环认码要还原内容");
+        // 再来一次 → dedupe 加序号,绝不覆盖
+        tool.run(serde_json::json!({"text": "第二个", "dir": dir.to_string_lossy()}), &ctx)
+            .await
+            .unwrap();
+        assert!(dir.join("qrcode (2).png").is_file(), "同名要 dedupe 成 (2)(资源管理器口径从 2 起)");
+    }
+
+    #[tokio::test]
+    async fn encode_rejects_missing_and_oversize_text() {
+        let (ctx, dir) = ctx("encode-rej");
+        let tool = QrEncode::new();
+        assert!(tool.run(serde_json::json!({}), &ctx).await.is_err(), "缺 text 要退回");
+        let long = "字".repeat(QR_ENCODE_MAX_BYTES); // 每个中文 3 字节,稳超上限
+        let err = tool
+            .run(serde_json::json!({"text": long, "dir": dir.to_string_lossy()}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("太长"), "超容量要给明白话: {err:#}");
     }
 }

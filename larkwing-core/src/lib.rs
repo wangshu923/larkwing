@@ -24,6 +24,7 @@ pub mod skills_builtin;
 pub mod store;
 pub mod tasks;
 pub mod tools;
+pub mod usage;
 pub mod voice;
 pub mod weather;
 pub mod web;

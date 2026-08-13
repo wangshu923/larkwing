@@ -175,7 +175,7 @@ impl Tool for ReadImage {
         ctx: &ToolCtx,
     ) -> anyhow::Result<ToolOutput> {
         let (text, images) = self.look(args, ctx).await?;
-        Ok(ToolOutput { text, images })
+        Ok(ToolOutput { text, images, ..Default::default() })
     }
 }
 

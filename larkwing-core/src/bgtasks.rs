@@ -200,8 +200,11 @@ impl BgTasks {
             .map(|e| {
                 let st = e.st.lock().expect("bg st lock");
                 format!(
-                    "「{}」(编号{}) {}/{} 正在{}",
-                    e.title, e.id, st.done_units, e.total, st.current
+                    "「{}」(编号{}) {}正在{}",
+                    e.title,
+                    e.id,
+                    progress_frag(st.done_units, e.total, "", " "),
+                    st.current
                 )
             })
             .collect();
@@ -222,11 +225,10 @@ impl BgTasks {
             match &st.finished {
                 None => {
                     let mut line = format!(
-                        "「{}」编号{}:{}/{},正在{},已跑 {}",
+                        "「{}」编号{}:{}正在{},已跑 {}",
                         e.title,
                         e.id,
-                        st.done_units,
-                        e.total,
+                        progress_frag(st.done_units, e.total, "", ","),
                         st.current,
                         human_elapsed(now - e.started_ms)
                     );
@@ -291,12 +293,11 @@ impl BgTasks {
                     continue; // 竞态:刚好收尾了
                 }
                 let summary = format!(
-                    "「{}」卡住没动静(超过 {} 分钟无进展),已停掉:跑到 {}/{},最后在处理{}。\
+                    "「{}」卡住没动静(超过 {} 分钟无进展),已停掉:{}最后在处理{}。\
                      把情况告诉用户;要不要重跑剩下的,听用户的。",
                     e.title,
                     STALL_MS / 60_000,
-                    st.done_units,
-                    e.total,
+                    progress_frag(st.done_units, e.total, "跑到 ", ","),
                     st.current
                 );
                 st.finished = Some(Fin { ok: false, summary: summary.clone(), at_ms: now });
@@ -401,8 +402,10 @@ impl Drop for BgTicket {
                 return; // 正常收尾 / 看门狗已处理
             }
             let s = format!(
-                "「{}」半路断了(进程内部中断):跑到 {}/{},最后在处理{}。把情况告诉用户。",
-                self.entry.title, st.done_units, self.entry.total, st.current
+                "「{}」半路断了(进程内部中断):{}最后在处理{}。把情况告诉用户。",
+                self.entry.title,
+                progress_frag(st.done_units, self.entry.total, "跑到 ", ","),
+                st.current
             );
             st.finished = Some(Fin { ok: false, summary: s.clone(), at_ms: now_ms() });
             s
@@ -410,6 +413,15 @@ impl Drop for BgTicket {
         tracing::warn!(id = self.entry.id, title = %self.entry.title, "后台任务半路断,已汇报");
         self.reg.report(self.entry.origin, summary);
     }
+}
+
+/// 「12/40」进度片段(带前后缀);总数未知的清点型任务(total=0,如磁盘扫描)
+/// 不显分母——返回空串,连同前后缀一起省略,进度全靠 current 文案自述。
+fn progress_frag(done: usize, total: usize, prefix: &str, suffix: &str) -> String {
+    if total == 0 {
+        return String::new();
+    }
+    format!("{prefix}{done}/{total}{suffix}")
 }
 
 fn human_elapsed(ms: i64) -> String {

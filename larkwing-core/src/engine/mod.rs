@@ -43,6 +43,10 @@ pub enum TurnEvent {
     /// 插队(PLAN §9 B):回合在飞时注入的一条 user 消息已落库,之后的回复另起一段。
     /// 前端据此:收尾当前回复气泡 → 插用户气泡 → 开新回复气泡。
     Injected { message_id: i64, text: String, attachments: Vec<AttachmentRef> },
+    /// show_image 亮图:工具把本机图片摆进聊天给**用户**看(图卡走 UI,不喂模型)。
+    /// 前端把图卡插进当前在飞气泡组;同一批 refs 已随该 tool 行 payload 落库,
+    /// 重开会话由行派生同一张卡(回执小票同构的「live 事件 + 落库派生」双路)。
+    Shown { attachments: Vec<AttachmentRef> },
     /// 带文字的工具轮(PLAN §9):这一轮模型既说了话、又要继续调工具,它在落库里是一条独立
     /// assistant 内容行。前端据此把当前回复气泡封口(钉上 message_id 供「想了想」轨迹回挂)、
     /// 另起新泡接后续文字 —— 让在飞气泡结构 = 落库/重启结构(否则 trace 实时挂不上、重启才显)。
@@ -89,6 +93,10 @@ pub(crate) struct ToolRowPayload {
     pub call_id: String,
     pub name: String,
     pub status: String,
+    /// show_image 亮的图(空 = 常态,序列化省略、老行反序列化补默认):
+    /// 前端从工具行派生聊天图卡(重开会话图卡照在,与 live 的 TurnEvent::Shown 同一批 refs)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentRef>,
 }
 
 /// user 行:输入来源与朗读意向(PLAN §11 语音会话模式)。input: typed | mic | wake |
@@ -447,35 +455,9 @@ pub(crate) struct InjectReady {
 }
 
 /// 图片按 mime 定落盘扩展名(仅为文件名好看 / relay 猜 content-type;识别失败给 bin)。
-fn image_ext(mime: &str) -> &'static str {
-    match mime {
-        "image/png" => "png",
-        "image/gif" => "gif",
-        "image/webp" => "webp",
-        "image/bmp" => "bmp",
-        m if m.starts_with("image/") => "jpg", // jpeg / 其它都当 jpg
-        _ => "bin",
-    }
-}
-
-/// 把图片 bytes 落到 `atts_dir`(内容寻址命名,天然去重),返回相对文件名;失败 → None
-/// (没缩略图但不炸,退回旧行为)。§6.2 blob 走文件不进库、§9 图不喂 LLM 只为 UI 回看。
-fn save_image_blob(atts_dir: &std::path::Path, bytes: &[u8], mime: &str) -> Option<String> {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut h);
-    let name = format!("{:016x}.{}", h.finish(), image_ext(mime));
-    if std::fs::create_dir_all(atts_dir).is_err() {
-        return None;
-    }
-    let path = atts_dir.join(&name);
-    // 内容寻址:已存在(同图重发)就不重写
-    if path.exists() || std::fs::write(&path, bytes).is_ok() {
-        Some(name)
-    } else {
-        None
-    }
-}
+// image_ext / save_image_blob 已上移 crate::files 单源(2026-08-13 show_image 批:
+// 工具侧亮图与这里的用户发图共用同一个内容寻址仓,tools 不反依赖 engine → 家安在 files)。
+use crate::files::{image_ext, save_image_blob};
 
 /// 入站附件 → (图 image_url parts, 文档抽出的文字 + 落盘路径行, 落库小票)。send_message 与插队共用。
 /// `atts_dir` = 图片缩略图落盘目录(`<media>/attachments`);图 bytes 写盘、小票记相对名,
@@ -2923,6 +2905,7 @@ mod tests {
             call_id: call_id.into(),
             name: name.into(),
             status: status.into(),
+            attachments: Vec::new(),
         })
         .unwrap()
     }

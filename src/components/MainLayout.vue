@@ -875,7 +875,19 @@ watch(messages, () => nextTick(() => {
           <span v-if="g.kind === 'user' && g.msgs[0].speakerName" class="spk-tag spk-who">{{ g.msgs[0].speakerName }}</span>
           <template v-for="m in g.msgs" :key="m.id">
             <!-- wang 走富文本(markdown);user 是用户原话,纯文本保留换行、不解析标记 -->
-            <div v-if="g.kind === 'wang'" class="md" v-html="renderMarkdown(m.text)"></div>
+            <template v-if="g.kind === 'wang'">
+              <div class="md" v-html="renderMarkdown(m.text)"></div>
+              <!-- show_image 亮的图:段文字后出图卡(live 挂后段、重载派生挂前段,合并组里同一落位) -->
+              <div v-if="m.attachments?.length" class="atts atts-wang">
+                <template v-for="(a, ai) in m.attachments" :key="ai">
+                  <img v-if="a.kind === 'image' && a.dataUrl" :src="a.dataUrl" class="att-img" alt="" />
+                  <span v-else class="att-chip">
+                    <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2" /><path d="M3 16l5-4 4 3 3-2 6 5" /></svg>
+                    {{ a.name }}
+                  </span>
+                </template>
+              </div>
+            </template>
             <template v-else>
               <div v-if="m.attachments?.length" class="atts">
                 <template v-for="(a, ai) in m.attachments" :key="ai">
@@ -1438,6 +1450,9 @@ textarea.field { resize: none; font-family: inherit; line-height: 1.5; max-heigh
 
 .atts { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
 .att-img { max-width: 200px; max-height: 220px; border-radius: 10px; display: block; }
+/* show_image 亮的图(wang 侧):比用户缩略图大一号——二维码隔着几十厘米也要扫得动 */
+.atts-wang { margin: 6px 0 2px; }
+.atts-wang .att-img { max-width: min(340px, 100%); max-height: 340px; }
 .att-chip {
   display: inline-flex; align-items: center; gap: 6px;
   background: var(--surface-deep); border: 1px solid var(--line); border-radius: 9px; padding: 5px 9px;
