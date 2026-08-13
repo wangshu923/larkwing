@@ -168,6 +168,8 @@ export default {
     render_confirm: '等你确认…',
     render_scroll: '翻页…',
     render_snap: '读取页面内容…',
+    render_read: '通读全文…',
+    render_pdf: '存成 PDF…',
     relocate_copy: '复制文件…',
     relocate_db: '整理数据库…',
     relocate_commit: '就位…',

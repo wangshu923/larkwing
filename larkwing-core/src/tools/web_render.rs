@@ -139,7 +139,10 @@ impl WebRender {
                               upload_ref+upload_paths 往文件上传框传本机文件(只传用户点名/这次\
                               差事里的文件)、scroll 上/下翻页、back 返回、再带 url 跳新地址。填完\
                               下张快照会回读各框当前值,自己核对填对没。点出的下载自动存到本机并\
-                              返回路径。\
+                              返回路径。read=true 通读当前页正文**全文**(一段段给,结果里带下一段\
+                              offset;登录后的文章、动态加载的长文读全靠它);save_pdf=true 把当前\
+                              页面带排版存成 PDF 落 dir(存档发票/订单/文章)。这两个是单独的一步,\
+                              不与点击/填表同调。\
                               浏览窗在屏幕右下角对用户可见:遇到要登录/扫码/验证码,或要填密码/\
                               银行卡这类敏感信息,别自己填——请用户在那个小窗里操作,完成后你带 \
                               session 继续。点「付款/发布/删除」这类有实际后果的按钮会自动先请\
@@ -229,9 +232,21 @@ impl WebRender {
                             "type": "boolean",
                             "description": "顺便截当前页一张图(想看画面长啥样时用;文字快照说不清版式/图形时才需要,多数情况不用)。得先有打开的页面(配 url 或 session)"
                         },
+                        "read": {
+                            "type": "boolean",
+                            "description": "通读:抽当前页正文全文按段返回(读长文/登录后的文章用);单独一步,不与动作同调"
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "配 read:从第几个字接着读(0 起;上次通读结果里给了下一段的 offset)"
+                        },
+                        "save_pdf": {
+                            "type": "boolean",
+                            "description": "把当前页面带排版存成 PDF(存档单据/文章);落在 dir,文件名取页面标题、重名自动加序号。单独一步,不与动作同调"
+                        },
                         "dir": {
                             "type": "string",
-                            "description": "点出的下载存到哪个文件夹(绝对路径);省略 = 系统「下载」文件夹"
+                            "description": "点出的下载 / save_pdf 的成品存到哪个文件夹(绝对路径);省略 = 系统「下载」文件夹"
                         }
                     }
                 }),
@@ -369,6 +384,25 @@ impl WebRender {
         let scroll = str_arg(&args, "scroll");
         let wait_text = str_arg(&args, "wait_text");
         let want_shot = super::arg_bool(&args, "screenshot", false);
+        // 观察形态(通读/存 PDF):单独一步,与动作互斥——混着调会让「做了没」变含糊
+        let read = super::arg_bool(&args, "read", false);
+        let read_offset = super::arg_u64(&args, "offset", 0);
+        let want_pdf = super::arg_bool(&args, "save_pdf", false);
+        if read || want_pdf {
+            let acting = click_ref.is_some()
+                || click_text.is_some()
+                || back
+                || type_ref.is_some()
+                || !fill.is_empty()
+                || select_ref.is_some()
+                || press_key.is_some()
+                || scroll.is_some()
+                || upload_ref.is_some()
+                || submit
+                || want_shot;
+            anyhow::ensure!(!acting, "read/save_pdf 是单独的一步——先做动作,下一步再读/存");
+            anyhow::ensure!(!(read && want_pdf), "read 和 save_pdf 一次只做一件");
+        }
         let download_dir = match args.get("dir").and_then(serde_json::Value::as_str).map(str::trim)
         {
             Some(d) if !d.is_empty() => {
@@ -424,6 +458,9 @@ impl WebRender {
             confirmed: false,
             expect_text: None,
             screenshot: want_shot,
+            read,
+            read_offset,
+            save_pdf: want_pdf.then(|| download_dir.clone()),
             download_dir,
             timeout: RENDER_TIMEOUT,
         };
@@ -537,6 +574,57 @@ impl WebRender {
                     ));
                 }
             }
+        }
+
+        // ── 观察形态的结局(通读切片 / PDF 成品):不带编号快照,提前返回 ──
+        let obs_session = outcome
+            .session
+            .as_deref()
+            .map(|s| format!("\n(会话 {s} 还开着,带 session 可以继续)"))
+            .unwrap_or_default();
+        if let Some(r) = &outcome.read {
+            let got = r.text.chars().count() as u64;
+            if got == 0 {
+                return Ok((
+                    format!(
+                        "《{}》通读:offset={} 已超出全文(共 {} 字)——读到头了。{obs_session}",
+                        r.title, r.offset, r.total
+                    ),
+                    None,
+                ));
+            }
+            let capped_note =
+                if r.capped { "(页面比定格上限还长,只定格了开头一段)" } else { "" };
+            let mut out = format!(
+                "《{}》通读:第 {}–{} 字 / 共 {} 字{capped_note}\n\n{}",
+                r.title,
+                r.offset + 1,
+                r.offset + got,
+                r.total,
+                r.text
+            );
+            let next = r.offset + got;
+            if next < r.total {
+                out.push_str(&format!(
+                    "\n\n(还没完——继续读:带同一个 session、read=true、offset={next})"
+                ));
+            } else if r.capped {
+                out.push_str("\n\n(定格内的内容到此为止,更后面的够不到了——如实说明即可)");
+            } else {
+                out.push_str("\n\n(全文完)");
+            }
+            out.push_str(&obs_session);
+            return Ok((out, None));
+        }
+        if let Some(p) = &outcome.saved_pdf {
+            return Ok((
+                format!(
+                    "已把当前页面存成 PDF:{}(重名自动加了序号)。要转图接 pdf_to_png,\
+                     发手机接 send_file。{obs_session}",
+                    p.display()
+                ),
+                None,
+            ));
         }
 
         let mut out = String::new();
@@ -685,8 +773,57 @@ mod tests {
                 session: self.0.session.clone(),
                 screenshot: self.0.screenshot.clone(),
                 needs_confirm: if confirmed { None } else { self.0.needs_confirm.clone() },
+                read: self.0.read.clone(),
+                saved_pdf: self.0.saved_pdf.clone(),
             })
         }
+    }
+
+    /// 观察形态(通读 / 存 PDF):互斥校验 + 结局文案(下一段 offset 指路 / 组合链指路)。
+    #[tokio::test]
+    async fn read_and_save_pdf_outcomes_compose() {
+        // read + 动作混调 = 明白话退回(还没开窗就拦下,不白跑一步)
+        let ctx0 = base_ctx("obs0");
+        let tool = WebRender::new();
+        let err = tool
+            .run(serde_json::json!({"url": "http://x.test/", "read": true, "click_ref": 1}), &ctx0)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("单独"), "{err:#}");
+
+        // 通读切片:标注区间/总长 + 指路下一段 offset
+        let mut ctx = base_ctx("obs1");
+        ctx.web = Some(Arc::new(FakeRender::new(RenderOutcome {
+            read: Some(crate::webrender::ReadSlice {
+                title: "长文".into(),
+                text: "一二三".into(),
+                offset: 0,
+                total: 10,
+                capped: false,
+            }),
+            session: Some("s1".into()),
+            ..Default::default()
+        })));
+        let out = tool
+            .run(serde_json::json!({"url": "http://x.test/", "read": true}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("第 1–3 字 / 共 10 字"), "{out}");
+        assert!(out.contains("offset=3"), "指路下一段:{out}");
+
+        // 存 PDF:成品路径 + 组合链指路
+        let mut ctx2 = base_ctx("obs2");
+        ctx2.web = Some(Arc::new(FakeRender::new(RenderOutcome {
+            saved_pdf: Some(std::path::PathBuf::from("/tmp/页面.pdf")),
+            session: Some("s2".into()),
+            ..Default::default()
+        })));
+        let out = tool
+            .run(serde_json::json!({"url": "http://x.test/", "save_pdf": true}), &ctx2)
+            .await
+            .unwrap();
+        assert!(out.contains("存成 PDF") && out.contains("页面.pdf"), "{out}");
+        assert!(out.contains("pdf_to_png"), "组合链指路:{out}");
     }
 
     /// 确认闸测试件:真 Confirmer + 自动应答订阅者(pending 卡一到就点头/摇头)。

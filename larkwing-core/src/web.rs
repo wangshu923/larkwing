@@ -566,6 +566,9 @@ fn extract_page(html: &str, base_url: &str) -> Page {
 
 /// 正文抽取(readability 简化版):正文形元素的文本聚合;太少则退化为全文压平。
 /// 不追求完美,目标是"给模型可读的证据",失败兜底永远有东西。
+/// **数据表格单独转 markdown**(2026-08-13):结构就是信息——时刻表/价格表/参数表拍
+/// 扁就没了,短单元格(价格数字)还会被「不足 8 字」滤掉;布局表(<2 行或单列)不算
+/// 数据表,照旧走拍扁老路。
 fn extract_text_from(doc: &Html) -> (String, String) {
     let title = doc
         .select(&sel("title"))
@@ -574,7 +577,24 @@ fn extract_text_from(doc: &Html) -> (String, String) {
         .unwrap_or_default();
 
     let mut parts: Vec<String> = Vec::new();
-    for el in doc.select(&sel("p, h1, h2, h3, li, blockquote, td, pre")) {
+    // 已转 markdown 的表:其内 td 不再重复收(文档序里表先于其后代出现,先到先转)
+    let mut converted: std::collections::HashSet<ego_tree::NodeId> = Default::default();
+    for el in doc.select(&sel("p, h1, h2, h3, li, blockquote, td, pre, table")) {
+        if el.value().name() == "table" {
+            if in_converted(&el, &converted) {
+                // 外层表已整转,嵌套表的文本已并入外层单元格 → 自己也标掉
+                converted.insert(el.id());
+                continue;
+            }
+            if let Some(md) = table_to_markdown(&el) {
+                converted.insert(el.id());
+                parts.push(md);
+            }
+            continue; // 转不成 = 布局表:不标记,里面的 td 照旧走下面的拍扁老路
+        }
+        if el.value().name() == "td" && in_converted(&el, &converted) {
+            continue;
+        }
         let t: String = el.text().collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
         if t.chars().count() >= 8 {
             parts.push(t);
@@ -588,6 +608,77 @@ fn extract_text_from(doc: &Html) -> (String, String) {
         }
     }
     (title, text)
+}
+
+/// 落在「已转 markdown 的表」里?(ancestors 不含自身;表自身判嵌套正好用它)
+fn in_converted(
+    el: &scraper::ElementRef,
+    converted: &std::collections::HashSet<ego_tree::NodeId>,
+) -> bool {
+    el.ancestors().any(|a| converted.contains(&a.id()))
+}
+
+/// 最近的 table 祖先(这个 tr/td 归哪张表;None = 不在表里)。
+fn owner_table(el: &scraper::ElementRef) -> Option<ego_tree::NodeId> {
+    el.ancestors()
+        .find(|a| a.value().as_element().is_some_and(|e| e.name() == "table"))
+        .map(|a| a.id())
+}
+
+/// `<table>` → markdown 表。None = 不像数据表(<2 行或单列 = 布局/装饰用,调用方让它
+/// 走拍扁老路)。首行当表头(野页面多半没规范 thead);单元格内联化 + `|` 转义 + 80 字
+/// 截断;行列封顶(量约束 §7.2)超出**如实注明**,绝不静默截。
+fn table_to_markdown(table: &scraper::ElementRef) -> Option<String> {
+    const MAX_COLS: usize = 8;
+    const MAX_ROWS: usize = 30;
+    let tid = table.id();
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for tr in table.select(&sel("tr")) {
+        if owner_table(&tr) != Some(tid) {
+            continue; // 嵌套表的行归嵌套表(其文本已并入本表单元格)
+        }
+        let mut cells: Vec<String> = Vec::new();
+        for cell in tr.select(&sel("th, td")) {
+            if owner_table(&cell) != Some(tid) {
+                continue;
+            }
+            let t: String =
+                cell.text().collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
+            cells.push(clip(&t.replace('|', "\\|"), 80));
+        }
+        if !cells.is_empty() {
+            rows.push(cells);
+        }
+    }
+    if rows.len() < 2 {
+        return None;
+    }
+    let full_width = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if full_width < 2 {
+        return None;
+    }
+    let width = full_width.min(MAX_COLS);
+    let shown = rows.len().min(MAX_ROWS);
+    let mut out = String::new();
+    for (i, row) in rows.iter().take(shown).enumerate() {
+        let mut cells: Vec<String> = row.iter().take(width).cloned().collect();
+        cells.resize(width, String::new());
+        out.push_str(&format!("| {} |\n", cells.join(" | ")));
+        if i == 0 {
+            out.push_str(&format!("|{}\n", "---|".repeat(width)));
+        }
+    }
+    let mut notes: Vec<String> = Vec::new();
+    if rows.len() > shown {
+        notes.push(format!("表格还有 {} 行,截了", rows.len() - shown));
+    }
+    if full_width > width {
+        notes.push(format!("列太多,只显前 {width} 列"));
+    }
+    if !notes.is_empty() {
+        out.push_str(&format!("({})\n", notes.join(";")));
+    }
+    Some(out.trim_end().to_string())
 }
 
 /// 页内链接:`<a href>` 解析成绝对地址(相对地址按最终 URL 拼),按文档序取前
@@ -787,6 +878,46 @@ mod tests {
                 Err(e) => println!("{:>6}: 失败 {e:#}", src.name()),
             }
         }
+    }
+
+    #[test]
+    fn extract_text_renders_data_tables_as_markdown() {
+        let html = r#"<html><head><title>时刻表</title></head><body>
+          <p>下面是班车时刻表,这句话足够长会进正文;为了不触发「太短整页拍扁」的
+             兜底阈值,这段说明写得再啰嗦一点,凑足一百二十个字的正文体量,真实页面
+             天然比这长得多,不需要这种填充。</p>
+          <table><tbody>
+            <tr><th>班次</th><th>发车</th><th>票价|说明</th></tr>
+            <tr><td>K1</td><td>08:00</td><td>12 元</td></tr>
+            <tr><td>K2</td><td>09:30</td><td>15 元</td></tr>
+          </tbody></table>
+          <table><tr><td>纯布局的单行表格照旧拍扁不转</td></tr></table>
+        </body></html>"#;
+        let doc = Html::parse_document(html);
+        let (_t, text) = extract_text_from(&doc);
+        assert!(text.contains("| 班次 | 发车 | 票价\\|说明 |"), "表头 + 竖线转义:{text}");
+        assert!(text.contains("|---|---|---|"), "表头分隔线:{text}");
+        assert!(text.contains("| K2 | 09:30 | 15 元 |"), "{text}");
+        // 短单元格(K1/12 元)不再被「不足 8 字」滤掉;td 也不重复收
+        assert_eq!(text.matches("K2").count(), 1, "转过的表 td 不再重复收:{text}");
+        // 布局表(单行)不转、内容照旧在
+        assert!(text.contains("纯布局的单行表格照旧拍扁不转"), "{text}");
+        assert!(!text.contains("| 纯布局"), "布局表不该转成 markdown:{text}");
+    }
+
+    #[test]
+    fn table_row_cap_notes_truncation_honestly() {
+        let mut rows = String::new();
+        for i in 0..35 {
+            rows.push_str(&format!("<tr><td>第{i}行</td><td>值{i}</td></tr>"));
+        }
+        let html = format!("<html><body><table>{rows}</table></body></html>");
+        let doc = Html::parse_document(&html);
+        let (_t, text) = extract_text_from(&doc);
+        assert!(text.contains("| 第0行 | 值0 |"), "{text}");
+        assert!(text.contains("| 第29行 | 值29 |"), "封顶 30 行:{text}");
+        assert!(!text.contains("| 第30行"), "{text}");
+        assert!(text.contains("表格还有 5 行,截了"), "超出如实注明(§7.2):{text}");
     }
 
     #[test]

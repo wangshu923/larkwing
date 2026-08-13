@@ -65,7 +65,19 @@ struct SessionEntry {
     load_seq: Arc<AtomicU64>,
     /// 下载落点目录(每步请求可换,handler 闭包实时读)。
     download_dir: Arc<Mutex<PathBuf>>,
+    /// 通读(read)定格:同一导航代次内全文只抽一次,offset 从这份定格切 → 语义稳定
+    /// (滚动不换代;换页/重导航 = load_seq 变 = 自动重抽)。
+    read_cache: Mutex<Option<ReadCache>>,
     last_used: Mutex<Instant>,
+}
+
+/// 通读定格(见 `SessionEntry::read_cache`)。
+struct ReadCache {
+    seq: u64,
+    title: String,
+    text: Arc<String>,
+    /// 页面正文比 `READ_CAP_CHARS` 还长(定格只收了前一段)。
+    capped: bool,
 }
 
 impl SessionEntry {
@@ -345,6 +357,25 @@ async fn browse_step_inner(
         }
     }
 
+    // ---- 3.5 观察形态:通读 / 存 PDF(与动作互斥——工具层已拦;不拍编号快照,提前返回。
+    //      放在 wait_text 之后 = SPA 可先等内容出现再通读)----
+    if req.read {
+        task.step("step.render_read", serde_json::Value::Null);
+        let slice = read_slice(&media, &entry, req.read_offset, deadline).await?;
+        entry.touch();
+        return Ok(RenderOutcome { read: Some(slice), session: Some(sid), ..Default::default() });
+    }
+    if let Some(dir) = &req.save_pdf {
+        task.step("step.render_pdf", serde_json::Value::Null);
+        let path = save_page_pdf(&entry, dir).await?;
+        entry.touch();
+        return Ok(RenderOutcome {
+            saved_pdf: Some(path),
+            session: Some(sid),
+            ..Default::default()
+        });
+    }
+
     // ---- 4. 编号快照(每步都照一张;文件内联跳过——注入脚本在 PDF 查看器里跑不了)----
     let mut page = if skip_snapshot {
         None
@@ -386,7 +417,7 @@ async fn browse_step_inner(
         post_click_url,
         session: Some(sid),
         screenshot,
-        needs_confirm: None,
+        ..Default::default()
     })
 }
 
@@ -394,12 +425,9 @@ async fn browse_step_inner(
 /// 带 session(窗留着,允许后 confirmed 重发/拒绝后继续别的操作)。
 fn pending_outcome(sid: &str, kind: &str, target_text: String, host: String) -> RenderOutcome {
     RenderOutcome {
-        page: None,
-        download: None,
-        post_click_url: None,
         session: Some(sid.to_string()),
-        screenshot: None,
         needs_confirm: Some(PendingConfirm { target_text, kind: kind.into(), host }),
+        ..Default::default()
     }
 }
 
@@ -538,6 +566,7 @@ fn open_session(
         navs,
         load_seq,
         download_dir,
+        read_cache: Mutex::new(None),
         last_used: Mutex::new(Instant::now()),
     });
     sessions.lock().expect("webrender sessions").insert(sid.clone(), entry.clone());
@@ -692,6 +721,108 @@ async fn take_snapshot(
         Ok(Ok(json)) => serde_json::from_str(&json).ok(),
         _ => None,
     }
+}
+
+/// 通读定格封顶(字符):collect 信箱 512KB 字节闸之下留足余量(CJK ≈ 3 字节/字)。
+const READ_CAP_CHARS: usize = 120_000;
+/// 通读切片长度(字符/次):web_fetch 全文预算同口径(§7.4),模型一口吃得下。
+const READ_SLICE_CHARS: usize = 6_000;
+
+/// 通读:定格全文(同一导航代次只抽一次,offset 从定格切;换页自动重抽)→ 按字符切片。
+async fn read_slice(
+    media: &larkwing_core::media::MediaRuntime,
+    entry: &Arc<SessionEntry>,
+    offset: u64,
+    deadline: tokio::time::Instant,
+) -> Result<larkwing_core::webrender::ReadSlice> {
+    let seq = entry.load_seq.load(Ordering::Relaxed);
+    let cached = {
+        let c = entry.read_cache.lock().expect("webrender read cache");
+        c.as_ref()
+            .filter(|c| c.seq == seq)
+            .map(|c| (c.title.clone(), c.text.clone(), c.capped))
+    };
+    let (title, full, capped) = match cached {
+        Some(v) => v,
+        None => {
+            let (post_url, rx) =
+                media.webrender_collect().await.context("webrender 回传信箱没备好")?;
+            let js = build_read_script(&post_url);
+            let _ = entry.win.eval(js.as_str());
+            let mut rx = rx;
+            let first = tokio::time::Instant::now() + SNAPSHOT_WAIT;
+            let json = match tokio::time::timeout_at(first.min(deadline), &mut rx).await {
+                Ok(Ok(j)) => Some(j),
+                Ok(Err(_)) => None,
+                Err(_) => {
+                    // 迟到水合兜底:重注入同一 token 再等一段(take_snapshot 同款)
+                    let _ = entry.win.eval(js.as_str());
+                    let second = tokio::time::Instant::now() + SNAPSHOT_WAIT;
+                    tokio::time::timeout_at(second.min(deadline), rx)
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                }
+            };
+            let json = json.context(
+                "页面没回传正文(还在加载,或当前窗不是 HTML 页)——稍等再试,或换 web_fetch",
+            )?;
+            #[derive(Default, serde::Deserialize)]
+            #[serde(default)]
+            struct ReadPayload {
+                title: String,
+                text: String,
+                capped: bool,
+            }
+            let p: ReadPayload = serde_json::from_str(&json).unwrap_or_default();
+            anyhow::ensure!(
+                !p.text.trim().is_empty(),
+                "这页抽不出正文(可能是纯图形/画布页)——要看画面用 screenshot"
+            );
+            let cache =
+                ReadCache { seq, title: p.title.clone(), text: Arc::new(p.text), capped: p.capped };
+            let out = (cache.title.clone(), cache.text.clone(), cache.capped);
+            *entry.read_cache.lock().expect("webrender read cache") = Some(cache);
+            out
+        }
+    };
+    let total = full.chars().count() as u64;
+    let start = offset.min(total);
+    let text: String = full.chars().skip(start as usize).take(READ_SLICE_CHARS).collect();
+    Ok(larkwing_core::webrender::ReadSlice { title, text, offset: start, total, capped })
+}
+
+/// 通读脚本:正文优先文章类容器(article/main 等,比整页 innerText 少导航噪声),容器
+/// 太单薄(短于整页 1/4,多半只圈到摘要)退整页;页内封顶 `READ_CAP_CHARS`,超了如实标。
+fn build_read_script(collect_url: &str) -> String {
+    let post = serde_json::to_string(collect_url).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        r#"(function() {{
+  var POST = {post};
+  var CAP = {cap};
+  function textOf(el) {{ return (el && el.innerText) ? el.innerText : ''; }}
+  var best = '';
+  var sels = ['article', 'main', '[role="main"]', '#content', '.article', '.post-content', '.content'];
+  for (var i = 0; i < sels.length; i++) {{
+    try {{
+      var els = document.querySelectorAll(sels[i]);
+      for (var j = 0; j < els.length; j++) {{
+        var t = textOf(els[j]);
+        if (t.length > best.length) best = t;
+      }}
+    }} catch (e) {{}}
+  }}
+  var body = textOf(document.body);
+  if (best.length < body.length / 4) best = body;
+  var payload = {{
+    title: (document.title || '').slice(0, 200),
+    text: best.slice(0, CAP),
+    capped: best.length > CAP
+  }};
+  try {{ fetch(POST, {{ method: 'POST', headers: {{ 'Content-Type': 'text/plain' }}, body: JSON.stringify(payload) }}); }} catch (e) {{}}
+}})();"#,
+        cap = READ_CAP_CHARS
+    )
 }
 
 fn last_nav_after(
@@ -1227,6 +1358,118 @@ async fn capture_png(_win: &tauri::WebviewWindow) -> Option<Vec<u8>> {
     None
 }
 
+// ───────────────────────── 存 PDF(save_pdf 观察形态) ─────────────────────────
+const PDF_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// 把当前页面存成 PDF:文件名 = 窗题(快照后跟页面标题;一步式新窗则是站点名)清洗 +
+/// .pdf,dedupe 永不覆盖(§7.2 三规①)。
+async fn save_page_pdf(entry: &Arc<SessionEntry>, dir: &std::path::Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).with_context(|| format!("建不出目录 {}", dir.display()))?;
+    let raw = entry.win.title().unwrap_or_default();
+    let base = raw.trim();
+    let name = if base.is_empty() {
+        "网页".to_string()
+    } else {
+        larkwing_core::files::sanitize_filename(base)
+    };
+    let dest = larkwing_core::files::dedupe_path(&dir.join(format!("{name}.pdf")));
+    print_pdf_platform(&entry.win, &dest).await?;
+    let ok = std::fs::metadata(&dest).map(|m| m.len() > 0).unwrap_or(false);
+    anyhow::ensure!(ok, "PDF 没写出来(打印组件没给数据)");
+    Ok(dest)
+}
+
+/// macOS:WKWebView.createPDF(配置 None = 当前页面 bounds 的整页 PDF)→ NSData →
+/// 临时件写完改名。发起/等待模式与 capture_png 一模一样(主线程只发起,completion 回调)。
+#[cfg(target_os = "macos")]
+async fn print_pdf_platform(win: &tauri::WebviewWindow, dest: &std::path::Path) -> Result<()> {
+    use block2::RcBlock;
+    use objc2_foundation::{NSData, NSError};
+    use objc2_web_kit::WKWebView;
+    use std::cell::RefCell;
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<Option<Vec<u8>>>();
+    let dispatched = win.with_webview(move |pw| {
+        let ptr = pw.inner() as *const WKWebView;
+        if ptr.is_null() {
+            let _ = tx.send(None);
+            return;
+        }
+        let webview: &WKWebView = unsafe { &*ptr };
+        let slot = RefCell::new(Some(tx));
+        let completion = RcBlock::new(move |data: *mut NSData, _err: *mut NSError| {
+            let bytes = if data.is_null() { None } else { Some(unsafe { &*data }.to_vec()) };
+            if let Some(tx) = slot.borrow_mut().take() {
+                let _ = tx.send(bytes);
+            }
+        });
+        unsafe { webview.createPDFWithConfiguration_completionHandler(None, &completion) };
+    });
+    anyhow::ensure!(dispatched.is_ok(), "够不到渲染窗");
+    let bytes = match tokio::time::timeout(PDF_TIMEOUT, rx).await {
+        Ok(Ok(Some(b))) if !b.is_empty() => b,
+        _ => anyhow::bail!("页面没生成出 PDF(还在加载,或内容不支持)"),
+    };
+    let tmp = dest.with_extension("pdf.part");
+    std::fs::write(&tmp, &bytes).with_context(|| format!("写不了 {}", tmp.display()))?;
+    std::fs::rename(&tmp, dest)
+        .with_context(|| format!("成品改名失败 -> {}", dest.display()))?;
+    Ok(())
+}
+
+/// Windows:WebView2.PrintToPdf(直写目标路径;失败清残件)。cast 到 ICoreWebView2_7
+/// (PrintToPdf 所在版本接口);发起/等待模式与 capture_png 一模一样。
+#[cfg(target_os = "windows")]
+async fn print_pdf_platform(win: &tauri::WebviewWindow, dest: &std::path::Path) -> Result<()> {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2PrintSettings, ICoreWebView2_7,
+    };
+    use webview2_com::PrintToPdfCompletedHandler;
+    use windows::core::{Interface, HSTRING};
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+    let path = HSTRING::from(dest.as_os_str());
+    let dispatched = win.with_webview(move |pw| {
+        let controller = pw.controller();
+        let webview = match unsafe { controller.CoreWebView2() } {
+            Ok(w) => w,
+            Err(_) => {
+                let _ = tx.send(false);
+                return;
+            }
+        };
+        let wv7: ICoreWebView2_7 = match webview.cast() {
+            Ok(w) => w,
+            Err(_) => {
+                let _ = tx.send(false);
+                return;
+            }
+        };
+        let handler = PrintToPdfCompletedHandler::create(Box::new(
+            move |result: windows::core::Result<()>,
+                  ok: windows::Win32::Foundation::BOOL|
+                  -> windows::core::Result<()> {
+                let _ = tx.send(result.is_ok() && ok.as_bool());
+                Ok(())
+            },
+        ));
+        let _ = unsafe { wv7.PrintToPdf(&path, None::<&ICoreWebView2PrintSettings>, &handler) };
+    });
+    anyhow::ensure!(dispatched.is_ok(), "够不到渲染窗");
+    match tokio::time::timeout(PDF_TIMEOUT, rx).await {
+        Ok(Ok(true)) => Ok(()),
+        _ => {
+            let _ = std::fs::remove_file(dest);
+            anyhow::bail!("页面没生成出 PDF(还在加载,或打印组件没就绪)")
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+async fn print_pdf_platform(_win: &tauri::WebviewWindow, _dest: &std::path::Path) -> Result<()> {
+    anyhow::bail!("这个平台还不支持把页面存成 PDF")
+}
+
 /// 快照脚本:给可见交互元素(可点 + 可填 + 可选 + 勾选)打 `data-lw-ref` 编号,抽
 /// 「标题/正文/链接/编号元素(带 label/值/勾选态/选项)/滚动位置」+ 上一步动作报告
 /// (__lwClick,读完即清)POST 回 loopback。文本版 Set-of-Marks:同一编号既能 click_ref
@@ -1321,6 +1564,15 @@ fn build_snapshot_script(collect_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 通读脚本的形状守卫;`--nocapture` 打印成品脚本给预览浏览器冒烟(upload 同款手法)。
+    #[test]
+    fn read_script_shape() {
+        let js = build_read_script("http://127.0.0.1:1/collect/tok");
+        assert!(js.contains("collect/tok") && js.contains("article"), "{js}");
+        assert!(js.contains(&format!("var CAP = {READ_CAP_CHARS}")), "{js}");
+        println!("=== READ_JS ===\n{js}\n=== END ===");
+    }
 
     /// 上传/快照脚本的形状守卫;`--nocapture` 时打印成品脚本(浏览器冒烟验 JS 语法/行为用:
     /// format! 模板的括号转义错误只有真跑 JS 才抓得到)。

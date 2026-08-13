@@ -129,6 +129,15 @@ pub struct RenderRequest {
     /// 顺便截当前渲染窗一张图(模型自行决定要不要看画面;只对能看图的模型有用,非视觉出向降级)。
     /// **没有活跃渲染窗 = 截不了**(截图依附浏览窗,不凭空截);平台/组件不支持也如实回 None。
     pub screenshot: bool,
+    /// 通读:抽当前页正文**全文**(定格进会话,按 `read_offset` 切片返回)——登录墙后/
+    /// 要跑 JS 的长文由此读全(编号快照的正文刻意短,是给操作用的)。观察形态,与动作
+    /// 互斥(工具层拦);同一页面内定格不变 → offset 语义稳定,换页/重导航自动重抽。
+    pub read: bool,
+    /// 配 `read`:切片起点(字符,0 起;上次切片结果里给下一段起点)。
+    pub read_offset: u64,
+    /// 存当前页为 PDF:落到这个**目录**(壳层用页面标题起名 + dedupe 永不覆盖)。
+    /// 观察形态,与动作互斥(工具层拦)。
+    pub save_pdf: Option<PathBuf>,
     /// 点击若触发下载,成品落这个目录(壳层负责唯一名,复用 `files::dedupe_path` 口径)。
     pub download_dir: PathBuf,
     /// 单步预算(壳层超时即收手回快照;会话窗本身由 TTL 管生死)。
@@ -140,6 +149,21 @@ pub struct RenderRequest {
 pub struct FillField {
     pub ref_no: u32,
     pub value: String,
+}
+
+/// 通读(read)结果:定格正文的一个切片。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ReadSlice {
+    pub title: String,
+    /// 本次切片文本。
+    pub text: String,
+    /// 切片在定格全文里的字符起点(实际生效值;传超了会被夹到末尾)。
+    pub offset: u64,
+    /// 定格全文总字符数。
+    pub total: u64,
+    /// 页面正文比定格封顶还长(定格只收了前一段,offset 读到头也够不到更后面)。
+    pub capped: bool,
 }
 
 /// 动作撞了确认闸(§7.8):壳层解析到目标、**没执行**,把现场信息交回工具层去问用户。
@@ -169,6 +193,10 @@ pub struct RenderOutcome {
     /// 页面截图(data: URL,`data:image/png;base64,…`):仅 `screenshot=true` 且截到才有。
     /// 工具把它当图片 part 回给模型(工具结果多媒体第一个消费者;非视觉模型出向降级成占位)。
     pub screenshot: Option<String>,
+    /// 通读切片(仅 `read=true`;观察形态不带编号快照)。
+    pub read: Option<ReadSlice>,
+    /// 存好的 PDF 路径(仅 `save_pdf` 有值且存成;观察形态不带编号快照)。
+    pub saved_pdf: Option<PathBuf>,
     /// 动作撞确认闸没执行(高危词表命中 / 模型自报):工具层据此问用户、允许后重发。
     pub needs_confirm: Option<PendingConfirm>,
 }

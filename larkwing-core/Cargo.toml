@@ -48,6 +48,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 rusqlite = { version = "0.32", features = ["bundled"] }
 # web 工具的 HTML 解析(搜索结果页 + 正文抽取)
 scraper = "0.23"
+# 正文抽取的表格转 markdown(web.rs::table_to_markdown):认「这个 td 归哪张表」要用
+# scraper 底下的 ego-tree NodeId(本就在依赖树里,版本与 lock 对齐;scraper 不 re-export)。
+ego-tree = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # 组件下载的完整性校验(SHA2-256SUMS)

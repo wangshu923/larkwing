@@ -167,6 +167,8 @@ export default {
     render_confirm: 'Waiting for your OK…',
     render_scroll: 'Scrolling…',
     render_snap: 'Reading the page…',
+    render_read: 'Reading the full text…',
+    render_pdf: 'Saving as PDF…',
     relocate_copy: 'Copying files…',
     relocate_db: 'Compacting the database…',
     relocate_commit: 'Finalizing…',
