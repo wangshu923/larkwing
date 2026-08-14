@@ -305,6 +305,7 @@ impl Tools {
         tools.register(Arc::new(fs::FsList::new()));
         tools.register(Arc::new(fs::FsFind::new()));
         tools.register(Arc::new(fs::FsReadText::new()));
+        tools.register(Arc::new(fs::FsStat::new()));
         tools.register(Arc::new(fs::FsMove::new()));
         tools.register(Arc::new(fs::FsCopy::new()));
         tools.register(Arc::new(fs::FsMkdir::new()));

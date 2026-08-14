@@ -97,6 +97,8 @@ flate2 = "1"
 pdfium-render = "0.9"
 # 微信渠道(channels/weixin.rs):扫码登录二维码渲染成 SVG 给设置 UI(原 dev-dep,登录用转正)。
 qrcode = "0.14"
+# 照片 EXIF(fs_stat:拍摄时间/相机/分辨率兜底):纯 Rust 零依赖,JPEG/HEIF/PNG/WebP 容器都认
+kamadak-exif = "0.6"
 # 微信渠道媒体:CDN 走 AES-128-ECB(PKCS7)——手做 ECB(逐块)+ 手做 PKCS7(不引 ecb/cipher 额外面)。
 aes = "0.8"
 # 微信出站文件:getUploadUrl 要明文 MD5(sha2 不含 MD5);hex = filekey/aeskey/md5 的十六进制编解码。

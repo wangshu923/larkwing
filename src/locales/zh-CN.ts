@@ -41,6 +41,7 @@ export default {
     fs_append: '添一笔…',
     fs_edit: '改文件中…',
     fs_undo: '退回上一步…',
+    fs_stat: '看看文件信息…',
     fs_unzip: '解开压缩包…',
     fs_zip: '打包文件…',
     fs_usage: '算算磁盘占用…',

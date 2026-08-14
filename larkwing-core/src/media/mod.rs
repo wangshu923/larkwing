@@ -26,6 +26,7 @@ pub use torrent::{
 };
 pub(crate) use lyrics::compose_batch_summary;
 pub use lyrics::{LyricsBatchOutcome, LyricsFileResult, LyricsItem, LyricsResult};
+pub(crate) use probe::probe_local; // fs_stat 白拿 BMFF 时长(免 ffmpeg 的轻量 moov 探测)
 pub use usage::UsageOutcome;
 
 use std::collections::HashMap;

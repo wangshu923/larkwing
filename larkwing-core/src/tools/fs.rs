@@ -41,8 +41,9 @@ impl FsList {
             spec: ToolSpec {
                 name: "fs_list",
                 description: "列出一个文件夹里有什么(单层)。配合任务需知里登记的目录用,\
-                              比如需知说电影在某个文件夹,就先列出来再挑。返回 名字/大小,\
-                              文件夹名以 / 结尾。",
+                              比如需知说电影在某个文件夹,就先列出来再挑。返回 名字/大小/\
+                              改动日期,文件夹名以 / 结尾。要看更细的属性(拍摄时间/时长)\
+                              用 fs_stat。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -87,7 +88,14 @@ impl Tool for FsList {
                 }
                 match entry.metadata() {
                     Ok(md) if md.is_dir() => dirs.push(format!("{name}/")),
-                    Ok(md) => files.push(format!("{name} ({})", human_size(md.len()))),
+                    Ok(md) => {
+                        // 大小 · 改动日期(排序/找最近的显示级信息;细属性归 fs_stat)
+                        let mut meta = human_size(md.len());
+                        if let Ok(t) = md.modified() {
+                            meta.push_str(&format!(" · {}", fmt_date(t)));
+                        }
+                        files.push(format!("{name} ({meta})"));
+                    }
                     Err(_) => files.push(name),
                 }
             }
@@ -242,8 +250,16 @@ impl Tool for FsFind {
                 return Ok(format!("在 {root} 里没找到匹配「{raw}」的文件"));
             }
             let truncated = out.len() >= FIND_MAX_RESULTS;
-            let mut lines: Vec<String> =
-                out.into_iter().map(|p| p.to_string_lossy().to_string()).collect();
+            let mut lines: Vec<String> = out
+                .into_iter()
+                .map(|p| {
+                    // 尾捎改动日期(「找最近下载的那个」直接可判;细属性归 fs_stat)
+                    match std::fs::metadata(&p).and_then(|m| m.modified()) {
+                        Ok(t) => format!("{} ({})", p.to_string_lossy(), fmt_date(t)),
+                        Err(_) => p.to_string_lossy().to_string(),
+                    }
+                })
+                .collect();
             if truncated {
                 lines.push(format!("…(已达 {FIND_MAX_RESULTS} 条上限,可换更具体的模式)"));
             }
@@ -357,7 +373,8 @@ impl FsReadText {
                               支持纯文本/源码,以及 Word(.docx)、PowerPoint(.pptx)、\
                               Excel(.xlsx,会转成表格文本)、PDF(文字版;扫描成图的 PDF 读不出字)。\
                               老格式 .doc/.xls/.ppt 读不了;太长会分段,结果末尾标注\
-                              「继续读带 offset=N」,带上 offset 再调就接着读。",
+                              「继续读带 offset=N」,带上 offset 再调就接着读。只看大小/时间/\
+                              拍摄信息这类属性、不读内容的,用 fs_stat。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -430,6 +447,179 @@ impl Tool for FsReadText {
         })
         .await
         .context("读文件任务挂了")?
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fs_stat(批量看属性,只读;2026-08-13 用户拍板独立成原语——内容读取天然单文件、
+// 属性读取天然整批〔照片按拍摄时间归档〕,塞进 fs_read_text 会出双形参数)
+// ---------------------------------------------------------------------------
+
+/// fs_stat 单次封顶(fs 批量纪律同口径,§7.2 量约束:超额如实退回)。
+const STAT_MAX: usize = 300;
+
+pub(super) struct FsStat {
+    spec: ToolSpec,
+}
+
+impl FsStat {
+    pub(super) fn new() -> FsStat {
+        FsStat {
+            spec: ToolSpec {
+                name: "fs_stat",
+                description: "看文件的属性、不读内容:大小、修改/创建时间;照片(jpg/heic/\
+                              png…)带 EXIF 拍摄时间、相机、分辨率;mp4/mov 视频带时长。\
+                              批量原生——paths 一次传一整批(照片按拍摄时间归类,先拿它批量\
+                              查时间再分组),最多 300 个,结果顺序与传入一致。读内容用 \
+                              fs_read_text,列文件夹用 fs_list。",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "paths": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "文件绝对路径(支持 ~ 开头),最多 300 个"
+                        }
+                    },
+                    "required": ["paths"]
+                }),
+                timeout: std::time::Duration::from_secs(60),
+                ui_key: "tool.fs_stat",
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for FsStat {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
+        let paths = arg_paths(&args, "paths")?;
+        anyhow::ensure!(
+            paths.len() <= STAT_MAX,
+            "一次最多看 {STAT_MAX} 个,收到 {}——分批来",
+            paths.len()
+        );
+        super::guard::ensure(ctx, super::guard::Access::Read, &paths).await?;
+        tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+            Ok(paths.iter().map(|p| stat_line(Path::new(p))).collect::<Vec<_>>().join("\n"))
+        })
+        .await
+        .context("看属性的任务没跑完")?
+    }
+}
+
+/// 单文件一行:有啥报啥、缺啥不装(§3.5);读不了如实点名,不砸整批。
+fn stat_line(p: &Path) -> String {
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.display().to_string());
+    let md = match std::fs::metadata(p) {
+        Ok(md) => md,
+        Err(_) => return format!("- {name}: 不存在或读不了"),
+    };
+    if md.is_dir() {
+        let m = md.modified().map(fmt_time).unwrap_or_default();
+        return format!("- {name}/ — 文件夹 · 改于 {m}(里面有什么用 fs_list 看)");
+    }
+    let mut parts = vec![human_size(md.len())];
+    if let Ok(t) = md.modified() {
+        parts.push(format!("改于 {}", fmt_time(t)));
+    }
+    if let Ok(t) = md.created() {
+        parts.push(format!("建于 {}", fmt_time(t)));
+    }
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "heic" | "heif" => {
+            if let Some(x) = photo_bits(p) {
+                parts.push(x);
+            }
+        }
+        // BMFF 才有免 ffmpeg 的轻量时长(moov);mkv/mp3 等不报,不为一行属性拉子进程
+        "mp4" | "m4v" | "mov" => {
+            if let Some(d) = crate::media::probe_local(p).and_then(|pr| pr.duration_seconds) {
+                parts.push(format!("时长 {}", fmt_dur(d)));
+            }
+        }
+        _ => {}
+    }
+    format!("- {name} — {}", parts.join(" · "))
+}
+
+/// 照片三样(EXIF 拍摄时间 / 相机 / 分辨率),有啥报啥;全没有 → None(基本行照报)。
+fn photo_bits(p: &Path) -> Option<String> {
+    let mut bits: Vec<String> = Vec::new();
+    if let Ok(f) = std::fs::File::open(p) {
+        let mut br = std::io::BufReader::new(f);
+        if let Ok(ex) = exif::Reader::new().read_from_container(&mut br) {
+            let dt = ex
+                .get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY)
+                .or_else(|| ex.get_field(exif::Tag::DateTime, exif::In::PRIMARY))
+                .map(|f| tidy_exif_dt(&f.display_value().to_string()));
+            if let Some(dt) = dt {
+                bits.push(format!("拍摄 {dt}"));
+            }
+            let cam = [exif::Tag::Make, exif::Tag::Model]
+                .iter()
+                .filter_map(|t| ex.get_field(*t, exif::In::PRIMARY))
+                .map(|f| f.display_value().to_string().trim_matches('"').trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !cam.is_empty() {
+                bits.push(cam);
+            }
+        }
+    }
+    // 分辨率:读头不解码(HEIC 这类解不了的就省略,EXIF 半边照报)
+    if let Ok((w, h)) = image::image_dimensions(p) {
+        bits.push(format!("{w}×{h}"));
+    }
+    if bits.is_empty() {
+        None
+    } else {
+        Some(bits.join(","))
+    }
+}
+
+/// EXIF 日期形「2024:01:15 13:20:11」→「2024-01-15 13:20」(不是这个形就原样)。
+fn tidy_exif_dt(raw: &str) -> String {
+    let s = raw.trim().trim_matches('"');
+    let b = s.as_bytes();
+    if b.len() >= 16 && b[4] == b':' && b[7] == b':' {
+        let mut t = b[..16].to_vec();
+        t[4] = b'-';
+        t[7] = b'-';
+        if let Ok(v) = String::from_utf8(t) {
+            return v;
+        }
+    }
+    s.to_string()
+}
+
+fn fmt_time(t: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Local>::from(t).format("%Y-%m-%d %H:%M").to_string()
+}
+
+fn fmt_date(t: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Local>::from(t).format("%Y-%m-%d").to_string()
+}
+
+fn fmt_dur(secs: f64) -> String {
+    let s = secs.round().max(0.0) as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
     }
 }
 
@@ -1077,5 +1267,107 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(e, "(空文件)");
+    }
+
+    #[tokio::test]
+    async fn list_and_find_carry_modified_dates() {
+        let (ctx, dir) = ctx_and_dir("dates");
+        let out = FsList::new()
+            .run(serde_json::json!({"path": dir.to_string_lossy()}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            out.lines().any(|l| l.starts_with("电影A.mp4 (2KB · 20")),
+            "fs_list 行要捎改动日期: {out}"
+        );
+        let found = FsFind::new()
+            .run(serde_json::json!({"root": dir.to_string_lossy(), "pattern": "佩奇"}), &ctx)
+            .await
+            .unwrap();
+        assert!(found.contains("小猪佩奇01.mp4 (20"), "fs_find 行要捎改动日期: {found}");
+    }
+
+    #[tokio::test]
+    async fn stat_reports_batch_with_misses_and_dirs() {
+        let (ctx, dir) = ctx_and_dir("stat");
+        let out = FsStat::new()
+            .run(
+                serde_json::json!({"paths": [
+                    dir.join("电影A.mp4").to_string_lossy(),
+                    dir.join("kids").to_string_lossy(),
+                    dir.join("没有的.txt").to_string_lossy(),
+                ]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "结果顺序与传入一致、一行一个: {out}");
+        assert!(lines[0].contains("电影A.mp4 — 2KB · 改于 20"), "{out}");
+        assert!(lines[1].contains("kids/ — 文件夹"), "{out}");
+        assert!(lines[2].contains("不存在"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn stat_caps_batch_honestly() {
+        let (ctx, dir) = ctx_and_dir("stat-cap");
+        let many: Vec<String> =
+            (0..STAT_MAX + 1).map(|i| dir.join(format!("f{i}")).to_string_lossy().into_owned()).collect();
+        let err =
+            FsStat::new().run(serde_json::json!({ "paths": many }), &ctx).await.unwrap_err();
+        assert!(err.to_string().contains("最多看"), "{err:#}");
+    }
+
+    /// EXIF 半边:手工拼一张带 EXIF(拍摄时间/相机)的 JPEG——SOI 后插 APP1 段,
+    /// TIFF 载荷用 exif crate 的实验 Writer 生成,读回验证「拍摄 …」归一化格式。
+    #[tokio::test]
+    async fn stat_reads_photo_exif_and_dimensions() {
+        let (ctx, dir) = ctx_and_dir("stat-exif");
+        let dt = exif::Field {
+            tag: exif::Tag::DateTimeOriginal,
+            ifd_num: exif::In::PRIMARY,
+            value: exif::Value::Ascii(vec![b"2024:01:15 13:20:11".to_vec()]),
+        };
+        let make = exif::Field {
+            tag: exif::Tag::Make,
+            ifd_num: exif::In::PRIMARY,
+            value: exif::Value::Ascii(vec![b"TestCam".to_vec()]),
+        };
+        let mut writer = exif::experimental::Writer::new();
+        writer.push_field(&dt);
+        writer.push_field(&make);
+        let mut tiff = std::io::Cursor::new(Vec::new());
+        writer.write(&mut tiff, false).unwrap();
+
+        let mut jpeg = Vec::new();
+        {
+            let mut cur = std::io::Cursor::new(&mut jpeg);
+            let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cur, 80);
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                8,
+                8,
+                image::Rgb([100, 100, 100]),
+            ))
+            .write_with_encoder(enc)
+            .unwrap();
+        }
+        let mut payload = b"Exif\0\0".to_vec();
+        payload.extend_from_slice(tiff.get_ref());
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&jpeg[..2]); // SOI
+        bytes.extend_from_slice(&[0xFF, 0xE1]);
+        bytes.extend_from_slice(&(((payload.len() + 2) as u16).to_be_bytes()));
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(&jpeg[2..]);
+        let photo = dir.join("照片.jpg");
+        std::fs::write(&photo, bytes).unwrap();
+
+        let out = FsStat::new()
+            .run(serde_json::json!({"paths": [photo.to_string_lossy()]}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("拍摄 2024-01-15 13:20"), "EXIF 日期要归一化: {out}");
+        assert!(out.contains("TestCam"), "相机要报出来: {out}");
+        assert!(out.contains("8×8"), "分辨率要报出来: {out}");
     }
 }

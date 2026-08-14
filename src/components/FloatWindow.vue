@@ -10,7 +10,9 @@ import { useAgentMood } from '../composables/useAgentMood'
 import { confirmActionPhrase, isScopeCard, useConfirm } from '../composables/useConfirm'
 import { useFloat } from '../composables/useFloat'
 import { useFloatIdle } from '../composables/useFloatIdle'
+import { usePetDemoActivity, resolveActivity, type PetActivity } from '../composables/usePetActivity'
 import { useSettings } from '../composables/useSettings'
+import PetProp from './PetProp.vue'
 import { emitFloatSay, emitFloatUpdate, emitOpenConversation, floatWin, type TextRef } from '../lib/backend'
 import titanIdle from '../assets/titan-idle-1.png'
 import dogIdle from '../assets/dog-idle.png'
@@ -91,6 +93,20 @@ const orbState = computed(() => {
   if (mood.state.mood === 'speaking') return 'speak'
   if (wakeArmed.value) return 'armed' // 待机·免手唤醒在跑:头像一圈很淡的常亮环(竖着耳朵)
   return ''
+})
+
+// 戏份角标(#10 A 层,与主窗桌宠共用 usePetActivity):orb 右下小圆片显示正在搬/查/放歌。
+// think 不出角标——orb 自己的辉光环已表达思考,别重复;主窗藏托盘时这是唯一的「在干活」线索。
+const demoAct = usePetDemoActivity()
+const orbBadge = computed<PetActivity | null>(() => {
+  const a =
+    demoAct.value ??
+    resolveActivity(
+      running.value.map((tk) => tk.kind),
+      false, // think 走 orbState 光圈,不进角标
+      mediaPlaying.value,
+    )
+  return a === 'think' ? null : a
 })
 
 // 聆听波形:单个 level 标量 × 固定形状 → 一条随声音起伏的波(胶囊条 + 面板共用)。
@@ -225,7 +241,10 @@ onUnmounted(() => stopMoved())
           <em v-if="bar.pct != null" class="pct">{{ Math.round(bar.pct * 100) }}%</em>
           <span v-if="bar.count" class="bar-dot">{{ bar.count }}</span>
         </div>
-        <div class="orb" :class="orbState" @mousedown="onOrbDown"><img :src="avatar" :alt="petName" /></div>
+        <div class="orb" :class="orbState" @mousedown="onOrbDown">
+          <img :src="avatar" :alt="petName" />
+          <div v-if="orbBadge" class="orb-badge"><PetProp :activity="orbBadge" /></div>
+        </div>
       </div>
 
       <!-- 展开内容:两区 —— 正在进行(钉住) / 最近消息(新→旧);全显示,不取舍 -->
@@ -361,6 +380,20 @@ onUnmounted(() => stopMoved())
   cursor: pointer; /* 小手(用户偏好);拖动手柄但不用 move 那个"十"字光标 */
 }
 .orb img { width: 36px; height: 36px; object-fit: contain; pointer-events: none; }
+/* 戏份角标:右下小圆片(搬箱子/放大镜/音符);think 已有辉光环,不出角标 */
+.orb-badge {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  width: 17px;
+  height: 17px;
+  padding: 2.5px;
+  box-sizing: border-box;
+  border-radius: 50%;
+  background: var(--f-solid);
+  border: 1px solid var(--f-line);
+  pointer-events: none;
+}
 /* 头像状态灯:语音/mood 给圆头像加辉光环(box-shadow 严格贴圆,不用 drop-shadow 防 WKWebView 方块影) */
 .orb.listen { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 2px var(--f-cy); }
 .orb.think { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 2px rgba(var(--accent-rgb), 0.5); }

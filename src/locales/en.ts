@@ -42,6 +42,7 @@ export default {
     fs_append: 'Adding a line…',
     fs_edit: 'Editing the file…',
     fs_undo: 'Stepping back…',
+    fs_stat: 'Checking file details…',
     fs_unzip: 'Unpacking the archive…',
     fs_zip: 'Zipping files up…',
     fs_usage: 'Sizing up disk usage…',
