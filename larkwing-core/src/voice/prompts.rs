@@ -16,6 +16,15 @@ use crate::scenes::SceneVoice;
 pub(super) struct Clip {
     pub samples: Vec<f32>,
     pub rate: u32,
+    /// 这条短句的原文(确认层「剥自听回声」用:cpal 直出的应答被麦收进转写时,
+    /// 按**本次播的这句**精准剥,别的词一律不碰)。
+    pub text: String,
+}
+
+/// 一次短句播放:`ready` = 播完/失败置 true(调用方等收尾);`text` = 播的是哪句。
+pub(super) struct PromptPlay {
+    pub ready: Arc<AtomicBool>,
+    pub text: String,
 }
 
 #[derive(Default)]
@@ -71,11 +80,12 @@ impl PromptBank {
         // 别一律当 mp3——否则克隆/离线音色的 wav 解不开 → 短句银行空 → 唤醒「叫不应」一声不出。
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("mp3").to_ascii_lowercase();
         let bytes = tokio::fs::read(&path).await?;
+        let text = text.to_string();
         tokio::task::spawn_blocking(move || -> Result<Clip> {
             let (pcm, rate) = if ext == "wav" { decode_wav(&bytes)? } else { decode_mp3(&bytes)? };
             let samples = trim_silence(&pcm, rate);
             anyhow::ensure!(!samples.is_empty(), "解码出空音频");
-            Ok(Clip { samples, rate })
+            Ok(Clip { samples, rate, text })
         })
         .await
         .context("解码任务挂了")?
@@ -119,10 +129,11 @@ impl PromptBank {
     /// 后台播一条短句,返回"输出已收尾"信号(wake 用)。要点:播放不再阻塞 wake 线程,
     /// 后者可在播放期间持续清麦(实时清回声、不积压),信号一亮即开录 —— 比"阻塞播完再
     /// 一次性大清"少丢用户紧接应答音抢说的头几个字(#5)。None = 该类目无音频(降级无声)。
-    pub fn play_async(&self, kind: PromptKind) -> Option<Arc<AtomicBool>> {
+    pub fn play_async(&self, kind: PromptKind) -> Option<PromptPlay> {
         let clip = self.pick(kind)?;
         let samples = clip.samples.clone(); // 短句几 KB,克隆进后台线程
         let rate = clip.rate;
+        let text = clip.text.clone();
         let ready = Arc::new(AtomicBool::new(false));
         let ready2 = ready.clone();
         std::thread::spawn(move || {
@@ -131,7 +142,7 @@ impl PromptBank {
             }
             ready2.store(true, Ordering::Release); // 失败兜底:别让 wake 线程死等
         });
-        Some(ready)
+        Some(PromptPlay { ready, text })
     }
 }
 

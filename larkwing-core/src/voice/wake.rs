@@ -452,8 +452,8 @@ fn wake_loop(d: &WakeDeps, cmd: &Receiver<WakeCmd>) -> Result<()> {
 /// 比"阻塞播完再一次性 drain"少丢用户紧接应答音抢说的头几个字(#5)。无音频(降级)= 不阻塞、清一次。
 fn ack_and_drain(prompts: &PromptBank, pipe: &super::CapturePipe, kind: PromptKind) {
     let mut drained = 0usize;
-    if let Some(ready) = prompts.play_async(kind) {
-        while !ready.load(Ordering::Acquire) {
+    if let Some(play) = prompts.play_async(kind) {
+        while !play.ready.load(Ordering::Acquire) {
             drained += pipe.drain();
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -600,8 +600,19 @@ pub(super) fn to_syllables(s: &str) -> Vec<String> {
 /// 连喊、末次在句尾 = 孤立呼名),看其后还剩几个音节。只看尾随不看前文:中文里句尾的
 /// 名字几乎都是呼语(「过来,天天」),句中的才是嵌入(「我们天天去公园」→ 尾随≥2)。
 /// 多唤醒词取最像呼名的判定(Wake > Overheard > Reject)。
-pub(super) fn triage_transcript(transcript: &str, keywords: &[String]) -> Triage {
+///
+/// `played_ack` = 本次命中后播出去的应答词原文(cpal 直出、AEC 消不掉的形态下它会被
+/// 麦收进转写):若尾随以它的拼音序列**打头**,先剥掉再数——「逼踢我在」剥成裸呼名、
+/// 「逼踢我在帮我放歌」剥剩真实续句。**只剥本次这条、只剥紧跟呼名的前缀**(词表整体剥
+/// 会误伤真实续句里恰好同词的开头);同音异字靠拼音层天然容忍;半截泄漏不剥(落旁听
+/// 仲裁,模型兜,不比修前差)。None(回落「叮」/纯打字路)= 零剥离,行为与从前逐字节同。
+pub(super) fn triage_transcript(
+    transcript: &str,
+    keywords: &[String],
+    played_ack: Option<&str>,
+) -> Triage {
     let syl = to_syllables(transcript);
+    let ack_syl: Vec<String> = played_ack.map(to_syllables).unwrap_or_default();
     let mut best = Triage::Reject;
     for kw in keywords {
         let kws = to_syllables(kw);
@@ -615,13 +626,36 @@ pub(super) fn triage_transcript(transcript: &str, keywords: &[String]) -> Triage
             }
         }
         let Some(i) = last else { continue };
-        let trailing = syl.len() - (i + kws.len());
-        if trailing <= WAKE_TRAIL_MAX {
+        let mut rest = &syl[i + kws.len()..];
+        if !ack_syl.is_empty() && rest.len() >= ack_syl.len() && rest[..ack_syl.len()] == ack_syl[..] {
+            rest = &rest[ack_syl.len()..]; // 剥掉自家应答的回声
+        }
+        if rest.len() <= WAKE_TRAIL_MAX {
             return Triage::Wake; // 最强判定,直接定
         }
         best = Triage::Overheard;
     }
     best
+}
+
+/// 旁听上抛文本的自听回声清理(best-effort,字符层):删掉转写里**第一次**出现的应答词
+/// 字面(判定层已在拼音层剥过;这里只为别让仲裁模型看见自家应答)。ASR 同音异字
+/// (在呢→再呢)删不到就原样上抛——判定正确性不依赖这一步。
+fn strip_ack_once(transcript: &str, ack: &str) -> String {
+    // 应答词落转写时标点常被丢/换(「怎么了?」→「怎么了」),按去标点形找
+    let core: String = ack.chars().filter(|c| c.is_alphanumeric()).collect();
+    if core.is_empty() {
+        return transcript.to_string();
+    }
+    match transcript.find(&core) {
+        Some(pos) => {
+            let mut out = String::with_capacity(transcript.len());
+            out.push_str(&transcript[..pos]);
+            out.push_str(&transcript[pos + core.len()..]);
+            out
+        }
+        None => transcript.to_string(),
+    }
 }
 
 /// 确认层的静默续录:命中后接着收帧,VAD 只当「说没说话」的表(段产物丢弃)。
@@ -682,14 +716,23 @@ fn on_hit(
     d.rt.publish(VoiceEvent::WakeCandidate); // 前端:提前 duck + 轻视觉「在听」
     // 命中即出声应答(2026-07-11 用户拍板「立刻出声应答、录音不断」,取代 v0.2.13 的「叮」;
     // 代价照单收下:误命中/旁听也会应一声——派生名〔逼踢〕极少撞,起高频常用名才会吵)。
-    // 应答期间麦照收、**全程不 drain**(录音不断):browser 源(默认)AEC 消自播,应答音
-    // 不进识别;cpal 源应答音可能被录进转写——单音节应答词落在 triage 尾随豁免里,多音节
-    // (「怎么了?」)会把孤立呼名推去旁听仲裁(模型兜),真机嫌吵再议,不做特殊处理。
-    // 应答音银行没就绪(首启预合成中/断网降级)→ 回落「叮」,绝不静默让人喊了没动静(§3.5)。
+    // 应答期间麦照收、**全程不 drain**(录音不断)。⚠️ 应答走 cpal 直出,AEC 能不能消掉它
+    // **分平台且不可赌**(mac 系统级 VPIO 消得掉;Windows AEC3 只消 WebView 自播的音,
+    // cpal 是另一路 OS 音频流 → 大概率消不掉):扬声器出声时应答会被麦收进转写,原先
+    // 多音节应答词(「我在/在呢/怎么了」,词表 3/4)把孤立呼名推去旁听仲裁 → 模型判无实质
+    // 内容 → 整轮蒸发 + 回待唤醒 = 「答了一声却像没唤醒、没人在听」(2026-08-14 真机实锤,
+    // 取代原「真机嫌吵再议」记档)。修 = triage 按**本次播的应答词**拼音精准剥离(见
+    // triage_transcript;按本次不按词表 —— 词表整体剥会误伤真实续句里恰好同词的开头)。
+    // 应答音银行没就绪(首启预合成中/断网降级)→ 回落「叮」,绝不静默让人喊了没动静(§3.5);
+    // 「叮」是纯正弦不进转写,played_ack = None = 零剥离。
     let prompts = d.prompts.lock().expect("prompts lock").clone();
-    if prompts.play_async(PromptKind::Ack).is_none() {
-        super::prompts::play_chirp_async();
-    }
+    let played_ack = match prompts.play_async(PromptKind::Ack) {
+        Some(play) => Some(play.text),
+        None => {
+            super::prompts::play_chirp_async();
+            None
+        }
+    };
     vad.reset();
     let tail = confirm_tail(pipe, vad)?;
     vad.reset();
@@ -705,7 +748,7 @@ fn on_hit(
         }
     };
     let keywords = d.rt.wake_keywords();
-    match triage_transcript(&transcript, &keywords) {
+    match triage_transcript(&transcript, &keywords, played_ack.as_deref()) {
         Triage::Wake => {
             tracing::info!(%transcript, "唤醒确认:孤立呼名 → 经典唤醒");
             on_wake(d, pipe, vad, hangover)
@@ -714,8 +757,14 @@ fn on_hit(
             // 声纹同段识别(有注册才有):仲裁回合的记忆归人跟说话人走
             let speaker_id =
                 d.speaker.as_ref().and_then(|s| s.identify(&pcm, &d.rt.voiceprint_library()));
+            // 上抛前把自听回声(本次应答词字面)best-effort 抠掉:判定正确性在拼音层已保住,
+            // 这里只是别让仲裁模型看见「逼踢我在帮我放歌」里那句自家应答;同音异字抠不到就原样。
+            let text = match played_ack.as_deref() {
+                Some(ack) => strip_ack_once(&transcript, ack),
+                None => transcript.clone(),
+            };
             tracing::info!(%transcript, ?speaker_id, "唤醒确认:呼名+续句 → 交模型仲裁(旁听)");
-            d.rt.publish(VoiceEvent::Overheard { text: transcript, speaker_id });
+            d.rt.publish(VoiceEvent::Overheard { text, speaker_id });
             pipe.drain();
             Ok(Phase::Watch)
         }
@@ -960,46 +1009,76 @@ mod tests {
     #[test]
     fn triage_isolated_call_wakes() {
         let k = kw(&["天天"]);
-        assert!(matches!(triage_transcript("天天", &k), Triage::Wake), "裸呼名");
-        assert!(matches!(triage_transcript("天天。", &k), Triage::Wake), "标点丢弃");
-        assert!(matches!(triage_transcript("天天呀", &k), Triage::Wake), "尾随语气词 ≤1 仍是呼名");
-        assert!(matches!(triage_transcript("天天天天", &k), Triage::Wake), "连喊取末次出现,句尾=呼名");
-        assert!(matches!(triage_transcript("过来天天", &k), Triage::Wake), "句尾呼语(前文不否决)");
+        assert!(matches!(triage_transcript("天天", &k, None), Triage::Wake), "裸呼名");
+        assert!(matches!(triage_transcript("天天。", &k, None), Triage::Wake), "标点丢弃");
+        assert!(matches!(triage_transcript("天天呀", &k, None), Triage::Wake), "尾随语气词 ≤1 仍是呼名");
+        assert!(matches!(triage_transcript("天天天天", &k, None), Triage::Wake), "连喊取末次出现,句尾=呼名");
+        assert!(matches!(triage_transcript("过来天天", &k, None), Triage::Wake), "句尾呼语(前文不否决)");
     }
 
     #[test]
     fn triage_homophones_still_wake() {
         // ASR 选错字(甜甜/田田)按拼音等价 —— 不因错字误杀(§8.2 宁松勿严)
         let k = kw(&["天天"]);
-        assert!(matches!(triage_transcript("甜甜", &k), Triage::Wake));
-        assert!(matches!(triage_transcript("田田", &k), Triage::Wake));
+        assert!(matches!(triage_transcript("甜甜", &k, None), Triage::Wake));
+        assert!(matches!(triage_transcript("田田", &k, None), Triage::Wake));
+    }
+
+    /// 自听回声剥离(2026-08-14 真机实锤修):cpal 直出的应答被麦收进转写 → 原先多音节
+    /// 应答词把每次孤立呼名推去旁听蒸发 = 「答了一声却像没唤醒」。按**本次播的那条**剥。
+    #[test]
+    fn triage_strips_played_ack_echo() {
+        let k = kw(&["逼踢"]);
+        // 泄漏的应答跟在呼名后 → 剥掉 = 裸呼名,正常开录(修前:Overheard 蒸发)
+        assert!(matches!(triage_transcript("逼踢我在", &k, Some("我在")), Triage::Wake));
+        assert!(matches!(triage_transcript("逼踢怎么了", &k, Some("怎么了?")), Triage::Wake), "应答词标点在音节层天然丢弃");
+        // 同音异字转写(在呢→再呢)拼音层照剥
+        assert!(matches!(triage_transcript("逼踢再呢", &k, Some("在呢")), Triage::Wake));
+        // 剥完还剩语气词 ≤1 → 仍豁免
+        assert!(matches!(triage_transcript("逼踢我在呀", &k, Some("我在")), Triage::Wake));
+        // 应答后带真实续句 → 剥掉应答、剩余交仲裁(直达执行路不受损)
+        assert!(matches!(triage_transcript("逼踢我在帮我放首歌", &k, Some("我在")), Triage::Overheard));
+        // **精准**:只剥本次播的这条——用户真实续句开头恰是别的应答词,一个字不碰
+        assert!(matches!(triage_transcript("逼踢怎么了今天", &k, Some("我在")), Triage::Overheard));
+        // 没播应答(回落「叮」)= 零剥离,行为与从前相同
+        assert!(matches!(triage_transcript("逼踢我在", &k, None), Triage::Overheard));
+        // 应答词没泄漏(AEC 消掉了)= 剥不到,孤立呼名照常
+        assert!(matches!(triage_transcript("逼踢", &k, Some("我在")), Triage::Wake));
+    }
+
+    #[test]
+    fn strip_ack_once_is_best_effort() {
+        assert_eq!(strip_ack_once("逼踢我在帮我放首歌", "我在"), "逼踢帮我放首歌");
+        assert_eq!(strip_ack_once("逼踢怎么了帮个忙", "怎么了?"), "逼踢帮个忙", "按去标点形找");
+        // 同音异字找不到 → 原样(判定层已在拼音层保住,这步只是美化)
+        assert_eq!(strip_ack_once("逼踢再呢放首歌", "在呢"), "逼踢再呢放首歌");
     }
 
     #[test]
     fn triage_continuation_goes_overheard() {
         let k = kw(&["天天"]);
-        assert!(matches!(triage_transcript("天天向上", &k), Triage::Overheard), "节目名");
-        assert!(matches!(triage_transcript("看天天向上真好看", &k), Triage::Overheard));
-        assert!(matches!(triage_transcript("我们天天去公园", &k), Triage::Overheard), "副词嵌入");
-        assert!(matches!(triage_transcript("天天暂停", &k), Triage::Overheard), "连说指令 → 交模型仲裁执行");
-        assert!(matches!(triage_transcript("甜甜圈好吃", &k), Triage::Overheard), "同音嵌入也交仲裁");
+        assert!(matches!(triage_transcript("天天向上", &k, None), Triage::Overheard), "节目名");
+        assert!(matches!(triage_transcript("看天天向上真好看", &k, None), Triage::Overheard));
+        assert!(matches!(triage_transcript("我们天天去公园", &k, None), Triage::Overheard), "副词嵌入");
+        assert!(matches!(triage_transcript("天天暂停", &k, None), Triage::Overheard), "连说指令 → 交模型仲裁执行");
+        assert!(matches!(triage_transcript("甜甜圈好吃", &k, None), Triage::Overheard), "同音嵌入也交仲裁");
     }
 
     #[test]
     fn triage_no_keyword_rejects() {
         let k = kw(&["天天"]);
-        assert!(matches!(triage_transcript("今天气不错", &k), Triage::Reject), "只有一个「天」不算");
-        assert!(matches!(triage_transcript("", &k), Triage::Reject), "空转写=幻听");
-        assert!(matches!(triage_transcript("音乐轰隆隆", &k), Triage::Reject));
+        assert!(matches!(triage_transcript("今天气不错", &k, None), Triage::Reject), "只有一个「天」不算");
+        assert!(matches!(triage_transcript("", &k, None), Triage::Reject), "空转写=幻听");
+        assert!(matches!(triage_transcript("音乐轰隆隆", &k, None), Triage::Reject));
     }
 
     #[test]
     fn triage_multi_keyword_prefers_wake() {
         // 多唤醒词:任一判成呼名即唤醒(Wake > Overheard > Reject)
         let k = kw(&["小七", "天天"]);
-        assert!(matches!(triage_transcript("小七", &k), Triage::Wake));
-        assert!(matches!(triage_transcript("天天向上", &k), Triage::Overheard));
-        assert!(matches!(triage_transcript("小七和天天向上", &k), Triage::Overheard), "小七也带尾随");
+        assert!(matches!(triage_transcript("小七", &k, None), Triage::Wake));
+        assert!(matches!(triage_transcript("天天向上", &k, None), Triage::Overheard));
+        assert!(matches!(triage_transcript("小七和天天向上", &k, None), Triage::Overheard), "小七也带尾随");
     }
 
     #[test]
@@ -1058,12 +1137,12 @@ mod tests {
         // 名字 BT → 唤醒词「逼踢」;ASR 常吐拉丁原文「BT」——两头经同一张读音表归一后必须相等,
         // 否则确认层会把真呼叫当幻听拒掉(这正是派生表与 to_syllables 共用一张的原因)。
         let k = kw(&["逼踢"]);
-        assert!(matches!(triage_transcript("BT", &k), Triage::Wake), "拉丁原文孤立呼名");
-        assert!(matches!(triage_transcript("逼踢", &k), Triage::Wake));
-        assert!(matches!(triage_transcript("必提", &k), Triage::Wake), "同音字等价(无调拼音)");
-        assert!(matches!(triage_transcript("BT暂停", &k), Triage::Overheard), "呼名+续句交仲裁");
+        assert!(matches!(triage_transcript("BT", &k, None), Triage::Wake), "拉丁原文孤立呼名");
+        assert!(matches!(triage_transcript("逼踢", &k, None), Triage::Wake));
+        assert!(matches!(triage_transcript("必提", &k, None), Triage::Wake), "同音字等价(无调拼音)");
+        assert!(matches!(triage_transcript("BT暂停", &k, None), Triage::Overheard), "呼名+续句交仲裁");
         let k74 = kw(&["七二七四"]);
-        assert!(matches!(triage_transcript("7274", &k74), Triage::Wake), "数字原文对得上读法");
+        assert!(matches!(triage_transcript("7274", &k74, None), Triage::Wake), "数字原文对得上读法");
     }
 
     #[test]
