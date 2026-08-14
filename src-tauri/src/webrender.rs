@@ -1445,13 +1445,12 @@ async fn print_pdf_platform(win: &tauri::WebviewWindow, dest: &std::path::Path) 
                 return;
             }
         };
-        // BOOL 在 windows 0.61 已从 Win32::Foundation 搬进 windows-core(webview2-com 0.38
-        // 锁的同一个 windows-core 0.61,类型正好统一)——首次 Windows 编译实锤后改正。
+        // 首编两跳实锤(2026-08-14 CI):① BOOL 在 windows 0.61 已搬离 Win32::Foundation;
+        // ② webview2-com 0.38 的包装层又多走一步——原生 Invoke(HRESULT, BOOL) 到回调时
+        // 已转成 (Result<()>, **bool**)(E0631 期望签名原文),所以这里是裸 bool。
         let handler = PrintToPdfCompletedHandler::create(Box::new(
-            move |result: windows::core::Result<()>,
-                  ok: windows::core::BOOL|
-                  -> windows::core::Result<()> {
-                let _ = tx.send(result.is_ok() && ok.as_bool());
+            move |result: windows::core::Result<()>, ok: bool| -> windows::core::Result<()> {
+                let _ = tx.send(result.is_ok() && ok);
                 Ok(())
             },
         ));
