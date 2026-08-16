@@ -343,8 +343,21 @@ export interface FloatIdle {
 export type TurnEvent =
   | { type: 'delta'; data: string }
   | { type: 'thinking'; data: string }
-  // label = i18n 键(如 'tool.remember'),文案在字典;绝不露"工具"概念
-  | { type: 'tool_use'; data: { label: string; state: 'started' | 'finished' } }
+  // label = i18n 键(如 'tool.remember'),文案在字典;绝不露"工具"概念(折叠层口径)。
+  // 展开层的细节也随流走:id 配对、name 原始工具名、args(started 带)、result/status
+  // (finished 带,均已截断)—— 在飞就能点开看个大概,收尾 hydrate 再用落库全量版覆盖。
+  | {
+      type: 'tool_use'
+      data: {
+        id: string
+        label: string
+        name: string
+        args: string
+        result: string
+        status: string
+        state: 'started' | 'finished'
+      }
+    }
   // 记账灯带:本轮消耗 + 今日/会话累计快照(工具回合每轮一次;累计来自库,前端只展示)
   | { type: 'usage'; data: { round: UsageDigest; today: DayUsage; conv: UsageTotals } }
   // 插队(PLAN §9 B):回合在飞时注入的 user 消息已落库,之后的回复另起一段

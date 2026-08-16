@@ -24,6 +24,35 @@ use super::{
 // 工具轮控制(PLAN §8):不是单个魔法数 —— 深度是任务属性,固定数调大放走失控、调小卡死深任务。
 // 拆成三层:模型自检(智能判官)+ 空转兜底网(自检失灵时)+ 硬上限(纯 backstop)。
 // 三个阈值眼下是常数;真做复杂桌面任务时按计划挪进 Scene.options 数据位、按场景调。
+/// 在飞事件里的入参/结果截断长度(展开层「看个大概」够用;收尾 hydrate 用落库全量版覆盖)。
+/// 之所以要截:fs_write_text 的正文、web_fetch 的整页正文动辄几千上万字,原样进事件流
+/// 等于把整轮内容再走一遍 IPC。几百字节 × 几十步 = 可忽略。
+const LIVE_ARGS_MAX: usize = 400;
+const LIVE_RESULT_MAX: usize = 300;
+
+/// 按**字符**截断并标出省略(不劈开多字节;够短就原样)。
+fn clip(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    format!("{head}…(还有 {} 字,跑完看全)", n - max)
+}
+
+#[cfg(test)]
+mod clip_tests {
+    #[test]
+    fn clip_cuts_on_char_boundary_and_reports_the_rest() {
+        assert_eq!(super::clip("短的", 10), "短的", "装得下就原样");
+        assert_eq!(super::clip("一二三四五", 5), "一二三四五", "正好装下不加尾巴");
+        let out = super::clip("一二三四五六", 5);
+        assert!(out.starts_with("一二三四五") && out.contains("还有 1 字"), "{out}");
+        // 多字节不劈半(劈了 String 会 panic,这里能构造出来就说明没劈)
+        assert_eq!(super::clip("🎵🎵🎵", 2).chars().next(), Some('🎵'));
+    }
+}
+
 /// 硬上限:纯失控 backstop,正常永远碰不到;到顶强制用嘴收尾。
 const MAX_TOOL_ROUNDS: usize = 200;
 /// 每隔几轮给模型插一句中立自检,让它自己评要不要继续 / 收尾(智能判官)。
@@ -338,7 +367,14 @@ impl Turn {
                 }
                 let _ = tx
                     .send(TurnEvent::ToolUse {
+                        id: call.id.clone(),
                         label: label_of(&call.name),
+                        name: call.name.clone(),
+                        // 入参随流走(展开层在飞可看):截断防超长参数(fs_write_text 正文、
+                        // ffmpeg 长参数串)把事件流压垮;收尾 hydrate 用落库全量版覆盖。
+                        args: clip(&call.args.to_string(), LIVE_ARGS_MAX),
+                        result: String::new(),
+                        status: String::new(),
                         state: ToolUseState::Started,
                     })
                     .await;
@@ -378,7 +414,12 @@ impl Turn {
                 persist_row(&store, conv_id, "tool", &out.text, p.as_deref()).await;
                 let _ = tx
                     .send(TurnEvent::ToolUse {
+                        id: call.id.clone(),
                         label: label_of(&call.name),
+                        name: call.name.clone(),
+                        args: String::new(), // Started 时已给,不重发
+                        result: clip(&out.text, LIVE_RESULT_MAX),
+                        status: status.clone(),
                         state: ToolUseState::Finished,
                     })
                     .await;

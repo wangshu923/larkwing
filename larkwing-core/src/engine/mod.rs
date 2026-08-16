@@ -35,8 +35,21 @@ pub enum TurnEvent {
     Delta(String),
     Thinking(String),
     /// 工具状态泡:label 是 i18n 键(如 "tool.remember"),文案由前端字典选
-    /// (core 不产文案铁规);绝不露工具/agent 概念,只露友好动词。
-    ToolUse { label: String, state: ToolUseState },
+    /// (core 不产文案铁规);绝不露工具/agent 概念,只露友好动词 —— 这是**折叠层**的口径。
+    /// **展开层的技术细节也随流走(2026-08-16 改)**:`id`(call_id,配对用)+ `name`(原始
+    /// 工具名)+ `args`(入参,Started 时带)+ `result`/`status`(Finished 时带,**截断**)。
+    /// 原先「入参/结果故意不入流、回合收尾 hydrate 再补」——真机实锤:批量回合一跑几分钟,
+    /// 这期间展开「想了想」里全是光秃秃的动词、点都点不开。截断后每步几百字节,流量可忽略;
+    /// 收尾 hydrate 仍会用落库全量版整条覆盖(在飞看个大概,完了看全)。
+    ToolUse {
+        id: String,
+        label: String,
+        name: String,
+        args: String,
+        result: String,
+        status: String,
+        state: ToolUseState,
+    },
     /// 记账灯带:本轮消耗 + 今日/会话累计快照(工具回合每轮各发一次;累计直接来自库,
     /// 前端只展示不记账)。provider 没回 usage(严格端点/假流)就不发 —— 不点没数据的灯。
     Usage { round: UsageDigest, today: DayUsage, conv: crate::store::UsageTotals },

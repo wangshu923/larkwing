@@ -155,10 +155,17 @@ async fn tool_round_executes_persists_and_finishes() {
     while let Some(ev) = rx.recv().await {
         match ev {
             TurnEvent::Delta(t) => streamed.push_str(&t),
-            TurnEvent::ToolUse { label, state } => {
+            TurnEvent::ToolUse { id, label, name, args, result, state, .. } => {
                 assert!(label.starts_with("tool."), "label 是 i18n 键,不露工具概念");
+                assert!(!id.is_empty() && !name.is_empty(), "配对用的 call id 与原始工具名要带上");
                 match state {
-                    larkwing_core::engine::ToolUseState::Started => tool_started += 1,
+                    // 展开层在飞可看:入参随 Started 走(结果这时还没有)
+                    larkwing_core::engine::ToolUseState::Started => {
+                        assert!(result.is_empty(), "还没跑完,不该有结果");
+                        assert!(!args.is_empty(), "入参要随流走,否则在飞点开是空的:{name}");
+                        tool_started += 1;
+                    }
+                    // 结果摘要随 Finished 回填(截断版;收尾 hydrate 再换全量)
                     larkwing_core::engine::ToolUseState::Finished => tool_finished += 1,
                 }
             }

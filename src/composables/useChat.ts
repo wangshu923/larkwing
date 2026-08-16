@@ -773,6 +773,9 @@ function send(
   }
   let fullText = '' // __IGNORE__ 判定要看全量(打字机还没放完的字不算数)
   let turnHadTrace = false // 本回合动过工具或脑 → done 后补拉 trace(详情从落库 payload 重建)
+  // 本回合在飞的工具步骤:call id → 那条轨迹条目(finished 事件按 id 回填结果,
+  // 同一轮并发调好几个同名工具时也认得准)。回合结束即随闭包丢弃。
+  const liveSteps = new Map<string, Extract<TraceItem, { kind: 'tool' }>>()
 
   twFlush() // 上一回合的字还在放:立刻放完并收尾,别让两台打字机打架
   state.messages.push({
@@ -845,10 +848,27 @@ function send(
           if (ev.data.state === 'started') {
             state.toolAction = ev.data.label
             turnHadTrace = true // 这回合有工具步骤 → done 后补拉 trace
-            // 工具步骤实时进「想了想」:默认折叠,只需「·N 步」当场涨;入参/结果故意不入流,
-            // done 时 hydrateTrace 用落库规范版(原始工具名 + args/result)整条覆盖归位。
+            // 工具步骤实时进「想了想」:折叠层只需「·N 步」当场涨;展开层也当场有东西可看
+            // ——入参随流走(已截断),结果等这一步跑完回填。done 时 hydrateTrace 再用落库
+            // 全量版整条覆盖归位(在飞看个大概,跑完看全)。
             if (!wang.trace) wang.trace = { items: [] }
-            wang.trace.items.push({ kind: 'tool', name: t(ev.data.label), ui_key: ev.data.label, args: '', result: '', status: '' })
+            const step = {
+              kind: 'tool' as const,
+              name: ev.data.name,
+              ui_key: ev.data.label,
+              args: ev.data.args,
+              result: '',
+              status: '',
+            }
+            wang.trace.items.push(step)
+            liveSteps.set(ev.data.id, step) // 按 call id 配对(同一轮可能并发好几个同名调用)
+          } else {
+            // 这一步跑完:结果摘要 + 状态回填到**那一条**(拿不到就算了,收尾 hydrate 会补)
+            const step = liveSteps.get(ev.data.id)
+            if (step) {
+              step.result = ev.data.result
+              step.status = ev.data.status
+            }
           }
           state.mood = 'thinking'
           break
