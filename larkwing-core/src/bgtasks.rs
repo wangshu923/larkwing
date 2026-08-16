@@ -26,8 +26,14 @@ const STALL_MS: i64 = 10 * 60 * 1000;
 const FINISHED_KEEP: usize = 10;
 /// 〔此刻〕背景最多列几个运行中任务(再多只报个数,让模型用 task_status 细看)。
 const AMBIENT_MAX: usize = 3;
-/// 点名清单封顶(§7.2 量约束):批量汇总与 status 视图共用。
-const NAME_CAP: usize = 12;
+/// 点名清单的**字数**预算(§7.2 量约束):批量汇总与 status 视图共用。
+/// 按字数而不是按条数截 —— 名字长短差十倍(「两只老虎.mp3」vs 一整条绝对路径),
+/// 条数封顶要么把短名单白白砍掉(2026-08-15 真机:92 首没配上,模型只拿到 12 个名字、
+/// 用户问「是哪些」它答不出),要么被长路径撑爆。预算内尽量列全,超了列到预算 + 「等 N 个」。
+/// 结果给全之后**怎么处置归模型**(要存下来它自己 fs_write_text 写,不给它造专门的机制)。
+const NAMES_MAX_CHARS: usize = 2000;
+/// 运行中视图(task_status)保留多少个没成的名字:打印仍按字数截,这里只是别无限攒。
+const MISS_KEEP: usize = 300;
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -36,13 +42,28 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// 点名清单封顶:超过 NAME_CAP 个只列前几个 + 「等 N 个」(token 不随批量大小爆)。
+/// 点名清单:字数预算内尽量列全,装不下的以「等 N 个」交代总数(token 不随批量大小爆,
+/// 但也别为省几百字把模型变成瞎子——它得答得出「到底是哪几个」)。至少列一个。
 pub(crate) fn cap_names(names: &[String]) -> String {
-    if names.len() <= NAME_CAP {
-        names.join("、")
-    } else {
-        format!("{} 等 {} 个", names[..NAME_CAP].join("、"), names.len())
+    let mut out = String::new();
+    let (mut used, mut listed) = (0usize, 0usize);
+    for n in names {
+        let n_len = n.chars().count();
+        let add = if out.is_empty() { n_len } else { n_len + 1 }; // +1 = 顿号
+        if !out.is_empty() && used + add > NAMES_MAX_CHARS {
+            break;
+        }
+        if !out.is_empty() {
+            out.push('、');
+        }
+        out.push_str(n);
+        used += add;
+        listed += 1;
     }
+    if listed < names.len() {
+        out.push_str(&format!(" 等 {} 个", names.len()));
+    }
+    out
 }
 
 #[derive(Clone)]
@@ -327,13 +348,15 @@ impl BgTasks {
     }
 
     /// 收尾汇报:插 due=now 的一次性 jobs 任务(调度器 ≤30s 捡起 wake_turn 唤回合)。
+    /// 走 `add_report`(kind=report)而不是普通提醒 —— 下游据此把「后台忙完了」与「到点提醒」
+    /// 分开:汇报不自动念、系统线也不贴「到点了」(2026-08-15 真机:打字支使它干活,汇报却被念出来)。
     /// 插不进去只 warn(汇报丢了不至于砸任务;任务条终态仍在)。
     fn report(&self, origin: (i64, i64), text: String) {
         let store = self.inner.store.clone();
         let (user_id, conv_id) = origin;
         let due = now_ms();
         let insert = move || {
-            if let Err(e) = store.jobs.add(user_id, conv_id, &text, due, "once") {
+            if let Err(e) = store.jobs.add_report(user_id, conv_id, &text, due) {
                 tracing::warn!("后台任务收尾汇报没插进任务: {e:#}");
             }
         };
@@ -373,7 +396,7 @@ impl BgTicket {
     pub fn miss(&self, name: &str) {
         let mut st = self.entry.st.lock().expect("bg st lock");
         st.miss_count += 1;
-        if st.misses.len() < NAME_CAP + 1 {
+        if st.misses.len() < MISS_KEEP {
             st.misses.push(name.to_string());
         }
     }
@@ -471,10 +494,11 @@ mod tests {
         let bg = BgTasks::new(store.clone());
         let t = bg.submit("下载合集(3 首)".into(), (1, 42), 3).unwrap();
         t.finish(true, "下好 3 首,全成。");
-        let jobs = store.jobs.list_pending(1).unwrap();
+        let jobs = store.jobs.due(now_ms() + 1_000).unwrap();
         assert_eq!(jobs.len(), 1, "收尾必插一条唤醒任务");
         assert_eq!(jobs[0].conv_id, 42);
         assert!(jobs[0].content.contains("下好 3 首"));
+        assert_eq!(jobs[0].kind, "report", "汇报要与到点提醒分家(桌面据此决定念不念)");
     }
 
     #[test]
@@ -498,11 +522,11 @@ mod tests {
         bg.sweep_once(now_ms() + STALL_MS + 1000);
         let st = bg.status_report();
         assert!(st.contains("刚结束的") && st.contains("卡住没动静"), "{st}");
-        let jobs = store.jobs.list_pending(1).unwrap();
+        let jobs = store.jobs.due(now_ms() + 1_000).unwrap();
         assert_eq!(jobs.len(), 1);
         assert!(jobs[0].content.contains("卡住没动静") && jobs[0].content.contains("5/30"));
         drop(t); // 看门狗已置终态 → drop 兜底不再重复汇报
-        assert_eq!(store.jobs.list_pending(1).unwrap().len(), 1);
+        assert_eq!(store.jobs.due(now_ms() + 1_000).unwrap().len(), 1);
     }
 
     #[test]
@@ -512,7 +536,7 @@ mod tests {
         let t = bg.submit("下载合集(9 首)".into(), (1, 3), 9).unwrap();
         t.beat(4, "《某曲》");
         drop(t); // 模拟 panic / abort:没收尾
-        let jobs = store.jobs.list_pending(1).unwrap();
+        let jobs = store.jobs.due(now_ms() + 1_000).unwrap();
         assert_eq!(jobs.len(), 1);
         assert!(jobs[0].content.contains("半路断了") && jobs[0].content.contains("4/9"));
     }
@@ -535,8 +559,21 @@ mod tests {
 
     #[test]
     fn cap_names_caps() {
-        let names: Vec<String> = (0..15).map(|i| format!("n{i}")).collect();
-        assert!(cap_names(&names).contains("等 15 个"));
-        assert_eq!(cap_names(&names[..2]), "n0、n1");
+        // 按字数不按条数:几十上百个短名字要**列全**(真机 92 首没配上,模型得答得出是哪些)
+        let short: Vec<String> = (0..92).map(|i| format!("儿歌{i:02}.mp3")).collect();
+        let out = cap_names(&short);
+        assert!(!out.contains("等 "), "短名单要列全,不该截:{out}");
+        assert!(out.contains("儿歌00.mp3") && out.contains("儿歌91.mp3"));
+        assert_eq!(cap_names(&short[..2]), "儿歌00.mp3、儿歌01.mp3");
+
+        // 长路径撑爆预算 → 列到预算 + 交代总数(且总在预算附近,不随条数爆)
+        let long: Vec<String> = (0..300).map(|i| format!("{}{i:03}.flac", "某个很长的目录名/".repeat(5))).collect();
+        let out = cap_names(&long);
+        assert!(out.contains("等 300 个"), "装不下要交代总数:{}", &out[out.len() - 30..]);
+        assert!(out.chars().count() < NAMES_MAX_CHARS + 60, "不该超预算太多:{} 字", out.chars().count());
+
+        // 单个名字就超预算:至少列一个(不给空清单)
+        let huge = vec!["x".repeat(NAMES_MAX_CHARS + 500), "y".into()];
+        assert!(cap_names(&huge).starts_with("xxx") && cap_names(&huge).contains("等 2 个"));
     }
 }

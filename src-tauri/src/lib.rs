@@ -211,6 +211,9 @@ pub fn run() {
       // 确认中枢注入 voice(§7.8 口头确认):同一份实例,语音听音的 resolve 与桌面卡/
       // 渠道回话先到先得(voice 不碰 engine,只吃这个平级 confirm 件——set_web_renderer 同款接缝)。
       voice.set_confirmer(engine.confirmer().clone());
+      // 语音运行时注入 engine(read_audio 的耳朵):同一份实例,与唤醒/听写共用缓存的
+      // VAD/识别器;core 侧没注入时该工具如实说语音组件没就绪(set_web_renderer 同款接缝)。
+      engine.set_voice(voice.clone());
       tracing::info!(
         data_dir = %data_dir.display(),
         has_key = engine.has_provider(),

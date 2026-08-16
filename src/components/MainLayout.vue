@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { useChat, type TurnStats, type UiMessage, type UiAttachment } from '../composables/useChat'
+import { useChat, traceTools, type TurnStats, type UiMessage, type UiAttachment } from '../composables/useChat'
+import type { TraceItem } from '../lib/backend'
 import { useSettings } from '../composables/useSettings'
 import { onOverheard, onTranscribed, useVoice } from '../composables/useVoice'
 import { useMicBridge } from '../composables/useMicBridge'
@@ -345,12 +346,32 @@ function onStreamClick(e: MouseEvent) {
   void openExternal(a.getAttribute('href') || '')
 }
 
-// 「想了想」漏出(PLAN §9):折叠药丸只露"想了想·N 步"(§3 干净默认);
-// 展开 = 工具名/入参/结果 + CoT 原文(给好奇/专业用户;非专业用户不必点开)。展开态按 message id 记
+// 「想了想」漏出(PLAN §9):折叠药丸只露"想了想·N 步"(§3 干净默认);展开 = 时间序条目
+// (想→做→想→做),每条再点开才露细节 —— 两级都按用户拍板(2026-08-15)。展开态按 message id 记
 const traceOpen = ref<Set<number>>(new Set())
 function toggleTrace(id: number) {
   if (traceOpen.value.has(id)) traceOpen.value.delete(id)
   else traceOpen.value.add(id)
+}
+// 第二级:条目自己的展开态,键 = 「消息 id:条目序号」(药丸收起不清,再点开还是原样)
+const itemOpen = ref<Set<string>>(new Set())
+function toggleItem(id: number, i: number) {
+  const k = `${id}:${i}`
+  if (itemOpen.value.has(k)) itemOpen.value.delete(k)
+  else itemOpen.value.add(k)
+}
+/** 条目的一行人话:工具 = 拟人化动词(ui_key 认不出就退回工具名)、思考 = 「思考」。
+ *  tool.* 那套词是给 HUD 的进行时(「瞄了一眼时钟…」),轨迹里是已经做完的一步 → 去掉尾巴的省略号。 */
+function itemLabel(it: TraceItem): string {
+  if (it.kind === 'thinking') return t('trace.thinking')
+  return (te(it.ui_key) ? t(it.ui_key) : it.name).replace(/[…\s.]+$/, '')
+}
+/** 有没有可展开的细节:在飞的工具步骤只有名字(入参/结果不入流,回合收尾 hydrate 才补上)
+ *  → 这类不给箭头、点了也不动,免得点开一片空(§3.5 不装有内容)。 */
+function itemDetail(it: TraceItem): boolean {
+  return it.kind === 'thinking'
+    ? !!it.text.trim()
+    : !!it.result || (!!it.args && it.args !== '{}')
 }
 
 // 波形:9 根柱,电平驱动,固定相位差(纯视觉,不求频谱真实)
@@ -460,7 +481,7 @@ function groupChips(g: StreamGroup): ReceiptChip[] {
   if (g.kind !== 'wang') return []
   const out: ReceiptChip[] = []
   for (const m of g.msgs) {
-    for (const s of m.trace?.steps ?? []) {
+    for (const s of traceTools(m)) {
       if (s.status !== 'ok' || !s.args) continue
       try {
         if (s.ui_key === 'tool.reminder_set') {
@@ -562,7 +583,7 @@ const lastWangToolKeys = computed<Set<string>>(() => {
   const list = messages.value
   for (let i = list.length - 1; i >= 0; i--) {
     const m = list[i]
-    if (m.role === 'wang') return new Set((m.trace?.steps ?? []).map((s) => s.ui_key))
+    if (m.role === 'wang') return new Set(traceTools(m).map((s) => s.ui_key))
   }
   return new Set()
 })
@@ -860,11 +881,13 @@ watch(messages, () => nextTick(() => {
       <div class="stream" ref="streamEl" @click="onStreamClick">
         <template v-for="(g, gi) in streamGroups" :key="g.key">
           <div v-if="g.sep" class="day-sep"><span>{{ g.sep }}</span></div>
-          <!-- 定时任务到点的系统线(event 行):交代"是定好的安排叫醒了它"——下面的回复
-               就是它自己组织的话,所以回复气泡不再打「提醒」标签(2026-07-10)。 -->
+          <!-- 自启回合的系统线(event 行):交代"它为什么突然开口"——下面的回复就是它自己
+               组织的话,所以回复气泡不再打「提醒」标签(2026-07-10)。两种由来两副面孔:
+               闹钟 = 定好的安排到点了;对勾 = 后台差事忙完了回来汇报(2026-08-15)。 -->
           <div v-if="g.kind === 'event'" class="evt-line" :title="g.msgs[0].text">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="13" r="7" /><path d="M12 9.5V13l2 1.5" /><path d="M5 4 2.5 6.5" /><path d="M19 4 21.5 6.5" /></svg>
-            <b>{{ t('chat.eventDue') }}</b>
+            <svg v-if="g.msgs[0].eventKind === 'report'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M8 12.5l2.5 2.5L16 9.5" /></svg>
+            <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="13" r="7" /><path d="M12 9.5V13l2 1.5" /><path d="M5 4 2.5 6.5" /><path d="M19 4 21.5 6.5" /></svg>
+            <b>{{ g.msgs[0].eventKind === 'report' ? t('chat.eventDone') : t('chat.eventDue') }}</b>
             <span class="evt-text">{{ g.msgs[0].text }}</span>
           </div>
           <!-- 气泡:wang 组 = 同一轮的多段(说话→调工具→再说话)合并成**一个**气泡,段间只留
@@ -874,6 +897,44 @@ watch(messages, () => nextTick(() => {
                「我」说的 + 旺财的回复都不标,保持干净——只在需要区分时才冒出标签。 -->
           <span v-if="g.kind === 'user' && g.msgs[0].speakerName" class="spk-tag spk-who">{{ g.msgs[0].speakerName }}</span>
           <template v-for="m in g.msgs" :key="m.id">
+            <!-- 「想了想」漏出:摆在该段正文**之前** —— 药丸里装的全是这段话说出口之前发生的
+                 事(CoT 是先想的;工具步骤按 conversation_trace 的封口语义,挂到它**后面**那条
+                 可见回复上 = 也在这段话之前跑完)。摆下面读起来成了「先说后想」(2026-08-15)。
+                 每段的步骤/CoT 挂各自 message_id,合并成一个气泡后仍逐段可查。 -->
+            <div v-if="g.kind === 'wang' && m.trace?.items.length" class="think">
+              <button class="think-pill" :class="{ open: traceOpen.has(m.id) }" @click="toggleTrace(m.id)">
+                <svg class="think-i" viewBox="0 0 24 24"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-4 10.5c.7.7 1 1.3 1 2.5h6c0-1.2.3-1.8 1-2.5A6 6 0 0 0 12 3z" /></svg>
+                <span>{{ t('trace.title') }}<template v-if="traceTools(m).length"> · {{ t('trace.steps', { n: traceTools(m).length }) }}</template></span>
+                <svg class="think-chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" /></svg>
+              </button>
+              <!-- 展开层 = **时间序**条目(想→做→想→做,与真实次序一致);每条默认只一行人话
+                   (工具 = 拟人化动词、思考 = 「思考」),再点一下才露细节(入参/结果 / CoT 原文)。 -->
+              <div v-if="traceOpen.has(m.id)" class="think-detail">
+                <div v-for="(it, ii) in m.trace.items" :key="ii" class="ti">
+                  <component
+                    :is="itemDetail(it) ? 'button' : 'div'"
+                    class="ti-head"
+                    :class="{ open: itemOpen.has(m.id + ':' + ii), flat: !itemDetail(it) }"
+                    @click="itemDetail(it) && toggleItem(m.id, ii)"
+                  >
+                    <svg v-if="itemDetail(it)" class="ti-chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6" /></svg>
+                    <span v-else class="ti-dot"></span>
+                    <span class="ti-label">{{ itemLabel(it) }}</span>
+                    <span v-if="it.kind === 'tool' && it.status && it.status !== 'ok'" class="td-bad">{{ it.status }}</span>
+                  </component>
+                  <div v-if="itemOpen.has(m.id + ':' + ii)" class="ti-body">
+                    <template v-if="it.kind === 'tool'">
+                      <div class="td-call">
+                        <span class="td-name">{{ it.name }}</span>
+                        <span v-if="it.args && it.args !== '{}'" class="td-args">{{ it.args }}</span>
+                      </div>
+                      <div v-if="it.result" class="td-result">{{ it.result }}</div>
+                    </template>
+                    <pre v-else class="td-cot-body">{{ it.text }}</pre>
+                  </div>
+                </div>
+              </div>
+            </div>
             <!-- wang 走富文本(markdown);user 是用户原话,纯文本保留换行、不解析标记 -->
             <template v-if="g.kind === 'wang'">
               <div class="md" v-html="renderMarkdown(m.text)"></div>
@@ -901,28 +962,6 @@ watch(messages, () => nextTick(() => {
               </div>
               <div v-if="m.text" class="usertext">{{ m.text }}</div>
             </template>
-            <!-- 「想了想」漏出:逐段的折叠药丸(每段的工具步骤/CoT 挂各自 message_id,合并后仍逐段可查) -->
-            <div v-if="g.kind === 'wang' && m.trace && (m.trace.steps.length || m.trace.reasoning)" class="think">
-              <button class="think-pill" :class="{ open: traceOpen.has(m.id) }" @click="toggleTrace(m.id)">
-                <svg class="think-i" viewBox="0 0 24 24"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-4 10.5c.7.7 1 1.3 1 2.5h6c0-1.2.3-1.8 1-2.5A6 6 0 0 0 12 3z" /></svg>
-                <span>{{ t('trace.title') }}<template v-if="m.trace.steps.length"> · {{ t('trace.steps', { n: m.trace.steps.length }) }}</template></span>
-                <svg class="think-chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" /></svg>
-              </button>
-              <div v-if="traceOpen.has(m.id)" class="think-detail">
-                <div v-for="(s, si) in m.trace.steps" :key="si" class="td-step">
-                  <div class="td-call">
-                    <span class="td-name">{{ s.name }}</span>
-                    <span v-if="s.args && s.args !== '{}'" class="td-args">{{ s.args }}</span>
-                    <span v-if="s.status && s.status !== 'ok'" class="td-bad">{{ s.status }}</span>
-                  </div>
-                  <div v-if="s.result" class="td-result">{{ s.result }}</div>
-                </div>
-                <div v-if="m.trace.reasoning" class="td-cot">
-                  <div class="td-cot-h">{{ t('trace.reasoning') }}</div>
-                  <pre class="td-cot-body">{{ m.trace.reasoning }}</pre>
-                </div>
-              </div>
-            </div>
           </template>
           <!-- 回执小票(组级,收在气泡最后):这轮设了提醒 / 记了记忆 → 「✓ 已记下 / 记住了」,
                点击去对应页看/改/删(数据来自「想了想」轨迹,零后端) -->
@@ -1460,8 +1499,11 @@ textarea.field { resize: none; font-family: inherit; line-height: 1.5; max-heigh
 }
 .att-chip svg { width: 15px; height: 15px; flex: 0 0 auto; fill: none; stroke: var(--accent); stroke-width: 1.6; stroke-linejoin: round; }
 
-/* —— 「想了想」漏出(PLAN §9):折叠药丸 + 展开人格化步骤 —— */
-.think { margin-top: 7px; }
+/* —— 「想了想」漏出(PLAN §9):折叠药丸 + 展开人格化步骤 ——
+   药丸在该段正文之前(2026-08-15):段与段之间留段落间距,气泡首段不顶空,药丸与它的正文贴紧。 */
+.think { margin-top: 9px; }
+.think:first-child { margin-top: 0; }
+.bubble.wang .think + .md { margin-top: 6px; }
 .think-pill {
   display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
   background: rgba(var(--accent-rgb), 0.06); border: 1px solid var(--line); border-radius: 999px;
@@ -1474,10 +1516,30 @@ textarea.field { resize: none; font-family: inherit; line-height: 1.5; max-heigh
 .think-pill.open .think-chev { transform: rotate(180deg); }
 .think-detail {
   margin-top: 6px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 11px;
-  background: var(--surface-deep); display: flex; flex-direction: column; gap: 9px;
+  background: var(--surface-deep); display: flex; flex-direction: column; gap: 2px;
   animation: thinkIn .18s ease; max-width: 100%;
 }
 @keyframes thinkIn { from { opacity: 0; transform: translateY(-3px); } }
+
+/* —— 展开层的时间序条目:一行人话,点开才露细节 —— */
+.ti { display: flex; flex-direction: column; }
+.ti-head {
+  display: flex; align-items: center; gap: 6px; width: 100%; padding: 3px 0;
+  background: none; border: 0; text-align: left; color: var(--text-dim); font-size: 12px; line-height: 1.5;
+  cursor: pointer; transition: color .15s;
+}
+.ti-head.flat { cursor: default; }
+.ti-head:not(.flat):hover { color: var(--accent); }
+.ti-chev {
+  width: 12px; height: 12px; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 2;
+  stroke-linecap: round; stroke-linejoin: round; transition: transform .18s ease;
+}
+.ti-head.open .ti-chev { transform: rotate(90deg); }
+/* 没细节可点的条目(在飞的工具步骤):留个小圆点占住箭头的位,列表不参差 */
+.ti-dot { width: 12px; flex: 0 0 auto; display: flex; justify-content: center; }
+.ti-dot::before { content: ''; width: 3px; height: 3px; border-radius: 50%; background: currentColor; opacity: .5; }
+.ti-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ti-body { display: flex; flex-direction: column; gap: 4px; margin: 2px 0 6px 18px; }
 .td-step { display: flex; flex-direction: column; gap: 3px; }
 .td-call { display: flex; flex-wrap: wrap; align-items: baseline; gap: 7px; font: 12px/1.45 ui-monospace, "SF Mono", monospace; }
 .td-name { color: var(--accent); }

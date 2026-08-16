@@ -19,6 +19,7 @@ mod media_search;
 mod now;
 mod pdf;
 mod qr;
+mod read_audio;
 mod read_image;
 mod recall;
 mod remember;
@@ -179,6 +180,9 @@ pub struct ToolCtx {
     /// 壳层网页渲染器(web_render 专用;None = 壳层没注入〔core 单测/eval/headless〕,
     /// 工具如实说没有渲染组件,§3.5)。
     pub web: Option<Arc<dyn crate::webrender::WebRenderer>>,
+    /// 语音运行时(read_audio 专用:本地 ASR + VAD 切句)。None = 壳层没注入(core 单测/eval)
+    /// → 工具如实说语音组件没就绪。engine → voice 与 engine → media 同向,voice 不反依赖(§6.1)。
+    pub voice: Option<crate::voice::VoiceRuntime>,
     /// 动作确认中枢(§7.8 确认闸,通用件):动作后果「出圈且收不回」的工具执行前经它
     /// 请用户点头。None(单测)= 没有确认通道,当拒处理。消费者 = web_render + 文件授权圈。
     pub confirm: Option<Arc<crate::confirm::Confirmer>>,
@@ -333,6 +337,7 @@ impl Tools {
         tools.register(Arc::new(qr::QrEncode::new()));
         tools.register(Arc::new(pdf::PdfToPng::new()));
         tools.register(Arc::new(read_image::ReadImage::new()));
+        tools.register(Arc::new(read_audio::ReadAudio::new()));
         tools.register(Arc::new(show_image::ShowImage::new()));
         tools.register(Arc::new(send_file::SendFile::new()));
         tools.register(Arc::new(send_text::SendText::new()));

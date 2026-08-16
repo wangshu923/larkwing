@@ -90,6 +90,8 @@ pub(super) struct Turn {
     pub media: crate::media::MediaRuntime,
     /// 壳层网页渲染器(进 ToolCtx;None = 壳层没注入,web_render 工具如实退回)。
     pub web: Option<Arc<dyn crate::webrender::WebRenderer>>,
+    /// 语音运行时(进 ToolCtx;None = 壳层没注入,read_audio 如实退回)。
+    pub voice: Option<crate::voice::VoiceRuntime>,
     /// 动作确认中枢(进 ToolCtx;§7.8 确认闸)。
     pub confirm: Option<Arc<crate::confirm::Confirmer>>,
     /// 第 1 轮已开的流(建连失败切换发生在 engine;Turn 内不再切换)。
@@ -133,6 +135,7 @@ impl Turn {
             tools,
             media,
             web,
+            voice,
             confirm,
             mut rx,
             inject,
@@ -155,7 +158,8 @@ impl Turn {
         let _inject_guard = InjectGuard(inject.clone());
         let meta = usage::RoundMeta { user_id, conv_id, user_msg_id, provider_id, model };
         let mut round_start = first_round_start;
-        let ctx = ToolCtx { user_id, conv_id, store: store.clone(), media, web, confirm, grants: Default::default() };
+        let ctx =
+            ToolCtx { user_id, conv_id, store: store.clone(), media, web, voice, confirm, grants: Default::default() };
         let label_of = |name: &str| -> String {
             tools
                 .iter()

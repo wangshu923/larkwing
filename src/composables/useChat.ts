@@ -13,6 +13,7 @@ import {
   type ErrorKind,
   type Message,
   type OutAttachment,
+  type TraceItem,
   type TraceStep,
   type TurnTrace,
   type UsageDigest,
@@ -53,19 +54,28 @@ export interface UiAttachment {
 
 export interface UiMessage {
   id: number
-  /** event = 定时任务到点的系统线(「⏰ 到点了」居中细线,不是气泡)。 */
+  /** event = 自启回合的系统线(居中细线,不是气泡):到点提醒 / 后台差事忙完了。 */
   role: 'user' | 'wang' | 'event'
+  /** event 行的由来:'report' = 后台差事忙完来汇报(标签/图标不同),缺省 = 定时到点。 */
+  eventKind?: 'report'
   text: string
   /** 仅本次会话内产生的回复有;历史消息不回填(流水在库里,要看走分析)。 */
   stats?: TurnStats
   /** 本条带过的附件(图缩略 / 文件小票)。 */
   attachments?: UiAttachment[]
-  /** 「想了想」轨迹(PLAN §9):折叠药丸 + 展开技术细节(工具名/入参/结果 + CoT 原文)。空 = 不显药丸。 */
-  trace?: { steps: TraceStep[]; reasoning?: string }
+  /** 「想了想」轨迹(PLAN §9):折叠药丸 + 展开的时间序条目(想/做交错,逐条再展开看细节)。空 = 不显药丸。 */
+  trace?: { items: TraceItem[] }
   /** 这条消息的时刻(unix ms):用户气泡 hover 显时间。历史取 created_at,在飞取发送时刻。 */
   at?: number
   /** 说话人名(多人会话:家人插话 / 声纹 / 渠道归人才有;「我」说的为空)。user 气泡据此标名。 */
   speakerName?: string
+}
+
+/** 药丸条目里只取工具步骤:折叠层「N 步」、回执小票、建议气泡都按这个口径(思考不算一步)。 */
+export function traceTools(m: UiMessage): TraceStep[] {
+  return (m.trace?.items ?? []).filter(
+    (i): i is { kind: 'tool' } & TraceStep => i.kind === 'tool'
+  )
 }
 
 const state = reactive({
@@ -119,6 +129,14 @@ function toUi(m: Message): UiMessage {
   const ui: UiMessage = { id: m.id, role, text: m.content, at: m.created_at }
   // 说话人显性化(engine 富化):user 行「谁说的」名字(非我才有)。
   if (m.speaker_name) ui.speakerName = m.speaker_name
+  // event 行的由来(wake_turn 落库时物化):汇报类换标签,认不出的按老样子当「到点了」
+  if (m.role === 'event' && m.payload) {
+    try {
+      if ((JSON.parse(m.payload) as { kind?: string }).kind === 'report') ui.eventKind = 'report'
+    } catch {
+      /* payload 非 JSON / 旧数据:按到点提醒渲染 */
+    }
+  }
   // 历史里的附件小票:从 user 行 payload(UserMeta)解出。图带 file → 稍后 resolveThumbs
   // 拉回缩略图(填 dataUrl);拉到前 / doc / 旧数据显「📷/📄 名字」兜底。
   if (m.role === 'user' && m.payload) {
@@ -237,7 +255,10 @@ function pushReminderDemo() {
     text: '我看一下现在的时间。',
     at: now - 89_000,
     trace: {
-      steps: [{ name: 'now', ui_key: 'tool.now', args: '{}', result: '2026-07-10 21:59:03 星期五', status: 'ok' }],
+      items: [
+        { kind: 'thinking', text: '用户说「1分钟后」,是相对时间——得先拿当前时刻,才算得出绝对的触发点。' },
+        { kind: 'tool', name: 'now', ui_key: 'tool.now', args: '{}', result: '2026-07-10 21:59:03 星期五', status: 'ok' },
+      ],
     },
   })
   state.messages.push({
@@ -246,8 +267,10 @@ function pushReminderDemo() {
     text: '收到,一分钟后叫你。',
     at: now - 88_000,
     trace: {
-      steps: [
+      items: [
+        { kind: 'thinking', text: '21:59:03 + 1 分钟 = 22:00:03,一次性的。内容写成到点时自包含的一句话。' },
         {
+          kind: 'tool',
           name: 'reminder_set',
           ui_key: 'tool.reminder_set',
           args: '{"content":"叫用户喝水,顺便起来活动一下","first_at":"2026-07-10 22:00:03","repeat":"once"}',
@@ -259,6 +282,20 @@ function pushReminderDemo() {
   })
   state.messages.push({ id: localId--, role: 'event', text: '叫用户喝水,顺便起来活动一下', at: now })
   state.messages.push({ id: localId--, role: 'wang', text: '该喝水了!起来接杯水,顺便活动活动肩膀~', at: now })
+  // 系统线的另一副面孔:后台差事忙完了回来汇报(对勾 +「忙完了」,不是闹钟;桌面也不念它)
+  state.messages.push({
+    id: localId--,
+    role: 'event',
+    eventKind: 'report',
+    text: '批量配歌词跑完了(共 71 个):配好 35 个;没找到歌词 11 个',
+    at: now,
+  })
+  state.messages.push({
+    id: localId--,
+    role: 'wang',
+    text: '歌词配完啦:35 首配上了,11 首没找到(多是现场版),16 首本来就有、跳过了。',
+    at: now,
+  })
   // 记忆回执小票样例:remember 成功 → 气泡末尾「记住了 · …」(点击去记忆页)
   state.messages.push({ id: localId--, role: 'user', text: '对了,我不吃香菜,记一下', at: now })
   state.messages.push({
@@ -267,8 +304,8 @@ function pushReminderDemo() {
     text: '好,记住啦,以后避开香菜。',
     at: now,
     trace: {
-      steps: [
-        { name: 'remember', ui_key: 'tool.remember', args: '{"fact":"用户不吃香菜","kind":"fact"}', result: '已记下', status: 'ok' },
+      items: [
+        { kind: 'tool', name: 'remember', ui_key: 'tool.remember', args: '{"fact":"用户不吃香菜","kind":"fact"}', result: '已记下', status: 'ok' },
       ],
     },
   })
@@ -288,9 +325,10 @@ function pushReminderDemo() {
     at: now,
     attachments: [{ kind: 'image', name: 'qrcode.png', dataUrl: qrSvg }],
     trace: {
-      steps: [
-        { name: 'qr_encode', ui_key: 'tool.qr_encode', args: '{"text":"WIFI:S:某某家;T:WPA;P:******;;"}', result: '二维码已生成', status: 'ok' },
-        { name: 'show_image', ui_key: 'tool.show_image', args: '{"paths":["qrcode.png"]}', result: '已把 1 张图亮在对话里', status: 'ok' },
+      items: [
+        { kind: 'tool', name: 'qr_encode', ui_key: 'tool.qr_encode', args: '{"text":"WIFI:S:某某家;T:WPA;P:******;;"}', result: '二维码已生成', status: 'ok' },
+        { kind: 'thinking', text: '码出好了,但用户是要拿手机扫的——光给路径没用,得亮在对话里。' },
+        { kind: 'tool', name: 'show_image', ui_key: 'tool.show_image', args: '{"paths":["qrcode.png"]}', result: '已把 1 张图亮在对话里', status: 'ok' },
       ],
     },
   })
@@ -463,8 +501,7 @@ async function hydrateTrace(convId: number) {
     const map = new Map(list.map((tr) => [tr.message_id, tr]))
     for (const m of state.messages) {
       if (m.role === 'wang' && m.id > 0 && map.has(m.id)) {
-        const tr = map.get(m.id)!
-        m.trace = { steps: tr.steps, reasoning: tr.reasoning ?? undefined }
+        m.trace = { items: map.get(m.id)!.items }
       }
     }
   } catch (e) {
@@ -810,8 +847,8 @@ function send(
             turnHadTrace = true // 这回合有工具步骤 → done 后补拉 trace
             // 工具步骤实时进「想了想」:默认折叠,只需「·N 步」当场涨;入参/结果故意不入流,
             // done 时 hydrateTrace 用落库规范版(原始工具名 + args/result)整条覆盖归位。
-            if (!wang.trace) wang.trace = { steps: [], reasoning: '' }
-            wang.trace.steps.push({ name: t(ev.data.label), ui_key: ev.data.label, args: '', result: '', status: '' })
+            if (!wang.trace) wang.trace = { items: [] }
+            wang.trace.items.push({ kind: 'tool', name: t(ev.data.label), ui_key: ev.data.label, args: '', result: '', status: '' })
           }
           state.mood = 'thinking'
           break
@@ -829,12 +866,17 @@ function send(
           break
         }
         case 'thinking':
-          // CoT 实时漏出:思考增量直接累进当前气泡的 trace.reasoning(药丸默认折叠 → 不走打字机平滑,糊上即可)。
+          // CoT 实时漏出:思考增量累进**当前这条**思考条目(药丸默认折叠 → 不走打字机平滑,糊上即可);
+          // 中间隔了工具就另起一条 —— 与落库回放同一条时间线(想→做→想→做)。
           // 这也是「最终轮」CoT 的唯一来源:纯文本收尾轮 payload=None,done 时 hydrateTrace 取不到该气泡条目、
           // 不覆盖,故在飞攒的留得住;工具轮的 reasoning + 步骤仍由 hydrateTrace 按 message_id 规范回挂。
           turnHadTrace = true
-          if (!wang.trace) wang.trace = { steps: [], reasoning: '' }
-          wang.trace.reasoning = (wang.trace.reasoning ?? '') + ev.data
+          if (!wang.trace) wang.trace = { items: [] }
+          {
+            const last = wang.trace.items.at(-1)
+            if (last?.kind === 'thinking') last.text += ev.data
+            else wang.trace.items.push({ kind: 'thinking', text: ev.data })
+          }
           state.mood = 'thinking'
           break
         case 'injected': {

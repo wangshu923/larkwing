@@ -1,7 +1,8 @@
 //! 能力轴:文件(读 + 写,正交原语)。配合任务需知里的目录,模型自行组合出
 //! "找到电影并播放""把这些歌按歌手归类""记个清单"——不造 local_media_search/organize_media
 //! 这类任务形工具(宪法 §5 正交纪律)。
-//! 读类:fs_list / fs_find(封顶条数/深度)/ fs_read_text。
+//! 读类:fs_list / fs_find(封顶条数/深度)/ fs_read_text。三者都是「一页 + 报总数 +
+//! 给续读起点(offset)」同一形态 —— 截断了得有路把后面看完,不然模型只能瞎猜。
 //! 写类(PLAN §9 文件能力,2026-06-15):move/copy/mkdir/trash/write/append/edit/undo;
 //! 底层执行 + 撤销/重做在 crate::files,记账在 store::fsops。功能性、不覆盖、可撤销,
 //! **不做安全承诺**(用户准则)。
@@ -15,11 +16,14 @@ use super::{Tool, ToolCtx, ToolRisk, ToolSpec};
 use crate::files;
 use crate::store::Store;
 
-/// 单层列目录上限。
+/// 单层列目录:一页多少项(超了报总数 + 给续读起点,fs_read_text 的 offset 同款形态)。
 const LIST_MAX: usize = 200;
-/// 递归找文件:深度与结果上限。
+/// 递归找文件:深度上限 + 一页多少条。
 const FIND_MAX_DEPTH: usize = 4;
 const FIND_MAX_RESULTS: usize = 50;
+/// 递归找文件的**扫描**上限(失控 backstop):要给出总数就不能再「凑够一页就停」,
+/// 但也不能对着大盘无限走(工具 30s 超时)——扫到这个数就收手,并如实说「可能还有」。
+const FIND_SCAN_MAX: usize = 1000;
 
 pub(super) use crate::files::human_size; // 单源在 files.rs(media 下载话术也用),这里留旧名转发
 
@@ -43,13 +47,18 @@ impl FsList {
                 description: "列出一个文件夹里有什么(单层)。配合任务需知里登记的目录用,\
                               比如需知说电影在某个文件夹,就先列出来再挑。返回 名字/大小/\
                               改动日期,文件夹名以 / 结尾。要看更细的属性(拍摄时间/时长)\
-                              用 fs_stat。",
+                              用 fs_stat。一次最多列 200 项,东西多会报总数并给续读起点,\
+                              要接着看就带 offset 再调一次。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
                             "description": "文件夹绝对路径(盘符 D:\\…、UNC \\\\nas\\…、Unix /…;支持 ~ 开头 = 用户主目录)"
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "从第几项开始列(0 起,缺省 0)。上一次结果说「继续列带 offset=N」就填那个 N"
                         }
                     },
                     "required": ["path"]
@@ -76,6 +85,7 @@ impl Tool for FsList {
             .map(super::expand_home) // 「~/xxx」宽容展开(§4.4)
             .context("缺少 path 参数")?;
         super::guard::ensure(ctx, super::guard::Access::Read, std::slice::from_ref(&path)).await?;
+        let offset = super::arg_u64(&args, "offset", 0) as usize;
         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let dir = Path::new(&path);
             anyhow::ensure!(dir.is_dir(), "{path} 不是文件夹或不存在");
@@ -102,12 +112,28 @@ impl Tool for FsList {
             dirs.sort();
             files.sort();
             let total = dirs.len() + files.len();
-            let mut lines: Vec<String> = dirs.into_iter().chain(files).take(LIST_MAX).collect();
-            if total > LIST_MAX {
-                lines.push(format!("…(共 {total} 项,只列出前 {LIST_MAX} 项)"));
-            }
-            if lines.is_empty() {
+            if total == 0 {
                 return Ok("(空文件夹)".into());
+            }
+            // 分页:排好序 = 顺序稳定,offset 跨调用对得上(文件夹没被改动的话)。
+            anyhow::ensure!(
+                offset < total,
+                "这个文件夹一共 {total} 项,offset={offset} 超出末尾——已经列完了"
+            );
+            let mut lines: Vec<String> =
+                dirs.into_iter().chain(files).skip(offset).take(LIST_MAX).collect();
+            let end = offset + lines.len();
+            // 装不下、或本来就是翻页请求 → 报总数与位置(翻页时不报,模型分不清是不是到底了)
+            if total > LIST_MAX || offset > 0 {
+                // 总数一并给:模型据此判断是接着翻(offset)还是换个更细的路径
+                lines.push(if end < total {
+                    format!(
+                        "…(共 {total} 项,这是第 {}-{end} 项;继续列带 offset={end})",
+                        offset + 1
+                    )
+                } else {
+                    format!("…(共 {total} 项,这是第 {}-{end} 项,已到末尾)", offset + 1)
+                });
             }
             Ok(lines.join("\n"))
         })
@@ -132,7 +158,9 @@ impl FsFind {
                 description: "在一个目录树里按 glob 模式找文件(不分大小写,递归几层)。\
                               pattern 支持 * 和 ?:如 *动画*.mp4、*.mp3;含 / 时按相对路径匹配\
                               (如 某子目录/*.mp4);纯关键词(无通配符)自动当 *关键词* 用。\
-                              知道想找什么时比逐层 fs_list 快,返回绝对路径列表。",
+                              知道想找什么时比逐层 fs_list 快,返回绝对路径列表(按路径排序)。\
+                              一次最多返回 50 条,命中多会报总数并给续读起点:要接着看就带 \
+                              offset 再调一次,总数大得离谱就换更具体的模式或更小的起点。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -143,6 +171,10 @@ impl FsFind {
                         "pattern": {
                             "type": "string",
                             "description": "glob 模式或关键词(拿用户说的词组模式,别自己编)"
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "从第几条开始返回(0 起,缺省 0)。上一次结果说「继续带 offset=N」就填那个 N"
                         }
                     },
                     "required": ["root", "pattern"]
@@ -189,13 +221,15 @@ impl Matcher {
     }
 }
 
+/// 收集命中(深度 ≤ FIND_MAX_DEPTH,总量 ≤ FIND_SCAN_MAX)。停在**扫描**上限而不是一页,
+/// 才有总数可报、offset 才翻得动;扫满 = 调用方如实说「可能还有」。
 fn walk(dir: &Path, root: &Path, matcher: &Matcher, depth: usize, out: &mut Vec<PathBuf>) {
-    if depth > FIND_MAX_DEPTH || out.len() >= FIND_MAX_RESULTS {
+    if depth > FIND_MAX_DEPTH || out.len() >= FIND_SCAN_MAX {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
-        if out.len() >= FIND_MAX_RESULTS {
+        if out.len() >= FIND_SCAN_MAX {
             return;
         }
         let name = entry.file_name().to_string_lossy().to_string();
@@ -241,6 +275,7 @@ impl Tool for FsFind {
             .context("缺少 pattern 参数")?
             .to_string();
         let matcher = Matcher::new(&raw)?;
+        let offset = super::arg_u64(&args, "offset", 0) as usize;
         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let dir = Path::new(&root);
             anyhow::ensure!(dir.is_dir(), "{root} 不是文件夹或不存在");
@@ -249,9 +284,18 @@ impl Tool for FsFind {
             if out.is_empty() {
                 return Ok(format!("在 {root} 里没找到匹配「{raw}」的文件"));
             }
-            let truncated = out.len() >= FIND_MAX_RESULTS;
+            // 排序 = 分页顺序稳定(read_dir 的原始顺序不保证,offset 会翻乱)
+            out.sort();
+            let total = out.len();
+            let capped = total >= FIND_SCAN_MAX;
+            anyhow::ensure!(
+                offset < total,
+                "一共找到 {total} 条,offset={offset} 超出末尾——已经列完了"
+            );
             let mut lines: Vec<String> = out
                 .into_iter()
+                .skip(offset)
+                .take(FIND_MAX_RESULTS)
                 .map(|p| {
                     // 尾捎改动日期(「找最近下载的那个」直接可判;细属性归 fs_stat)
                     match std::fs::metadata(&p).and_then(|m| m.modified()) {
@@ -260,8 +304,20 @@ impl Tool for FsFind {
                     }
                 })
                 .collect();
-            if truncated {
-                lines.push(format!("…(已达 {FIND_MAX_RESULTS} 条上限,可换更具体的模式)"));
+            let end = offset + lines.len();
+            // 总数一并给:模型据此判断该翻页(offset)还是该换更具体的模式
+            if capped {
+                lines.push(format!(
+                    "…(扫到 {FIND_SCAN_MAX} 条就停了、可能还有,这是第 {}-{end} 条;\
+                     继续带 offset={end},或换更具体的模式/更小的起点)",
+                    offset + 1
+                ));
+            } else if total > FIND_MAX_RESULTS || offset > 0 {
+                lines.push(if end < total {
+                    format!("…(共 {total} 条,这是第 {}-{end} 条;继续带 offset={end})", offset + 1)
+                } else {
+                    format!("…(共 {total} 条,这是第 {}-{end} 条,已到末尾)", offset + 1)
+                });
             }
             Ok(lines.join("\n"))
         })
@@ -1169,7 +1225,7 @@ mod tests {
         std::fs::write(dir.join(".hidden"), b"x").unwrap();
         let store = Store::open(&dir.join("t.db")).unwrap();
         let ctx =
-            ToolCtx { user_id: 1, conv_id: 1, media: MediaRuntime::detached(store.clone()), store, web: None, confirm: None, grants: Default::default() };
+            ToolCtx { user_id: 1, conv_id: 1, media: MediaRuntime::detached(store.clone()), store, web: None, voice: None, confirm: None, grants: Default::default() };
         (ctx, dir)
     }
 
@@ -1189,6 +1245,77 @@ mod tests {
             .run(serde_json::json!({"path": dir.join("nope").to_string_lossy()}), &ctx)
             .await
             .is_err());
+    }
+
+    /// 东西多:报总数 + 给续读起点,带 offset 能把后面看完(原先第 201 项起永远拿不到)。
+    #[tokio::test]
+    async fn list_paginates_with_offset_and_reports_total() {
+        let (ctx, dir) = ctx_and_dir("list-page");
+        let big = dir.join("big");
+        std::fs::create_dir_all(&big).unwrap();
+        for i in 0..LIST_MAX + 30 {
+            std::fs::write(big.join(format!("f{i:04}.txt")), b"x").unwrap();
+        }
+        let path = big.to_string_lossy().to_string();
+
+        let p1 = FsList::new()
+            .run(serde_json::json!({"path": &path}), &ctx)
+            .await
+            .unwrap();
+        assert!(p1.contains("f0000.txt"), "首页从头列: {}", &p1[..80.min(p1.len())]);
+        assert!(!p1.contains("f0200.txt"), "首页只到第 200 项");
+        assert!(
+            p1.contains(&format!("共 {} 项", LIST_MAX + 30)) && p1.contains("继续列带 offset=200"),
+            "要报总数 + 续读起点: {}",
+            p1.lines().last().unwrap()
+        );
+
+        // 第二页:字符串形 offset 也认(quirks 同 arg_bool);到末尾不再给起点
+        let p2 = FsList::new()
+            .run(serde_json::json!({"path": &path, "offset": "200"}), &ctx)
+            .await
+            .unwrap();
+        assert!(p2.contains("f0200.txt") && p2.contains("f0229.txt"), "第二页接着列: {p2}");
+        assert!(p2.contains("已到末尾") && !p2.contains("继续列带"), "末页不再给起点: {p2}");
+
+        // 越界如实退回(fs_read_text 同款措辞)
+        assert!(FsList::new()
+            .run(serde_json::json!({"path": &path, "offset": 999}), &ctx)
+            .await
+            .is_err());
+    }
+
+    /// 命中多:同样报总数 + 翻页;且结果按路径排序 —— 顺序稳定 offset 才对得上。
+    #[tokio::test]
+    async fn find_paginates_with_offset_and_reports_total() {
+        let (ctx, dir) = ctx_and_dir("find-page");
+        let many = dir.join("many");
+        std::fs::create_dir_all(&many).unwrap();
+        for i in 0..FIND_MAX_RESULTS + 12 {
+            std::fs::write(many.join(format!("song{i:03}.mp3")), b"x").unwrap();
+        }
+        let root = many.to_string_lossy().to_string();
+        let total = FIND_MAX_RESULTS + 12;
+
+        let p1 = FsFind::new()
+            .run(serde_json::json!({"root": &root, "pattern": "*.mp3"}), &ctx)
+            .await
+            .unwrap();
+        assert!(p1.contains("song000.mp3"), "排序后从第一个起: {p1}");
+        assert!(
+            p1.contains(&format!("共 {total} 条")) && p1.contains("继续带 offset=50"),
+            "要报总数 + 续读起点: {}",
+            p1.lines().last().unwrap()
+        );
+        assert_eq!(p1.lines().count(), FIND_MAX_RESULTS + 1, "一页 50 条 + 一行说明");
+
+        let p2 = FsFind::new()
+            .run(serde_json::json!({"root": &root, "pattern": "*.mp3", "offset": 50}), &ctx)
+            .await
+            .unwrap();
+        assert!(p2.contains("song050.mp3") && p2.contains("song061.mp3"), "第二页接着给: {p2}");
+        assert!(!p2.contains("song049.mp3"), "不重复上一页");
+        assert!(p2.contains("已到末尾"), "末页如实说: {p2}");
     }
 
     #[tokio::test]

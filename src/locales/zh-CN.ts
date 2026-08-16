@@ -63,6 +63,7 @@ export default {
     qr_encode: '生成二维码…',
     pdf_to_png: '把 PDF 转成图…',
     read_image: '看看图片…',
+    read_audio: '听一下音频…',
     show_image: '把图亮出来…',
     send_file: '发到手机上…',
     send_text: '发消息到手机…',
@@ -335,8 +336,10 @@ export default {
     pasteName: '粘贴的文本',
     pasteBackTitle: '点击放回编辑框修改',
     // 「设提醒 → 到点」链路呈现:eventDue = 到点系统线的标签(event 行,交代"定好的安排
-    // 叫醒了它");reminderSaved / memorySaved = 回执小票(设了提醒/记了记忆,点击去对应页)
+    // 叫醒了它");eventDone = 同一条线的另一副面孔(后台差事忙完了回来汇报,不是闹钟响);
+    // reminderSaved / memorySaved = 回执小票(设了提醒/记了记忆,点击去对应页)
     eventDue: '到点了',
+    eventDone: '忙完了',
     reminderSaved: '已记下',
     reminderSavedHint: '到点我会喊你 · 点开看全部提醒',
     memorySaved: '记住了',
@@ -374,7 +377,8 @@ export default {
   trace: {
     title: '推理轨迹',
     steps: '{n} 步',
-    reasoning: '原始思考',
+    // 展开层的条目行:工具用各自的 tool.* 人话动词,思考统一这一个词(点开才是 CoT 原文)
+    thinking: '思考',
   },
   // 听写/唤醒(PLAN §11):reason 词表与 core VoiceEvent::ListenEnded 一一对应
   voice: {

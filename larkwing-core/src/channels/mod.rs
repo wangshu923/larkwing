@@ -314,8 +314,10 @@ async fn outbound_loop(ctx: Arc<ChannelCtx>, ct: CancellationToken) {
         };
         match ev {
             crate::bus::AppEvent::Conversation(act) => {
-                // 只管自启回合(提醒/盯天气);渠道入站回合(kind="channel")drive_turn 内回过了
-                if act.kind != "reminder" {
+                // 只管自启回合(提醒/盯天气 = reminder,后台差事忙完汇报 = report);渠道入站
+                // 回合(kind="channel")drive_turn 内回过了。⚠️ 两类都要推:手机上支使它下东西,
+                // 跑完的汇报得回到那台手机(桌面只是「念不念」分家,推送不分家)。
+                if act.kind != "reminder" && act.kind != "report" {
                     continue;
                 }
                 if let Err(e) = push_reminder(&ctx, &net, act.conv_id, act.outcome).await {

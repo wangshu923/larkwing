@@ -64,6 +64,7 @@ export default {
     qr_encode: 'Making a QR code…',
     pdf_to_png: 'Turning the PDF into images…',
     read_image: 'Taking a look at the picture…',
+    read_audio: 'Having a listen…',
     show_image: 'Putting the picture on screen…',
     send_file: 'Sending to the phone…',
     send_text: 'Texting the phone…',
@@ -334,8 +335,10 @@ export default {
     pasteName: 'Pasted text',
     pasteBackTitle: 'Click to edit in the expanded editor',
     // "Set a reminder → it fires" presentation: eventDue labels the centered system line (event row);
+    // eventDone is the same line's other face (a background chore finished and came back to report);
     // reminderSaved / memorySaved are receipt chips (reminder set / memory saved, tap → that page)
     eventDue: 'Time’s up',
+    eventDone: 'All done',
     reminderSaved: 'Noted',
     reminderSavedHint: 'I’ll call you when it’s time · tap to see all reminders',
     memorySaved: 'Remembered',
@@ -373,7 +376,8 @@ export default {
   trace: {
     title: 'Reasoning trace',
     steps: '{n} steps',
-    reasoning: 'Raw reasoning',
+    // Expanded-row label: tools use their own tool.* verb; thinking rows share this one
+    thinking: 'Thinking',
   },
   // Dictation / wake (PLAN §11): reason keys map 1:1 to core VoiceEvent::ListenEnded
   voice: {

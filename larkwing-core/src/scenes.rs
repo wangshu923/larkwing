@@ -161,7 +161,7 @@ mod tests {
              "fs_read_text", "fs_stat", "fs_move", "fs_copy", "fs_mkdir", "fs_trash", "fs_write_text",
              "fs_append", "fs_edit", "fs_undo", "fs_unzip", "fs_zip", "fs_usage",
              "reminder_set", "reminder_list", "reminder_cancel", "watch_set", "web_search", "web_fetch",
-             "web_download", "web_render", "qr_decode", "qr_encode", "pdf_to_png", "read_image",
+             "web_download", "web_render", "qr_decode", "qr_encode", "pdf_to_png", "read_image", "read_audio",
              "show_image", "send_file", "send_text", "note_todo", "finish_todo"]
         );
         assert!(!s.few_shots.is_empty(), "companion 必须带 few-shot 示范");

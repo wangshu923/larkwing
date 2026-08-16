@@ -114,6 +114,35 @@ impl JobRepo {
         })
     }
 
+    /// 后台差事的收尾汇报(kind=report):照样走「due 到点 → wake_turn 唤回合」这条路
+    /// (调度器对非 cond 一视同仁),但下游据 kind 分得清「定好的安排叫醒它」和「后台忙完了
+    /// 来汇报」——前者到点必须出声(人可能不在屏幕前),后者是你刚支使它干的活,别念。
+    pub fn add_report(&self, user_id: i64, conv_id: i64, content: &str, due_at: i64) -> Result<Job> {
+        self.db.with(|c| {
+            let now = now_ms();
+            c.execute(
+                "INSERT INTO jobs (user_id, conv_id, content, due_at, repeat, status, kind, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'once', 'pending', 'report', ?5, ?5)",
+                rusqlite::params![user_id, conv_id, content, due_at, now],
+            )?;
+            let id = c.last_insert_rowid();
+            Ok(Job {
+                id,
+                user_id,
+                conv_id,
+                content: content.into(),
+                due_at,
+                repeat: "once".into(),
+                status: "pending".into(),
+                kind: "report".into(),
+                condition: None,
+                created_by: None,
+                created_at: now,
+                updated_at: now,
+            })
+        })
+    }
+
     /// 条件提醒(kind=cond):due_at = 首次检查时刻,condition = 谓词 JSON;repeat 固定 once
     /// (满足即收尾)。检查节奏由 scheduler 推进 due_at 控制,不走 repeat。
     pub fn add_watch(
@@ -150,11 +179,14 @@ impl JobRepo {
     }
 
     /// 该用户的待触发清单(悬浮窗「下个提醒」等自己视角的用途),按 due_at 升序。
+    /// ⚠️ 三个 list_* 都是**给人/给模型看的视图**,一律滤掉 kind=report ——
+    /// 后台差事的收尾汇报只是借 jobs 这条路唤回合,不是用户设的提醒,不该混进提醒清单
+    /// (会话忙时它会 pending 好几分钟,真机见过挂在提醒页上)。触发照旧走 `due()`,不受影响。
     pub fn list_pending(&self, user_id: i64) -> Result<Vec<Job>> {
         self.db.with(|c| {
             let mut stmt = c.prepare(
                 "SELECT id, user_id, conv_id, content, due_at, repeat, status, created_at, updated_at, kind, condition, created_by
-                 FROM jobs WHERE user_id = ?1 AND status = 'pending' ORDER BY due_at",
+                 FROM jobs WHERE user_id = ?1 AND status = 'pending' AND kind != 'report' ORDER BY due_at",
             )?;
             let rows = stmt
                 .query_map([user_id], map_row)?
@@ -169,7 +201,7 @@ impl JobRepo {
         self.db.with(|c| {
             let mut stmt = c.prepare(
                 "SELECT id, user_id, conv_id, content, due_at, repeat, status, created_at, updated_at, kind, condition, created_by
-                 FROM jobs WHERE (user_id = ?1 OR created_by = ?1) AND status = 'pending' ORDER BY due_at",
+                 FROM jobs WHERE (user_id = ?1 OR created_by = ?1) AND status = 'pending' AND kind != 'report' ORDER BY due_at",
             )?;
             let rows = stmt
                 .query_map([user_id], map_row)?
@@ -204,7 +236,7 @@ impl JobRepo {
         self.db.with(|c| {
             let mut stmt = c.prepare(
                 "SELECT id, user_id, conv_id, content, due_at, repeat, status, created_at, updated_at, kind, condition, created_by
-                 FROM jobs WHERE status = 'pending' ORDER BY due_at",
+                 FROM jobs WHERE status = 'pending' AND kind != 'report' ORDER BY due_at",
             )?;
             let jobs = stmt.query_map([], map_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(jobs)
@@ -299,6 +331,28 @@ mod tests {
         assert!(s.jobs.cancel(u.id, b.id).unwrap());
         assert!(!s.jobs.cancel(u.id, b.id).unwrap(), "重复取消 = false");
         assert_eq!(s.jobs.list_pending(u.id).unwrap().len(), 1);
+    }
+
+    /// 后台差事的收尾汇报借 jobs 唤回合,但**不是**用户设的提醒:照样到点触发,
+    /// 却不该出现在任何「提醒清单」里(提醒页 / 悬浮窗下个提醒 / 模型的 reminder_list)。
+    #[test]
+    fn report_jobs_fire_but_never_show_up_as_reminders() {
+        let s = store("report-hidden");
+        let u = s.users.ensure_default_user().unwrap();
+        let r = s.jobs.add_report(u.id, 5, "批量配歌词跑完了(共 71 个)", 1000).unwrap();
+        let n = s.jobs.add(u.id, 5, "吃药", 1000, "once").unwrap();
+
+        let due: Vec<i64> = s.jobs.due(2000).unwrap().into_iter().map(|j| j.id).collect();
+        assert!(due.contains(&r.id) && due.contains(&n.id), "触发队列两条都在:{due:?}");
+
+        for list in [
+            s.jobs.list_pending(u.id).unwrap(),
+            s.jobs.list_visible(u.id).unwrap(),
+            s.jobs.list_pending_all().unwrap(),
+        ] {
+            let ids: Vec<i64> = list.iter().map(|j| j.id).collect();
+            assert_eq!(ids, vec![n.id], "提醒清单里只该有用户设的那条:{ids:?}");
+        }
     }
 
     #[test]

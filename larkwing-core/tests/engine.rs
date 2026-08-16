@@ -517,6 +517,61 @@ async fn wake_turn_fires_after_completed_turn_in_same_conv() {
     assert!(fired, "聊过的会话到点必须能触发:忙检要看 join 是否真在跑,不是句柄在不在");
 }
 
+/// 后台差事忙完的汇报 ≠ 到点提醒(2026-08-15 真机:打字支使它批量配歌词,汇报却被念出来,
+/// 系统线还贴着「⏰ 到点了」)。同走 wake_turn,但 event 行 payload 记 kind=report、终态广播
+/// kind=report —— 桌面据此不自动念、换标签;渠道推送两类都照推(手机上支使的活要回手机)。
+#[tokio::test(flavor = "multi_thread")]
+async fn report_job_marks_event_row_and_activity_as_report() {
+    let (store, engine, conv_id) = setup("wake-report", 1);
+    let mut bus_rx = engine.bus().subscribe();
+    let user = store.users.ensure_default_user().unwrap();
+
+    // ① 汇报类
+    let job = store.jobs.add_report(user.id, conv_id, "批量配歌词跑完了(共 3 个)", 0).unwrap();
+    assert!(engine.wake_turn(&job).await.unwrap());
+    let act = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Ok(larkwing_core::bus::AppEvent::Conversation(c)) = bus_rx.recv().await {
+                return c;
+            }
+        }
+    })
+    .await
+    .expect("自启回合必须广播会话动静");
+    assert_eq!(act.kind, "report", "汇报类广播 report(桌面据此不念)");
+    let evt = store
+        .chat
+        .recent_messages(conv_id, 20)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.role == "event")
+        .expect("event 行必须落库");
+    assert_eq!(evt.payload.as_deref(), Some(r#"{"kind":"report"}"#), "event 行要记明由来");
+
+    // ② 普通提醒:老行为一字不动(payload 空 = 前端按「到点了」渲染)
+    let job = store.jobs.add(user.id, conv_id, "提醒用户喝水", 0, "once").unwrap();
+    assert!(engine.wake_turn(&job).await.unwrap());
+    let act = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Ok(larkwing_core::bus::AppEvent::Conversation(c)) = bus_rx.recv().await {
+                return c;
+            }
+        }
+    })
+    .await
+    .expect("自启回合必须广播会话动静");
+    assert_eq!(act.kind, "reminder", "到点提醒仍是 reminder(必须出声那条路不动)");
+    let evts: Vec<_> = store
+        .chat
+        .recent_messages(conv_id, 40)
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.role == "event")
+        .collect();
+    assert_eq!(evts.len(), 2);
+    assert_eq!(evts[1].payload, None, "提醒的 event 行不带 payload");
+}
+
 // ---- 旁听临时回合(唤醒确认层「呼名+续句」仲裁;§8.2 精度方向,2026-07-06) ----
 
 /// 等旁听终态(全局车道 kind=overheard*);10s 兜底防挂死。

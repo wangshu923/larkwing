@@ -44,6 +44,13 @@ const VAD_WINDOW: usize = 512; // silero v5 定长窗,32ms @16k
 const VAD_THRESHOLD: f32 = 0.5;
 const MIN_SPEECH_S: f32 = 0.5; // 反幻觉第一道闸:更短的段不算话
 const MAX_SPEECH_S: f32 = 12.0;
+/// 「听着写」(read_audio)的断句静默阈:说话用 800ms,唱歌句间常常只停两三百毫秒 ——
+/// 沿用说话档会把整段唱连成一坨(时间轴就没了句级粒度)。歌声实际手感是真机调参项(§4.11)。
+const SING_HANGOVER_S: f32 = 0.35;
+/// 每段往回多带一点音频再喂 ASR:VAD 的起点卡在能量抬起那一刻,声母/气口在它之前,
+/// 不带就被削掉(实测「跑得快」听成「得快」)。唤醒/听写链早有同款 pre-roll,这条路补上。
+/// 时间戳仍用 VAD 起点(唱起来的那一刻),只是给识别器多一点上下文。
+const SEG_PREROLL_S: f32 = 0.2;
 const START_TIMEOUT: Duration = Duration::from_secs(6); // 开听后多久没人开口就放弃
 const LEVEL_EVERY_WINDOWS: u32 = 3; // 电平事件节流:每 3 窗 ≈ 96ms ≈ 10Hz
 const ENROLL_SAMPLES: u32 = 3; // 声纹注册录几段取平均(2026-07-04 用户拍板,§4.2「绝不错认」)
@@ -1320,6 +1327,51 @@ impl VoiceRuntime {
         tokio::task::spawn_blocking(move || asr.transcribe(&samples))
             .await
             .context("转写任务挂了")?
+    }
+
+    /// 听一整段音频,出「第几秒唱/说了什么」(read_audio 的耳朵)。VAD 切句 → 段起点就是
+    /// 时间戳 → 逐段 ASR:**轴来自音频本身,不是编的**(§7.1「绝不编造时间轴」纪律的正解)。
+    /// 与听写/唤醒共用同一份缓存的识别器;句间静默阈用 `SING_HANGOVER_S`(唱歌停顿比说话短)。
+    pub async fn transcribe_timed(&self, samples: Vec<f32>) -> Result<Vec<(f64, String)>> {
+        anyhow::ensure!(!samples.is_empty(), "音频数据为空");
+        let (vad_model, asr) = self.ensure_engines().await?;
+        tokio::task::spawn_blocking(move || -> Result<Vec<(f64, String)>> {
+            let vad = new_vad(&vad_model, SING_HANGOVER_S)?;
+            let preroll = (SEG_PREROLL_S * TARGET_RATE as f32) as usize;
+            let mut out: Vec<(f64, String)> = Vec::new();
+            // 一段一段地取:front() 给样本 + 起点(采样点序号),转写完 pop 掉。
+            // 喂 ASR 的是「往回多带 pre-roll」的切片(声母不被削);时间戳仍用 VAD 起点。
+            let mut drain = |vad: &sherpa_onnx::VoiceActivityDetector| -> Result<()> {
+                while !vad.is_empty() {
+                    if let Some(seg) = vad.front() {
+                        let start = seg.start().max(0) as usize;
+                        let at = start as f64 / f64::from(TARGET_RATE);
+                        let from = start.saturating_sub(preroll);
+                        let to = (start + seg.samples().len()).min(samples.len());
+                        let text = if from < to {
+                            asr.transcribe(&samples[from..to])?
+                        } else {
+                            asr.transcribe(seg.samples())? // 越界兜底(理论上到不了)
+                        };
+                        let text = text.trim().to_string();
+                        if !text.is_empty() {
+                            out.push((at, text));
+                        }
+                    }
+                    vad.pop();
+                }
+                Ok(())
+            };
+            for chunk in samples.chunks(VAD_WINDOW) {
+                vad.accept_waveform(chunk);
+                drain(&vad)?;
+            }
+            vad.flush(); // 收尾:最后一段没等到静默也要吐出来
+            drain(&vad)?;
+            Ok(out)
+        })
+        .await
+        .context("转写任务挂了")?
     }
 
     /// 听写前的准备(含声纹:有家人录过声纹才加载,下载失败降级为不识别)。

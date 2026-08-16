@@ -733,7 +733,9 @@ mod tests {
         let s = compose_batch_summary(&results);
         assert!(s.contains("配好 2 个") && s.contains("其中 1 个是纯文本"), "{s}");
         assert!(s.contains("1 个旁边已有歌词文件"), "{s}");
-        assert!(s.contains("没找到歌词 15 个") && s.contains("等 15 个"), "点名封顶: {s}");
+        // 点名按字数预算,不按条数:15 个短文件名要**列全**(模型得答得出「是哪几首没配上」)
+        assert!(s.contains("没找到歌词 15 个"), "{s}");
+        assert!(s.contains("没词0.mp3") && s.contains("没词14.mp3") && !s.contains("等 15 个"), "{s}");
         assert!(s.contains("缺歌名 1 个") && s.contains("d.mp3"), "{s}");
         assert!(s.contains("处理不了:e.mp3(文件不存在)"), "{s}");
     }

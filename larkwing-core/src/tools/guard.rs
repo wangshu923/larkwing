@@ -699,6 +699,7 @@ mod tests {
             media: crate::media::MediaRuntime::detached(store.clone()),
             store,
             web: None,
+            voice: None,
             confirm,
             grants: Default::default(),
         }

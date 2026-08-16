@@ -307,6 +307,7 @@ mod tests {
                 media: MediaRuntime::detached(store.clone()),
                 store,
                 web: None,
+                voice: None,
                 confirm: None,
                 grants: Default::default(),
             },

@@ -301,12 +301,16 @@ export interface TraceStep {
   status: string
 }
 
-/** 一回合的「想了想」轨迹(PLAN §9 思考漏出):展开层给好奇/专业用户看的技术细节
- *  (工具名/入参/结果 + CoT 原文)。load 会话后(及 trace-y 回合落库后)回填到代表气泡。 */
+/** 「想了想」里的一条:**按时间顺序**排的队列(想→做→想→做),不是两个桶。
+ *  tool 条目就是 TraceStep 平铺 + kind 标签(Rust 侧 serde 内部 tag)。 */
+export type TraceItem = { kind: 'thinking'; text: string } | ({ kind: 'tool' } & TraceStep)
+
+/** 一回合的「想了想」轨迹(PLAN §9 思考漏出):折叠层只露「N 步」;展开层 = 时间序条目,
+ *  每条再点开才露技术细节(工具名/入参/结果、或 CoT 原文)。load 会话后(及 trace-y 回合
+ *  落库后)回填到代表气泡。 */
 export interface TurnTrace {
   message_id: number
-  steps: TraceStep[]
-  reasoning?: string | null
+  items: TraceItem[]
 }
 
 /** 账户余额(供应商支持才有);amount 是供应商原文字符串,只展示不算术。 */
