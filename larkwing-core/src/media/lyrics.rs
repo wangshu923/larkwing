@@ -498,11 +498,31 @@ fn bilibili_sub_to_lrc(json: &serde_json::Value) -> Option<String> {
 }
 
 /// 音频旁写同名 .lrc:已存在 = 跳过(Ok(false),绝不覆盖);先临时件再改名。
+/// 歌词正文字形归一:**繁 → 简**。为什么要转:简繁双轨查询(§7.1 ⑤)为了命中港台老歌
+/// 会拿繁体变体去查,查回来的正文自然也是繁体 —— 查询转了、结果没转回来,简体用户的曲库
+/// 里就混进一堆繁体歌词(2026-08-16 用户实锤「lyrics_fetch 好多都是繁体字」)。B 站的繁体
+/// CC 字幕同理。只做这一个方向:繁→简是多对一映射、基本无歧义,反方向才有「電台/電臺」
+/// 那类歧义(查询梯子里已为此特判)。
+///
+/// **日文歌跳过**:正文里有平假名/片假名 = 日文,它的汉字不能按中文简化规则转(会转坏)。
+/// 时间戳、拉丁字母、韩文谚文都不在转换域内,原样不动。
+fn to_simplified_lyrics(s: &str) -> String {
+    let has_kana = s
+        .chars()
+        .any(|c| matches!(c, '\u{3040}'..='\u{309F}' | '\u{30A0}'..='\u{30FF}'));
+    if has_kana {
+        return s.to_string();
+    }
+    character_converter::traditional_to_simplified(s).into_owned()
+}
+
 fn write_lrc_beside(audio: &Path, content: &str) -> Result<bool> {
     let dest = audio.with_extension("lrc");
     if dest.exists() {
         return Ok(false);
     }
+    // 落盘前统一字形(所有写 .lrc 的路都过这儿,不会漏一条)
+    let content = &to_simplified_lyrics(content);
     let tmp = dest.with_file_name(format!(".lw-lrc-{}.tmp", std::process::id()));
     std::fs::write(&tmp, content)
         .with_context(|| format!("写不进歌词临时文件 {}", tmp.display()))?;
@@ -714,6 +734,26 @@ mod tests {
             .unwrap()
             .expect("简繁变体轨应命中");
         assert!(synced && lrc.contains("繁体库里的词"));
+    }
+
+    /// 落盘前字形归一:繁体歌词转简体(查询双轨的副作用回收),日文歌不碰,时间戳不动。
+    #[test]
+    fn lrc_content_is_normalized_to_simplified_but_japanese_is_left_alone() {
+        // 繁 → 简;方括号时间戳与拉丁字母原样
+        let trad = "[00:12.34] 電台情歌\n[00:20.00] 誰的眼淚在飛 feat. A";
+        let got = to_simplified_lyrics(trad);
+        assert!(got.contains("电台情歌") && got.contains("谁的眼泪在飞"), "{got}");
+        assert!(got.contains("[00:12.34]") && got.contains("feat. A"), "时间戳/拉丁不该动: {got}");
+
+        // 日文(有假名)整段不碰 —— 它的汉字按中文简化规则转会转坏
+        let jp = "[00:05.00] 君の名は 言わないで\n[00:10.00] カタカナもある";
+        assert_eq!(to_simplified_lyrics(jp), jp);
+
+        // 本来就是简体 / 纯英文:原样
+        let zh = "[00:01.00] 两只老虎跑得快";
+        assert_eq!(to_simplified_lyrics(zh), zh);
+        let en = "[00:01.00] Do re mi fa so";
+        assert_eq!(to_simplified_lyrics(en), en);
     }
 
     #[test]
