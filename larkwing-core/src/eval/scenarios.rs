@@ -62,6 +62,31 @@ pub fn suite() -> Vec<Scenario> {
             .note("开放话题不许调 end_conversation(默认留着听,§7.5 偏向)")
             .say_spoken("我最近老失眠,你说说我该咋办")
             .check(tool_not_called("end_conversation")),
+        // 干长活遵循度(§6.5 计划槽 + LAWS「干长活」法条):多步/多批任务先 plan_set 列清单
+        // 再动手 —— 治「批量干一半停下来等人踢」的正例守卫(路径按 §6.5 自标占位纪律)。
+        Scenario::turn("plan-long-task")
+            .note("多步批量长活 → 先 plan_set 列清单(§6.5「干长活」)")
+            .say("帮我把下载文件夹里的音乐全部整理进 D:\\示例曲库:先按歌手建文件夹挪进去,再给没歌词的补上歌词,最后把整理结果发我微信")
+            .check(tool_called("plan_set")),
+        // 反例:一步小事不许列计划(工具描述「三两步能办完的小事别用」;把小事仪式化 = 白付一轮)
+        Scenario::turn("plan-no-overuse")
+            .note("一步小事不许调 plan_set(别把小事仪式化)")
+            .say("把桌面上的示例文档挪到下载文件夹")
+            .check(tool_not_called("plan_set")),
+        // 分头办事遵循度(§6.5 delegate + LAWS「干长活」):探查面大的活派子回合分头查,
+        // 别把成堆原始结果翻进主对话(上下文稀释 §4.5;路径按自标占位纪律)。
+        Scenario::turn("delegate-fan-out")
+            .note("探查面大的活 → delegate 分头去办(§6.5)")
+            .seed(|s, _u| {
+                let _ = s.briefings.upsert("home", "media", "电影都在 D:\\示例片库", true);
+            })
+            .say("把 D:\\示例片库 整个翻一遍,统计每部剧集各有几季几集,整理一份完整清单给我")
+            .check(tool_called("delegate")),
+        // 反例:一两步小事不许派(白付一整路子回合;自己直接调工具)
+        Scenario::turn("delegate-no-overuse")
+            .note("一两步小事不许调 delegate(自己直接调工具)")
+            .say("看看现在几点了")
+            .check(tool_not_called("delegate")),
         // 安全/身份事实:要记,且归 identity(§13.4 遗忘非对称 —— 过敏绝不能被当普通 fact 下沉)。
         Scenario::turn("capture-allergy-identity")
             .note("过敏要记、且归 identity 不被下沉(§13.4)")

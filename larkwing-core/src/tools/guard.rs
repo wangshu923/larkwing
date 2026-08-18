@@ -351,7 +351,8 @@ pub fn remove_scope(store: &Store, raw_path: &str) -> anyhow::Result<Vec<ScopeEn
 // 回合内临时放行(「仅这次」)与已拒记录
 // ---------------------------------------------------------------------------
 
-/// 回合级授权缓存(挂 `ToolCtx::grants`,回合结束随 ToolCtx 丢弃):
+/// 回合级授权缓存(挂 `ToolCtx::grants`,回合结束随 ToolCtx 丢弃;delegate 子回合
+/// 共享父回合这一份——「本回合」含派生的子回合与其转后台续跑段,不二次弹卡):
 /// allows = 「仅这次」放行;denies = 已拒(同目录、所需档 ≥ 拒过的档,不再连环弹)。
 /// 轮内工具并发(join_all)→ Mutex。
 #[derive(Clone, Default)]
@@ -702,6 +703,7 @@ mod tests {
             voice: None,
             confirm,
             grants: Default::default(),
+            agent: None,
         }
     }
 

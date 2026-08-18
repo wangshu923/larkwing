@@ -24,7 +24,7 @@ use super::MediaRuntime;
 
 /// 回合内等待窗:起跑后等这么久,没跑完就转后台接着跑(§4.11 常量单源;方案已确认。
 /// pub(super):压缩包差事〔media/archive.rs〕同一个节奏,不另造第二个数)。
-pub(super) const IN_TURN_WAIT: Duration = Duration::from_secs(30);
+pub(crate) const IN_TURN_WAIT: Duration = Duration::from_secs(30);
 /// 报错尾巴留存(行数/字符):stderr 可能很长,喂回模型自纠只要末尾这点(量约束 §7.2)。
 const STDERR_TAIL_LINES: usize = 40;
 const STDERR_TAIL_CHARS: usize = 2000;
@@ -168,6 +168,7 @@ impl MediaRuntime {
         };
         let ticket_id = ticket.id();
         let task = self.inner.tasks.start("ffmpeg", Text::new("task.ffmpeg"));
+        task.bind_bg(ticket_id); // HUD 可直接停(§7 停止钮通用件)
         let dest = req.dest.clone();
         let bg_name = name.clone();
         let join = tokio::spawn(async move {

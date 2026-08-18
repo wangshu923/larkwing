@@ -21,6 +21,8 @@ pub use archive::{ExtractOutcome, ZipOutcome};
 pub use cookies::CookieRec;
 pub use download::{DownloadOutcome, DownloadedAudio, TrackMeta};
 pub use edit::{EditOutcome, EditRequest};
+/// 「回合内等多久再转后台」单源(§4.11):ffmpeg/解压/扫盘/delegate 子回合共用一个 30。
+pub(crate) use edit::IN_TURN_WAIT;
 pub use torrent::{
     TorrentLink, TorrentOutcome, DEFAULT_ONLY_RE, MAX_CONCURRENT as TORRENT_MAX_CONCURRENT,
 };

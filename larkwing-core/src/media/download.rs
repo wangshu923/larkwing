@@ -197,6 +197,7 @@ impl MediaRuntime {
             let client = download_client();
             let task =
                 this.inner.tasks.start("media_download", Text::new("task.media_download"));
+            task.bind_bg(ticket.id()); // HUD 可直接停(§7 停止钮通用件)
             let mut failed_titles: Vec<String> = Vec::new();
             let mut lyr_missing = 0usize;
             let mut halted_for_login = false;

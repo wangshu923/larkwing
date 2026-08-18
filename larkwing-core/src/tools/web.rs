@@ -433,6 +433,13 @@ impl WebDownload {
             100,
         )?;
         let ticket_id = ticket.id();
+        // HUD 卡(原先只登记 bgtasks、屏幕上其实看不见,话术却说「在任务条上」——补齐)
+        // + 停止钮(bind_bg,§7 通用件)。
+        let task = ctx
+            .media
+            .tasks()
+            .start("download", crate::bus::Text::new("task.web_download"));
+        task.bind_bg(ticket_id);
         let dir_owned = dir.to_path_buf();
         let name = t.filename.clone();
         let join = tokio::spawn(async move {
@@ -450,6 +457,9 @@ impl WebDownload {
                 Ok::<_, anyhow::Error>((dest, got))
             }
             .await;
+            // 用户点了停(HUD 停止钮 / task_cancel)→ 传输层 bail「按要求停下了」落进 Err 臂:
+            // 按停下收尾,别把主动叫停报成「下载失败」(评审实锤:文案自相矛盾)。
+            let cancelled = ticket.is_cancelled();
             let (ok, text) = match outcome {
                 Ok((dest, got)) => (
                     true,
@@ -459,12 +469,23 @@ impl WebDownload {
                         dest.display()
                     ),
                 ),
+                Err(_) if cancelled => {
+                    let _ = std::fs::remove_file(&part);
+                    (false, format!("《{name}》的下载按要求停下了,没下完的部分已清理。"))
+                }
                 Err(e) => {
                     let _ = std::fs::remove_file(&part);
                     tracing::warn!("ftp job 失败: {e:#}");
                     (false, format!("《{name}》没下成:{e:#}。把原因如实告诉用户。"))
                 }
             };
+            if ok {
+                task.done();
+            } else if cancelled {
+                task.fail("task.err.cancelled", serde_json::Value::Null);
+            } else {
+                task.fail("task.err.download", serde_json::Value::Null);
+            }
             ticket.finish(ok, text);
         });
         ctx.media.bg().attach_abort(ticket_id, join.abort_handle());
@@ -507,6 +528,12 @@ impl WebDownload {
             100,
         )?;
         let ticket_id = ticket.id();
+        // HUD 卡 + 停止钮(§7 通用件;原先只登记 bgtasks,屏幕上其实看不见)
+        let task = ctx
+            .media
+            .tasks()
+            .start("download", crate::bus::Text::new("task.web_download"));
+        task.bind_bg(ticket_id);
         let net = download_client(None); // 后台档:不设总超时(见 download_client 注释)
         let url_owned = url.to_string();
         let dir_owned = dir.to_path_buf();
@@ -532,6 +559,8 @@ impl WebDownload {
                 Ok::<_, anyhow::Error>((dest, got))
             }
             .await;
+            // 同 ftp job:主动叫停按「停下」收尾,不冒充「下载失败」。
+            let cancelled = ticket.is_cancelled();
             let (ok, text) = match report {
                 Ok((dest, got)) => (
                     true,
@@ -541,12 +570,23 @@ impl WebDownload {
                         dest.display()
                     ),
                 ),
+                Err(_) if cancelled => {
+                    let _ = std::fs::remove_file(&part);
+                    (false, format!("《{name_owned}》的下载按要求停下了,没下完的部分已清理。"))
+                }
                 Err(e) => {
                     let _ = std::fs::remove_file(&part);
                     tracing::warn!("web_download job 失败: {e:#}");
                     (false, format!("《{name_owned}》没下成:{e:#}。把原因如实告诉用户。"))
                 }
             };
+            if ok {
+                task.done();
+            } else if cancelled {
+                task.fail("task.err.cancelled", serde_json::Value::Null);
+            } else {
+                task.fail("task.err.download", serde_json::Value::Null);
+            }
             ticket.finish(ok, text);
         });
         ctx.media.bg().attach_abort(ticket_id, join.abort_handle());
@@ -703,7 +743,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let _ = std::fs::remove_file(dir.join("t.db"));
         let store = Store::open(&dir.join("t.db")).unwrap();
-        ToolCtx { user_id: 1, conv_id: 1, media: MediaRuntime::detached(store.clone()), store, web: None, voice: None, confirm: None, grants: Default::default() }
+        ToolCtx { user_id: 1, conv_id: 1, media: MediaRuntime::detached(store.clone()), store, web: None, voice: None, confirm: None, grants: Default::default(), agent: None }
     }
 
     #[tokio::test]

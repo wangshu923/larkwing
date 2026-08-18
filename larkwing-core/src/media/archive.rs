@@ -120,6 +120,7 @@ impl MediaRuntime {
         };
         let ticket_id = ticket.id();
         let task = self.inner.tasks.start("archive", Text::new("task.archive"));
+        task.bind_bg(ticket_id); // HUD 可直接停(§7 停止钮通用件)
         let (bg_name, dest_disp) = (name.clone(), dest.display().to_string());
         let watch_prog = prog.clone();
         let join = tokio::spawn(async move {
@@ -253,6 +254,7 @@ impl MediaRuntime {
         };
         let ticket_id = ticket.id();
         let task = self.inner.tasks.start("pack", Text::new("task.pack"));
+        task.bind_bg(ticket_id);
         let (bg_name, bg_tmp, bg_dest) = (name.clone(), tmp.clone(), dest.clone());
         let watch_prog = prog.clone();
         let join = tokio::spawn(async move {

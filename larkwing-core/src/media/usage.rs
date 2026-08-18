@@ -80,6 +80,7 @@ impl MediaRuntime {
         guard.disarm(); // 交棒:此后旗子归看守任务里的 guard 管
         let ticket_id = ticket.id();
         let task = self.inner.tasks.start("usage", Text::new("task.usage"));
+        task.bind_bg(ticket_id); // HUD 可直接停(§7 停止钮通用件)
         let (bg_name, bg_root) = (name.clone(), root.clone());
         let watch_prog = prog.clone();
         let join = tokio::spawn(async move {

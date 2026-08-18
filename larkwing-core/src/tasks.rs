@@ -30,6 +30,7 @@ impl Tasks {
             step: None,
             error: None,
             retry: None,
+            bg: None,
         };
         self.bus.publish(AppEvent::Task(view.clone()));
         TaskHandle { bus: self.bus.clone(), view: Mutex::new(view), finished: AtomicBool::new(false) }
@@ -58,6 +59,12 @@ impl TaskHandle {
     /// 0..=1;调用方自行节流(下载循环里别每个 chunk 都喊)。
     pub fn progress(&self, p: f32) {
         self.publish(|v| v.progress = Some(p.clamp(0.0, 1.0)));
+    }
+
+    /// 挂上 bgtasks 登记处编号:HUD 据此显「停止」钮(点击直连 bg_cancel,不绕 LLM §7.1)。
+    /// 有 BgTicket 的长活(批量下载/配词/BT/ffmpeg/解压/扫盘/delegate 转后台)注册完就 bind。
+    pub fn bind_bg(&self, id: u64) {
+        self.publish(|v| v.bg = Some(id));
     }
 
     /// 步骤 + 进度一起更新(下载场景一条事件搞定)。

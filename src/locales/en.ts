@@ -18,6 +18,8 @@ export default {
     remember: 'Noting it down…',
     now: 'Checking the time…',
     end_conversation: 'Wrapping up…',
+    plan_set: 'Planning…',
+    delegate: 'Delegating…',
     weather: 'Checking the weather…',
     media_search: 'Searching the library…',
     media_play: 'Starting playback…',
@@ -76,6 +78,7 @@ export default {
   task: {
     progress: '{n} in progress',
     retry: 'Retry', // retry button on a failed task (currently media resolve / component download)
+    stop: 'Stop', // stop button on a running background task (cards with a bg id; direct flag, no model round-trip)
     unknown: 'Background task',
     resolve: 'Resolving the stream',
     media_download: 'Audio download',
@@ -85,6 +88,8 @@ export default {
     archive: 'Unpacking an archive',
     pack: 'Packing files',
     usage: 'Sizing up disk usage',
+    web_download: 'Downloading a file',
+    delegate: 'Side errand: {t}',
     relocate: 'Moving data',
     update: 'Downloading update',
     remux: 'Preparing video “{name}”',
@@ -118,7 +123,13 @@ export default {
       torrent_meta: 'Could not fetch torrent info (no seeders, or DHT throttled)',
       torrent_size: 'That torrent is too big — skipped',
       torrent_stall: 'No data came through — stopped (likely no seeders)',
+      delegate: 'The errand didn’t work out',
     },
+  },
+  // Plan card (§6.5 in-session working memo): steps BT lists for long jobs; HUD/float show progress
+  plan: {
+    title: 'Plan',
+    next: 'Next',
   },
   // Action confirmation card (§7.8): asks you before clicking pay/publish/delete-grade buttons on the web
   confirm: {

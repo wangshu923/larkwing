@@ -106,7 +106,7 @@ mod tests {
         let _ = std::fs::remove_file(dir.join("t.db"));
         let store = Store::open(&dir.join("t.db")).unwrap();
         store.users.ensure_default_user().unwrap();
-        ToolCtx { user_id: 1, conv_id: 1, media: MediaRuntime::detached(store.clone()), store, web: None, voice: None, confirm: None, grants: Default::default() }
+        ToolCtx { user_id: 1, conv_id: 1, media: MediaRuntime::detached(store.clone()), store, web: None, voice: None, confirm: None, grants: Default::default(), agent: None }
     }
 
     #[tokio::test]

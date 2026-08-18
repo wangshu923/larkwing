@@ -7,12 +7,20 @@ import { useI18n } from 'vue-i18n'
 import { useTasks } from '../composables/useTasks'
 import { useMedia } from '../composables/useMedia'
 import { confirmActionPhrase, isScopeCard, useConfirm } from '../composables/useConfirm'
-import { api, type ConfirmCard, type TaskView, type TextRef } from '../lib/backend'
+import { planProgress, usePlan } from '../composables/usePlan'
+import { api, type ConfirmCard, type PlanCard, type TaskView, type TextRef } from '../lib/backend'
 
 const { t, te } = useI18n()
 const { state, dismiss } = useTasks()
 const { state: media } = useMedia()
 const confirm = useConfirm()
+const plan = usePlan()
+
+// 计划卡进度条宽度(done/total;total 恒 >0,空快照到不了渲染层)
+function planPct(p: PlanCard): string {
+  const { done, total } = planProgress(p)
+  return ((done / total) * 100).toFixed(1) + '%'
+}
 
 // 确认卡终态一行(短暂停留后淡出)
 function confirmOutcome(c: ConfirmCard): string {
@@ -37,6 +45,12 @@ function retry(task: TaskView) {
   dismiss(task.task_id)
 }
 
+// 停止运行中的后台任务(带 bg 编号的卡才有钮):直连 bgtasks 协作旗标 —— 做错了
+// 不用跟模型说「停下」再烧一轮 token。协作式:正在做的这项做完就停,卡片随终态快照收尾。
+function stop(task: TaskView) {
+  if (task.bg != null) void api.bgCancel(task.bg)
+}
+
 const running = computed(() => state.tasks.filter(x => x.state === 'running').length)
 const collapsed = computed(
   () => !state.expanded && (media.fullscreen || state.tasks.length > COLLAPSE_AT),
@@ -51,7 +65,11 @@ function txt(ref?: TextRef, fallback = 'task.unknown'): string {
 </script>
 
 <template>
-  <div class="tasks" :class="{ mini: media.fullscreen }" v-if="state.tasks.length || confirm.state.cards.length">
+  <div
+    class="tasks"
+    :class="{ mini: media.fullscreen }"
+    v-if="state.tasks.length || confirm.state.cards.length || plan.cards.value.length"
+  >
     <!-- 确认卡(§7.8):等人点头的动作,置顶、永不折叠;终态短暂停留后自动淡出 -->
     <TransitionGroup name="card" tag="div" class="stack" v-if="confirm.state.cards.length">
       <div v-for="c in confirm.state.cards" :key="'cfm-' + c.id" class="card confirm" :class="c.state">
@@ -75,6 +93,20 @@ function txt(ref?: TextRef, fallback = 'task.unknown'): string {
       </div>
     </TransitionGroup>
 
+    <!-- 计划卡(§6.5):BT 干长活的步骤清单进度;纯展示无按钮,空快照即收卡 -->
+    <TransitionGroup name="card" tag="div" class="stack" v-if="plan.cards.value.length">
+      <div v-for="p in plan.cards.value" :key="'plan-' + p.conv_id" class="card">
+        <div class="row">
+          <span class="label">📋 {{ p.title || t('plan.title') }}</span>
+          <span class="count">{{ planProgress(p).done }}/{{ planProgress(p).total }}</span>
+        </div>
+        <div v-if="planProgress(p).next" class="step">{{ t('plan.next') }}:{{ planProgress(p).next }}</div>
+        <div class="bar">
+          <div class="fill" :style="{ width: planPct(p) }"></div>
+        </div>
+      </div>
+    </TransitionGroup>
+
     <!-- 折叠胶囊:N 项进行中(点开展开) -->
     <button v-if="collapsed && state.tasks.length" class="pill" @click="state.expanded = true">
       <span class="spin" v-if="running"></span>
@@ -85,6 +117,11 @@ function txt(ref?: TextRef, fallback = 'task.unknown'): string {
       <div v-for="task in state.tasks" :key="task.task_id" class="card" :class="task.state">
         <div class="row">
           <span class="label">{{ txt(task.label) }}</span>
+          <button
+            v-if="task.state === 'running' && task.bg != null"
+            class="stop"
+            @click="stop(task)"
+          >{{ t('task.stop') }}</button>
           <button
             v-if="task.state === 'failed' && task.retry"
             class="retry"
@@ -183,6 +220,14 @@ function txt(ref?: TextRef, fallback = 'task.unknown'): string {
   border-radius: 6px; padding: 2px 7px;
 }
 .retry:hover { background: rgba(var(--accent-rgb), 0.2); border-color: var(--accent); }
+/* 停止钮:运行中卡的克制次钮(hover 转警示色 —— 它是「叫停」不是「关闭」) */
+.stop {
+  flex: 0 0 auto; cursor: pointer; line-height: 1;
+  font-size: 10.5px; letter-spacing: .4px; color: var(--text-dim);
+  background: none; border: 1px solid var(--line);
+  border-radius: 6px; padding: 2px 7px;
+}
+.stop:hover { color: var(--attn); border-color: rgba(var(--attn-rgb), 0.6); }
 
 .step {
   margin-top: 3px; font: 10.5px/1.4 ui-monospace, "SF Mono", monospace;

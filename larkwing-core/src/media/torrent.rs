@@ -121,6 +121,7 @@ impl TorrentEngine {
 
         // 1) 等 metadata（磁力链要从 DHT 取；.torrent 文件是现成的，这步瞬间过）
         let task = tasks.start("torrent", Text::new("task.torrent"));
+        task.bind_bg(ticket.id()); // HUD 可直接停(§7 停止钮通用件)
         task.step_progress("step.torrent_meta", serde_json::Value::Null, 0.0);
         if tokio::time::timeout(METADATA_TIMEOUT, handle.wait_until_initialized())
             .await

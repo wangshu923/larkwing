@@ -398,6 +398,9 @@ export interface TaskView {
   error?: TextRef
   /** 失败且可重放时带上 → UI 显「重试」按钮;无 = 不可重试。 */
   retry?: TaskRetry
+  /** 后台差事编号(批量下载/配词/BT/加工/delegate 等长活带上)→ 运行中显「停止」钮,
+   *  点击直连 bgCancel(与嘴上说「停下」拨的是同一个协作旗标,不绕 LLM)。 */
+  bg?: number
 }
 
 /** 多集续播位置(有值 = 当前是 ≥2 集的剧集:B 站合集/分P、本地剧集文件夹)。 */
@@ -670,6 +673,14 @@ export interface ConfirmCard {
   via?: string
 }
 
+/** 「计划」快照(§6.5 会话内工作备忘):HUD 计划卡 + 悬浮窗一行。全量快照,
+ *  items 空 = 无计划/已清空(收卡);title/条目是模型产的数据、非文案。 */
+export interface PlanCard {
+  conv_id: number
+  title?: string | null
+  items: { text: string; done: boolean }[]
+}
+
 /** 文件授权圈(§7.2):一条「能碰的文件夹」授权。 */
 export type ScopeMode = 'read' | 'create' | 'full'
 export interface ScopeEntry {
@@ -711,6 +722,8 @@ export type AppEvent =
   | { type: 'mood'; data: 'idle' | 'thinking' | 'speaking' }
   // 动作确认卡(§7.8):HUD 任务区 + 悬浮窗显卡可点;终态卡 = 收卡信号
   | { type: 'confirm'; data: ConfirmCard }
+  // 「计划」快照(§6.5):HUD 计划卡 + 悬浮窗一行;items 空 = 收卡
+  | { type: 'plan'; data: PlanCard }
 
 /** 订阅全局事件车道;未知 type 忽略(与 TurnEvent 同一增量演化约定)。 */
 export function onAppEvent(cb: (ev: AppEvent) => void): void {
@@ -1096,6 +1109,9 @@ export const api = {
   /** 失败下载重试:重下一个组件(yt-dlp/ffmpeg…),直连不绕 LLM。 */
   retryDownload: (component: string) => invoke<void>('retry_download', { component }),
   retryVoiceModel: (id: string) => invoke<void>('retry_voice_model', { id }),
+  /** HUD 任务卡「停止」:直连 bgtasks 协作旗标(做错了不用跟模型说「停下」再烧一轮)。
+   *  false = 已收尾/查无此号,无需报错(终态快照马上到)。 */
+  bgCancel: (id: number) => invoke<boolean>('bg_cancel', { id }),
   /** 多集续播切集(+1 下一集 / -1 上一集):ended 自动续播、播放器上/下一集按钮直连这里(不绕 LLM)。
    *  越界(到头/到顶)在 core 内静默(只记日志)。fire-and-forget。 */
   mediaAdvance: (delta: number) => invoke<void>('media_advance', { delta }),

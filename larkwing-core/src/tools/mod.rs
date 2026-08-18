@@ -5,6 +5,7 @@
 
 mod bgtask;
 mod briefing;
+pub mod delegate;
 mod desktop;
 mod end_conversation;
 mod ffmpeg_run;
@@ -18,6 +19,7 @@ mod media_play;
 mod media_search;
 mod now;
 mod pdf;
+pub mod plan;
 mod qr;
 mod read_audio;
 mod read_image;
@@ -49,6 +51,8 @@ use crate::store::Store;
 /// 声明 —— 运行时法条(engine/context::LAWS)点名了它们,法条全场景生效,工具就得全场景在。
 /// end_conversation = 免唤醒连续对话的显式关闭信号(LAWS「聊完了就收尾」点名),同 remember 一族
 /// 全场景可用。skill 三件 = 技能(工作手册)取/教/删(LAWS「技能」节点名),同族全场景在。
+/// plan_set = 干长活的工作备忘(LAWS「干长活」点名):多步/多批任务列清单防「干一半停下等人踢」。
+/// delegate = 分头办事(LAWS「干长活」点名):探查面大的一步派子回合独立跑,只拿回要点。
 pub const BASE_TOOLS: &[&str] = &[
     "remember",
     "recall",
@@ -59,6 +63,8 @@ pub const BASE_TOOLS: &[&str] = &[
     "skill_write",
     "skill_remove",
     "end_conversation",
+    "plan_set",
+    "delegate",
 ];
 
 /// 静态规格:给模型看的(name/description/parameters)+ 给运行时的(timeout)
@@ -187,7 +193,11 @@ pub struct ToolCtx {
     /// 请用户点头。None(单测)= 没有确认通道,当拒处理。消费者 = web_render + 文件授权圈。
     pub confirm: Option<Arc<crate::confirm::Confirmer>>,
     /// 文件授权圈的回合级缓存(§7.2):「仅这次」放行与本回合已拒记录,回合结束即丢。
+    /// 子回合共享父回合的这一份(「仅这次」= 主回合这一次,含它派生的子回合,不二次弹卡)。
     pub grants: guard::Grants,
+    /// 子回合执行接缝(delegate 专用;webrender 同款):engine 实现并注入。None = 单测 /
+    /// 子回合自身(深度 1 双锁的一半)→ 工具如实退回。
+    pub agent: Option<Arc<dyn delegate::SubAgent>>,
 }
 
 /// 工具风险分级(预留 slot,PLAN §8):`Safe` = 读/记类;`Mutating` = 会改动用户文件
@@ -284,6 +294,8 @@ impl Tools {
         let mut tools = Tools::default();
         tools.register(Arc::new(now::Now::new()));
         tools.register(Arc::new(end_conversation::EndConversation::new()));
+        tools.register(Arc::new(plan::PlanSet::new()));
+        tools.register(Arc::new(delegate::Delegate::new()));
         tools.register(Arc::new(remember::Remember::new()));
         tools.register(Arc::new(recall::Recall::new()));
         tools.register(Arc::new(todo::NoteTodo::new()));
@@ -353,6 +365,13 @@ impl Tools {
 
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
         self.by_name.get(name)
+    }
+
+    /// 注册表全名单(排序稳定;delegate 白名单 golden / 审计用)。
+    pub fn names(&self) -> Vec<&'static str> {
+        let mut v: Vec<&'static str> = self.by_name.keys().copied().collect();
+        v.sort_unstable();
+        v
     }
 
     /// 白名单子集 = **常驻基础工具(固定在前)+ 场景声明(原序在后)**,去重;
@@ -477,6 +496,8 @@ mod tests {
                 "skill_write",
                 "skill_remove",
                 "end_conversation",
+                "plan_set",
+                "delegate",
                 "now"
             ],
             "base 在前(声明里的 remember 被去重),场景序在后,ghost 被忽略"

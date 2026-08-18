@@ -40,6 +40,12 @@ impl FakeLlm {
     pub fn scripted(turns: Vec<FakeTurn>) -> Self {
         Self { delay_ms: 1, script: Mutex::new(turns.into()) }
     }
+
+    /// 剩余剧本条数。给「级联取消真掐死了子回合」这类断言用:被取消的回合不该再开新流,
+    /// 后续剧本就该原封不动剩着(ephemeral 子回合不落库,DB 断言看不见孤儿 —— 评审实锤)。
+    pub fn remaining(&self) -> usize {
+        self.script.lock().expect("fake script lock").len()
+    }
 }
 
 #[async_trait::async_trait]

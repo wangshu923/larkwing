@@ -155,12 +155,14 @@ impl FsFind {
         FsFind {
             spec: ToolSpec {
                 name: "fs_find",
-                description: "在一个目录树里按 glob 模式找文件(不分大小写,递归几层)。\
+                description: "在一个目录树里按 glob 模式找文件和文件夹(不分大小写,递归几层)。\
                               pattern 支持 * 和 ?:如 *动画*.mp4、*.mp3;含 / 时按相对路径匹配\
                               (如 某子目录/*.mp4);纯关键词(无通配符)自动当 *关键词* 用。\
-                              知道想找什么时比逐层 fs_list 快,返回绝对路径列表(按路径排序)。\
-                              一次最多返回 50 条,命中多会报总数并给续读起点:要接着看就带 \
-                              offset 再调一次,总数大得离谱就换更具体的模式或更小的起点。",
+                              知道想找什么时比逐层 fs_list 快。返回绝对路径列表,浅的在前:\
+                              命中的文件夹以 / 结尾、排在深处文件前面(先看到结构,想看某个\
+                              文件夹里有什么接 fs_list)。一次最多返回 50 条,命中多会报总数\
+                              并给续读起点:要接着看就带 offset 再调一次,总数大得离谱就换\
+                              更具体的模式或更小的起点。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -221,35 +223,53 @@ impl Matcher {
     }
 }
 
-/// 收集命中(深度 ≤ FIND_MAX_DEPTH,总量 ≤ FIND_SCAN_MAX)。停在**扫描**上限而不是一页,
-/// 才有总数可报、offset 才翻得动;扫满 = 调用方如实说「可能还有」。
-fn walk(dir: &Path, root: &Path, matcher: &Matcher, depth: usize, out: &mut Vec<PathBuf>) {
-    if depth > FIND_MAX_DEPTH || out.len() >= FIND_SCAN_MAX {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
+/// 一条命中:深度(相对 root 的层级)+ 路径 + 是否文件夹。排序键 = (深度, 路径),
+/// 浅的先出——命中的文件夹(树的骨架)排在深处文件前面,第一页不再被某个深分支灌满
+/// (实锤:剧集库「四季各几十集」按路径排序时第一页全是第一季,被误判成只有两季)。
+struct Hit {
+    depth: usize,
+    path: PathBuf,
+    is_dir: bool,
+}
+
+/// 收集命中(深度 ≤ FIND_MAX_DEPTH,总量 ≤ FIND_SCAN_MAX)。文件和文件夹同一套匹配
+/// 口径都算命中,命中的文件夹照样往下钻(子项可能也命中)。**广度优先**:撞扫描上限时
+/// 浅层保证扫全,截掉的只是更深的;每层条目按名字排序 → 截断集合确定,offset 跨调用
+/// 对得上(旧 DFS 撞上限时收进哪些取决于 read_dir 原始序,不保证)。停在**扫描**上限
+/// 而不是一页,才有总数可报、offset 才翻得动;扫满 = 调用方如实说「可能还有」。
+fn walk(root: &Path, matcher: &Matcher) -> Vec<Hit> {
+    let mut out = Vec::new();
+    let mut queue = std::collections::VecDeque::from([(root.to_path_buf(), 0usize)]);
+    while let Some((dir, depth)) = queue.pop_front() {
         if out.len() >= FIND_SCAN_MAX {
-            return;
+            break;
         }
-        let name = entry.file_name().to_string_lossy().to_string();
-        if hidden(&name) {
-            continue;
-        }
-        let path = entry.path();
-        let is_dir = entry.metadata().map(|m| m.is_dir()).unwrap_or(false);
-        if is_dir {
-            walk(&path, root, matcher, depth + 1, out);
-        } else {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_cached_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            if out.len() >= FIND_SCAN_MAX {
+                break;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if hidden(&name) {
+                continue;
+            }
+            let path = entry.path();
+            let is_dir = entry.metadata().map(|m| m.is_dir()).unwrap_or(false);
             let rel = path
                 .strip_prefix(root)
                 .map(|p| p.to_string_lossy().replace('\\', "/"))
                 .unwrap_or_else(|_| name.clone());
             if matcher.hit(&name, &rel) {
-                out.push(path);
+                out.push(Hit { depth: depth + 1, path: path.clone(), is_dir });
+            }
+            if is_dir && depth < FIND_MAX_DEPTH {
+                queue.push_back((path, depth + 1));
             }
         }
     }
+    out
 }
 
 #[async_trait]
@@ -279,13 +299,12 @@ impl Tool for FsFind {
         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let dir = Path::new(&root);
             anyhow::ensure!(dir.is_dir(), "{root} 不是文件夹或不存在");
-            let mut out = Vec::new();
-            walk(dir, dir, &matcher, 0, &mut out);
+            let mut out = walk(dir, &matcher);
             if out.is_empty() {
-                return Ok(format!("在 {root} 里没找到匹配「{raw}」的文件"));
+                return Ok(format!("在 {root} 里没找到匹配「{raw}」的文件或文件夹"));
             }
-            // 排序 = 分页顺序稳定(read_dir 的原始顺序不保证,offset 会翻乱)
-            out.sort();
+            // 排序 = 分页顺序稳定;键 (深度, 路径):浅的先出,深分支不再灌满第一页
+            out.sort_by(|a, b| a.depth.cmp(&b.depth).then_with(|| a.path.cmp(&b.path)));
             let total = out.len();
             let capped = total >= FIND_SCAN_MAX;
             anyhow::ensure!(
@@ -296,11 +315,13 @@ impl Tool for FsFind {
                 .into_iter()
                 .skip(offset)
                 .take(FIND_MAX_RESULTS)
-                .map(|p| {
-                    // 尾捎改动日期(「找最近下载的那个」直接可判;细属性归 fs_stat)
-                    match std::fs::metadata(&p).and_then(|m| m.modified()) {
-                        Ok(t) => format!("{} ({})", p.to_string_lossy(), fmt_date(t)),
-                        Err(_) => p.to_string_lossy().to_string(),
+                .map(|h| {
+                    // 文件夹以 / 结尾(fs_list 同款标记);尾捎改动日期(「找最近下载的
+                    // 那个」直接可判;细属性归 fs_stat)
+                    let mark = if h.is_dir { "/" } else { "" };
+                    match std::fs::metadata(&h.path).and_then(|m| m.modified()) {
+                        Ok(t) => format!("{}{mark} ({})", h.path.to_string_lossy(), fmt_date(t)),
+                        Err(_) => format!("{}{mark}", h.path.to_string_lossy()),
                     }
                 })
                 .collect();
@@ -1225,7 +1246,7 @@ mod tests {
         std::fs::write(dir.join(".hidden"), b"x").unwrap();
         let store = Store::open(&dir.join("t.db")).unwrap();
         let ctx =
-            ToolCtx { user_id: 1, conv_id: 1, media: MediaRuntime::detached(store.clone()), store, web: None, voice: None, confirm: None, grants: Default::default() };
+            ToolCtx { user_id: 1, conv_id: 1, media: MediaRuntime::detached(store.clone()), store, web: None, voice: None, confirm: None, grants: Default::default(), agent: None };
         (ctx, dir)
     }
 
@@ -1356,6 +1377,72 @@ mod tests {
             .run(serde_json::json!({"root": root, "pattern": "[bad"}), &ctx)
             .await
             .is_err());
+    }
+
+    /// 文件夹也算命中(以 / 结尾)+ 排序键 (深度, 路径):骨架先看到、浅的先出。
+    /// 实锤场景:剧集库「四季各几十集」按路径排序时第一页全是第一季 → 被误判只有两季。
+    #[tokio::test]
+    async fn find_returns_dirs_and_orders_shallow_first() {
+        let (ctx, dir) = ctx_and_dir("find-dirs");
+        for season in ["第1季", "第2季", "第3季", "第4季"] {
+            let d = dir.join("米老鼠").join(season);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(format!("米老鼠{season}E01.mp4")), b"x").unwrap();
+        }
+        let root = dir.to_string_lossy().to_string();
+
+        let out = FsFind::new()
+            .run(serde_json::json!({"root": &root, "pattern": "米老鼠"}), &ctx)
+            .await
+            .unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        // 命中的文件夹在结果里、以 / 结尾,且照样往下钻(四季的集数文件都在)
+        let dir_at = lines.iter().position(|l| l.contains("米老鼠/ (")).unwrap_or_else(|| {
+            panic!("文件夹要命中且以 / 结尾: {out}")
+        });
+        for season in ["第1季", "第2季", "第3季", "第4季"] {
+            assert!(out.contains(&format!("米老鼠{season}E01.mp4")), "缺 {season}: {out}");
+        }
+        // 深度序:文件夹(深度 1)排在所有深处文件(深度 3)之前
+        let first_file = lines.iter().position(|l| l.contains("E01.mp4")).unwrap();
+        assert!(dir_at < first_file, "浅的要先出: {out}");
+
+        // 判别用例:同一深度键下,纯路径排序会把深分支排前(anime/... < zz_...),
+        // (深度, 路径) 则浅文件先出 —— 钉住排序键不是纯路径
+        let sub = dir.join("anime").join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("mickey_deep.mp4"), b"x").unwrap();
+        std::fs::write(dir.join("zz_mickey.mp4"), b"x").unwrap();
+        let out = FsFind::new()
+            .run(serde_json::json!({"root": &root, "pattern": "mickey"}), &ctx)
+            .await
+            .unwrap();
+        let shallow = out.lines().position(|l| l.contains("zz_mickey.mp4")).unwrap();
+        let deep = out.lines().position(|l| l.contains("mickey_deep.mp4")).unwrap();
+        assert!(shallow < deep, "浅文件要排在深分支前: {out}");
+    }
+
+    /// 撞扫描上限时浅层保证扫全(广度优先):深分支塞满上限,浅处命中不被挤掉。
+    #[tokio::test]
+    async fn find_scan_cap_keeps_shallow_hits() {
+        let (ctx, dir) = ctx_and_dir("find-cap");
+        let deep = dir.join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        for i in 0..FIND_SCAN_MAX {
+            std::fs::write(deep.join(format!("d{i:04}.bin")), b"x").unwrap();
+        }
+        for i in 0..5 {
+            std::fs::write(dir.join(format!("shallow{i}.bin")), b"x").unwrap();
+        }
+        let root = dir.to_string_lossy().to_string();
+        let out = FsFind::new()
+            .run(serde_json::json!({"root": &root, "pattern": "*.bin"}), &ctx)
+            .await
+            .unwrap();
+        for i in 0..5 {
+            assert!(out.contains(&format!("shallow{i}.bin")), "浅层命中被深分支挤掉: {out}");
+        }
+        assert!(out.contains("就停了"), "撞上限要如实说: {}", out.lines().last().unwrap());
     }
 
     #[tokio::test]

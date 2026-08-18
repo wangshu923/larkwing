@@ -8,6 +8,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useAgentMood } from '../composables/useAgentMood'
 import { confirmActionPhrase, isScopeCard, useConfirm } from '../composables/useConfirm'
+import { planProgress, usePlan } from '../composables/usePlan'
 import { useFloat } from '../composables/useFloat'
 import { useFloatIdle } from '../composables/useFloatIdle'
 import { usePetDemoActivity, resolveActivity, type PetActivity } from '../composables/usePetActivity'
@@ -26,6 +27,8 @@ const idle = useFloatIdle()
 // 确认卡(§7.8):悬浮窗也收 bus 卡——主窗藏托盘时这里是唯一可点的确认入口(展开面板直接
 // 允许/拒绝,confirm_action 是 core 命令、悬浮窗直连不转发;via=float 记进审计)。
 const confirm = useConfirm()
+// 「计划」(§6.5):BT 干长活的步骤清单;展开面板「进行中」区一行看进度(纯展示)。
+const { cards: plans } = usePlan()
 
 const avatars: Record<string, string> = { titan: titanIdle, dog: dogIdle, cat: catIdle }
 const avatar = computed(() => avatars[settings.get('ui.character')] ?? titanIdle)
@@ -265,7 +268,7 @@ onUnmounted(() => stopMoved())
           </div>
         </template>
 
-        <template v-if="listening || nowPlaying || running.length">
+        <template v-if="listening || nowPlaying || running.length || plans.length">
           <div class="ptag">{{ t('float.zoneNow') }}</div>
           <div v-if="listening" class="status">
             <i>🎙</i><span class="ellip">{{ t('float.listening') }}</span>
@@ -281,6 +284,11 @@ onUnmounted(() => stopMoved())
             <i>⬇</i><span class="ellip">{{ txt(tk.label) }}</span>
             <em v-if="tk.progress != null">{{ Math.round(tk.progress * 100) }}%</em>
           </div>
+          <!-- 计划(§6.5):干长活的清单进度,一行足矣(细节在主窗 HUD 卡) -->
+          <div v-for="p in plans" :key="'plan-' + p.conv_id" class="status">
+            <i>📋</i><span class="ellip">{{ p.title || t('plan.title') }}</span>
+            <em>{{ planProgress(p).done }}/{{ planProgress(p).total }}</em>
+          </div>
         </template>
 
         <template v-if="state.notices.length">
@@ -292,7 +300,7 @@ onUnmounted(() => stopMoved())
         </template>
 
         <!-- 待机:轮播当前条(下个提醒/关怀候选/发现新版…) / 问候;可点条(关怀/更新)渲染成卡 -->
-        <template v-if="!state.notices.length && !listening && !nowPlaying && !running.length">
+        <template v-if="!state.notices.length && !listening && !nowPlaying && !running.length && !plans.length">
           <div v-if="idleAct" class="idle-act" @click.stop="onIdleTap">
             <span class="n-text">{{ idleAct.text }}</span>
             <i class="act-arrow">▶</i>

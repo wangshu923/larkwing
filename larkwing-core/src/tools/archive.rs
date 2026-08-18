@@ -310,6 +310,7 @@ mod tests {
                 voice: None,
                 confirm: None,
                 grants: Default::default(),
+                agent: None,
             },
             dir,
         )

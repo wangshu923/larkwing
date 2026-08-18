@@ -654,3 +654,250 @@ async fn overheard_yields_to_inflight_turn() {
         "放弃的仲裁不落任何行: {msgs:?}"
     );
 }
+
+/// 「计划」槽(§6.5 会话内工作备忘):plan_set 结果 ok → 回合循环写会话槽 + 发 Plan 快照;
+/// 下一回合「此刻」行带上计划(FakeLlm 回声模式把末条 user 连 ambient 一起照出来);
+/// 删会话发空快照收卡(HUD/悬浮窗据此收卡)。
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_set_updates_slot_feeds_ambient_and_publishes_card() {
+    let (_store, engine, conv_id) = setup("plan-slot", 1);
+    engine.set_provider(Some(Arc::new(FakeLlm::scripted(vec![
+        FakeTurn {
+            text: "先列个计划".into(),
+            tool_calls: vec![call(
+                "p1",
+                "plan_set",
+                serde_json::json!({
+                    "title": "整理曲库",
+                    "items": [ { "text": "扫文件夹", "done": true }, { "text": "补歌词" } ]
+                }),
+            )],
+            usage: Default::default(),
+        },
+        FakeTurn { text: "开始干活".into(), tool_calls: vec![], usage: Default::default() },
+    ]))));
+    let mut bus = engine.bus().subscribe();
+    let mut rx = engine.send_message(conv_id, "把曲库整理一下".into(), None, vec![]).await.unwrap();
+    while let Some(ev) = rx.recv().await {
+        if matches!(ev, TurnEvent::Done { .. } | TurnEvent::Failed { .. }) {
+            break;
+        }
+    }
+
+    // ① 快照上全局事件车道(HUD 计划卡 / 悬浮窗一行按它显)
+    let card = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Ok(larkwing_core::bus::AppEvent::Plan(c)) = bus.recv().await {
+                return c;
+            }
+        }
+    })
+    .await
+    .expect("10s 内必须收到计划快照");
+    assert_eq!(card.conv_id, conv_id);
+    assert_eq!(card.title.as_deref(), Some("整理曲库"));
+    assert_eq!(card.items.len(), 2);
+    assert!(card.items[0].done && !card.items[1].done, "done 标记原样过桥");
+
+    // ② 下一回合「此刻」行带计划(脚本已耗尽 → FakeLlm 回声模式照出末条 user 全文)
+    let mut rx2 = engine.send_message(conv_id, "继续".into(), None, vec![]).await.unwrap();
+    let mut echoed = String::new();
+    while let Some(ev) = rx2.recv().await {
+        match ev {
+            TurnEvent::Delta(t) => echoed.push_str(&t),
+            TurnEvent::Done { .. } | TurnEvent::Failed { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(
+        echoed.contains("计划") && echoed.contains("补歌词") && echoed.contains("1/2"),
+        "「此刻」行该带计划进度与未完项:{echoed}"
+    );
+    assert!(!echoed.contains("扫文件夹"), "已完成项不进「此刻」行(只计数):{echoed}");
+
+    // ③ 删会话 = 发空快照收卡
+    engine.delete_conversation(conv_id).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Ok(larkwing_core::bus::AppEvent::Plan(c)) = bus.recv().await {
+                if c.conv_id == conv_id && c.items.is_empty() {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .expect("删会话须发空计划快照收卡");
+}
+
+// 分头办事(delegate,§6.5):父回合派活 → 子回合在新鲜上下文里跑同一份回合循环
+// (ephemeral:会话行一概不落)→ 子回合收尾文本 = 汇报,作为 delegate 的 ToolResult
+// 回填 → 父回合拿着汇报收尾。FakeLlm 单剧本队列天然分时消费:父 1 → 子 1 → 子 2 → 父 2
+// (父回合在 run_tools 里阻塞等汇报,子回合开流必然先抢到下一份剧本)。
+#[tokio::test(flavor = "multi_thread")]
+async fn delegate_runs_ephemeral_sub_turn_and_reports_back() {
+    let (store, engine, conv_id) = setup("delegate", 1);
+    let usage = larkwing_core::llm::Usage { input_tokens: 10, output_tokens: 5, cache_hit_tokens: 0 };
+    engine.set_provider(Some(Arc::new(FakeLlm::scripted(vec![
+        // 父回合第 1 轮:派活
+        FakeTurn {
+            text: "我去分头看看".into(),
+            tool_calls: vec![call(
+                "d1",
+                "delegate",
+                serde_json::json!({ "task": "看一眼现在几点,汇报给我" }),
+            )],
+            usage: usage.clone(),
+        },
+        // 子回合第 1 轮:调工具(子回合共享同一个 FakeLlm,新开流消费下一份剧本)
+        FakeTurn {
+            text: String::new(),
+            tool_calls: vec![call("s1", "now", serde_json::json!({}))],
+            usage: usage.clone(),
+        },
+        // 子回合第 2 轮:收尾汇报(= 回到父回合手里的 digest)
+        FakeTurn { text: "汇报:钟看过了,时间正常。".into(), tool_calls: vec![], usage: usage.clone() },
+        // 父回合第 2 轮:拿着汇报收尾
+        FakeTurn { text: "都办好了。".into(), tool_calls: vec![], usage: usage.clone() },
+    ]))));
+
+    let mut bus = engine.bus().subscribe();
+    let mut rx = engine.send_message(conv_id, "帮我查个事".into(), None, vec![]).await.unwrap();
+    let mut streamed = String::new();
+    let mut delegate_result = String::new();
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            TurnEvent::Delta(t) => streamed.push_str(&t),
+            TurnEvent::ToolUse {
+                name,
+                result,
+                state: larkwing_core::engine::ToolUseState::Finished,
+                ..
+            } => {
+                assert_eq!(name, "delegate", "父事件流只该有 delegate 这一步(子回合的 now 不上桥)");
+                delegate_result = result;
+            }
+            TurnEvent::Done { .. } => break,
+            TurnEvent::Failed { message, .. } => panic!("不该失败: {message}"),
+            _ => {}
+        }
+    }
+    assert!(streamed.ends_with("都办好了。"), "父回合终回收尾:{streamed}");
+    assert!(delegate_result.contains("汇报"), "子回合收尾文本 = delegate 结果:{delegate_result}");
+
+    // 会话零子回合痕迹(ephemeral):user / assistant(带 delegate 调用)/ tool(汇报)/ assistant 终回;
+    // 子回合自己的 assistant 轮与 now 的 tool 行一概不落库。
+    let msgs = store.chat.recent_messages(conv_id, 20).unwrap();
+    let roles: Vec<&str> = msgs.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(roles, ["user", "assistant", "tool", "assistant"], "子回合不落会话行");
+    assert!(msgs[2].content.contains("汇报:钟看过了"), "汇报经父回合 tool 行留痕:{}", msgs[2].content);
+    assert!(
+        msgs[2].payload.as_deref().unwrap_or("").contains("\"name\":\"delegate\""),
+        "tool 行 payload 记的是 delegate"
+    );
+
+    // usage 流水锚父回合:4 轮(父 2 + 子 2)全部滚进同一个 user_msg_id 的账
+    // (气泡读数如实含子回合成本,§6.4)。
+    let rollups = store.usage.rounds_by_turn(conv_id).unwrap();
+    assert_eq!(rollups.len(), 1, "只有一个回合锚点(子回合不另立账头)");
+    assert_eq!(rollups[0].input_tokens, 40, "父 2 轮 + 子 2 轮 = 4 × 10 input,全记父回合头上");
+    assert_eq!(rollups[0].user_msg_id, msgs[0].id, "锚点 = 父回合的 user 行");
+
+    // HUD 任务卡:kind=delegate 的 running → done 快照上全局车道(悬浮窗/主窗同源)
+    let saw = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let (mut started, mut done) = (false, false);
+        loop {
+            if let Ok(larkwing_core::bus::AppEvent::Task(v)) = bus.recv().await {
+                if v.kind == "delegate" {
+                    match v.state {
+                        larkwing_core::bus::TaskState::Running => started = true,
+                        larkwing_core::bus::TaskState::Done => done = true,
+                        larkwing_core::bus::TaskState::Failed => panic!("任务卡不该失败"),
+                    }
+                    if started && done {
+                        return true;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(saw, "delegate 任务卡该走 running → done");
+}
+
+// delegate 深度锁(双锁之一的白名单半边)在 tools::delegate::tests 里 golden 钉着;
+// 这里补取消级联:父回合被新输入挤掉(send 自动 cancel)→ delegate 的 future 被 drop →
+// drop-guard 掐灭子回合,合成「已取消」ToolResult 保历史完形,不留悬空子回合空转。
+#[tokio::test(flavor = "multi_thread")]
+async fn delegate_cancelled_with_parent_leaves_no_orphan() {
+    let (store, engine, conv_id) = setup("delegate-cancel", 1);
+    let fake: Arc<FakeLlm> = Arc::new(FakeLlm::scripted(vec![
+        // 父回合第 1 轮:派活
+        FakeTurn {
+            text: String::new(),
+            tool_calls: vec![call(
+                "d1",
+                "delegate",
+                serde_json::json!({ "task": "慢慢查一件事" }),
+            )],
+            usage: Default::default(),
+        },
+        // 子回合第 1 轮:长文本逐字流(FakeLlm 1ms/字 ≈ 数百 ms)—— 给取消留出确定窗口,
+        // 保证父回合的 cancel 一定落在子回合还在飞的时候(否则本测会看时序脸色)。
+        FakeTurn {
+            text: "查".repeat(400),
+            tool_calls: vec![call("s1", "now", serde_json::json!({}))],
+            usage: Default::default(),
+        },
+        // 子回合后续轮(取消到来前可能开到):再调一次,维持在飞
+        FakeTurn {
+            text: String::new(),
+            tool_calls: vec![call("s2", "now", serde_json::json!({"again": 1}))],
+            usage: Default::default(),
+        },
+    ]));
+    engine.set_provider(Some(fake.clone()));
+
+    let mut rx = engine.send_message(conv_id, "去查个大活".into(), None, vec![]).await.unwrap();
+    // 等 delegate 这步真的开始(父回合进入 run_tools、子回合已在飞),再取消父回合
+    let mut cancelled = false;
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            TurnEvent::ToolUse { name, state: larkwing_core::engine::ToolUseState::Started, .. }
+                if name == "delegate" && !cancelled =>
+            {
+                cancelled = true;
+                // 等子回合真开了第 1 轮流(s1 被消费)再取消 —— 测的是「在飞子回合被
+                // 级联掐死」这条最阴的路。立即取消会掐在装配期(子回合连流都没开,
+                // remaining 停在 2):那条路同样安全,但不是本测要钉的行为。
+                for _ in 0..100 {
+                    if fake.remaining() <= 1 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                assert_eq!(fake.remaining(), 1, "子回合该已开第 1 轮流(消费 s1)");
+                engine.cancel(conv_id).await; // 停止按钮路径:取消级联进工具(六条约束 #5)
+            }
+            TurnEvent::Cancelled => break,
+            TurnEvent::Done { .. } => panic!("被取消的回合不该 Done"),
+            _ => {}
+        }
+    }
+    assert!(cancelled, "必须在 delegate 在飞时取消");
+
+    // 历史完形:delegate 的 call 有配对的「已取消」tool 行;子回合零痕迹
+    let msgs = store.chat.recent_messages(conv_id, 20).unwrap();
+    let tool_rows: Vec<_> = msgs.iter().filter(|m| m.role == "tool").collect();
+    assert_eq!(tool_rows.len(), 1, "只有 delegate 的合成取消行,没有子回合的 now 行");
+    assert_eq!(tool_rows[0].content, "已取消");
+    assert!(tool_rows[0].payload.as_deref().unwrap_or("").contains("\"name\":\"delegate\""));
+
+    // 「无孤儿」的真断言(评审实锤:ephemeral 不落库,上面的 DB 断言看不见孤儿——把
+    // drop_guard 删掉、子回合静默跑完,原断言照样绿):被级联取消的子回合绝不会再开
+    // 第 2 轮流 → 第 3 份剧本(s2)必须原封不动剩着。给足静置窗(健康路子回合毫秒级死;
+    // 回归路它要 ~400ms 流完第 1 轮才会去消费 s2,900ms 稳盖住)。
+    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+    assert_eq!(fake.remaining(), 1, "子回合该被级联掐死:s2 剧本不许被消费(孤儿在偷跑)");
+}

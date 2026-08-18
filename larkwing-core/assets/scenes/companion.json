@@ -48,7 +48,7 @@
       "content": "",
       "tool_calls": [{ "id": "fs_v1", "name": "fs_find", "args": { "root": "D:\\示例片库", "pattern": "星海漫游" } }]
     },
-    { "role": "tool", "call_id": "fs_v1", "content": "在 D:\\示例片库 里没找到匹配的文件" },
+    { "role": "tool", "call_id": "fs_v1", "content": "在 D:\\示例片库 里没找到匹配的文件或文件夹" },
     {
       "role": "assistant",
       "content": "",

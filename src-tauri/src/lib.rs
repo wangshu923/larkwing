@@ -420,6 +420,7 @@ pub fn run() {
       commands::media_retry,
       commands::retry_download,
       commands::retry_voice_model,
+      commands::bg_cancel,
       commands::media_advance,
       commands::media_auto_next,
       commands::media_mode,

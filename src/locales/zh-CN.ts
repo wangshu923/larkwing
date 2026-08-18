@@ -17,6 +17,8 @@ export default {
     remember: '记进小本本…',
     now: '看时间…',
     end_conversation: '收尾…',
+    plan_set: '列计划…',
+    delegate: '分头办事…',
     weather: '查天气…',
     media_search: '搜片库…',
     media_play: '开始播放…',
@@ -75,6 +77,7 @@ export default {
   task: {
     progress: '{n} 项进行中',
     retry: '重试', // 失败任务的重试按钮(目前仅影音解析/组件下载)
+    stop: '停止', // 运行中后台任务的停止按钮(带 bg 编号的卡才显;直连协作旗标,不绕模型)
     unknown: '后台小任务',
     resolve: '解析播放地址',
     media_download: '下载音频',
@@ -84,6 +87,8 @@ export default {
     archive: '解压压缩包',
     pack: '打包文件',
     usage: '统计磁盘占用',
+    web_download: '下载文件',
+    delegate: '分头办事:{t}',
     relocate: '搬家中',
     update: '下载更新',
     remux: '准备视频「{name}」',
@@ -117,7 +122,13 @@ export default {
       torrent_meta: '拿不到种子信息(可能没人做种,或 DHT 被限速)',
       torrent_size: '这个种子太大了,没有下',
       torrent_stall: '一直没数据进来,停了(可能没人做种)',
+      delegate: '这路活没办成',
     },
+  },
+  // 「计划」卡(§6.5 会话内工作备忘):BT 干长活时列的步骤清单,HUD/悬浮窗看进度
+  plan: {
+    title: '计划',
+    next: '下一步',
   },
   // 动作确认卡(§7.8 确认闸):网页上点「付款/发布/删除」级按钮前先问你一声
   confirm: {

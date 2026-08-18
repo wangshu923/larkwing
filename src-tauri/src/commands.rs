@@ -969,6 +969,14 @@ pub fn retry_voice_model(state: State<'_, AppState>, id: String) -> Result<(), A
     Ok(())
 }
 
+/// HUD 任务卡「停止」钮(§7 停止钮通用件):直连 bgtasks 协作旗标(与 task_cancel 工具
+/// 同一个,按钮不绕 LLM §7.1)——做错了不用跟模型说「停下」再烧一轮 token。
+/// 返回 false = 没在跑(已收尾/查无此号),前端不用报错(卡片马上会收到终态快照)。
+#[tauri::command]
+pub fn bg_cancel(state: State<'_, AppState>, id: u64) -> Result<bool, AppError> {
+    Ok(state.engine.bg_cancel(id).is_some())
+}
+
 /// 多集续播切集(PLAN §9 多集续播):前端 `ended` 自动下一集、播放器上/下一集按钮直连这里
 /// (不绕 LLM,同 media_retry / 嘴控按钮哲学 §7.1)。delta = +1 下一集 / -1 上一集。
 /// 越界(到头/到顶)在 advance 内报错,这里只记日志 —— 按钮路径没有模型可叙述。

@@ -96,6 +96,7 @@ impl MediaRuntime {
         let join = tokio::spawn(async move {
             let net = lyrics_client();
             let task = this.inner.tasks.start("lyrics", Text::new("task.lyrics"));
+            task.bind_bg(ticket.id()); // HUD 可直接停(§7 停止钮通用件)
             let mut results: Vec<(PathBuf, LyricsFileResult)> = Vec::with_capacity(total);
             let mut cancelled = false;
             for (i, it) in items.iter().enumerate() {

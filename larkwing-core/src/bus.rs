@@ -69,6 +69,11 @@ pub struct TaskView {
     /// 失败且可重放时带上(UI 显「重试」按钮);None = 不可重试。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry: Option<TaskRetry>,
+    /// bgtasks 登记处编号(有 BgTicket 的长活带上):UI 据此显「停止」钮,点击直连
+    /// `bg_cancel` 拨协作旗标(与 task_cancel 工具同一个;按钮不绕 LLM §7.1)。
+    /// None = 回合内小任务(跟着回合走,聊天停止键管)。serde 增量,旧前端忽略(§6.8)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bg: Option<u64>,
 }
 
 /// 播放器车道。Play/Control 是 core → UI 的指令;UI 本地按钮直接操作播放元素,不绕这里。
@@ -225,6 +230,38 @@ pub enum AppEvent {
     /// 动作确认卡(§7.8 确认闸):HUD 任务区 + 悬浮窗显卡可点;渠道回合由 outbound_loop
     /// 消费推回发起 chat。全量快照语义(state 翻终态 = 收卡)。
     Confirm(crate::confirm::ConfirmCard),
+    /// 「计划」快照(§6.5 会话内工作备忘):HUD 计划卡 + 悬浮窗一行。全量快照语义,
+    /// items 空 = 无计划/已清空(收卡);回合循环嗅探 plan_set 后发,删会话时发空快照。
+    Plan(PlanCard),
+}
+
+/// 计划快照载荷:title/条目全是模型产的数据、不是我们的文案(§6.6 无债);
+/// 重启丢槽 = 不再发新快照,前端内存态自然消失,不算失败(所以不走 tasks 进度总线)。
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanCard {
+    pub conv_id: i64,
+    pub title: Option<String>,
+    pub items: Vec<PlanCardItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanCardItem {
+    pub text: String,
+    pub done: bool,
+}
+
+impl PlanCard {
+    pub fn of(conv_id: i64, plan: &crate::tools::plan::Plan) -> PlanCard {
+        PlanCard {
+            conv_id,
+            title: plan.title.clone(),
+            items: plan
+                .items
+                .iter()
+                .map(|i| PlanCardItem { text: i.text.clone(), done: i.done })
+                .collect(),
+        }
+    }
 }
 
 /// 广播总线:壳层订阅一次、转发成 Tauri 全局事件;core 各处只管 publish。
@@ -284,6 +321,7 @@ mod tests {
             step: Some(Text::with("step.download", serde_json::json!({"done": 12, "total": 40}))),
             error: None,
             retry: None,
+            bg: None,
         }));
         let ev = rx.recv().await.unwrap();
         let v = serde_json::to_value(&ev).unwrap();

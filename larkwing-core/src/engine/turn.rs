@@ -41,6 +41,46 @@ fn clip(s: &str, max: usize) -> String {
 }
 
 #[cfg(test)]
+mod self_check_tests {
+    use crate::tools::plan::{parse_args, Plan};
+    use serde_json::json;
+
+    #[test]
+    fn quote_head_strips_ambient_and_clips() {
+        let q = super::quote_head("把曲库整理一下\n\n〔此刻 · 播放器正在播放《样例》〕");
+        assert_eq!(q, "把曲库整理一下", "尾部「此刻」注记要剥掉");
+        let long = "字".repeat(500);
+        let q = super::quote_head(&long);
+        assert_eq!(q.chars().count(), super::QUOTE_CHARS + 1, "裁到上限 + 省略号");
+        assert!(q.ends_with('…'));
+    }
+
+    #[test]
+    fn self_check_line_is_a_compass_not_just_a_brake() {
+        let plan = parse_args(&json!({
+            "items": [{ "text": "扫文件夹", "done": true }, { "text": "补歌词" }]
+        }))
+        .unwrap();
+        let line = super::self_check_line(20, "把曲库整理一下", &plan);
+        assert!(line.starts_with("[system]"), "{line}");
+        assert!(line.contains("20"), "带轮数:{line}");
+        assert!(line.contains("把曲库整理一下"), "带任务原话(治截断丢原话):{line}");
+        assert!(line.contains("补歌词"), "带计划未完项:{line}");
+        assert!(!line.contains("扫文件夹"), "已完成项不进:{line}");
+        assert!(line.contains("别停下来问"), "罗盘半句(没干完别停):{line}");
+        assert!(line.contains("收尾"), "刹车半句仍在(干完/卡住才停):{line}");
+    }
+
+    #[test]
+    fn self_check_line_without_plan_or_quote_still_valid() {
+        let line = super::self_check_line(10, "", &Plan::default());
+        assert!(line.starts_with("[system]") && line.contains("10"), "{line}");
+        assert!(!line.contains("最初的任务"), "无原话不留空引用:{line}");
+        assert!(!line.contains("计划"), "无计划不提计划:{line}");
+    }
+}
+
+#[cfg(test)]
 mod clip_tests {
     #[test]
     fn clip_cuts_on_char_boundary_and_reports_the_rest() {
@@ -53,8 +93,43 @@ mod clip_tests {
     }
 }
 
+/// 自检句里「本回合最初的任务」的原话截引长度(§4.11 用户拍板 2026-08-18)。超长回合
+/// cap_messages_tail 会把最早轮次(含任务原话)裁掉,这份引用随自检句一直活在尾部。
+const QUOTE_CHARS: usize = 400;
+
+/// 任务原话引用:剥掉尾部「此刻」注记(那是背景不是任务),按字符裁到 QUOTE_CHARS。
+fn quote_head(content: &str) -> String {
+    let head = content.split("\n\n〔此刻 · ").next().unwrap_or(content).trim();
+    let n = head.chars().count();
+    if n <= QUOTE_CHARS {
+        return head.to_string();
+    }
+    let mut s: String = head.chars().take(QUOTE_CHARS).collect();
+    s.push('…');
+    s
+}
+
+/// 周期自检句(§6.5 罗盘化):原先只有刹车半句(「做完了就停」),批量干一半的模型会顺
+/// 台阶下车 —— 现在带上任务原话(治截断丢原话)+ 计划未完项(治漏步骤)+「没干完别停下来
+/// 问」(治提前收工)。不落库、挂 request 尾,前缀缓存零损伤。
+fn self_check_line(round: usize, task_quote: &str, plan: &crate::tools::plan::Plan) -> String {
+    let mut s = format!("[system] 已连续 {round} 轮工具调用。");
+    if !task_quote.is_empty() {
+        s.push_str(&format!("本回合最初的任务:「{task_quote}」。"));
+    }
+    if let Some(rest) = plan.remaining_brief() {
+        s.push_str(&format!("计划里还没完成的:{rest}。"));
+    }
+    s.push_str(
+        "自查:任务还没全部干完就接着干下一项,别停下来问「要不要继续」;\
+         确实全部干完了、或眼下真的推进不动了,再停止调用工具,用自然语言向用户收尾汇报。",
+    );
+    s
+}
+
 /// 硬上限:纯失控 backstop,正常永远碰不到;到顶强制用嘴收尾。
-const MAX_TOOL_ROUNDS: usize = 200;
+/// (主回合用这个;子回合走 Turn.max_rounds = delegate::SUB_MAX_ROUNDS 收窄版。)
+pub(super) const MAX_TOOL_ROUNDS: usize = 200;
 /// 每隔几轮给模型插一句中立自检,让它自己评要不要继续 / 收尾(智能判官)。
 const SELF_CHECK_EVERY: usize = 10;
 /// 连续多少轮"全重复调用 / 全报错"(无新进展)即判空转、强制收尾;
@@ -125,11 +200,25 @@ pub(super) struct Turn {
     pub confirm: Option<Arc<crate::confirm::Confirmer>>,
     /// 第 1 轮已开的流(建连失败切换发生在 engine;Turn 内不再切换)。
     pub rx: mpsc::Receiver<ChatEvent>,
+    /// 「计划」槽(§6.5 会话内工作备忘):嗅探到 plan_set 结果 ok 就全量替换写入
+    /// (end_conversation 同构的带外信号;工具本体无状态)。与 SessionSlot 共持同一 Arc。
+    pub plan: Arc<Mutex<crate::tools::plan::Plan>>,
     /// 插队队列(PLAN §9 B):与 engine.inject 命令共用;回合在轮间/收尾前排空它。
     pub inject: Arc<Mutex<super::InjectState>>,
     /// 旁听临时回合的悬置用户行(send_overheard 传入):Some = 本回合是旁听仲裁——
     /// 转正前 Delta/Thinking/mood 全静音(可能整轮蒸发,不给用户看半截);None = 普通回合。
     pub overheard: Option<PendingUser>,
+    /// 子回合(delegate)模式:会话行**一概不落库**、不点全局 mood 灯 —— 事件仍全量走 tx
+    /// (runner 私有消费,够不到会话 UI),汇报经父回合的 tool 行留痕;usage 流水照记
+    /// (锚点 = 父回合 user_msg_id,气泡读数如实含子回合成本 §6.4)。
+    pub ephemeral: bool,
+    /// 轮数硬上限:主回合 = MAX_TOOL_ROUNDS;子回合 = delegate::SUB_MAX_ROUNDS(收窄)。
+    pub max_rounds: usize,
+    /// 文件授权圈的回合级缓存:主回合新建;子回合共享父回合那份(「仅这次」含派生的子回合)。
+    pub grants: crate::tools::guard::Grants,
+    /// 子回合执行接缝(经 ToolCtx 进 delegate 工具):主回合 = engine 注入;
+    /// 子回合 = None(深度 1 双锁的一半,另一半是白名单排除 delegate 自身)。
+    pub agent: Option<Arc<dyn crate::tools::delegate::SubAgent>>,
 }
 
 /// 一轮流式消费的结局。
@@ -168,8 +257,15 @@ impl Turn {
             confirm,
             mut rx,
             inject,
+            plan,
             mut overheard,
+            ephemeral,
+            max_rounds,
+            grants,
+            agent,
         } = self;
+        // 子回合:会话行不落库(persist=false 时 persist_row_if 直接回 Some(0) = 成功语义)
+        let persist = !ephemeral;
         // 本回合防溢出预算:按**实际服务的** provider 的窗口算(可能是 fallback,故比建连前的主候选更准)。
         let budget = super::context::tail_budget_chars(
             crate::llm::catalog::ctx_window_of(provider.model_id()),
@@ -178,17 +274,17 @@ impl Turn {
         // mood 上总线(PLAN §12 修订):悬浮窗据此显「正在想/正在说」;
         // Guard 在任一出口(done/failed/cancelled/落库失败/建连失败)收回 Idle。
         let bus = media.bus().clone();
-        // 旁听未转正期间不点 mood 灯(可能整轮蒸发,悬浮窗别"正在想"两秒又灭 —— 零痕迹)
-        if overheard.is_none() {
+        // 旁听未转正期间不点 mood 灯(可能整轮蒸发,悬浮窗别"正在想"两秒又灭 —— 零痕迹);
+        // 子回合恒不点灯(父回合正持着 Thinking,别抢)。
+        if overheard.is_none() && !ephemeral {
             bus.publish(AppEvent::Mood(Mood::Thinking));
         }
-        let _mood = MoodGuard(bus.clone());
+        let _mood = (!ephemeral).then(|| MoodGuard(bus.clone()));
         // 回合任一出口闸上注入队列(Failed/Cancelled 退出后别再往死队列里塞)
         let _inject_guard = InjectGuard(inject.clone());
         let meta = usage::RoundMeta { user_id, conv_id, user_msg_id, provider_id, model };
         let mut round_start = first_round_start;
-        let ctx =
-            ToolCtx { user_id, conv_id, store: store.clone(), media, web, voice, confirm, grants: Default::default() };
+        let ctx = ToolCtx { user_id, conv_id, store: store.clone(), media, web, voice, confirm, grants, agent };
         let label_of = |name: &str| -> String {
             tools
                 .iter()
@@ -197,6 +293,19 @@ impl Turn {
                 .unwrap_or_else(|| "tool.unknown".into())
         };
 
+        // 罗盘素材(§6.5):本回合最初的用户原话 —— 超长回合里 cap_messages_tail 可能把
+        // 最早轮次连原话一起裁掉,这份引用随自检句一直活在尾部。回合开始时抓一次即可
+        // (插队的新输入天然在尾部、不易被裁,不重抓)。
+        let task_quote: String = request
+            .messages
+            .iter()
+            .rev()
+            .find_map(|m| match m {
+                ChatMessage::User { content, .. } => Some(quote_head(content)),
+                _ => None,
+            })
+            .unwrap_or_default();
+
         let mut round: usize = 0;
         let mut stall: usize = 0; // 连续无进展(全重复 / 全失败)轮数
         let mut seen_calls: HashSet<String> = HashSet::new(); // 本回合已发过的工具调用指纹
@@ -204,13 +313,16 @@ impl Turn {
         // 收窗回待唤醒而非开跟进窗。一调即锁(哪一轮调的都算),纯带外信号、不碰回复文本。
         let mut end_session = false;
         loop {
-            // 旁听未转正 = 静音消费(Delta/Thinking/mood 不外发;蒸发时用户从头到尾无感)
+            // 旁听未转正 = 静音消费(Delta/Thinking/mood 不外发;蒸发时用户从头到尾无感);
+            // 子回合 = Delta 照发(runner 攒汇报)、mood 不点(全局灯归父回合)。
             let muted = overheard.is_some();
+            let mood_on = !muted && !ephemeral;
             let (text, reasoning, tool_calls, reasoning_state) =
-                match drain(&token, &tx, &bus, rx, conv_id, round_start, muted).await {
+                match drain(&token, &tx, &bus, rx, conv_id, round_start, muted, mood_on).await {
                     RoundEnd::Cancelled { partial } => {
-                        // 旁听未转正被取消(真输入把仲裁挤掉了):什么都没发生过,不落 partial
-                        if overheard.is_none() {
+                        // 旁听未转正被取消(真输入把仲裁挤掉了):什么都没发生过,不落 partial;
+                        // 子回合恒不落(汇报经父回合 tool 行留痕,半截话没有落点)
+                        if overheard.is_none() && persist {
                             persist_partial(&store, conv_id, &partial).await;
                         }
                         let _ = tx.send(TurnEvent::Cancelled).await;
@@ -218,9 +330,9 @@ impl Turn {
                     }
                     RoundEnd::Failed { partial, kind, message } => {
                         // 旁听未转正就失败(仲裁自身出错):没有可见变化,只留日志
-                        if overheard.is_none() {
+                        if overheard.is_none() && persist {
                             persist_partial(&store, conv_id, &partial).await;
-                        } else {
+                        } else if overheard.is_some() {
                             tracing::warn!(conv = conv_id, %message, "旁听仲裁失败(未转正,无可见变化)");
                         }
                         let _ = tx.send(TurnEvent::Failed { kind, message }).await;
@@ -247,7 +359,7 @@ impl Turn {
 
             // 纯文本收尾 —— 或端点无视 tool_choice=none 仍要调工具(防御):都按终回处理。
             // 收尾前先看插队(PLAN §9 B):有就先落这段回复、把注入接上、重开流继续(不打断进度)。
-            if tool_calls.is_empty() || round >= MAX_TOOL_ROUNDS || stall >= MAX_STALL_ROUNDS {
+            if tool_calls.is_empty() || round >= max_rounds || stall >= MAX_STALL_ROUNDS {
                 if !tool_calls.is_empty() {
                     tracing::warn!(conv = conv_id, "工具轮到顶 / 空转仍想调用,丢弃调用强制收尾");
                 }
@@ -275,7 +387,7 @@ impl Turn {
                 let pending = take_or_finish(&inject);
                 if pending.is_empty() {
                     // 真收尾(take_or_finish 内已原子置 finishing,此后 inject 拒绝)
-                    match persist_row(&store, conv_id, "assistant", &text, None).await {
+                    match persist_row_if(persist, &store, conv_id, "assistant", &text, None).await {
                         Some(message_id) => {
                             let _ = tx.send(TurnEvent::Done { message_id, end_session }).await;
                         }
@@ -292,7 +404,7 @@ impl Turn {
                 }
                 // 用户在收尾前插了话:先把这段回复落库(它答上一段输入),保证历史顺序
                 // assistant(本段回复) 在 user(注入) 之前;再 apply 注入、重开流继续答。
-                if persist_row(&store, conv_id, "assistant", &text, None).await.is_none() {
+                if persist_row_if(persist, &store, conv_id, "assistant", &text, None).await.is_none() {
                     let _ = tx
                         .send(TurnEvent::Failed {
                             kind: ErrorKind::Internal,
@@ -302,7 +414,7 @@ impl Turn {
                     return;
                 }
                 for it in pending {
-                    apply_injection(&store, conv_id, &tx, &mut request, it).await;
+                    apply_injection(&store, conv_id, &tx, &mut request, it, persist).await;
                 }
                 round = 0; // 新输入 → 新一轮工具预算
                 stall = 0;
@@ -336,18 +448,21 @@ impl Turn {
                     .await;
                 return;
             }
-            bus.publish(AppEvent::Mood(Mood::Thinking)); // 工具执行中 = 思考态(本轮若已 Speaking 过则切回;旁听转正后首次点灯)
+            if !ephemeral {
+                bus.publish(AppEvent::Mood(Mood::Thinking)); // 工具执行中 = 思考态(本轮若已 Speaking 过则切回;旁听转正后首次点灯)
+            }
             let payload = serde_json::to_string(&AssistantPayload {
                 tool_calls: tool_calls.clone(),
                 reasoning: reasoning.clone(),
                 reasoning_state: reasoning_state.clone(),
             })
             .ok();
-            match persist_row(&store, conv_id, "assistant", &text, payload.as_deref()).await {
+            match persist_row_if(persist, &store, conv_id, "assistant", &text, payload.as_deref()).await {
                 // 这一轮带了可见文字 + 还要继续调工具:它在落库里是独立 assistant 内容行,通知前端
                 // 封口当前气泡(钉 mid 供「想了想」回挂)、另起新泡接后续文字 —— 在飞结构对齐落库。
+                // 子回合没有气泡结构,不发 Segment(runner 只认 Delta/ToolUse/终态)。
                 Some(mid) => {
-                    if !text.trim().is_empty() {
+                    if !text.trim().is_empty() && persist {
                         let _ = tx.send(TurnEvent::Segment { message_id: mid }).await;
                     }
                 }
@@ -391,7 +506,7 @@ impl Turn {
                 None => {
                     for call in &tool_calls {
                         let p = tool_payload(call, "cancelled", &[]);
-                        persist_row(&store, conv_id, "tool", "已取消", p.as_deref()).await;
+                        persist_row_if(persist, &store, conv_id, "tool", "已取消", p.as_deref()).await;
                     }
                     let _ = tx.send(TurnEvent::Cancelled).await;
                     return;
@@ -406,12 +521,22 @@ impl Turn {
                 reasoning_state,
             });
             for (call, status, out) in &results {
+                // 「计划」嗅探(§6.5,end_conversation 同构):plan_set 校验通过(status=ok)
+                // 才写槽 + 发快照;解析与工具 run 共用 parse_args 单源,两处永不漂。
+                // !ephemeral = 纵深防御:子回合白名单本就排除 plan_set(golden 钉着),这道门
+                // 防未来放行时子回合拿父 conv_id 发幽灵计划卡、写进无人认领的私有槽。
+                if call.name == "plan_set" && status == "ok" && !ephemeral {
+                    if let Ok(p) = crate::tools::plan::parse_args(&call.args) {
+                        bus.publish(AppEvent::Plan(crate::bus::PlanCard::of(conv_id, &p)));
+                        *plan.lock().expect("plan lock poisoned") = p;
+                    }
+                }
                 // show_image 亮的图:refs 随 tool 行 payload 落库(重开会话派生图卡)+
                 // live 事件推前端(在飞气泡组当场出卡)。字节早已在 attachments/ 内容寻址仓。
                 let shown = shown_refs(&out.shown);
                 let p = tool_payload(call, status, &shown);
                 // 落库只落文本:图不进 DB、不回放(与用户发图「当轮不落库」同源 §9)。
-                persist_row(&store, conv_id, "tool", &out.text, p.as_deref()).await;
+                persist_row_if(persist, &store, conv_id, "tool", &out.text, p.as_deref()).await;
                 let _ = tx
                     .send(TurnEvent::ToolUse {
                         id: call.id.clone(),
@@ -451,25 +576,25 @@ impl Turn {
             stall = if made_progress { 0 } else { stall + 1 };
 
             // 插队(PLAN §9 B):轮间排空注入队列,append 进 request,下一轮 LLM 就带上
-            drain_injections(&store, conv_id, &tx, &inject, &mut request).await;
+            drain_injections(&store, conv_id, &tx, &inject, &mut request, persist).await;
             round += 1;
             // 收尾闸:① 硬上限到顶(纯失控 backstop)② 连续空转到顶(自检失灵的兜底网)。
             // 命中就禁用工具,下一次开流模型只能用嘴收尾;否则按周期插一句自检让模型自决。
-            if round >= MAX_TOOL_ROUNDS || stall >= MAX_STALL_ROUNDS {
+            if round >= max_rounds || stall >= MAX_STALL_ROUNDS {
                 request.tool_choice = ToolChoice::None;
                 if stall >= MAX_STALL_ROUNDS {
                     tracing::warn!(conv = conv_id, round, stall, "连续多轮无新进展,判定空转,强制收尾");
                 }
             } else if round % SELF_CHECK_EVERY == 0 {
-                // 软提示自检(PLAN §8):中立一句进 request 尾部 —— 不落库(不进历史 / 不重放)、
-                // 处于已变动的工具结果尾后(不破前缀缓存)。让当前模型自己评要不要继续:
-                // 智能判官在前,机械空转网只兜它"自欺答继续"的洞。
-                request.messages.push(ChatMessage::user(format!(
-                    "[system] You have made {round} consecutive rounds of tool calls. \
-                     Reassess now: if the task is complete, or cannot make progress right now, \
-                     stop calling tools and reply to the user directly in natural language. \
-                     Continue only if you are genuinely making progress."
-                )));
+                // 软提示自检(PLAN §8,§6.5 罗盘化):中立一句进 request 尾部 —— 不落库
+                // (不进历史 / 不重放)、处于已变动的工具结果尾后(不破前缀缓存)。带任务
+                // 原话 + 计划未完项:让当前模型评的不只是「要不要停」,更是「还剩什么没干」。
+                let line = self_check_line(
+                    round,
+                    &task_quote,
+                    &plan.lock().expect("plan lock poisoned"),
+                );
+                request.messages.push(ChatMessage::user(line));
             }
 
             // 再开流,粘住同一 provider。此处建连失败不切换:半截对话已经发生,
@@ -506,13 +631,14 @@ async fn drain_injections(
     tx: &mpsc::Sender<TurnEvent>,
     inject: &Arc<Mutex<super::InjectState>>,
     request: &mut ChatRequest,
+    persist: bool,
 ) {
     let items = {
         let mut st = inject.lock().expect("inject lock poisoned");
         std::mem::take(&mut st.buffer)
     };
     for it in items {
-        apply_injection(store, conv_id, tx, request, it).await;
+        apply_injection(store, conv_id, tx, request, it, persist).await;
     }
 }
 
@@ -529,17 +655,21 @@ fn take_or_finish(inject: &Arc<Mutex<super::InjectState>>) -> Vec<super::InjectR
 }
 
 /// 一条注入:落 user 行 → 发 Injected(带 id + 原话 + 小票)→ append 进 request(下一轮带上)。
+/// persist = ephemeral 密封面的一环:子回合今天没有插队入口(私有空队列、不进 sessions),
+/// 但这里是密封面上唯一的落库点,补上门免得未来接了插队变漏点(评审加固)。
 async fn apply_injection(
     store: &Store,
     conv_id: i64,
     tx: &mpsc::Sender<TurnEvent>,
     request: &mut ChatRequest,
     it: super::InjectReady,
+    persist: bool,
 ) {
     // 落库用 llm_content(含文档文字)→ 注入的文档也进 history、多轮还在(与主发送路径一致,§9);
     // UI 事件仍用 display(用户原文,不灌文档正文)。无文档时 llm_content == display,行为不变。
     if let Some(id) =
-        persist_row(store, conv_id, "user", &it.llm_content, it.payload.as_deref()).await
+        persist_row_if(persist, store, conv_id, "user", &it.llm_content, it.payload.as_deref())
+            .await
     {
         let _ = tx
             .send(TurnEvent::Injected { message_id: id, text: it.display, attachments: it.refs })
@@ -577,7 +707,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
         let mut request = ChatRequest::default();
 
-        apply_injection(&store, conv.id, &tx, &mut request, ready("插一句:主角叫小七")).await;
+        apply_injection(&store, conv.id, &tx, &mut request, ready("插一句:主角叫小七"), true).await;
 
         assert!(
             matches!(request.messages.last(), Some(ChatMessage::User { content, .. }) if content == "插一句:主角叫小七"),
@@ -619,6 +749,8 @@ mod tests {
 /// 消费一轮流:文本/思考边攒边转发,Done 收口。取消 = drop rx,provider 任务随之中止。
 /// started = 本轮开流(建连)时刻:TTFT 锁存在第一个增量事件,elapsed 盖章在收尾。
 /// muted = 旁听未转正:增量与 mood 都不外发(只攒),整轮可能蒸发 —— 不给用户看半截。
+/// mood_on = 首字 Speaking 灯要不要点(子回合 Delta 照发但不点灯,与 muted 是两回事)。
+#[allow(clippy::too_many_arguments)]
 async fn drain(
     token: &CancellationToken,
     tx: &mpsc::Sender<TurnEvent>,
@@ -627,6 +759,7 @@ async fn drain(
     conv_id: i64,
     started: std::time::Instant,
     muted: bool,
+    mood_on: bool,
 ) -> RoundEnd {
     let mut buffer = String::new(); // turn 级状态:攒文本,流完一次落库(不逐 token 写)
     let mut reasoning = String::new(); // 坑 #4:工具轮的 reasoning 要回传,顺手攒下
@@ -644,7 +777,7 @@ async fn drain(
                 Some(ChatEvent::Delta(t)) => {
                     if !spoke {
                         spoke = true;
-                        if !muted {
+                        if mood_on {
                             bus.publish(AppEvent::Mood(Mood::Speaking)); // 首字出 = 说话态(悬浮窗)
                         }
                     }
@@ -787,6 +920,22 @@ fn shown_refs(shown: &[crate::tools::ShownImage]) -> Vec<AttachmentRef> {
 /// 模型重复调同一个工具会发出相同串 → 命中"重复",据此判空转。
 fn call_fingerprint(call: &ToolCall) -> String {
     format!("{}:{}", call.name, call.args)
+}
+
+/// persist_row 的可关版:子回合(ephemeral)一概不落会话行 —— 返回 Some(0) 保持
+/// 「成功」语义(0 不是合法 rowid,ephemeral 路无人消费 message_id),调用方零分叉。
+async fn persist_row_if(
+    on: bool,
+    store: &Store,
+    conv_id: i64,
+    role: &'static str,
+    content: &str,
+    payload: Option<&str>,
+) -> Option<i64> {
+    if !on {
+        return Some(0);
+    }
+    persist_row(store, conv_id, role, content, payload).await
 }
 
 async fn persist_row(

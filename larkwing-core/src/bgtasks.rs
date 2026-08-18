@@ -406,10 +406,15 @@ impl BgTicket {
     }
 
     /// 正常收尾(完成或按要求停下):记终态 + 插收尾汇报唤回合。
+    /// 已有终态则不动(评审抓的窄竞态:看门狗判卡置了终态并汇报、abort 还没生效的瞬间,
+    /// 任务循环恰好收尾 —— 原先 finish 会覆写再报一次,模型先说「卡住停了」又说「办完了」)。
     pub fn finish(self, ok: bool, summary: impl Into<String>) {
         let summary = summary.into();
         {
             let mut st = self.entry.st.lock().expect("bg st lock");
+            if st.finished.is_some() {
+                return; // 看门狗已收尾并汇报过,不双份
+            }
             st.finished = Some(Fin { ok, summary: summary.clone(), at_ms: now_ms() });
         }
         self.reg.report(self.entry.origin, summary);
