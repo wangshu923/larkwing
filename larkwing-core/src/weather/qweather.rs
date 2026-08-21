@@ -133,9 +133,9 @@ impl WeatherSource for QWeatherSource {
             _ => None,
         };
 
-        // 预报(仅 Today/ThreeDay 拉)
+        // 预报(Now 不拉;端点按跨度选,见 forecast_leaf)
         let days = if when.wants_forecast() {
-            let fc_url = v7_url(host, "weather/3d");
+            let fc_url = v7_url(host, forecast_leaf(when));
             let fc_text = net
                 .send(&fc_url, |c| {
                     c.get(&fc_url).query(&[("location", id.as_str())]).bearer_auth(&jwt)
@@ -172,9 +172,18 @@ fn geo_url(host: &str) -> String {
     format!("{host}/geo/v2/city/lookup")
 }
 
-/// `/v7` 业务接口 URL(实况 `weather/now`、预报 `weather/3d`、指数 `indices/1d`)。
+/// `/v7` 业务接口 URL(实况 `weather/now`、预报 `weather/3d|7d`、指数 `indices/1d`)。
 fn v7_url(host: &str, leaf: &str) -> String {
     format!("{host}/v7/{leaf}")
+}
+
+/// 预报端点按跨度选:七天走 `weather/7d`,其余(Today 取首日/ThreeDay)维持 `weather/3d`。
+fn forecast_leaf(when: When) -> &'static str {
+    if when == When::SevenDay {
+        "weather/7d"
+    } else {
+        "weather/3d"
+    }
 }
 
 /// 和风 code:"200" 成功,其余是错误码(401 鉴权、402 超额、403 无权限…)。
@@ -226,6 +235,14 @@ mod tests {
         assert_eq!(v7_url(h, "weather/now"), "https://abc.qweatherapi.com/v7/weather/now");
         assert_eq!(v7_url(h, "weather/3d"), "https://abc.qweatherapi.com/v7/weather/3d");
         assert_eq!(v7_url(h, "indices/1d"), "https://abc.qweatherapi.com/v7/indices/1d");
+    }
+
+    #[test]
+    fn forecast_leaf_picks_endpoint_by_span() {
+        // Today 拉 3d 端点取首日(现状);SevenDay 才换 7d 端点(和风免费订阅本就含 7 天)。
+        assert_eq!(forecast_leaf(When::Today), "weather/3d");
+        assert_eq!(forecast_leaf(When::ThreeDay), "weather/3d");
+        assert_eq!(forecast_leaf(When::SevenDay), "weather/7d");
     }
 
     #[test]

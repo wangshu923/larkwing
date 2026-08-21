@@ -766,6 +766,9 @@ function wire() {
         { url: '', lang: 'chi', sidecar: false },
         { url: '', lang: 'eng', sidecar: true },
       ],
+      // hover 缩略图预览:真机是 relay 的 /thumb/{token}(现抽现回),预览借一张仓库里的图
+      // 顶着看气泡布局(dev 路径,只活在 ?demo 分支里;`?t=` 查询对静态文件无害)。
+      thumb_url: '/src/assets/logo-tile.png',
     }
     state.status = 'playing'
     state.duration = 320

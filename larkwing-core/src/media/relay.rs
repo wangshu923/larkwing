@@ -191,6 +191,11 @@ enum Entry {
         /// 字幕来源清单(P4):内嵌轨号或外挂文件,按需转 WebVTT 从 `/la/{token}/sub{N}.vtt` 出。
         subs: Vec<SubSource>,
     },
+    /// 进度条 hover 预览缩略图:`/thumb/{token}?t=秒` 现抽现回一张 JPEG。**刻意与四条播放臂分开**
+    /// 注册(不给 File/FileRemux/FileHls/FileAdaptive 各加一个字段):预览与播放是两件事,各自
+    /// 一个 token 更好读、也让「这片有没有缩略图」只有一个信号(`NowPlaying.thumb_url` 有无)。
+    /// 只有本地文件配得上它 —— 网络流(B 站 DASH/混流)手里只有远端 URL,没帧可抽。
+    Thumb { path: PathBuf, ffmpeg: PathBuf },
 }
 
 /// 一条字幕的来源(P4):要么是文件内嵌的第 n 条字幕轨,要么是旁边的外挂文件。
@@ -211,6 +216,59 @@ const AUDIO_SEG: f64 = 6.0;
 /// 编码器 priming(~43ms 静音)一起裁掉 → 逐段独立编码也**无累计漂移**(gapless)。0.5s 足够盖住 priming。
 const AUDIO_PREROLL: f64 = 0.5;
 
+/* ——— 进度条 hover 缩略图的四道闸(单源在此;要调回来问,§4.11)———
+ * 抽一帧本身很快(输入 seek 直落关键帧再解一帧),贵的是**次数** —— 光标横穿一条进度条能
+ * 划过上千个像素。所以量化 + 缓存 + 串行 + 超时四道一起上,少一道就会在弱机上烧 CPU。 */
+/// 时间量化格(秒):hover 时间先落格再取图 —— 同格不换 URL,光标在几十像素内抖动零请求。
+/// 10s 与视频网站雪碧图的常见间隔同量级;副作用是缩略图最多"旧" 10s,预览够用。
+const THUMB_GRID: f64 = 10.0;
+/// 缩略图缓存上限(张)。**全局有界、不按 token 分**:`streams` 注册表本身从不清理(每次播放
+/// 留一个 entry),挂在 token 下的缓存会随播放次数一起长;全局 FIFO 才封得住。48 张 × ~20KB ≈ 1MB。
+const THUMB_CACHE_MAX: usize = 48;
+/// 单张缩略图字节上限(抽出来的 JPEG 约 10–30KB;超这个数说明参数不对,别把它收进内存)。
+const THUMB_MAX_BYTES: usize = 512 * 1024;
+/// 单帧超时:4K HEVC 在弱机上解一帧也就几百毫秒,8s 是"这台机器抽不出来"的 backstop
+/// (超时即放弃,child 由 kill_on_drop 收尸)。
+const THUMB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// 缩略图宽度(像素,高度按比例):进度条上方的小图,192 在窄框里也够看清是哪一场戏。
+const THUMB_WIDTH: u32 = 192;
+
+/// 把 hover 秒数落到 `THUMB_GRID` 格(向下取整),负数/非有限值一律归 0。
+/// 缓存键与 ffmpeg 的 `-ss` 都用它的结果 —— 前端也量化过,这里再落一次是为了
+/// **键规范化**:不管客户端送来什么,同一格永远命中同一张。
+fn quantize_thumb_t(t: f64) -> u64 {
+    if !t.is_finite() || t <= 0.0 {
+        return 0;
+    }
+    ((t / THUMB_GRID).floor() as u64).saturating_mul(THUMB_GRID as u64)
+}
+
+/// 缩略图缓存:全局 FIFO(不做真 LRU —— 拖进度条是顺序扫过去的,FIFO 与 LRU 的命中率差异
+/// 在这个场景可以忽略,换来零依赖零复杂度)。
+#[derive(Default)]
+struct ThumbCache {
+    map: HashMap<(String, u64), Arc<Vec<u8>>>,
+    /// 插入顺序,超上限从头淘汰。
+    order: std::collections::VecDeque<(String, u64)>,
+}
+
+impl ThumbCache {
+    fn get(&self, key: &(String, u64)) -> Option<Arc<Vec<u8>>> {
+        self.map.get(key).cloned()
+    }
+
+    fn put(&mut self, key: (String, u64), bytes: Arc<Vec<u8>>) {
+        if self.map.insert(key.clone(), bytes).is_none() {
+            self.order.push_back(key);
+        }
+        while self.order.len() > THUMB_CACHE_MAX {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+    }
+}
+
 struct Inner {
     port: u16,
     streams: Mutex<HashMap<String, Arc<Entry>>>,
@@ -221,6 +279,11 @@ struct Inner {
     /// webrender 回传信箱(`POST /collect/{token}`,一次性):壳层隐藏窗里注入的脚本把
     /// 渲染后页面 POST 回来。token 用完即取走;窗超时收摊后残留项由发起方 drop Receiver 自清。
     collect: Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>,
+    /// hover 缩略图缓存(全局有界 FIFO,见 `ThumbCache`)。
+    thumbs: Mutex<ThumbCache>,
+    /// 缩略图串行闸:同时只抽一帧。拖一趟进度条会连着来好几格,并发起 ffmpeg 只是互相抢 CPU;
+    /// 排队 + 前端只保留最新一次请求 = 最多积一个(拿到许可后还要再查一次缓存,别白抽)。
+    thumb_gate: tokio::sync::Semaphore,
 }
 
 #[derive(Clone)]
@@ -244,6 +307,8 @@ impl Relay {
             counter: AtomicU64::new(1),
             hw_encoder: tokio::sync::OnceCell::new(),
             collect: Mutex::new(HashMap::new()),
+            thumbs: Mutex::new(ThumbCache::default()),
+            thumb_gate: tokio::sync::Semaphore::new(1),
         });
         let app = Router::new()
             .route("/s/{token}", get(direct))
@@ -255,6 +320,8 @@ impl Relay {
             .route("/hls/{token}/{seg}", get(hls).options(dash_preflight))
             // 本地自适应(音视频分离,手写 MSE):desc/vinit/v{N}/audio(前端 fetch 跨源 → CORS)。
             .route("/la/{token}/{seg}", get(local_adaptive).options(dash_preflight))
+            // 进度条 hover 预览缩略图:`?t=秒` 现抽现回一张 JPEG(前端 <img>,不查 CORS → 不用放行)。
+            .route("/thumb/{token}", get(thumb))
             // webrender 回传(壳层隐藏窗注入脚本 → 任意外源页面 fetch 过来 → 需 CORS;
             // 脚本用 text/plain 发 = 简单请求免预检,OPTIONS 只是兜底)。
             .route("/collect/{token}", axum::routing::post(collect).options(collect_preflight))
@@ -316,6 +383,13 @@ impl Relay {
     /// 本地文件 URL(原生 Range 直传)。
     pub fn register_file(&self, path: PathBuf) -> String {
         self.register(Entry::File(path), "f")
+    }
+
+    /// 进度条 hover 缩略图的**基址**(`…/thumb/{token}`):前端自己拼 `?t=秒`。与播放条目分开注册,
+    /// 播放走哪条路(直传/自适应/HLS/渐进)都是同一套预览。ffmpeg 必须**已经在手**(调用方用
+    /// `Components::ready` 拿,不为预览图拉下载)—— 所以「有没有缩略图」就是 `thumb_url` 有没有值。
+    pub fn register_thumbs(&self, path: PathBuf, ffmpeg: PathBuf) -> String {
+        self.register(Entry::Thumb { path, ffmpeg }, "thumb")
     }
 
     /// 探/取该机器可用的视频编码器(硬件优先,整进程探一次缓存)。转码前调,拿来定 entry 的 `enc`。
@@ -1057,7 +1131,7 @@ async fn run_ffmpeg_collect(mut cmd: tokio::process::Command, cap: usize) -> Opt
             Ok(k) => {
                 buf.extend_from_slice(&chunk[..k]);
                 if buf.len() > cap {
-                    tracing::warn!("HLS 段超上限 {cap} 字节,截断");
+                    tracing::warn!("ffmpeg 输出超上限 {cap} 字节,截断");
                     break;
                 }
             }
@@ -1166,6 +1240,97 @@ struct RemuxQuery {
     /// 起播秒(seek = 换 src 重启混流,前端自己记位移)。
     #[serde(default)]
     t: f64,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct ThumbQuery {
+    /// 要看第几秒(hover 位置换算出来的;服务端还会落格,见 `quantize_thumb_t`)。
+    /// `Option` = 没带 `?t=` 时自己回 400;带了但不是数字由 axum 的 Query 拒收(也是 400)。
+    #[serde(default)]
+    t: Option<f64>,
+}
+
+/// 抽一帧当缩略图:输入 seek(`-ss` 在 `-i` 前 = 直落最近关键帧,不解码前面的内容)+ 一帧 JPEG。
+/// **`-map 0:V:0?` 的大写 V 是要紧的**:小写 v 会把 mkv/mp4 里的**封面图轨**(attached pic)算成
+/// 视频流,ffmpeg 的默认挑轨也一样 —— 挑中封面的话整条进度条 hover 出来全是同一张海报。
+/// 尾巴上的 `?` = 这条流不存在就别报错(纯音频视频文件、怪容器)。
+fn build_thumb_cmd(ffmpeg: &Path, path: &Path, t: u64) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(ffmpeg);
+    cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin");
+    if t > 0 {
+        cmd.arg("-ss").arg(t.to_string());
+    }
+    cmd.arg("-i")
+        .arg(path)
+        .arg("-map")
+        .arg("0:V:0?")
+        .arg("-an")
+        .arg("-sn")
+        .arg("-dn")
+        .arg("-frames:v")
+        .arg("1")
+        // -2 让高度对齐偶数(编码器友好,JPEG 无所谓但一致);宽度定死 → 前端图框尺寸恒定。
+        .arg("-vf")
+        .arg(format!("scale={THUMB_WIDTH}:-2"))
+        .arg("-f")
+        .arg("mjpeg") // 单帧 mjpeg = 一张普普通通的 JPEG
+        .arg("pipe:1");
+    cmd
+}
+
+/// 进度条 hover 预览:`/thumb/{token}?t=秒`。量化 → 查缓存 → (串行闸)→ 抽一帧 → 收进缓存。
+/// 抽不出来一律 404,让前端一次性降级成"只有时间气泡"(§3.5:不给半张破图,也不装作有图)。
+async fn thumb(
+    State(state): State<Arc<Inner>>,
+    AxPath(token): AxPath<String>,
+    Query(q): Query<ThumbQuery>,
+) -> Response {
+    // `?t=` 缺失/负数/非有限 → 400(是调用方写错了,不是"这片没有缩略图")
+    let Some(t) = q.t.filter(|t| t.is_finite() && *t >= 0.0) else {
+        return bad(StatusCode::BAD_REQUEST);
+    };
+    let Some(entry) = lookup(&state, &token) else { return bad(StatusCode::NOT_FOUND) };
+    let Entry::Thumb { path, ffmpeg } = entry.as_ref() else { return bad(StatusCode::NOT_FOUND) };
+    let at = quantize_thumb_t(t);
+    let key = (token, at);
+
+    if let Some(bytes) = state.thumbs.lock().expect("relay thumbs lock poisoned").get(&key) {
+        return thumb_response(bytes);
+    }
+    // 串行:排队期间前面那位可能正好抽的就是这一格 → 拿到许可先再查一次缓存
+    let Ok(_permit) = state.thumb_gate.acquire().await else {
+        return bad(StatusCode::SERVICE_UNAVAILABLE); // 闸被关(进程收尾),不该发生
+    };
+    if let Some(bytes) = state.thumbs.lock().expect("relay thumbs lock poisoned").get(&key) {
+        return thumb_response(bytes);
+    }
+
+    let cmd = build_thumb_cmd(ffmpeg, path, at);
+    let out = match tokio::time::timeout(THUMB_TIMEOUT, run_ffmpeg_collect(cmd, THUMB_MAX_BYTES))
+        .await
+    {
+        Ok(Some(bytes)) if !bytes.is_empty() => bytes,
+        // 抽不出(片尾之后的格 / 只有音轨 / 参数不合)与超时(弱机解不动)都走这:一律 404 降级
+        Ok(_) => return bad(StatusCode::NOT_FOUND),
+        Err(_) => {
+            tracing::warn!(path = %path.display(), at, "抽缩略图超时,放弃这一格");
+            return bad(StatusCode::NOT_FOUND);
+        }
+    };
+    let bytes = Arc::new(out);
+    state.thumbs.lock().expect("relay thumbs lock poisoned").put(key, bytes.clone());
+    thumb_response(bytes)
+}
+
+/// 缩略图响应:URL 已按格量化 + token 每次播放都换 → 可以放心让 WebView 自己缓存,
+/// 光标来回扫同一段时连回环请求都省了。
+fn thumb_response(bytes: Arc<Vec<u8>>) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "image/jpeg")
+        .header("cache-control", "private, max-age=3600")
+        .body(Body::from(bytes.as_ref().clone()))
+        .unwrap_or_else(|_| bad(StatusCode::INTERNAL_SERVER_ERROR))
 }
 
 /// 混流:经 ffmpeg 拼 fMP4 吐 stdout。无总长、不可 Range —— <video> 按渐进流播;两种来源:
@@ -1330,6 +1495,8 @@ mod tests {
             counter: AtomicU64::new(1),
             hw_encoder: tokio::sync::OnceCell::new(),
             collect: Mutex::new(HashMap::new()),
+            thumbs: Mutex::new(ThumbCache::default()),
+            thumb_gate: tokio::sync::Semaphore::new(1),
         });
         let relay = Relay { inner };
         let a = relay.register_direct(UpStream { url: "u1".into(), ..Default::default() });
@@ -1587,6 +1754,131 @@ mod tests {
         assert_eq!(a0.status().as_u16(), 200);
         let a0b = a0.bytes().await.unwrap();
         assert!(has(&a0b, b"moof") && has(&a0b, b"mdat"), "a0 应是 moof+mdat 段");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* ——— 进度条 hover 缩略图 ——— */
+
+    #[test]
+    fn thumb_time_quantizes_to_grid() {
+        assert_eq!(quantize_thumb_t(0.0), 0);
+        assert_eq!(quantize_thumb_t(4.9), 0);
+        assert_eq!(quantize_thumb_t(10.0), 10);
+        assert_eq!(quantize_thumb_t(19.999), 10);
+        assert_eq!(quantize_thumb_t(3600.4), 3600);
+        // 脏输入一律归 0(前端算错/URL 被手改都不该让服务端算出个负数去喂 -ss)
+        assert_eq!(quantize_thumb_t(-5.0), 0);
+        assert_eq!(quantize_thumb_t(f64::NAN), 0);
+        assert_eq!(quantize_thumb_t(f64::INFINITY), 0);
+    }
+
+    /// 抽帧命令的两件要紧事:**大写 V 挑真视频轨**(小写 v / 默认挑轨会挑中 mkv/mp4 里的封面图轨
+    /// → 整条进度条 hover 出来全是同一张海报),以及 `-ss` 在 `-i` 之前(输入 seek,不解码前面)。
+    #[test]
+    fn thumb_cmd_picks_real_video_stream_and_seeks_on_input() {
+        let args_at = |t: u64| {
+            let c = build_thumb_cmd(Path::new("ffmpeg"), Path::new("/tmp/movie.mkv"), t);
+            c.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<String>>()
+        };
+        let a = args_at(120);
+        let pos = |needle: &str| a.iter().position(|s| s == needle);
+        assert!(a.windows(2).any(|w| w[0] == "-map" && w[1] == "0:V:0?"), "必须大写 V:{a:?}");
+        assert!(a.windows(2).any(|w| w[0] == "-frames:v" && w[1] == "1"), "只要一帧:{a:?}");
+        assert!(a.windows(2).any(|w| w[0] == "-ss" && w[1] == "120"), "按格取整的秒:{a:?}");
+        assert!(pos("-ss") < pos("-i"), "-ss 要在 -i 之前(输入 seek):{a:?}");
+        assert!(
+            a.windows(2).any(|w| w[0] == "-vf" && w[1] == format!("scale={THUMB_WIDTH}:-2")),
+            "宽度定死、高度按比例:{a:?}"
+        );
+        assert!(a.windows(2).any(|w| w[0] == "-f" && w[1] == "mjpeg"), "单帧 mjpeg = 一张 JPEG:{a:?}");
+        assert_eq!(a.last().unwrap(), "pipe:1");
+        // 第 0 秒不带 -ss(省掉一次无意义的 seek)
+        assert!(!args_at(0).iter().any(|s| s == "-ss"));
+    }
+
+    #[test]
+    fn thumb_cache_evicts_oldest_beyond_cap() {
+        let mut c = ThumbCache::default();
+        for i in 0..(THUMB_CACHE_MAX as u64 + 3) {
+            c.put(("tok".into(), i), Arc::new(vec![i as u8]));
+        }
+        assert_eq!(c.map.len(), THUMB_CACHE_MAX, "总量封在上限");
+        assert!(c.get(&("tok".into(), 0)).is_none(), "最早的被淘汰");
+        assert!(c.get(&("tok".into(), THUMB_CACHE_MAX as u64 + 2)).is_some(), "最新的还在");
+        // 重复 put 同一格不该把队列撑长(否则反复 hover 同一处会把别的挤掉)
+        let key = ("tok".to_string(), THUMB_CACHE_MAX as u64 + 2);
+        c.put(key.clone(), Arc::new(vec![9]));
+        assert_eq!(c.order.len(), THUMB_CACHE_MAX);
+    }
+
+    /// 端点的坏路径:`?t=` 不对 = 400(调用方写错了);拿不到帧/token 不对 = 404(前端据此降级
+    /// 成"只有时间气泡")。这里的 Thumb 条目故意指向不存在的 ffmpeg —— 顺便验"抽不出就 404"。
+    #[tokio::test]
+    async fn thumb_endpoint_rejects_bad_requests_and_degrades() {
+        let relay = Relay::start().await.unwrap();
+        let base = relay
+            .register_thumbs(PathBuf::from("/tmp/nope.mp4"), PathBuf::from("/nonexistent/ffmpeg"));
+        let http = reqwest::Client::new();
+        let code = |r: reqwest::Response| r.status().as_u16();
+
+        assert_eq!(code(http.get(&base).send().await.unwrap()), 400, "没带 ?t=");
+        assert_eq!(code(http.get(format!("{base}?t=abc")).send().await.unwrap()), 400, "t 不是数字");
+        assert_eq!(code(http.get(format!("{base}?t=-3")).send().await.unwrap()), 400, "t 为负");
+        // ffmpeg 起不来 → 抽不出 → 404(不是 500:对前端就是"这片没有预览图")
+        assert_eq!(code(http.get(format!("{base}?t=30")).send().await.unwrap()), 404, "抽不出");
+
+        // 播放条目(不是 Thumb)拿到 /thumb 下 = 404,不给别的 token 蹭这个端点
+        let file_url = relay.register_file(PathBuf::from("/tmp/whatever.mp4"));
+        let token = file_url.rsplit('/').next().unwrap();
+        let port = relay.inner.port;
+        let wrong = format!("http://127.0.0.1:{port}/thumb/{token}?t=0");
+        assert_eq!(code(http.get(&wrong).send().await.unwrap()), 404, "条目类型不对");
+        let unknown = format!("http://127.0.0.1:{port}/thumb/deadbeef?t=0");
+        assert_eq!(code(http.get(&unknown).send().await.unwrap()), 404, "token 不存在");
+    }
+
+    /// 端到端(需 PATH 有 ffmpeg,平时 #[ignore],与上面 adaptive 那条同款):真片 → 真抽帧 →
+    /// 断言回来的是一张 JPEG、量化落格、片尾之后如实 404。
+    /// `cargo test -p larkwing-core --lib media::relay -- --ignored thumb` 手跑。
+    #[tokio::test]
+    #[ignore]
+    async fn real_ffmpeg_thumb_endpoint() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("lw-thumb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.mp4");
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                "testsrc=size=320x240:rate=25:duration=30", "-c:v", "libx264", "-preset",
+                "ultrafast", "-pix_fmt", "yuv420p", "-g", "50",
+            ])
+            .arg(&src)
+            .status()
+            .expect("run ffmpeg")
+            .success();
+        assert!(ok, "生成测试源失败");
+
+        let relay = Relay::start().await.unwrap();
+        let base = relay.register_thumbs(src, PathBuf::from("ffmpeg"));
+        let http = reqwest::Client::new();
+
+        let r = http.get(format!("{base}?t=10")).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        assert_eq!(r.headers()["content-type"], "image/jpeg");
+        let b = r.bytes().await.unwrap();
+        assert!(b.starts_with(&[0xFF, 0xD8, 0xFF]), "JPEG 魔数");
+        assert!(b.len() > 1000, "不是个空壳:{} 字节", b.len());
+
+        // 同一格再来一次:走缓存(字节完全一致)
+        let again = http.get(format!("{base}?t=15")).send().await.unwrap(); // 15 与 10 同格
+        assert_eq!(again.status().as_u16(), 200);
+        assert_eq!(again.bytes().await.unwrap(), b, "10s 与 15s 落同一格 → 同一张");
+
+        // 片尾之后没有帧 → 404(前端把这一格记下不再重试)
+        let past = http.get(format!("{base}?t=600")).send().await.unwrap();
+        assert_eq!(past.status().as_u16(), 404);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

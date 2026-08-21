@@ -145,6 +145,22 @@ pub const TTS_VITS_MELO: TarModelSpec = TarModelSpec {
     ],
 };
 
+/// 语音去噪:GTCRN(~0.5MB,16kHz 原生;克隆参考音录入时过一遍)。**推理期零旋钮** ——
+/// 神经去噪见过各种环境/信噪比,用的时候只有「音频进、人声出」,不像谱减法(afftdn 那类)要
+/// 按环境手调 nr/nf,换房间不用改任何东西(2026-08-21「莎莎声」追因:−49dB 底噪 → −60dB,
+/// 8 秒音频 158ms;谱减法在音节尾音处的「音乐噪声」伪影正是它避开的)。
+/// 裸下载单文件 → 钉死 sha256(截断/顶包必被抓,同 vocos 实锤)。
+pub const DENOISE_GTCRN: ModelSpec = ModelSpec {
+    id: "gtcrn-denoise",
+    label_key: "task.download.voice_denoise",
+    files: &[ModelFile {
+        name: "gtcrn_simple.onnx",
+        urls: &["https://github.com/k2-fsa/sherpa-onnx/releases/download/speech-enhancement-models/gtcrn_simple.onnx"],
+        // 本机实测值(535,638 字节)+ 已验证可加载可去噪(examples/denoise_probe.rs)
+        sha256: Some("e77603ac0c23dac3227dd2d7135b3a585cbee2679048aecfa886657d3ae1b534"),
+    }],
+};
+
 /// 声纹 embedding:3D-Speaker CAM++ zh-cn(PLAN §11 D;192 维,26MB,单 onnx)。
 pub const SPEAKER_CAMPP_ZH: ModelSpec = ModelSpec {
     id: "campplus-sv-zh",

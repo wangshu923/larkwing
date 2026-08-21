@@ -188,6 +188,22 @@ pub fn suite() -> Vec<Scenario> {
             })
             .say("帮我把这批照片整理成相册吧")
             .check(tool_called("skill_lookup")),
+        // 旅行规划守卫①(§7.9「规划旅行」技能:先问齐基本盘):信息不全的出行请求(没说
+        // 目的地/日期/谁去)→ 先追问,不许直接开写行程文件、也不许没搞清基本盘就派人调研。
+        Scenario::turn("trip-plan-asks-first")
+            .note("信息不全的旅行请求先问齐基本盘,别直接开干(§7.9 规划旅行)")
+            .say("我们全家想找个时间出去玩几天,帮我规划规划呗")
+            .check(tool_not_called("fs_write_text"))
+            .check(tool_not_called("delegate"))
+            .check(custom("回话里带追问", |o| {
+                o.replies.last().is_some_and(|r| r.contains('?') || r.contains('？'))
+            })),
+        // 旅行规划守卫②(技能:关键事实现查不凭记忆):节假日调休安排年年变、训练记忆必陈
+        // → 该 web_search 现查,不许拿旧安排直接答(编错一次假期,全家行程跟着错)。
+        Scenario::turn("trip-plan-research-current")
+            .note("调休安排这类年年变的事实要现查(§7.9:现查不凭记忆)")
+            .say("今年国庆到底怎么放假调休来着?我们想趁假期出门玩")
+            .check(tool_called("web_search")),
         // 旧事重提该用 recall 去取,而不是装不记得 / 瞎答(§13.7)。
         Scenario::turn("recall-triggers")
             .note("旧事重提、信息在按需层(episodic 非常驻)→ 该调 recall(§13.7)")

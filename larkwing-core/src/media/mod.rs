@@ -215,6 +215,11 @@ pub struct NowPlaying {
     /// 有值 = 从这个位置(秒)接着播:切音轨重建管线时带上,前端加载完 seek 过去。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_at: Option<f64>,
+    /// 进度条 hover 预览缩略图的基址(`…/thumb/{token}`,前端自己拼 `?t=秒`)。
+    /// **有值 = 这片能出图**,None = 只出时间气泡(网络流没帧可抽、放歌没画面、ffmpeg 还没到手)。
+    /// 前端只认这一个信号,不做别的判断(§3.5 不假装有图)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumb_url: Option<String>,
 }
 
 /// 「正在播放」里的队列位置(过桥给前端 + 给工具叙述)。
@@ -958,6 +963,9 @@ impl MediaRuntime {
             audio_tracks: Vec::new(),
             audio_track: 0,
             resume_at: None,
+            // 网络流手里只有远端 URL,没帧可抽 → 拖进度条只出时间气泡(B 站自家的雪碧图接口
+            // 是按源分化的另一档活,本期不接)。
+            thumb_url: None,
         };
         self.seed_playing(&np.title, pos.map(|p| (p.index, p.total)));
         self.publish(MediaEvent::Play(np.clone()));
@@ -1589,6 +1597,18 @@ impl MediaRuntime {
         };
 
         let (loop_mode, shuffle) = self.mode_flags();
+        // 进度条 hover 预览:放歌没画面不出图;视频**只在 ffmpeg 已经在手时**注册 —— 用
+        // `Components::ready`(绝不下载):预览图这种锦上添花的事不值得为它拉一次组件下载,
+        // 而播放本身早已在后台预取 ffmpeg(`prefetch_ffmpeg`),所以新装机器至多是第一次看片
+        // 没有预览图,之后都有。拿不到 = thumb_url None = 前端只出时间气泡,不发无用请求。
+        let thumb_url = if audio_only {
+            None
+        } else {
+            self.inner
+                .components
+                .ready(Component::Ffmpeg)
+                .map(|ffmpeg| relay.register_thumbs(path.clone(), ffmpeg))
+        };
         let route = route.unwrap_or_else(|| derive_route(&stream_url, manifest_url.as_deref()));
         // 记下本地现场:切音轨据此重建管线。多音轨时把清单打进日志(真机对「音轨没名字」
         // 一眼定案:是文件本身没标语言〔und〕还是解析漏了)。
@@ -1620,6 +1640,7 @@ impl MediaRuntime {
             audio_tracks: tracks,
             audio_track: sel_track,
             resume_at,
+            thumb_url,
         };
         self.seed_playing(&np.title, pos.map(|p| (p.index, p.total)));
         self.publish(MediaEvent::Play(np.clone()));

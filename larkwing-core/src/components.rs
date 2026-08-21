@@ -161,6 +161,18 @@ impl Components {
         Components { dir, tasks, net, locks: Default::default() }
     }
 
+    /// 已经在手就给路径,**绝不下载**(同步、无副作用)。给「有就用、没有就算了」的可选能力用:
+    /// 进度条 hover 缩略图这类锦上添花的活不该为一张预览图去拉一次组件下载(播放本身早已在
+    /// 后台预取 ffmpeg,`prefetch_ffmpeg`)。判据与 `ensure` 的前两步同源:托管目录 → PATH。
+    pub fn ready(&self, c: Component) -> Option<PathBuf> {
+        let spec = c.spec().ok()?;
+        let managed = self.dir.join(spec.bin_name);
+        if managed.is_file() {
+            return Some(managed);
+        }
+        which(c.path_name())
+    }
+
     /// 组件就绪:托管目录命中 → PATH 兜底(开发机)→ 用时下载(进度上 HUD)。
     /// 返回可执行文件路径。drop-safe:下载中途被取消只留 .part 残文件,下次覆盖重下。
     pub async fn ensure(&self, c: Component, mirrors: &[String]) -> Result<PathBuf> {

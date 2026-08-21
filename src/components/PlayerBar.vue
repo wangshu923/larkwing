@@ -1,10 +1,11 @@
 <script setup lang="ts">
 // 播放条(音频形态;视频走 VideoOverlay):标题 + 播放/暂停 + 进度 + 停止。
 // 按钮直连 VM,不绕 LLM。登录建议气泡也长在这排(有提示就出,与是否在放无关)。
-import { computed } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useLyrics } from '../composables/useLyrics'
 import { useMedia } from '../composables/useMedia'
+import { useScrubHover } from '../composables/useScrubHover'
 import { useSettings } from '../composables/useSettings'
 import { fmtClock } from '../lib/fmt'
 
@@ -41,9 +42,36 @@ const loopTitle = computed(() =>
       ? t('media.loopAll')
       : t('media.loopOff'),
 )
+// 进度条:拖动中只动视觉(scrub),不被 timeupdate 抢拇指;松手(change)才真 seek 一次
+// —— 与 VideoOverlay 同款。原先 @input 每 tick 就 seek:拖有声书就是一串 currentTime 风暴,
+// 而且读数被真实播放位盖住、跟不上光标。
+const dragging = ref(false)
+const scrub = ref(0)
 const pct = computed(() =>
-  state.duration > 0 ? Math.min(100, (state.position / state.duration) * 100) : 0,
+  dragging.value
+    ? scrub.value
+    : state.duration > 0
+      ? Math.min(100, (state.position / state.duration) * 100)
+      : 0,
 )
+/** 时钟:拖动中显示目标位,否则显示真实播放位。 */
+const displayPos = computed(() =>
+  dragging.value ? (scrub.value / 100) * state.duration : state.position,
+)
+
+/** 光标处是第几分几秒(音频没有画面,只出时间;缩略图那半边是视频的事)。 */
+const durationRef = computed(() => state.duration)
+const playerEl = ref<HTMLElement | null>(null)
+const { trackEl, hoverPct, hoverTime, bubbleLeft, bubbleW, onMove, onLeave } = useScrubHover(
+  durationRef,
+  { thumbWidth: 10, clampTo: playerEl },
+)
+const bubbleEl = ref<HTMLElement | null>(null)
+// nextTick(不是 rAF):要的是「DOM 更新完」,rAF 在窗口隐藏时压根不触发(§8.1)
+watch(hoverPct, async () => {
+  await nextTick()
+  bubbleW.value = bubbleEl.value?.offsetWidth ?? 0
+})
 /** 滚歌词(本地音频旁挂 .lrc):有带时间轴的词才出「词」按钮;默认显示、可关(记住)。 */
 const { available: lyricsAvailable, current: lyricLine } = useLyrics(
   computed(() => state.current?.lyrics),
@@ -54,8 +82,13 @@ function toggleLyrics() {
   settings.set('ui.lyrics', lyricsOn.value ? '0' : '1')
 }
 
-function onSeek(e: Event) {
+function onScrubInput(e: Event) {
+  dragging.value = true
+  scrub.value = Number((e.target as HTMLInputElement).value)
+}
+function onScrubCommit(e: Event) {
   const v = Number((e.target as HTMLInputElement).value)
+  dragging.value = false
   if (state.duration > 0) seek((v / 100) * state.duration)
 }
 
@@ -76,7 +109,7 @@ function onVolume(e: Event) {
     </div>
   </Transition>
 
-  <div v-if="showBar" class="player">
+  <div v-if="showBar" ref="playerEl" class="player">
     <button
       v-if="playlist"
       class="pbtn"
@@ -138,18 +171,36 @@ function onVolume(e: Event) {
         <span v-if="playlist" class="ep">{{
           t('media.trackOf', { cur: playlist.index + 1, total: playlist.total })
         }}</span>
-        <span class="clock">{{ fmtClock(state.position) }} / {{ fmtClock(state.duration) }}</span>
+        <span class="clock">{{ fmtClock(displayPos) }} / {{ fmtClock(state.duration) }}</span>
       </div>
-      <input
-        class="slider"
-        type="range"
-        min="0"
-        max="100"
-        step="0.1"
-        :value="pct"
-        @input="onSeek"
-        :style="{ '--pct': pct + '%' }"
-      />
+      <!-- 套一层 hover 检测:光标所在处是第几分几秒(按下之前就知道会跳到哪) -->
+      <div
+        ref="trackEl"
+        class="scrub-track"
+        @pointermove="onMove"
+        @pointerleave="onLeave"
+        @pointercancel="onLeave"
+      >
+        <div
+          v-if="hoverPct !== null"
+          ref="bubbleEl"
+          class="hover-bubble"
+          :style="{ left: bubbleLeft + 'px' }"
+        >
+          {{ fmtClock(hoverTime ?? 0) }}
+        </div>
+        <input
+          class="slider"
+          type="range"
+          min="0"
+          max="100"
+          step="0.1"
+          :value="pct"
+          @input="onScrubInput"
+          @change="onScrubCommit"
+          :style="{ '--pct': pct + '%' }"
+        />
+      </div>
     </div>
     <span class="vol" :title="t('media.volume')">
       <span class="vol-ico">{{ state.volume === 0 ? '🔇' : '🔊' }}</span>
@@ -204,6 +255,24 @@ function onVolume(e: Event) {
   background: rgba(var(--accent-rgb), 0.12); border: 1px solid rgba(var(--accent-rgb), 0.28);
 }
 .clock { color: var(--text-dim); font: 10.5px/1 ui-monospace, "SF Mono", monospace; letter-spacing: .5px; }
+
+/* 进度条的定位容器:滑杆照旧撑满,hover 时间气泡绝对定位挂上方(不占位、不吃指针)。
+   这条不压在视频画面上 → 用语义 token,跟着皮肤走(§6.7)。 */
+/* 进度条定位容器(名字别用 .track —— 与音轨/「词」按钮的 .pbtn.track 撞车)。
+   清掉 range 的 UA 默认 margin:2px:否则容器宽 ≠ 真实轨道宽,hover 秒数与拇指差几像素 */
+.scrub-track { position: relative; width: 100%; display: flex; align-items: center; }
+.scrub-track .slider { margin: 0; }
+/* bottom 得抬到 30px:播放条只有一行高,13px 会让气泡正压在标题/时钟那行上(预览量过:
+   气泡 522–541 vs 标题行 527–546)。抬到条外反而干净,不遮任何内容。 */
+.hover-bubble {
+  position: absolute; bottom: 30px; z-index: 2;
+  transform: translateX(-50%); pointer-events: none; white-space: nowrap;
+  padding: 3px 7px; border-radius: 7px;
+  font: 10.5px/1 ui-monospace, "SF Mono", monospace; letter-spacing: .5px;
+  color: var(--text); background: var(--surface-deep);
+  border: 1px solid rgba(var(--accent-rgb), 0.3);
+  backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+}
 
 .slider {
   -webkit-appearance: none; appearance: none; width: 100%; height: 3px; border-radius: 2px;

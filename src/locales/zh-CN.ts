@@ -103,6 +103,7 @@ export default {
       voice_tts_offline: '下载离线嗓音',
       voice_tts_clone: '下载克隆嗓音',
       voice_speaker: '准备声纹组件',
+      voice_denoise: '准备降噪组件',
     },
     err: {
       dropped: '意外中断了',
@@ -720,7 +721,13 @@ export default {
       cloneImporting: '处理中…',
       cloneNamePlaceholder: '给这个声音起个名字',
       transcriptPlaceholder: '这段音频里说的话(识别出来的,可改)',
-      transcriptHint: '文字稿越贴合音频,克隆越像。',
+      transcriptHint: '文字稿越贴合音频,克隆越像 —— 听错的字改过来再保存。',
+      // 参考音体检:录音条件会被克隆当音色一起学走,有毛病就说清怎么改(建议不是闸,照旧能保存)
+      refAudio: {
+        clipped: '声音有点撞满幅了,说话离麦远一点、或把系统里的麦克风音量调低些,重录会更干净。',
+        noisy: '录的环境偏吵,已尽力降噪;换个安静点的地方重录会更像你。',
+        noDenoise: '这次没能自动降噪(降噪组件没准备好),安静环境下重录效果更好。',
+      },
       cloneSave: '保存',
       cloneSaving: '保存中…',
       cloneCancel: '取消',

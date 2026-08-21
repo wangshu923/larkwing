@@ -5,6 +5,7 @@
 
 mod asr;
 mod calib;
+mod denoise;
 mod models;
 mod output_route;
 mod prompts;
@@ -12,6 +13,7 @@ mod speaker;
 mod tts;
 mod wake;
 
+pub use denoise::RefAudioCheck;
 pub use models::VoiceModels;
 pub use tts::{probe_zipvoice, Speaker, DEFAULT_SPEAKER, SPEAKERS_ZH};
 
@@ -116,6 +118,8 @@ struct Inner {
     clone_probe_done: std::sync::atomic::AtomicBool,
     /// 克隆参考音目录(`数据目录/voice/clones/<wav_file>`)。
     clones_dir: PathBuf,
+    /// 参考音去噪器(GTCRN 0.5MB):克隆录入时按需加载一次(2026-08-21「莎莎声」治本件)。
+    denoiser: tokio::sync::OnceCell<Arc<denoise::Denoiser>>,
     /// 声纹提取器(CAM++ 26MB):有家人注册声纹时才加载(PLAN §11 D)。
     speaker: tokio::sync::OnceCell<Arc<speaker::SpeakerId>>,
     /// 唤醒循环(开关 = voice.wake.enabled;同时只有一个)。
@@ -218,6 +222,7 @@ impl VoiceRuntime {
                 clone_reheal: std::sync::atomic::AtomicBool::new(false),
                 clone_probe_done: std::sync::atomic::AtomicBool::new(false),
                 clones_dir: dir.join("clones"),
+                denoiser: tokio::sync::OnceCell::new(),
                 speaker: tokio::sync::OnceCell::new(),
                 wake: std::sync::Mutex::new(None),
                 push_taps: std::sync::Mutex::new(Vec::new()),
@@ -430,22 +435,36 @@ impl VoiceRuntime {
         self.inner.store.cloned_voices.rename(id, name.trim())
     }
 
-    /// 删除克隆音色(内置不可删);连参考音 wav 一并删。
+    /// 删除克隆音色(内置不可删);连参考音 wav 一并删,并把**指着它的** `voice.speaker` 回落。
+    /// 回落是必须的(2026-08-21 真机实锤):不回落 = 设置悬空,之后每次合成都报「音色不存在」,
+    /// 而用户在设置页看到的只是「没选中任何音色」,自己也不知道该怎么修。空值 = 回落默认音色
+    /// (`user_setting` 把空当没设)。逐用户清 —— 家人各选各的,只动指着这条的那几个。
     pub fn delete_clone(&self, id: &str) -> Result<()> {
         if let Some(wav) = self.inner.store.cloned_voices.delete(id)? {
             std::fs::remove_file(self.inner.clones_dir.join(wav)).ok();
         }
+        let pointing = format!("clone:{id}");
+        for u in self.inner.store.users.list()? {
+            if self.inner.store.settings.get(Some(u.id), "voice.speaker")?.as_deref()
+                == Some(pointing.as_str())
+            {
+                self.inner.store.settings.set(Some(u.id), "voice.speaker", "")?;
+            }
+        }
         Ok(())
     }
 
-    /// 录一段参考音(复用听写采集:VAD 切一句)→ ASR 自动转写 → 落盘 wav。
-    /// 返回 (clone_id, 转写稿) 供前端给用户过目/修改;**此刻不写库**,确认时才落库
+    /// 录一段参考音(复用听写采集:VAD 切一句)→ 去噪 + 体检 → ASR 自动转写 → 落盘 wav。
+    /// 返回 (clone_id, 转写稿, 体检) 供前端给用户过目/修改;**此刻不写库**,确认时才落库
     /// (`clone_save`)——参考音以不可变 id 落盘,避免内存里悬 PCM,也避免未确认就生成的脏缓存。
-    pub async fn clone_record(&self) -> Result<(String, String)> {
+    pub async fn clone_record(&self) -> Result<(String, String, denoise::RefAudioCheck)> {
         let (vad_model, asr) = self.ensure_engines().await?;
+        // 去噪模型先备好(可能要下 0.5MB)——录音开始前拿到,免得录完还等下载。
+        let denoiser = self.ensure_denoiser().await;
         self.wake_suspend(true);
         let rt = self.clone();
-        let joined = tokio::task::spawn_blocking(move || -> Result<(Vec<f32>, String)> {
+        let joined = tokio::task::spawn_blocking(
+            move || -> Result<(Vec<f32>, String, denoise::RefAudioCheck)> {
             let hangover = hangover_secs(&rt.patience());
             let vad = new_vad(&vad_model, hangover)?;
             let pipe = rt.open_capture_auto()?;
@@ -460,7 +479,6 @@ impl VoiceRuntime {
                 (pcm.len() as f32) >= 3.0 * TARGET_RATE as f32,
                 "录音太短,至少 3 秒"
             );
-            peak_normalize(&mut pcm);
             // 参考音越长,ZipVoice 每次合成都整段重编码 → 越慢(21s 曾致单句 19s)。
             // 录入即截到上限:让合成延迟与参考时长解耦;截断在 ASR 前 → 文字稿与音频同源。
             const CLONE_REF_MAX_SECS: u32 = 8;
@@ -468,15 +486,29 @@ impl VoiceRuntime {
             if pcm.len() > max {
                 pcm.truncate(max);
             }
+            // 削波要在**归一前**量:归一后峰值恒在目标附近,量不出输入侧削没削。
+            let clip = denoise::clip_ratio(&pcm);
+            // 去噪(零旋钮神经模型)→ 再归一:先洗干净,归一的增益才不是在放大底噪。
+            // 采样率恒 TARGET_RATE(换了采样率的结果一律不采纳,见 apply_denoise)。
+            let denoised = denoise::apply_denoise(&mut pcm, TARGET_RATE, {
+                denoiser.as_ref().map(|d| move |p: &[f32], r: u32| d.run(p, r))
+            });
+            peak_normalize(&mut pcm);
+            // 底噪量**去噪后**那份 = 克隆真正会学到的东西
+            let check = denoise::RefAudioCheck::verdict(
+                denoise::noise_floor_db(&pcm, TARGET_RATE),
+                clip,
+                denoised,
+            );
             // 文字稿白送:复用 ASR 转写参考音(听错可在前端改后再 clone_save)
             let transcript = asr.transcribe(&pcm)?;
-            Ok((pcm, transcript))
+            Ok((pcm, transcript, check))
         })
         .await;
         // 正常出错或 panic(JoinError)都先复位唤醒/状态,再传播错误(否则唤醒循环可能永久挂起)。
         self.publish(VoiceEvent::State { phase: VoicePhase::Idle });
         self.wake_suspend(false);
-        let (pcm, transcript) = joined.context("录音任务挂了")??;
+        let (pcm, transcript, check) = joined.context("录音任务挂了")??;
         // id 不可变(uuid 形,时间戳即足够:录入是人手逐次操作);重录 = 新条目。
         let id = format!(
             "v{}",
@@ -488,12 +520,16 @@ impl VoiceRuntime {
         tokio::fs::create_dir_all(&self.inner.clones_dir).await?;
         let wav = tts::pcm_f32_to_wav(&pcm, TARGET_RATE);
         tokio::fs::write(self.inner.clones_dir.join(format!("{id}.wav")), &wav).await?;
-        Ok((id, transcript))
+        Ok((id, transcript, check))
     }
 
     /// 导入本地音频文件:前端已用 WebView 解码/重采样成 16k 单声道 wav 并 base64 编码。
-    /// 落盘 + ASR 转写出文字稿(草稿),不写库(clone_save 确认时才写)——与 clone_record 同形。
-    pub async fn clone_import(&self, wav_base64: &str) -> Result<(String, String)> {
+    /// 落盘 + 去噪 + 体检 + ASR 转写出文字稿(草稿),不写库(clone_save 确认时才写)——
+    /// 与 clone_record 同形(手机录的、微信语音导进来的同样带环境底噪,一视同仁洗一遍)。
+    pub async fn clone_import(
+        &self,
+        wav_base64: &str,
+    ) -> Result<(String, String, denoise::RefAudioCheck)> {
         use base64::Engine;
         let wav = base64::engine::general_purpose::STANDARD
             .decode(wav_base64.trim())
@@ -509,29 +545,41 @@ impl VoiceRuntime {
         tokio::fs::create_dir_all(&self.inner.clones_dir).await?;
         let wav_path = self.inner.clones_dir.join(format!("{id}.wav"));
         tokio::fs::write(&wav_path, &wav).await?;
-        // 读回 + ASR(同步、CPU 密集 → spawn_blocking);ASR 模型首次用时下载。
+        // 读回 + 去噪 + ASR(同步、CPU 密集 → spawn_blocking);模型首次用时下载。
         let (_vad, asr) = self.ensure_engines().await?;
+        let denoiser = self.ensure_denoiser().await;
         let path = wav_path.clone();
-        let transcript = tokio::task::spawn_blocking(move || -> Result<String> {
-            let wave = sherpa_onnx::Wave::read(path.to_string_lossy().as_ref())
-                .ok_or_else(|| anyhow!("音频读取失败或格式不支持"))?;
-            anyhow::ensure!(!wave.samples().is_empty(), "音频数据为空");
-            // 参考音越长,ZipVoice 每次合成都整段重编码 → 越慢。截到上限并覆盖回盘,
-            // 让存盘参考、合成输入、文字稿三者同源(合成延迟与参考时长解耦)。
-            const CLONE_REF_MAX_SECS: i32 = 8;
-            let sr = wave.sample_rate();
-            let max = (CLONE_REF_MAX_SECS * sr).max(0) as usize;
-            let all = wave.samples();
-            let capped: &[f32] = if all.len() > max { &all[..max] } else { all };
-            if capped.len() < all.len() {
-                let trimmed = tts::pcm_f32_to_wav(capped, sr as u32);
-                std::fs::write(&path, &trimmed)?;
-            }
-            asr.transcribe(capped)
-        })
-        .await
-        .context("转写任务挂了")??;
-        Ok((id, transcript))
+        let (transcript, check) =
+            tokio::task::spawn_blocking(move || -> Result<(String, denoise::RefAudioCheck)> {
+                let wave = sherpa_onnx::Wave::read(path.to_string_lossy().as_ref())
+                    .ok_or_else(|| anyhow!("音频读取失败或格式不支持"))?;
+                anyhow::ensure!(!wave.samples().is_empty(), "音频数据为空");
+                // 参考音越长,ZipVoice 每次合成都整段重编码 → 越慢。截到上限并覆盖回盘,
+                // 让存盘参考、合成输入、文字稿三者同源(合成延迟与参考时长解耦)。
+                const CLONE_REF_MAX_SECS: i32 = 8;
+                let sr = wave.sample_rate().max(1) as u32; // 导入音频自带采样率(去噪不改它)
+                let max = (CLONE_REF_MAX_SECS * sr as i32).max(0) as usize;
+                let all = wave.samples();
+                let capped: &[f32] = if all.len() > max { &all[..max] } else { all };
+                let clip = denoise::clip_ratio(capped); // 导入的音频没走我们的归一,原样量
+                let mut pcm = capped.to_vec();
+                let denoised = denoise::apply_denoise(&mut pcm, sr, {
+                    denoiser.as_ref().map(|d| move |p: &[f32], r: u32| d.run(p, r))
+                });
+                // 去噪或截断都改了内容 → 覆盖回盘,保「存盘 = 合成输入 = 文字稿来源」同源
+                if denoised || pcm.len() < all.len() {
+                    std::fs::write(&path, tts::pcm_f32_to_wav(&pcm, sr))?;
+                }
+                let check = denoise::RefAudioCheck::verdict(
+                    denoise::noise_floor_db(&pcm, sr),
+                    clip,
+                    denoised,
+                );
+                Ok((asr.transcribe(&pcm)?, check))
+            })
+            .await
+            .context("转写任务挂了")??;
+        Ok((id, transcript, check))
     }
 
     /// 确认录入:wav 已在盘上(`clone_record` 落的),用(可能改过的)文字稿 + 名字落库。
@@ -1262,6 +1310,25 @@ impl VoiceRuntime {
         Ok((vad_dir.join("silero_vad.onnx"), asr))
     }
 
+    /// 参考音去噪器就绪(GTCRN,~0.5MB 用时下载 + 加载一次进 OnceCell)。
+    /// **尽力件**:下载/加载不顺一律 `None` —— 去噪是质量增益,不该挡住录入本身
+    /// (体检结果里 `denoised:false` 会如实告诉用户没降噪成功,不静默 §3.5)。
+    async fn ensure_denoiser(&self) -> Option<Arc<denoise::Denoiser>> {
+        let mirrors = self.mirrors();
+        self.inner
+            .denoiser
+            .get_or_try_init(|| async move {
+                let dir = self.inner.models.ensure(&models::DENOISE_GTCRN, &mirrors).await?;
+                tokio::task::spawn_blocking(move || denoise::Denoiser::load(&dir).map(Arc::new))
+                    .await
+                    .context("语音去噪加载任务挂了")?
+            })
+            .await
+            .inspect_err(|e| tracing::warn!(err = %e, "参考音去噪不可用,本次录入不降噪"))
+            .ok()
+            .cloned()
+    }
+
     /// 失败语音模型下载的「重试」直连口(HUD 按钮 → 壳层 `retry_voice_model` → 这里;
     /// 不绕 LLM §7.1)。按 id 找回三型 spec 重跑对应 ensure(自带 HUD:成功 done、再失败仍
     /// fail_retryable 冒新卡);未知 id(老版本残卡)只记日志。后台 spawn,不阻塞调用方。
@@ -1781,25 +1848,33 @@ fn run_session(
     Ok(SessionOutcome::Text { text, speaker_id })
 }
 
-/// ASR 前 AGC(robot V1.2 验证参数,PLAN §11 A 期件):峰值归一到 -3dBFS,
-/// 只增不减、封顶 20dB、99.5 分位当峰值(单个爆音压不死增益)、近静音原样返回。
+/// ASR 前 AGC(robot V1.2 验证参数,PLAN §11 A 期件):响度归一到 -3dBFS,
+/// 只增不减、封顶 20dB、99.5 分位定响度(单个爆音压不死增益)、近静音原样返回。
 /// 麦克风硬件 AGC 已拉够电平时增益≈1 自动空转,不会叠加过度放大。
+///
+/// **增益必须按真峰封顶(2026-08-21 修,克隆「莎莎声」追因实锤)**:语音真峰约在 99.5 分位的
+/// 1.8 倍上,只按分位定增益会把顶部那 0.5% 推过满幅、被 clamp **切平**成削波失真(存盘参考音
+/// 真峰恰 1.0000 / 30 个平顶样本 / p99.5 正落在 0.708 = 三重铁证);且**录得越轻增益越大、削得
+/// 越狠**。零样本克隆会把这层失真当音色一起学走 → 响度目标让位于不失真:两个上限取小者。
 fn peak_normalize(pcm: &mut [f32]) {
     if pcm.is_empty() {
         return;
     }
     let mut mags: Vec<f32> = pcm.iter().map(|s| s.abs()).collect();
     let idx = ((mags.len() as f32 * 0.995) as usize).min(mags.len() - 1);
-    let (_, peak, _) = mags.select_nth_unstable_by(idx, |a, b| a.total_cmp(b));
-    let peak = *peak;
-    if peak < 3.0e-5 {
+    let (_, loud, _) = mags.select_nth_unstable_by(idx, |a, b| a.total_cmp(b));
+    let loud = *loud;
+    if loud < 3.0e-5 {
         return; // 近静音:不放大底噪
     }
-    let target = 0.708; // -3 dBFS
-    let gain = (target / peak).clamp(1.0, 10.0); // 只增不减,封顶 20dB(10 倍)
+    let true_peak = pcm.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    let target = 0.708; // -3 dBFS(响度目标,按 99.5 分位算)
+    let ceiling = 0.99; // 真峰天花板:留一丝余量,任何样本都到不了 clamp
+    // 只增不减(既有语义):输入本就够响 / 源头已削过 → 增益回落 1.0 原样不动,不雪上加霜。
+    let gain = (target / loud).min(ceiling / true_peak.max(1.0e-9)).clamp(1.0, 10.0);
     if gain > 1.0 {
         for s in pcm.iter_mut() {
-            *s = (*s * gain).clamp(-1.0, 1.0);
+            *s = (*s * gain).clamp(-1.0, 1.0); // clamp 此后恒不触发(gain×真峰 ≤ 0.99),留作纵深
         }
     }
 }
@@ -1859,6 +1934,87 @@ mod tests {
         let _ = std::fs::remove_file(dir.join("t.db"));
         let store = Store::open(&dir.join("t.db")).unwrap();
         VoiceRuntime::new(dir, store, Bus::new(), Scenes::builtin())
+    }
+
+    // ---- 参考音归一(克隆录入) ----
+
+    /// 真机实锤(2026-08-21「莎莎声」追因):按 99.5 分位推到 −3dBFS,而语音真峰约在 p99.5
+    /// 的 1.8 倍上 → 顶部那 0.5% 冲过目标、极值撞 clamp **切平**(存盘参考音真峰恰 1.0000、
+    /// 30 个平顶样本,p99.5=0.7025 正落在目标 0.708 = 铁证)。零样本克隆连削波失真一起学走。
+    /// 判据:归一后真峰**绝不**贴满幅 —— 增益按真峰封顶,响度目标让位于不失真。
+    #[test]
+    fn peak_normalize_never_hard_clips_transients() {
+        // 语音型样本:绝大多数样本小、极少数瞬态(爆破音)高出一大截
+        let mut pcm = vec![0.05f32; 10_000];
+        for i in 0..40 {
+            pcm[i * 250] = 0.35;
+        }
+        peak_normalize(&mut pcm);
+        let peak = pcm.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(peak < 1.0, "归一后真峰贴满幅 = 硬削(实测 {peak})");
+        assert_eq!(pcm.iter().filter(|s| s.abs() >= 0.999).count(), 0, "不得留下削平样本");
+    }
+
+    /// 归一的本意(把偏轻的录音提起来)不能因防削波而丢:安静录音仍要被抬到 −3dBFS 一带。
+    #[test]
+    fn peak_normalize_still_lifts_quiet_recording() {
+        let mut pcm: Vec<f32> = (0..10_000).map(|i| 0.02 * ((i % 7) as f32 - 3.0) / 3.0).collect();
+        let before = pcm.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        peak_normalize(&mut pcm);
+        let after = pcm.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(after > before * 3.0, "偏轻的录音该被抬起来({before} → {after})");
+        assert!(after < 1.0, "抬起来也不许贴满幅");
+    }
+
+    /// 只增不减(既有语义):输入本就够响 / 已在源头削过的,不去衰减它(也不雪上加霜)。
+    #[test]
+    fn peak_normalize_leaves_loud_input_alone() {
+        let mut pcm = vec![0.9f32; 100];
+        pcm[0] = 1.0; // 源头已削平
+        let before = pcm.clone();
+        peak_normalize(&mut pcm);
+        assert_eq!(pcm, before, "够响的输入原样不动");
+    }
+
+    /// 删掉正在用的克隆音色 → `voice.speaker` 必须回落,否则悬空:合成每次都报「音色不存在」。
+    /// 真机实锤(2026-08-21):库里那条 7-29 的克隆连记录带文件都删了,设置仍指着 `clone:<id>`。
+    /// 家人各选各的音色 → 逐用户清(只清指着这条的,别人的选择不动)。
+    #[test]
+    fn delete_clone_resets_speaker_for_every_user_pointing_at_it() {
+        let rt = test_rt("delclone");
+        let owner = rt.inner.store.users.ensure_default_user().unwrap();
+        let kid = rt.inner.store.users.create("小明").unwrap();
+        std::fs::create_dir_all(&rt.inner.clones_dir).unwrap();
+        std::fs::write(rt.inner.clones_dir.join("v9.wav"), b"RIFF....").unwrap();
+        rt.inner
+            .store
+            .cloned_voices
+            .insert(&crate::store::ClonedVoice {
+                id: "v9".into(),
+                name: "爸爸".into(),
+                wav_file: "v9.wav".into(),
+                transcript: "念一句".into(),
+                lang: "zh".into(),
+                builtin: false,
+                created_at: 0,
+            })
+            .unwrap();
+        let set = |uid: i64, v: &str| {
+            rt.inner.store.settings.set(Some(uid), "voice.speaker", v).unwrap();
+        };
+        let get = |uid: i64| rt.inner.store.settings.get(Some(uid), "voice.speaker").unwrap();
+        set(owner.id, "clone:v9");
+        set(kid.id, "zh-CN-XiaoxiaoNeural"); // 家人选的是内置音色,不该被动
+
+        rt.delete_clone("v9").unwrap();
+
+        assert_ne!(get(owner.id).as_deref(), Some("clone:v9"), "指着被删音色的必须回落");
+        assert_eq!(
+            get(kid.id).as_deref(),
+            Some("zh-CN-XiaoxiaoNeural"),
+            "别人选的内置音色不许被动"
+        );
+        assert!(!rt.inner.clones_dir.join("v9.wav").exists(), "参考音文件一并删");
     }
 
     // ---- 采集双源(层1 AEC 采集端) ----

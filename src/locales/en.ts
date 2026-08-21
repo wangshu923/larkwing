@@ -104,6 +104,7 @@ export default {
       voice_tts_offline: 'Downloading the offline voice',
       voice_tts_clone: 'Downloading the cloned voice',
       voice_speaker: 'Preparing the voiceprint component',
+      voice_denoise: 'Preparing the noise-reduction component',
     },
     err: {
       dropped: 'Interrupted unexpectedly',
@@ -719,7 +720,17 @@ export default {
       cloneImporting: 'Processing…',
       cloneNamePlaceholder: 'Name this voice',
       transcriptPlaceholder: 'What is said in this clip (auto-detected, editable)',
-      transcriptHint: 'The closer the transcript matches the audio, the better the clone.',
+      transcriptHint:
+        'The closer the transcript matches the audio, the better the clone — fix any misheard words before saving.',
+      // Reference-audio check: recording conditions get cloned along with the voice.
+      refAudio: {
+        clipped:
+          'The recording is hitting full scale. Sit a bit further from the mic, or lower the system input volume, and record again for a cleaner result.',
+        noisy:
+          'The room was a bit noisy — noise reduction has been applied. Recording somewhere quieter will sound more like you.',
+        noDenoise:
+          'Noise reduction could not run this time (component not ready). A quiet room will give a better result.',
+      },
       cloneSave: 'Save',
       cloneSaving: 'Saving…',
       cloneCancel: 'Cancel',

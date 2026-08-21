@@ -767,12 +767,14 @@ pub async fn voice_preview(
 
 // ---- 音色克隆(PLAN §11 D-clone) ----
 
-/// `voice_clone_record` 的返回:录完待确认的草稿(尚未落库)。
+/// `voice_clone_record` 的返回:录完待确认的草稿(尚未落库)+ 参考音体检。
+/// 体检是 serde 增量字段(§6.8:旧前端忽略即可);结论只过 issue **key**,文案在前端字典。
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CloneDraft {
     pub clone_id: String,
     pub transcript: String,
+    pub check: larkwing_core::voice::RefAudioCheck,
 }
 
 /// 列出克隆音色(内置预置 + 用户自录,混在音色列表)。
@@ -785,9 +787,9 @@ pub fn list_voice_clones(state: State<'_, AppState>) -> Result<Vec<ClonedVoice>,
 /// 录音/电平进展走 voice 车道事件(Listening→Idle);命令 await 到录完+转写才返回。
 #[tauri::command]
 pub async fn voice_clone_record(state: State<'_, AppState>) -> Result<CloneDraft, AppError> {
-    let (clone_id, transcript) =
+    let (clone_id, transcript, check) =
         state.voice.clone_record().await.map_err(AppError::internal)?;
-    Ok(CloneDraft { clone_id, transcript })
+    Ok(CloneDraft { clone_id, transcript, check })
 }
 
 /// 导入本地音频文件(前端解码/重采样成 16k 单声道 wav 的 base64)→ 转写,返回草稿(未落库)。
@@ -796,9 +798,9 @@ pub async fn voice_clone_import(
     state: State<'_, AppState>,
     wav_base64: String,
 ) -> Result<CloneDraft, AppError> {
-    let (clone_id, transcript) =
+    let (clone_id, transcript, check) =
         state.voice.clone_import(&wav_base64).await.map_err(AppError::internal)?;
-    Ok(CloneDraft { clone_id, transcript })
+    Ok(CloneDraft { clone_id, transcript, check })
 }
 
 /// 确认录入:用(可能改过的)文字稿 + 名字落库,返回新音色。

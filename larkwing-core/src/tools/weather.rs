@@ -36,8 +36,9 @@ impl WeatherTool {
                         },
                         "when": {
                             "type": "string",
-                            "enum": ["now", "today", "3d"],
-                            "description": "now=此刻实况(默认);today=今天;3d=未来三天预报"
+                            "enum": ["now", "today", "3d", "7d"],
+                            "description": "now=此刻实况(默认);today=今天;3d=未来三天预报;\
+                                            7d=未来七天预报(出行/收拾行李这类看远一点的用)"
                         }
                     }
                 }),

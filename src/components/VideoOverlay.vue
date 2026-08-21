@@ -5,9 +5,10 @@
 // 窗口态 = 非模态应用内小视窗(webrender 可见任务窗同款形态:右下停靠、标题栏拖动、拖角缩放),
 // 底下界面照常可用。不开真原生第二窗:播放引擎(MSE/relay 会话/useMedia VM)全在主窗 WebView,
 // 挪窗 = 悬浮窗双播陷阱同族 + 采集端 AEC 参考信号断链(§7.5)。
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { registerVideoEl, useMedia } from '../composables/useMedia'
+import { useScrubHover, useScrubThumb } from '../composables/useScrubHover'
 import { win } from '../lib/backend'
 import { fmtClock } from '../lib/fmt'
 
@@ -188,6 +189,26 @@ function onScrubCommit(e: Event) {
   if (state.duration > 0) seek((v / 100) * state.duration)
 }
 
+/* —— 光标处的读数:第几分几秒 + 那一刻的画面 ——
+ * 治"盲拖":原先要按下去拖起来才看得到目标时间(而且读数在最左边、离光标很远),
+ * 按下之前完全没数 —— 而 range 是点哪跳哪。缩略图只有本地片有(thumb_url 有值才出)。 */
+const durationRef = computed(() => state.duration)
+// 夹在面板里(不是夹在进度条里):带缩略图的气泡比窗口态的进度条还宽,夹轨道会顶出小窗。
+const { trackEl, hoverPct, hoverTime, bubbleLeft, bubbleW, onMove, onLeave } =
+  useScrubHover(durationRef, { thumbWidth: 11, clampTo: panelEl })
+const { src: thumbSrc, available: thumbAvailable } = useScrubThumb(
+  computed(() => state.current?.thumb_url),
+  hoverTime,
+  durationRef,
+)
+const bubbleEl = ref<HTMLElement | null>(null)
+/** 气泡宽度实测(用来把它夹在面板里不出框):有没有图两种宽度,变了就重量一次。
+ *  用 nextTick 而不是 rAF —— 要的是"DOM 更新完",而 rAF 在窗口隐藏时压根不触发(§8.1)。 */
+watch([hoverPct, thumbSrc], async () => {
+  await nextTick()
+  bubbleW.value = bubbleEl.value?.offsetWidth ?? 0
+})
+
 /** 原生窗口全屏(乐观置位,resize 兜底校准);视频默认全屏的进/退也走它。 */
 async function toggleFullscreen() {
   const next = !state.fullscreen
@@ -365,17 +386,42 @@ onUnmounted(() => {
       <span class="clock"
         >{{ fmtClock(displayPos) }}<template v-if="!compact"> / {{ fmtClock(state.duration) }}</template></span
       >
-      <input
-        class="slider"
-        type="range"
-        min="0"
-        max="100"
-        step="0.1"
-        :value="pct"
-        @input="onScrubInput"
-        @change="onScrubCommit"
-        :style="{ '--pct': pct + '%' }"
-      />
+      <!-- 进度条外面套一层 hover 检测:光标所在处的时间(+ 本地片的那一刻画面)。
+           拖动中 range 会抓走 pointer capture,但事件照样冒泡到这层 → 气泡跟着拇指走。 -->
+      <div
+        ref="trackEl"
+        class="scrub-track"
+        @pointermove="onMove"
+        @pointerleave="onLeave"
+        @pointercancel="onLeave"
+      >
+        <div
+          v-if="hoverPct !== null"
+          ref="bubbleEl"
+          class="hover-bubble"
+          :style="{ left: bubbleLeft + 'px' }"
+        >
+          <img
+            v-if="thumbAvailable && thumbSrc"
+            class="hover-thumb"
+            :src="thumbSrc"
+            alt=""
+            decoding="async"
+          />
+          <span class="hover-time">{{ fmtClock(hoverTime ?? 0) }}</span>
+        </div>
+        <input
+          class="slider"
+          type="range"
+          min="0"
+          max="100"
+          step="0.1"
+          :value="pct"
+          @input="onScrubInput"
+          @change="onScrubCommit"
+          :style="{ '--pct': pct + '%' }"
+        />
+      </div>
       <button
         v-if="audioTrackCount >= 2 && !compact"
         class="vbtn rate"
@@ -501,6 +547,31 @@ onUnmounted(() => {
 }
 .vbtn:hover { border-color: var(--accent); box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.3); }
 .vbtn:disabled { opacity: .32; cursor: default; border-color: rgba(var(--accent-rgb), 0.12); box-shadow: none; }
+
+/* 进度条的定位容器:滑杆照旧 flex:1 撑满它,hover 气泡绝对定位挂在它上方(不占位)。
+   `.slider { margin: 0 }` 是要紧的:Chrome 给 input[type=range] 的 UA 默认样式带 margin:2px,
+   两端各缩 2px → 容器宽 ≠ 真实轨道宽,hover 换算出来的秒数与拇指就差那么几像素(预览量出来
+   145.5 vs 141.5)。清掉之后"量容器"就等于"量轨道",useScrubHover 只需要一个参照物。 */
+.scrub-track { position: relative; flex: 1; min-width: 0; display: flex; align-items: center; }
+.scrub-track .slider { margin: 0; }
+
+/* 光标处读数:小图在上、时间在下,夹在条内不出框(bubbleLeft 已算好);
+   覆盖媒体豁免同控制条 —— 恒黑底浅字,压在画面上才读得清。 */
+.hover-bubble {
+  position: absolute; bottom: 15px; z-index: 4;
+  transform: translateX(-50%); pointer-events: none;
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  padding: 4px; border-radius: 9px;
+  background: rgba(0, 0, 0, 0.8);
+  border: 1px solid rgba(var(--accent-rgb), 0.3);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
+}
+/* 宽度与后端抽帧的 THUMB_WIDTH 一致(高度按片子比例走,不写死免变形) */
+.hover-thumb { display: block; width: 192px; height: auto; border-radius: 5px; background: #000; }
+.hover-time {
+  font: 11px/1 ui-monospace, "SF Mono", monospace; letter-spacing: 0.5px;
+  color: #eaf2fb; padding: 1px 3px; white-space: nowrap;
+}
 
 .slider {
   -webkit-appearance: none; appearance: none; flex: 1; height: 3px; border-radius: 2px;

@@ -66,11 +66,14 @@ pub enum When {
     Now,
     Today,
     ThreeDay,
+    /// 未来七天(出行/远期安排用;2026-08-19 随「规划旅行」补,和风免费订阅本就含 7d)。
+    SevenDay,
 }
 
 impl When {
     pub fn parse(s: Option<&str>) -> When {
         match s.map(str::trim) {
+            Some("7d") | Some("7天") | Some("七天") => When::SevenDay,
             Some("3d") | Some("forecast") | Some("3天") | Some("三天") => When::ThreeDay,
             Some("today") | Some("今天") => When::Today,
             _ => When::Now,
@@ -243,7 +246,11 @@ mod tests {
         assert_eq!(When::parse(Some("今天")), When::Today);
         assert_eq!(When::parse(Some("now")), When::Now);
         assert_eq!(When::parse(None), When::Now);
+        assert_eq!(When::parse(Some("7d")), When::SevenDay);
+        assert_eq!(When::parse(Some("七天")), When::SevenDay);
+        assert_eq!(When::parse(Some("7天")), When::SevenDay);
         assert!(When::ThreeDay.wants_forecast());
+        assert!(When::SevenDay.wants_forecast());
         assert!(!When::Now.wants_forecast());
     }
 

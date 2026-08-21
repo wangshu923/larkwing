@@ -287,7 +287,12 @@ const cloneFile = ref<HTMLInputElement | null>(null)
 const cloneBusy = ref(false)
 const cloneRecording = ref(false) // 现场录音中(命令 await 到 VAD 静音自动收尾)
 const cloneErr = ref('')
-const cloneDraft = ref<{ cloneId: string; name: string; transcript: string } | null>(null)
+const cloneDraft = ref<{
+  cloneId: string
+  name: string
+  transcript: string
+  issue: 'clipped' | 'noisy' | 'noDenoise' | null
+} | null>(null)
 function pickCustomVoice() {
   cloneErr.value = ''
   cloneFile.value?.click()
@@ -302,7 +307,7 @@ async function recordClone() {
   cloneRecording.value = true
   try {
     const d = await api.voiceCloneRecord()
-    cloneDraft.value = { cloneId: d.cloneId, name: '', transcript: d.transcript }
+    cloneDraft.value = { cloneId: d.cloneId, name: '', transcript: d.transcript, issue: d.check?.issue ?? null }
   } catch (e) {
     console.error('录音克隆失败', e)
     cloneErr.value = t('settings.voice.cloneRecordFailed')
@@ -322,7 +327,12 @@ async function onCustomFile(ev: Event) {
   try {
     const { base64 } = await audioFileToWavBase64(f)
     const d = await api.voiceCloneImport(base64)
-    cloneDraft.value = { cloneId: d.cloneId, name: f.name.replace(/\.[^.]+$/, ''), transcript: d.transcript }
+    cloneDraft.value = {
+      cloneId: d.cloneId,
+      name: f.name.replace(/\.[^.]+$/, ''),
+      transcript: d.transcript,
+      issue: d.check?.issue ?? null,
+    }
   } catch (e) {
     console.error('导入音色失败', e)
     cloneErr.value = t('settings.voice.cloneImportFailed')
@@ -1648,6 +1658,11 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               :placeholder="t('settings.voice.transcriptPlaceholder')"
             ></textarea>
             <p class="clone-hint">{{ t('settings.voice.transcriptHint') }}</p>
+            <!-- 参考音体检:录音有毛病就说清怎么改(克隆会把录音条件当音色一起学走);
+                 没毛病不出声(§3 收敛)。仍可直接保存 —— 是建议不是闸。 -->
+            <p v-if="cloneDraft.issue" class="clone-warn">
+              {{ t(`settings.voice.refAudio.${cloneDraft.issue}`) }}
+            </p>
             <div class="clone-actions">
               <button class="chip" :disabled="cloneBusy" @click="cancelClone">
                 {{ t('settings.voice.cloneCancel') }}
@@ -2437,6 +2452,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .clone-input, .clone-text { background: var(--surface-deep); border: 1px solid var(--line); border-radius: 8px; color: inherit; font: inherit; padding: 6px 9px; }
 .clone-text { resize: vertical; min-height: 56px; }
 .clone-hint { font-size: 11.5px; opacity: 0.6; margin: 0; }
+/* 参考音体检提示:警示色但不是错误(保存照旧能点)——语义 token,换肤跟随(§6.7) */
+.clone-warn { font-size: 12px; color: var(--warn); margin: 0; }
 .clone-actions { display: flex; gap: 8px; justify-content: flex-end; }
 /* 与音色 chip 同一套薄玻璃质感(否则 <button> 默认灰底会很出戏);保存走 .on 青色描边 */
 .clone-actions .chip { cursor: pointer; background: rgba(var(--accent-rgb), 0.04); transition: border-color .15s, color .15s, background .15s; }

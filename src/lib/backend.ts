@@ -141,6 +141,15 @@ export interface FsOp {
   updated_at: number
 }
 
+/** 克隆参考音体检(录入时自动去噪后测的)。core 只给数据 + issue key,文案在前端字典。
+ *  issue: null = 没问题 | 'clipped' 声音撞满幅了 | 'noisy' 环境太吵 | 'noDenoise' 没能自动降噪。 */
+export interface RefAudioCheck {
+  noiseFloorDb: number
+  clipRatio: number
+  denoised: boolean
+  issue: 'clipped' | 'noisy' | 'noDenoise' | null
+}
+
 /** 一条提醒(提醒页,jobs 域)。模型把自然语言翻成绝对时刻 + repeat 枚举,用户永不见 cron。
  *  repeat: once|daily|weekdays|weekly;status 待触发恒为 'pending'(列表只取 pending)。 */
 export interface Reminder {
@@ -467,6 +476,9 @@ export interface NowPlaying {
   audio_track?: number
   /** 有值 = 从这个位置(秒)接着播(切音轨重建管线时 core 带上,加载完 seek 过去)。 */
   resume_at?: number
+  /** 进度条 hover 预览缩略图的基址(自己拼 `?t=秒`)。**有值 = 这片能出图**;
+   *  缺 = 只出时间气泡(网络流没帧可抽 / 放歌没画面 / ffmpeg 还没到手)。 */
+  thumb_url?: string
 }
 
 export type MediaEvent =
@@ -1205,12 +1217,14 @@ export const api = {
     invoke<{ id: string; name: string; wavFile: string; transcript: string; lang: string; builtin: boolean; createdAt: number }[]>(
       'list_voice_clones',
     ),
-  /** 录一段参考音 → 自动转写,返回草稿(未落库);进展走 voice 事件。 */
+  /** 录一段参考音 → 去噪 + 体检 + 自动转写,返回草稿(未落库);进展走 voice 事件。 */
   voiceCloneRecord: () =>
-    invoke<{ cloneId: string; transcript: string }>('voice_clone_record'),
+    invoke<{ cloneId: string; transcript: string; check: RefAudioCheck }>('voice_clone_record'),
   /** 导入本地音频文件(前端已解码/重采样成 16k 单声道 wav 的 base64)→ 转写,返回草稿(未落库)。 */
   voiceCloneImport: (wavBase64: string) =>
-    invoke<{ cloneId: string; transcript: string }>('voice_clone_import', { wavBase64 }),
+    invoke<{ cloneId: string; transcript: string; check: RefAudioCheck }>('voice_clone_import', {
+      wavBase64,
+    }),
   /** 确认录入:用(可能改过的)文字稿 + 名字落库。 */
   voiceCloneSave: (cloneId: string, name: string, transcript: string) =>
     invoke<{ id: string; name: string }>('voice_clone_save', { cloneId, name, transcript }),

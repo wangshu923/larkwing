@@ -72,7 +72,7 @@ impl WeatherSource for OpenMeteoSource {
         ];
         if when.wants_forecast() {
             q.push(("daily", "weather_code,temperature_2m_max,temperature_2m_min".into()));
-            q.push(("forecast_days", "3".into()));
+            q.push(("forecast_days", forecast_days_param(when).into()));
         }
 
         let url = "https://api.open-meteo.com/v1/forecast";
@@ -137,6 +137,15 @@ fn parse_days(daily: Option<&Value>, when: When) -> Vec<DayForecast> {
 
 fn round_i32(f: f64) -> i32 {
     f.round() as i32
+}
+
+/// forecast_days 按跨度定:七天要 7,其余(Today 取首日/ThreeDay)维持 3。
+fn forecast_days_param(when: When) -> &'static str {
+    if when == When::SevenDay {
+        "7"
+    } else {
+        "3"
+    }
 }
 
 /// WMO weather code → 中文天气词(表来自 Open-Meteo 文档)。
@@ -218,6 +227,13 @@ mod tests {
         assert!(derive_tips(63, &[], Some(20)).iter().any(|t| t.contains("带伞")));
         assert!(derive_tips(3, &[], Some(-2)).iter().any(|t| t.contains("保暖")));
         assert!(derive_tips(0, &[], Some(22)).is_empty(), "舒适天无提示");
+    }
+
+    #[test]
+    fn forecast_days_param_maps_span() {
+        assert_eq!(forecast_days_param(When::Today), "3");
+        assert_eq!(forecast_days_param(When::ThreeDay), "3");
+        assert_eq!(forecast_days_param(When::SevenDay), "7");
     }
 
     #[test]
