@@ -41,8 +41,12 @@ unsafe extern "system" fn subclass_proc(
       // 尺寸 = 工作区宽高(到不了任务栏)
       info.ptMaxSize.x = work.right - work.left;
       info.ptMaxSize.y = work.bottom - work.top;
-      info.ptMaxTrackSize.x = info.ptMaxSize.x;
-      info.ptMaxTrackSize.y = info.ptMaxSize.y;
+      // ⚠️ **绝不能把 ptMaxTrackSize 也钉到工作区(2026-08-22 修)**:
+      // ptMaxSize/ptMaxPosition 管的是「最大化成什么样」,而 ptMaxTrackSize 管的是
+      // 「这个窗口**这辈子**最大能多大」。钉到工作区 = 原生全屏(看视频要盖住任务栏、
+      // 铺满整块屏)也被一起卡死在工作区里,底下露出一条任务栏 —— 而这份 hack 本来只是
+      // 为了修「无边框窗最大化会盖住任务栏」那个上游 bug(Tauri #7103),不该殃及全屏。
+      // 留系统预填的默认值即可(它按整个虚拟屏算,全屏自然放得开)。
       return LRESULT(0);
     }
   }

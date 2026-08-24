@@ -13,6 +13,46 @@ use super::{Tool, ToolCtx, ToolRisk, ToolSpec};
 
 /// 单次封顶(fs 批量纪律:超额如实退回,让模型带 pages 分批,绝不静默截断)。
 const PDF_MAX_PAGES: usize = 20;
+
+/// 宽容解析 `pages`(§4.4 Quirks,与 `arg_bool` / `arg_u64` 同族:流式 JSON 里模型常把
+/// 声明为数组的参数发成别的形)。认:数组(元素是数字或数字字符串)、单个数字、
+/// 逗号分隔的字符串(顺带认 `3-5` 这种范围写法)。认不出返回空 —— 调用方据此**如实退回**,
+/// 绝不当成「全转」。0 页不存在(页码从 1 起),丢掉。
+fn parse_pages(v: &serde_json::Value) -> Vec<usize> {
+    fn from_str(s: &str) -> Vec<usize> {
+        let mut out = Vec::new();
+        for part in s.split([',', '、', ';', ' ']).filter(|p| !p.trim().is_empty()) {
+            let part = part.trim();
+            if let Some((a, b)) = part.split_once('-') {
+                if let (Ok(a), Ok(b)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+                    if a >= 1 && b >= a {
+                        out.extend(a..=b);
+                        continue;
+                    }
+                }
+            }
+            if let Ok(n) = part.parse::<usize>() {
+                if n >= 1 {
+                    out.push(n);
+                }
+            }
+        }
+        out
+    }
+    match v {
+        serde_json::Value::Array(a) => a
+            .iter()
+            .flat_map(|e| match e {
+                serde_json::Value::Number(n) => n.as_u64().filter(|n| *n >= 1).map(|n| n as usize).into_iter().collect(),
+                serde_json::Value::String(s) => from_str(s),
+                _ => Vec::new(),
+            })
+            .collect(),
+        serde_json::Value::Number(n) => n.as_u64().filter(|n| *n >= 1).map(|n| n as usize).into_iter().collect(),
+        serde_json::Value::String(s) => from_str(s),
+        _ => Vec::new(),
+    }
+}
 /// 渲染目标宽(px):单据/文档在手机上看清楚够用,又不产出巨图。
 const RENDER_TARGET_WIDTH: i32 = 1600;
 
@@ -81,11 +121,21 @@ impl Tool for PdfToPng {
         let pdf = PathBuf::from(&path);
         anyhow::ensure!(pdf.is_absolute(), "path 需要绝对路径,收到: {path}");
         anyhow::ensure!(pdf.is_file(), "文件不存在: {path}");
-        let pages: Vec<usize> = args
-            .get("pages")
-            .and_then(serde_json::Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_u64()).map(|n| n as usize).collect())
-            .unwrap_or_default();
+        // ⚠️ **给了 pages 却没认出来,绝不能当成「全转」(2026-08-22 修)**:原先是
+        // `as_array` 拿不到就 `unwrap_or_default()` = 空 = 全转 —— 模型把参数发成
+        // `pages: 3` 或 `pages: "1,3"`(流式 JSON 的常态,arg_bool/arg_u64 早就为此宽容过),
+        // 于是「只转第 3 页」被**悄悄变成整本转**、还报成功。宽容认几种写法;认不出就如实退回。
+        let pages: Vec<usize> = match args.get("pages") {
+            None | Some(serde_json::Value::Null) => Vec::new(), // 没给 = 全转(本来的语义)
+            Some(v) => {
+                let got = parse_pages(v);
+                anyhow::ensure!(
+                    !got.is_empty(),
+                    "pages 没看懂:{v}——要一串页码,比如 [1, 3, 5];不指定就是整本都转"
+                );
+                got
+            }
+        };
         anyhow::ensure!(
             pages.len() <= PDF_MAX_PAGES,
             "一次最多转 {PDF_MAX_PAGES} 页,收到 {} 页——分批来",
@@ -195,6 +245,29 @@ mod tests {
     use super::*;
     use crate::media::MediaRuntime;
     use crate::store::Store;
+
+    /// **`pages` 认不出来时绝不能当「全转」(2026-08-22)**:模型把数组参数发成
+    /// 单个数字 / 逗号串是流式 JSON 的常态(arg_bool/arg_u64 早为此宽容过)。原先
+    /// `as_array` 拿不到就落空 = 全转,「只转第 3 页」被悄悄变成整本转还报成功。
+    #[test]
+    fn pages_accepts_loose_forms_and_refuses_to_guess() {
+        use serde_json::json;
+        // 正常形
+        assert_eq!(parse_pages(&json!([1, 3, 5])), vec![1, 3, 5]);
+        // 模型常发的几种松散形
+        assert_eq!(parse_pages(&json!(3)), vec![3], "单个数字");
+        assert_eq!(parse_pages(&json!("3")), vec![3], "数字字符串");
+        assert_eq!(parse_pages(&json!(["1", "2"])), vec![1, 2], "数组里是字符串");
+        assert_eq!(parse_pages(&json!("1,3")), vec![1, 3], "逗号串");
+        assert_eq!(parse_pages(&json!("2-4")), vec![2, 3, 4], "范围写法");
+        assert_eq!(parse_pages(&json!("1, 3-4")), vec![1, 3, 4], "混着来");
+        // 页码从 1 起,0 和负数不是页
+        assert_eq!(parse_pages(&json!([0, 2])), vec![2]);
+        // 真认不出 → 空(调用方据此如实退回,**不是**当成全转)
+        assert!(parse_pages(&json!("封面那几页")).is_empty());
+        assert!(parse_pages(&json!({"from": 1})).is_empty());
+        assert!(parse_pages(&json!(true)).is_empty());
+    }
 
     fn ctx(tag: &str) -> (ToolCtx, PathBuf) {
         let dir = std::env::temp_dir().join(format!("lw-pdf-{}-{tag}", std::process::id()));

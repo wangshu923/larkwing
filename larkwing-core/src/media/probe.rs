@@ -551,7 +551,11 @@ pub fn fragment_duration(seg: &[u8], timescale: u32) -> Option<f64> {
             match bt {
                 b"tfhd" => {
                     // fullbox:version(1)+flags(3),track_ID(4),再按 flags 依次是可选字段
-                    let flags = u32::from_be_bytes([0, p[1], p[2], p[3]]);
+                    // ⚠️ 裸下标会炸(2026-08-22 修):同一个闭包里别处都用 `get(..)` 了,
+                    // 只有这两处 flags 是 `p[1]` 硬读 —— 段被截断 / 空 payload 时越界 panic。
+                    // 我们解析的是**外部文件**(下载来的、种子里的、NAS 上的),半截 mp4 很常见。
+                    let Some(f) = p.get(1..4) else { return };
+                    let flags = u32::from_be_bytes([0, f[0], f[1], f[2]]);
                     let mut off = 8usize; // version/flags + track_ID
                     if flags & 0x01 != 0 {
                         off += 8; // base_data_offset
@@ -566,7 +570,8 @@ pub fn fragment_duration(seg: &[u8], timescale: u32) -> Option<f64> {
                     }
                 }
                 b"trun" => {
-                    let flags = u32::from_be_bytes([0, p[1], p[2], p[3]]);
+                    let Some(f) = p.get(1..4) else { return };
+                    let flags = u32::from_be_bytes([0, f[0], f[1], f[2]]);
                     let Some(cnt) = p.get(4..8).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
                     else {
                         return;

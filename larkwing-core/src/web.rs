@@ -138,6 +138,13 @@ const SEARCH_SOURCES: &[Source] = &[Source::Sogou, Source::Bing, Source::Ddg];
 /// 搜索单请求超时(比 `WebClient` 的 15s 通用档宽):要容得下 Bing 冷启那趟 ~26s 的
 /// 重定向引导,否则它永远只会超时、白占一个源位。抓正文仍用通用档。
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// 整条三源梯子的总预算(技术门限,同 `SEARCH_TIMEOUT`,不是产品默认值)。
+/// 取一个完整的 `SEARCH_TIMEOUT`:既保证**至少有一个源拿到完整的一次机会**
+/// (Bing 冷启动实测 ≈26s,放得下),又保证梯子绝不会把整个工具预算吃光 ——
+/// 工具那边留的是「梯子 30s + 并发抓正文 15s + 余量」。
+const SEARCH_LADDER_BUDGET: Duration = Duration::from_secs(30);
+/// 剩余时间少于这个数就别开新的源了(开了也只是白等一半再被掐)。
+const SEARCH_MIN_TRY: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone)]
 pub struct SearchHit {
@@ -201,11 +208,32 @@ impl WebClient {
     }
 
     /// 搜索:按序试各源,第一个「有结果 + 过合理性闸」的胜出;全军覆没才报错(带各源死因)。
+    ///
+    /// ⚠️ **整条梯子自带预算(2026-08-22 修)**:三个源各自最多 `SEARCH_TIMEOUT`(30s),
+    /// 串起来最坏 90s —— 而工具预算装不下,于是**整个 future 被从外面掐掉**:攒了一路的
+    /// 各源死因(`why`)跟着一起没了,模型只看到一句干巴巴的超时,连「哪个源怎么挂的」都
+    /// 不知道(而「搜索又不对劲了」的排查全靠这些死因,见模块顶部)。现在梯子自己盯着
+    /// 表:剩余时间不够再试一个了就停下,把「没来得及试」也如实写进死因里返回。
     pub async fn search(&self, query: &str, count: usize) -> Result<Vec<SearchHit>> {
         let mut why: Vec<String> = Vec::new();
+        let deadline = Instant::now() + SEARCH_LADDER_BUDGET;
         for &src in SEARCH_SOURCES {
             let name = src.name();
-            match self.search_with(src, query, count).await {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left < SEARCH_MIN_TRY {
+                why.push(format!("{name}: 没来得及试(前面的源把时间用完了)"));
+                continue;
+            }
+            let attempt = tokio::time::timeout(left, self.search_with(src, query, count));
+            let attempt = match attempt.await {
+                Ok(r) => r,
+                Err(_) => {
+                    tracing::warn!(source = name, "搜索超时(梯子预算用完),换下一个源");
+                    why.push(format!("{name}: 超时"));
+                    continue;
+                }
+            };
+            match attempt {
                 Ok(hits) if hits.is_empty() => {
                     tracing::warn!(source = name, "搜索没有结果,换下一个源");
                     why.push(format!("{name}: 没有结果"));

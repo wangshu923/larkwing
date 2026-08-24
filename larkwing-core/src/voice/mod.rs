@@ -127,7 +127,8 @@ struct Inner {
     /// 浏览器推流采集的扇出表(层1 AEC 采集端):`voice.capture.source=browser` 时
     /// `open_capture_auto` 往这儿挂 tap,壳层 `voice_push_audio` 命令喂 16k mono f32 帧。
     /// tap 的管子 drop 了 send 自然失败 → 下次推帧时剪除(与 cpal「pipe drop 即关麦」同语义)。
-    push_taps: std::sync::Mutex<Vec<std::sync::mpsc::SyncSender<Vec<f32>>>>,
+    /// 浏览器推流的扇出表(每项 = 一根管,见 `PushTap`)。
+    push_taps: std::sync::Mutex<Vec<PushTap>>,
     /// 唤醒交互(on_wake / 跟进窗)的「停 / 定稿」信号:`listen_stop` 写、唤醒侧 `collect_utterance` 读。
     /// 独立于听写会话槽 —— 唤醒录音跑在自己的循环线程、不占 `session` 槽,故此前「在听时点停」没反应;
     /// 唤醒侧每次开录前武装成 `CTL_RUN`,前端点停 = 定稿(发已听到的)/ 取消(丢弃回待唤醒)。
@@ -1587,8 +1588,17 @@ impl VoiceRuntime {
     /// 管子 drop → 下次推帧 send 失败 → 自动从扇出表剪除(与「pipe drop 即关麦」同语义)。
     fn open_push_pipe(&self) -> CapturePipe {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(64);
-        self.inner.push_taps.lock().expect("push_taps lock").push(tx);
-        CapturePipe { rx, resampler: None, _guard: CaptureGuard::Push }
+        let alive = std::sync::Arc::new(());
+        let mut taps = self.inner.push_taps.lock().expect("push_taps lock");
+        // ⚠️ **开管时也要剪死管(2026-08-22 修)**:原先只在 `push_audio` 里靠「发送失败」
+        // 剪 —— 而唤醒循环的看门狗恰恰是**因为一直没有帧**才每 30s 重开一次采集,于是
+        // browser 源下每 30s 挂一个新 tap、旧的谁也剪不掉(剪除靠的正是那个不会来的帧),
+        // 一直涨下去。用「存活标记」的弱引用判活:管子(CapturePipe)一 drop 就计数归零,
+        // 有没有帧流过都剪得掉。
+        taps.retain(|(w, _)| w.strong_count() > 0);
+        taps.push((std::sync::Arc::downgrade(&alive), tx));
+        drop(taps);
+        CapturePipe { rx, resampler: None, _guard: CaptureGuard::Push(alive) }
     }
 
     /// 壳层 `voice_push_audio` 命令入口:16k mono f32 帧扇出给所有在收的管。
@@ -1598,7 +1608,8 @@ impl VoiceRuntime {
             return;
         }
         let mut taps = self.inner.push_taps.lock().expect("push_taps lock");
-        taps.retain(|tx| match tx.try_send(pcm.clone()) {
+        taps.retain(|(w, _)| w.strong_count() > 0); // 管子已 drop 的先剪掉(不必等发送失败)
+        taps.retain(|(_, tx)| match tx.try_send(pcm.clone()) {
             Ok(()) => true,
             Err(std::sync::mpsc::TrySendError::Full(_)) => true, // 消费端慢:丢这帧,管还活着
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
@@ -1630,10 +1641,15 @@ pub(super) struct CapturePipe {
     _guard: CaptureGuard,
 }
 
+/// 浏览器推流的一根管:(存活标记的弱引用, 发送端)。
+/// 弱引用是为了**在没有帧流过时也能剪掉死管** —— 见 `open_push_pipe` 的注释。
+type PushTap = (std::sync::Weak<()>, std::sync::mpsc::SyncSender<Vec<f32>>);
+
 enum CaptureGuard {
     /// 只为持有(drop 即关麦),不读字段。
     Cpal(#[allow(dead_code)] cpal::Stream),
-    Push,
+    /// 存活标记:扇出表里存的是它的弱引用,这条管一 drop 就判死(见 `open_push_pipe`)。
+    Push(#[allow(dead_code)] std::sync::Arc<()>),
 }
 
 impl CapturePipe {
@@ -2060,6 +2076,26 @@ mod tests {
             pipe.rx.recv_timeout(std::time::Duration::from_millis(200)).expect("收到推流帧");
         assert_eq!(got.len(), 160);
         assert_eq!(pipe.to_16k(&got).len(), 160, "推流已是 16k,直通不重采样");
+    }
+
+    /// **看门狗反复重开采集时,死管必须被剪掉(2026-08-22)**:唤醒循环的看门狗正是
+    /// **因为一直没有帧**才每 30s 重开一次采集 —— 而原先剪死管只发生在「推帧时发送失败」,
+    /// 那个帧永远不会来,于是 browser 源下扇出表每 30s 长一个、无限涨下去。
+    #[test]
+    fn reopening_capture_prunes_dead_taps_even_with_no_frames() {
+        let rt = test_rt("tapleak");
+        rt.inner.store.settings.set(None, "voice.capture.source", "browser").unwrap();
+        for _ in 0..5 {
+            let pipe = rt.open_capture_auto().unwrap(); // 看门狗重开采集
+            drop(pipe); // 上一根管随即被丢弃(整个过程一帧都没推过)
+        }
+        let live = rt.open_capture_auto().unwrap();
+        assert_eq!(
+            rt.inner.push_taps.lock().unwrap().len(),
+            1,
+            "反复重开只该留最新那根;死管不能靠「等一个不会来的帧」才剪"
+        );
+        drop(live);
     }
 
     #[test]

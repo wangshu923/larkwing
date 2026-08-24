@@ -1429,9 +1429,31 @@ pub struct RelocateCheck {
 }
 
 /// 搬家预检(选完目录、确认前调:把目标路径 + 体积 + 可行性给前端)。
+///
+/// ⚠️ **必须挪出主线程(2026-08-22 修)**:`precheck` 要走一遍整棵数据树才算得出体积,
+/// 媒体多的用户是**几秒到几十秒**;同步 command 跑在主线程上 → 这段时间整个界面卡死,
+/// 用户以为程序挂了(而这一步恰恰是「点了选目录之后」,人正盯着看)。
 #[tauri::command]
-pub fn relocate_precheck(state: State<'_, AppState>, picked: String) -> RelocateCheck {
-    match datadir::precheck(&state.data_root, Path::new(&picked)) {
+// (Tauri 要求:入参带引用的 async command 必须返回 Result —— 这里恒 Ok,前端拿到的
+// 还是同一个 RelocateCheck,不用改。)
+pub async fn relocate_precheck(
+    state: State<'_, AppState>,
+    picked: String,
+) -> Result<RelocateCheck, AppError> {
+    let root = state.data_root.clone();
+    Ok(tokio::task::spawn_blocking(move || precheck_blocking(&root, &picked))
+        .await
+        .unwrap_or(RelocateCheck {
+            ok: false,
+            reason: Some("internal".into()),
+            new_root: None,
+            need_bytes: 0,
+            free_bytes: 0,
+        }))
+}
+
+fn precheck_blocking(data_root: &Path, picked: &str) -> RelocateCheck {
+    match datadir::precheck(data_root, Path::new(picked)) {
         Ok(plan) => RelocateCheck {
             ok: true,
             reason: None,

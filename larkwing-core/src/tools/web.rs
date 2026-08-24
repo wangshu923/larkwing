@@ -65,7 +65,9 @@ impl WebSearch {
                     },
                     "required": ["query"]
                 }),
-                timeout: std::time::Duration::from_secs(40),
+                // 梯子 30s(SEARCH_LADDER_BUDGET)+ 并发抓正文 15s + 余量 —— 原先 40s
+                // 装不下,三源梯子会被从外面掐掉、各源死因一起丢(2026-08-22 修)
+                timeout: std::time::Duration::from_secs(50),
                 ui_key: "tool.web_search",
             },
             web,

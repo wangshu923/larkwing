@@ -81,7 +81,32 @@ fn collect_materials(store: &Store, from_ms: i64, end_ms: i64) -> Result<Vec<Day
     let mut days: HashMap<String, Vec<String>> = HashMap::new();
     let mut day_counts: HashMap<String, usize> = HashMap::new();
 
-    for m in store.chat.messages_between(from_ms, end_ms, 2_000)? {
+    // ⚠️ **逐日取,别用一条全局 LIMIT(2026-08-22 修)**:原先是
+    // `messages_between(from, end, 2_000)`,而它按 `created_at ASC` 排 —— 区间一长
+    // (攒了好些天没写、或补写一大段),这 2000 条全被**最早的那几天**吃光,最近几天
+    // 一条原料都拿不到;偏偏水位线又照样往前推,那些日子的日记就**永远不会有了**,
+    // 而且一声不吭。改成一天一查、每天最多 `MSGS_PER_DAY` 条:每天都有自己的份额,
+    // 总量仍然有界(天数 × 60),谁也饿不着谁。
+    let mut day_msgs: Vec<crate::store::chat::Message> = Vec::new();
+    {
+        let Some(first) = local_date(from_ms) else { return Ok(Vec::new()) };
+        let Some(last) = local_date(end_ms.saturating_sub(1)) else { return Ok(Vec::new()) };
+        let mut d = first;
+        while d <= last {
+            let lo = day_start_ms(d).unwrap_or(from_ms).max(from_ms);
+            let hi = d
+                .succ_opt()
+                .and_then(day_start_ms)
+                .unwrap_or(end_ms)
+                .min(end_ms);
+            if lo < hi {
+                day_msgs.extend(store.chat.messages_between(lo, hi, MSGS_PER_DAY as i64)?);
+            }
+            let Some(next) = d.succ_opt() else { break };
+            d = next;
+        }
+    }
+    for m in day_msgs {
         let Some(date) = local_date(m.created_at).map(|d| d.to_string()) else { continue };
         let cnt = day_counts.entry(date.clone()).or_insert(0);
         if *cnt >= MSGS_PER_DAY {
@@ -283,10 +308,25 @@ mod tests {
     use crate::llm::fake::{FakeLlm, FakeTurn};
     use crate::store::Store;
 
+    fn store_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("lw-diary-run-{}-{tag}.db", std::process::id()))
+    }
+
     fn store(tag: &str) -> Store {
-        let p = std::env::temp_dir().join(format!("lw-diary-run-{}-{tag}.db", std::process::id()));
+        let p = store_path(tag);
         let _ = std::fs::remove_file(&p);
         Store::open(&p).unwrap()
+    }
+
+    /// 把消息的时间戳改到过去(测试用:`append_message` 只会写「此刻」)。
+    /// 另开一条连接直接改库,不为测试往生产代码里加口子。`up_to` = 只改这个 id 及以前的。
+    fn backdate_upto(tag: &str, up_to: i64, at_ms: i64) {
+        let c = rusqlite::Connection::open(store_path(tag)).unwrap();
+        c.execute(
+            "UPDATE messages SET created_at = ?1 WHERE id <= ?2 AND created_at > ?1",
+            rusqlite::params![at_ms, up_to],
+        )
+        .unwrap();
     }
 
     /// 剧本:若 LLM 真被调,这条会落库 → 「表空」即反证没调(FakeLlm 空队列是回声、不报错)。
@@ -297,6 +337,40 @@ mod tests {
 
     fn today_ms() -> i64 {
         crate::store::now_ms()
+    }
+
+    /// **长区间里,最近几天不能被最早几天饿死(2026-08-22)**:原先是一条
+    /// `messages_between(from, end, 2_000)` 按时间升序取 —— 攒了好些天没写时,配额全被
+    /// 最早的那天吃光,最近的日子一条原料都拿不到;水位线却照样往前推,那些日子的日记
+    /// **永远不会有**,而且一声不吭。
+    #[test]
+    fn collect_materials_gives_every_day_its_own_share() {
+        let tag = "fairshare";
+        let s = store(tag);
+        let user = s.users.ensure_default_user().unwrap();
+        let conv = s.chat.create_conversation(user.id, "companion").unwrap();
+        let now = today_ms();
+        let day = 86_400_000i64;
+        // 第 1 天:海量闲聊。**必须真的超过原先那条全局 LIMIT(2000)**,否则复现不出饿死。
+        let mut last = 0i64;
+        for i in 0..2_100 {
+            last = s.chat.append_message(conv.id, "user", &format!("很久以前的第{i}句")).unwrap().id;
+        }
+        backdate_upto(tag, last, now - 3 * day);
+        // 第 3 天:只说了一句 —— 就是它最容易被饿死
+        let one = s.chat.append_message(conv.id, "user", "昨天带娃去了公园").unwrap();
+        backdate_upto(tag, one.id, now - day);
+
+        let days = collect_materials(&s, now - 4 * day, now).unwrap();
+        let recent = local_date(now - day).unwrap().to_string();
+        let old = local_date(now - 3 * day).unwrap().to_string();
+        assert!(days.iter().any(|d| d.date == old), "热闹那天当然要有");
+        let got = days.iter().find(|d| d.date == recent).expect("最近那天必须也有原料,不能被前面吃光");
+        assert!(
+            got.lines.iter().any(|l| l.contains("公园")),
+            "拿到的应该正是那天说的话:{:?}",
+            got.lines
+        );
     }
 
     #[tokio::test]
