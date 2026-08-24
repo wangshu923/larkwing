@@ -215,6 +215,11 @@ const AUDIO_SEG: f64 = 6.0;
 /// 音频段左侧预卷(秒):切段时多切这么一段在前面,前端用 `appendWindowStart` 把它连同 AAC
 /// 编码器 priming(~43ms 静音)一起裁掉 → 逐段独立编码也**无累计漂移**(gapless)。0.5s 足够盖住 priming。
 const AUDIO_PREROLL: f64 = 0.5;
+/// **copy 音频段的精切余量(秒,§4.11 单源在此)**:输入侧 `-ss` 是容器级 seek、落到前一个
+/// **视频**关键帧,而 `-c:a copy` 不解码 → 早出来的那截不会被裁(见 `build_audio_frag_cmd`)。
+/// 故粗切只切到 `ss − 这个值`,余下交给输出侧 `-ss` 按时间戳精确丢弃(音频每包都是同步点)。
+/// 取小:丢弃量由关键帧间距决定、与本值无关,本值只影响粗切落点离目标多近。
+const AUDIO_FINE_SEEK: f64 = 0.1;
 
 /* ——— 进度条 hover 缩略图的四道闸(单源在此;要调回来问,§4.11)———
  * 抽一帧本身很快(输入 seek 直落关键帧再解一帧),贵的是**次数** —— 光标横穿一条进度条能
@@ -1096,10 +1101,23 @@ fn build_audio_frag_cmd(
 ) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(ffmpeg);
     cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin");
-    if ss > 0.0 {
-        cmd.arg("-ss").arg(format!("{ss:.6}"));
+    // **copy 路必须两段式 seek(2026-08-22 真机破案)**:单靠输入侧 `-ss` 时,容器级 seek 落到前一个
+    // **视频**关键帧,`-c:a copy` 不解码所以早出来的那截不会被裁;`-t` 又是按输出时间轴计数、
+    // 不丢负 PTS → 段内容 = 计划 + δ(δ = ss − 前一个关键帧,真机 BD 片实测达 7.3s)。随后 mp4
+    // muxer 的 `avoid_negative_ts` 把它整体平移、`tfdt` 归 0 —— **「内容实际从哪开始」的信息就此
+    // 丢失**(`zero_tfdt` 因而是 no-op)→ 前端按 `grid − preroll` 摆放 = 整段晚 δ、**每个接缝重播
+    // δ 秒**(表现:音画不同步 + 声音一段段重复)。故粗切留 `AUDIO_FINE_SEEK`,余量交给输出侧 `-ss`
+    // 按时间戳精确丢弃(音频每包都是同步点,不需解码,实测只多 0.04s)。
+    // 转码路本就是精确 seek(解码丢弃到 ss),**一字不动 = 零回归**。
+    let fine = if copy_audio && ss > 0.0 { AUDIO_FINE_SEEK.min(ss) } else { 0.0 };
+    if ss - fine > 0.0 {
+        cmd.arg("-ss").arg(format!("{:.6}", ss - fine));
     }
-    cmd.arg("-i").arg(path).arg("-t").arg(format!("{dur:.6}")).arg("-vn")
+    cmd.arg("-i").arg(path);
+    if fine > 0.0 {
+        cmd.arg("-ss").arg(format!("{fine:.6}"));
+    }
+    cmd.arg("-t").arg(format!("{dur:.6}")).arg("-vn")
         .arg("-map").arg(format!("0:a:{audio_track}?")) // 显式选轨(原 -vn 默认挑轨,多音轨不可控)
         .arg("-c:a");
     if copy_audio {
@@ -1879,6 +1897,68 @@ mod tests {
         // 片尾之后没有帧 → 404(前端把这一格记下不再重试)
         let past = http.get(format!("{base}?t=600")).send().await.unwrap();
         assert_eq!(past.status().as_u16(), 404);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **契约③的音频半边(2026-08-22 真机实锤后补)**:copy 音频段必须**恰好**是计划的长度。
+    ///
+    /// 事故形态:`-ss` 放在 `-i` 之前 = 容器级 seek,落到前一个**视频**关键帧;`-c:a copy` 不解码,
+    /// 所以早出来的那截不会被裁,而 `-t` 是按输出时间轴计数的、不丢负 PTS → 段内容 = 计划 + δ,
+    /// 其中 δ = ss − 前一个视频关键帧。接着 mp4 muxer 的 `avoid_negative_ts` 把它整体平移、
+    /// `tfdt` 归 0 —— **「内容实际从哪开始」的信息就此丢失**(`zero_tfdt` 因而是 no-op)。
+    /// 前端按 `grid − preroll` 摆放 → 整段晚 δ、**每个接缝重播 δ 秒**。真机 BD 片实测 δ 达 7.3s
+    /// (关键帧间距 3~14s),表现为「音画不同步 + 声音一段段重复」;切到转码路(精确 seek)反而正常。
+    ///
+    /// 关键设计:合成源的关键帧要**稀**(每 4s),δ 才够大到超出容差;音轨必须 **AAC**
+    /// (`capability` 的 copy 前提之一),否则走的是转码路、测不到这条。
+    ///
+    /// 需 PATH 有 ffmpeg:
+    /// `cargo test -p larkwing-core --lib media::relay::tests::audio_copy_segment -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn audio_copy_segment_is_exactly_planned_length() {
+        let dir = std::env::temp_dir().join(format!("lw-aseg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("片子.mp4");
+        // 40s;关键帧每 4s(-g 100 @25fps + 关掉场景切)→ 音频 6s 网格与关键帧刻意不对齐。
+        let ok = std::process::Command::new("ffmpeg")
+            .args([
+                "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=40",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=40",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                "-g", "100", "-keyint_min", "100", "-sc_threshold", "0",
+                "-c:a", "aac", "-b:a", "128k", "-f", "mp4",
+            ])
+            .arg(&src)
+            .status()
+            .expect("run ffmpeg")
+            .success();
+        assert!(ok, "生成测试源失败");
+
+        // AAC 在 mp4 里的 timescale = 采样率;段内 trun 的样本时长累加 = 真实时长。
+        const TS: u32 = 48000;
+        let ffmpeg = PathBuf::from("ffmpeg");
+        for n in 1usize..=4 {
+            let grid = n as f64 * AUDIO_SEG;
+            let ss = grid - AUDIO_PREROLL;
+            let cut = AUDIO_SEG + AUDIO_PREROLL;
+            let cmd = build_audio_frag_cmd(&ffmpeg, &src, ss, cut, 0, true);
+            let full = run_ffmpeg_collect(cmd, 16 * 1024 * 1024).await.expect("切音频段");
+            let moof = super::super::probe::first_moof_offset(&full).expect("找 moof");
+            let end = super::super::probe::moof_segment_end(&full, moof);
+            let real = super::super::probe::fragment_duration(&full[moof..end], TS)
+                .expect("量段内时长");
+            // 容差放一帧多一点(1024/48000 ≈ 21ms);δ 是秒级,一眼分得开。
+            assert!(
+                (real - cut).abs() < 0.05,
+                "a{n}(ss={ss}) 段长应 ≈{cut}s,实际 {real:.3}s —— 多出来的 {:.3}s \
+                 是 -ss 落到前一个视频关键帧带进来的陈旧音频,会在接缝处重播",
+                real - cut
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

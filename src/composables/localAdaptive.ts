@@ -414,8 +414,12 @@ export async function playAdaptive(
       // 两种卡法都要兜:!paused = 播着却不走;readyState<2 = 连首帧都没解出来 —— WKWebView 上
       // play() 被 MSE 拒掉会把 paused 弹回 true,原先只查 !paused 就永远不触发(2026-07-21
       // Mac 绿屏卡死实锤)。用户在首帧后主动暂停 = paused 且 readyState≥2,不会误杀。
+      // ⚠️ 判据是「离**起播位**还没动」,不是「currentTime < 0.3」——绝对阈值只对从头播成立,
+      // 续播(startAt=120.9 这类)时条件永远为假 → 看门狗形同不存在,静默卡死无人兜底。
+      // 2026-08-22 实锤:用户「切音轨有时候会变成转码就正常了」的偶发性正出在这里 —— 从头播
+      // 时它能响、于是降级到 muxed(转码)把人救了;续播时它不响,坏音频就一路播下去。
       const watchdog = window.setTimeout(() => {
-        if (!stopped && !dead && el.currentTime < 0.3 && (!el.paused || el.readyState < 2)) {
+        if (!stopped && !dead && el.currentTime - start < 0.3 && (!el.paused || el.readyState < 2)) {
           fail('stall: no progress in 12s')
         }
       }, 12000)

@@ -738,18 +738,104 @@ fn audio_track_of_trak(moov: &[u8], tr_s: usize, tr_e: usize) -> Option<AudioTra
         let text = String::from_utf8_lossy(raw).trim_matches(char::from(0)).trim().to_string();
         (!text.is_empty() && text.chars().count() <= 60).then_some(text)
     })();
-    // stsd 的 AudioSampleEntry 里有 channelcount:entry 起点 = stsd payload+8(size 字段),
-    // 其内 +24 处是 channelcount(SampleEntry 16 字节 + version/revision/vendor 8 字节)。
-    // ⚠️ AC-3/E-AC-3 这里常写 2、真实布局在 dac3 盒 —— 但那类编码浏览器本来就解不了、恒转码,
-    // 所以这处不准不影响判定;真正吃这个数的是 AAC 这类能 copy 的编码。
+    // 声道数:**AAC 优先读 esds 里的 AudioSpecificConfig**,读不到再回落 stsd 的 channelcount。
+    // ⚠️ 原先只读 stsd(entry 起点 = stsd payload+8,其内 +24 = channelcount),注释里还断言
+    // 「AC-3 那里常写 2 但那类恒转码、不影响判定;真正吃这个数的是 AAC 这类能 copy 的编码」——
+    // **这个假设 2026-08-22 被真机推翻**:一部 BD 三语 mp4 的三条 AAC 在 AudioSampleEntry 里
+    // 全写 2,而 esds 的 channelConfiguration 是 2/6/6(后两条实为 5.1)。判错的后果很硬:
+    // 5.1 被当立体声 → `capability::audio_track_plan` 判可 copy → 多声道 AAC 进 MSE(§7.1 的
+    // 硬墙)+ 下混响度不受控。ISO 14496-12 本就说 AudioSampleEntry 那两个字段应当忽略、
+    // 以解码器配置为准,所以这里的顺序才是对的。
     let channels = (|| {
         let (mn_s, mn_e) = find_box(moov, b"minf", md_s, md_e)?;
         let (st_s, st_e) = find_box(moov, b"stbl", mn_s, mn_e)?;
-        let (sd_s, _) = find_box(moov, b"stsd", st_s, st_e)?;
+        let (sd_s, sd_e) = find_box(moov, b"stsd", st_s, st_e)?;
+        // sample entry 起点 = stsd payload+8;其固定部分 36 字节(8 盒头 + 8 reserved/dref
+        // + 20 version..samplerate)之后才是子盒,esds 就在那儿。**QuickTime 的 v1/v2 音频 entry
+        // 在这之后还各多 16 / 36 字节**(实测这类 BD mp4 都是 v0,但认一下不花钱;认错版本会从
+        // 字段中间当盒子解 → 宁可算准)。
+        let extra = match u16::from_be_bytes(moov.get(sd_s + 24..sd_s + 26)?.try_into().ok()?) {
+            1 => 16,
+            2 => 36,
+            _ => 0,
+        };
+        let asc_ch = find_box(moov, b"esds", sd_s + 8 + 36 + extra, sd_e)
+            .and_then(|(e_s, e_e)| esds_asc(moov.get(e_s..e_e)?))
+            .and_then(asc_channels);
+        if asc_ch.is_some() {
+            return asc_ch;
+        }
         let b = moov.get(sd_s + 32..sd_s + 34)?;
         u8::try_from(u16::from_be_bytes([b[0], b[1]])).ok().filter(|c| *c > 0)
     })();
     Some(AudioTrack { codec, lang, title, channels })
+}
+
+/// MPEG-4 描述符的 BER 变长长度(每字节 7 位,高位 = 还有后续;实测常见 `0x80 0x80 0x80 0xNN`)。
+/// 超过 4 字节 = 形状不对,不猜 → None。
+fn ber_len(b: &[u8], p: &mut usize) -> Option<usize> {
+    let mut v = 0usize;
+    for _ in 0..4 {
+        let byte = *b.get(*p)?;
+        *p += 1;
+        v = (v << 7) | (byte & 0x7f) as usize;
+        if byte & 0x80 == 0 {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// 走 esds 载荷的描述符链,取出 DecoderSpecificInfo(tag 0x05)的内容 = AudioSpecificConfig。
+/// 链形:ES_Descriptor(0x03)→ DecoderConfigDescriptor(0x04)→ DecoderSpecificInfo(0x05)。
+/// **刻意不做「全文搜 0x05」**:0x05 会在码率等字节里假命中,读出来的声道数是错的 —— 而这个
+/// 函数存在的意义就是不再判错声道。形状对不上一律 None,调用方回落 stsd。
+fn esds_asc(payload: &[u8]) -> Option<&[u8]> {
+    let mut p = 4usize; // version/flags
+    if *payload.get(p)? != 0x03 {
+        return None;
+    }
+    p += 1;
+    ber_len(payload, &mut p)?;
+    let flags = *payload.get(p + 2)?;
+    p += 3; // ES_ID(2) + flags(1)
+    if flags & 0x80 != 0 {
+        p += 2; // dependsOn_ES_ID
+    }
+    if flags & 0x40 != 0 {
+        p += 1 + *payload.get(p)? as usize; // URL(长度前缀)
+    }
+    if flags & 0x20 != 0 {
+        p += 2; // OCR_ES_ID
+    }
+    if *payload.get(p)? != 0x04 {
+        return None;
+    }
+    p += 1;
+    ber_len(payload, &mut p)?;
+    p += 13; // objectTypeIndication(1) + streamType/bufferSize(4) + max/avg bitrate(8)
+    if *payload.get(p)? != 0x05 {
+        return None;
+    }
+    p += 1;
+    let len = ber_len(payload, &mut p)?;
+    payload.get(p..p + len)
+}
+
+/// AudioSpecificConfig 的 `channelConfiguration` → 声道数。
+/// 头 2 字节 = 5bit AOT + 4bit 采样率索引 + 4bit 声道配置。
+fn asc_channels(asc: &[u8]) -> Option<u8> {
+    if asc.len() < 2 {
+        return None;
+    }
+    let bits = u16::from_be_bytes([asc[0], asc[1]]);
+    // AOT=31 是转义(后跟 6bit),声道配置位置随之后移 —— 罕见,不猜,交给回落。
+    if (bits >> 11) & 0x1f == 31 {
+        return None;
+    }
+    // 0 = 布局写在 PCE 里(要解码才知道)→ 不猜;1..=7 是标准映射,注意 7 = 8 声道。
+    const CH: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 8];
+    CH.get(((bits >> 3) & 0xf) as usize).copied().filter(|c| *c > 0)
 }
 
 /// mdhd 打包语言 → ISO-639-2 三字码;全零/"und"/解出非小写字母 → None(未标注)。
@@ -2139,6 +2225,78 @@ Input #0, flac, from 'song.flac':
         assert!(segs.iter().all(|&(s, _)| kf.iter().any(|k| (k - s).abs() < 1e-6)));
         let total: f64 = segs.iter().map(|&(_, d)| d).sum();
         assert!((total - 20.0).abs() < 0.05, "覆盖到片尾,段:{segs:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AudioSpecificConfig 的声道位:5bit AOT + 4bit 采样率索引 + 4bit 声道配置。
+    /// 钉住三件事:标准映射(含 7 = 8 声道)、0 = 不猜(布局在 PCE 里)、AOT=31 转义 = 不猜。
+    #[test]
+    fn asc_channels_reads_channel_configuration() {
+        // AOT=2(LC) freq=3 ch=N → bits = 2<<11 | 3<<7 | N<<3
+        let mk = |ch: u16| ((2u16 << 11) | (3 << 7) | (ch << 3)).to_be_bytes();
+        for (cc, want) in [(1u16, 1u8), (2, 2), (6, 6), (7, 8)] {
+            assert_eq!(asc_channels(&mk(cc)), Some(want), "channelConfiguration={cc}");
+        }
+        assert_eq!(asc_channels(&mk(0)), None, "0 = 布局写在 PCE 里,不猜");
+        let escape = ((31u16 << 11) | (3 << 7) | (2 << 3)).to_be_bytes();
+        assert_eq!(asc_channels(&escape), None, "AOT=31 转义 → 位置后移,不猜");
+        assert_eq!(asc_channels(&[0x11]), None, "不足 2 字节");
+    }
+
+    /// esds 描述符链要**按链走**,不能全文搜 0x05 —— 真机上 5.1 被读成 2 就是判错声道的后果,
+    /// 这里刻意把 0x05 放进码率字节里当诱饵:走链能躲开,搜字节会中招读出错的声道数。
+    #[test]
+    fn esds_asc_walks_descriptor_chain_not_byte_scan() {
+        let asc = [0x11u8, 0x90]; // AOT=2 freq=3 ch=2
+        let mut dsi = vec![0x05, asc.len() as u8];
+        dsi.extend_from_slice(&asc);
+        let mut dcd = vec![0x04, (13 + dsi.len()) as u8, 0x40, 0x15];
+        dcd.extend_from_slice(&[0x00, 0x00, 0x05]); // bufferSizeDB:埋一个 0x05 诱饵
+        dcd.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]); // maxBitrate
+        dcd.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]); // avgBitrate
+        dcd.extend_from_slice(&dsi);
+        let mut payload = vec![0u8, 0, 0, 0]; // version/flags
+        payload.extend_from_slice(&[0x03, (3 + dcd.len()) as u8, 0x00, 0x01, 0x00]); // ES_Desc,flags=0
+        payload.extend_from_slice(&dcd);
+        assert_eq!(esds_asc(&payload), Some(&asc[..]), "按链走应取到 ASC");
+        assert_eq!(asc_channels(esds_asc(&payload).unwrap()), Some(2));
+        // BER 多字节长度(0x80 0x80 0x80 0xNN)也要认
+        let mut ber = vec![0u8, 0, 0, 0];
+        ber.extend_from_slice(&[0x03, 0x80, 0x80, 0x80, (3 + dcd.len()) as u8, 0x00, 0x01, 0x00]);
+        ber.extend_from_slice(&dcd);
+        assert_eq!(esds_asc(&ber), Some(&asc[..]), "BER 变长长度要认");
+        assert_eq!(esds_asc(&[0u8, 0, 0, 0, 0x06]), None, "形状对不上 → None(回落 stsd)");
+    }
+
+    /// **真机实锤的回归(2026-08-22)**:多音轨 BD mp4 的 AudioSampleEntry.channelcount 会对
+    /// 5.1 轨也写 2 —— 判成立体声就会让它走 copy(多声道 AAC 进 MSE 是硬墙)。合成一个
+    /// 「stsd 写 2、esds 写 5.1」的文件,断言我们报 6 而不是 2。
+    /// 需 PATH 有 ffmpeg:`cargo test -p larkwing-core --lib media::probe::tests::multichannel -- --ignored`
+    #[test]
+    #[ignore]
+    fn multichannel_aac_is_not_reported_as_stereo() {
+        let dir = std::env::temp_dir().join(format!("lw-ch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("5_1.mp4");
+        let ok = std::process::Command::new("ffmpeg")
+            .args([
+                "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2",
+                "-af", "pan=5.1|FL=c0|FR=c0|FC=c0|LFE=c0|BL=c0|BR=c0",
+                "-c:a", "aac", "-f", "mp4",
+            ])
+            .arg(&src)
+            .status()
+            .expect("run ffmpeg")
+            .success();
+        assert!(ok, "生成 5.1 测试源失败");
+        let p = probe_local(&src).expect("探测");
+        assert_eq!(
+            p.audio_tracks.first().and_then(|t| t.channels),
+            Some(6),
+            "5.1 轨必须报 6:报 2 就会被判成可 copy,多声道 AAC 进 MSE 是硬墙"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
