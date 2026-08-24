@@ -800,6 +800,7 @@ fn build_read_script(collect_url: &str) -> String {
         r#"(function() {{
   var POST = {post};
   var CAP = {cap};
+{SCRUB_JS}
   function textOf(el) {{ return (el && el.innerText) ? el.innerText : ''; }}
   var best = '';
   var sels = ['article', 'main', '[role="main"]', '#content', '.article', '.post-content', '.content'];
@@ -819,7 +820,7 @@ fn build_read_script(collect_url: &str) -> String {
     text: best.slice(0, CAP),
     capped: best.length > CAP
   }};
-  try {{ fetch(POST, {{ method: 'POST', headers: {{ 'Content-Type': 'text/plain' }}, body: JSON.stringify(payload) }}); }} catch (e) {{}}
+  try {{ fetch(POST, {{ method: 'POST', headers: {{ 'Content-Type': 'text/plain' }}, body: JSON.stringify(lwScrub(payload)) }}); }} catch (e) {{}}
 }})();"#,
         cap = READ_CAP_CHARS
     )
@@ -860,6 +861,29 @@ const POPUP_TAME_JS: &str = r#"(function() {
 /// 目标选择逻辑(JS 片段,resolve 脚本嵌入):按编号(data-lw-ref,上次快照打的)或按
 /// 文字(精确>包含、最内层优先、button/a/input 优先、文字更短更 specific——治「点到展开
 /// 菜单的容器」)。独立成片段 = 选择规则只有一份;真点由 CLICK_ARMED_JS 按标记执行。
+/// 出站前把落单的代理项(surrogate)清掉 —— 四个 collect 脚本共用(按 `{SCRUB_JS}` 插值)。
+///
+/// ⚠️ **一个落单代理项就能让整份回传作废**(2026-08-22 修):脚本里那些 `slice(0, N)` 切在
+/// emoji / 生僻字中间就会切出半个字符,`JSON.stringify` 把它写成 `\udXXX` 落单转义,而 Rust
+/// 侧 serde_json **拒收**落单代理项 → 整个 POST 解析失败 → 内容压根没到 → 报成「渲染超时/
+/// 反爬」,查都没处查。页面自己的 DOM 里本来就带落单代理项的情况也一并治了,所以清洗放在
+/// **出站边界**、而不是逐个 slice 打补丁。成对的代理项(正常 emoji)原样保留。
+const SCRUB_JS: &str = r#"
+  function lwDeLone(s) {
+    return s.replace(/[\uD800-\uDFFF]/g, function (ch, i) {
+      var c = ch.charCodeAt(0);
+      if (c >= 0xD800 && c <= 0xDBFF) { var n = s.charCodeAt(i + 1); return (n >= 0xDC00 && n <= 0xDFFF) ? ch : ''; }
+      var pv = s.charCodeAt(i - 1); return (pv >= 0xD800 && pv <= 0xDBFF) ? ch : '';
+    });
+  }
+  function lwScrub(v) {
+    if (typeof v === 'string') return lwDeLone(v);
+    if (Object.prototype.toString.call(v) === '[object Array]') { for (var i = 0; i < v.length; i++) v[i] = lwScrub(v[i]); return v; }
+    if (v && typeof v === 'object') { for (var k in v) if (Object.prototype.hasOwnProperty.call(v, k)) v[k] = lwScrub(v[k]); return v; }
+    return v;
+  }
+"#;
+
 const PICK_TARGET_JS: &str = r#"
   function txt(el) { return ((el.innerText || el.value || '') + '').replace(/\s+/g, ' ').trim().slice(0, 40); }
   function pickTarget(REF, CLICK) {
@@ -900,13 +924,14 @@ fn build_resolve_script(click_ref: Option<u32>, click_text: Option<&str>, post_u
     format!(
         r#"(function() {{
   var REF = {ref_js}; var CLICK = {text_js}; var POST = {post};
+{SCRUB_JS}
 {PICK_TARGET_JS}
   var old = document.querySelectorAll('[data-lw-armed]');
   for (var i = 0; i < old.length; i++) old[i].removeAttribute('data-lw-armed');
   var r = pickTarget(REF, CLICK);
   if (r.target) r.target.setAttribute('data-lw-armed', '1');
   var payload = {{ found: !!r.target, stale: r.stale, text: r.target ? txt(r.target) : '' }};
-  try {{ fetch(POST, {{ method: 'POST', headers: {{ 'Content-Type': 'text/plain' }}, body: JSON.stringify(payload) }}); }} catch (e) {{}}
+  try {{ fetch(POST, {{ method: 'POST', headers: {{ 'Content-Type': 'text/plain' }}, body: JSON.stringify(lwScrub(payload)) }}); }} catch (e) {{}}
 }})();"#
     )
 }
@@ -989,12 +1014,13 @@ async fn probe_submit_button(
     let js = format!(
         r#"(function() {{
   var REF = {ref_js}; var POST = {post};
+{SCRUB_JS}
   function txt(el) {{ return ((el.innerText || el.value || '') + '').replace(/\s+/g, ' ').trim().slice(0, 40); }}
   var el = REF !== null ? document.querySelector('[data-lw-ref="' + REF + '"]') : null;
   var f = (el && el.form) || (document.activeElement && document.activeElement.form) || document.querySelector('form');
   var btn = f ? f.querySelector('input[type="submit"],button[type="submit"],button:not([type])') : null;
   var payload = {{ text: btn ? txt(btn) : '' }};
-  try {{ fetch(POST, {{ method: 'POST', headers: {{ 'Content-Type': 'text/plain' }}, body: JSON.stringify(payload) }}); }} catch (e) {{}}
+  try {{ fetch(POST, {{ method: 'POST', headers: {{ 'Content-Type': 'text/plain' }}, body: JSON.stringify(lwScrub(payload)) }}); }} catch (e) {{}}
 }})();"#
     );
     if entry.win.eval(js.as_str()).is_err() {
@@ -1480,6 +1506,7 @@ fn build_snapshot_script(collect_url: &str) -> String {
     format!(
         r#"(function() {{
   var POST = {post};
+{SCRUB_JS}
   function txt(el) {{ return ((el.innerText || '') + '').replace(/\s+/g, ' ').trim().slice(0, 40); }}
   function labelOf(el) {{
     try {{ if (el.id) {{ var l = document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(el.id) : el.id) + '"]'); if (l) return txt(l); }} }} catch (e) {{}}
@@ -1514,6 +1541,18 @@ fn build_snapshot_script(collect_url: &str) -> String {
     if (el.getAttribute('role') === 'button' || el.hasAttribute('onclick')) {{ var ct = txt(el); return ct ? {{ role: 'click', text: ct }} : null; }}
     return null;
   }}
+  // 可见性判定。⚠️ **不能只看 offsetParent**(2026-08-22 修):按规范 `position:fixed`
+  // 的元素 offsetParent 也是 null —— 而吸顶导航、悬浮的「下载」按钮、cookie 横幅、模态框
+  // 全是 fixed,于是这一整类**看得见的按钮**从来不进编号快照,模型只能干瞪眼说页面上没有。
+  function visible(el) {{
+    if (el.offsetParent !== null) return true;
+    try {{
+      var cs = getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
+      if (cs.position === 'fixed') {{ var r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }}
+    }} catch (e) {{}}
+    return false;
+  }}
   var links = []; var seen = {{}};
   var anchors = document.querySelectorAll('a[href]');
   for (var i = 0; i < anchors.length && links.length < 25; i++) {{
@@ -1522,13 +1561,19 @@ fn build_snapshot_script(collect_url: &str) -> String {
     links.push({{ text: txt(anchors[i]) || h.split('/').pop().slice(0, 40), url: h }});
   }}
   var elements = [];
+  // ⚠️ **先把上一张快照的编号全清掉**(2026-08-22 修):`data-lw-ref` 从来没人擦,而每张
+  // 快照都从 1 重新编 —— 上一张的 7 号还挂着、这张的 7 号是另一个元素,`click_ref: 7` 用
+  // querySelector 找到的是**文档序在前的那个**,可能正是那个陈旧的。在付款页上点错按钮
+  // 是要命的。清干净 = 编号永远只属于最新这张快照。
+  var stale = document.querySelectorAll('[data-lw-ref]');
+  for (var sx = 0; sx < stale.length; sx++) stale[sx].removeAttribute('data-lw-ref');
   var cands = document.querySelectorAll('button,a,[role="button"],[onclick],input,textarea,select,[contenteditable]');
   var no = 1;
   for (var j = 0; j < cands.length && elements.length < 60; j++) {{
     var el = cands[j];
     // 文件上传框豁免可见性过滤:常见页型就是 display:none 的隐藏 input + 好看的按钮
     var isFile = (el.tagName === 'INPUT' && (el.getAttribute('type') || '').toLowerCase() === 'file');
-    if (el.offsetParent === null && !isFile) continue; // display:none 等不可见的不编号
+    if (!visible(el) && !isFile) continue; // 真正不可见的才不编号(fixed 是可见的,见 visible)
     var d = describe(el);
     if (!d) continue;
     el.setAttribute('data-lw-ref', String(no));
@@ -1557,7 +1602,7 @@ fn build_snapshot_script(collect_url: &str) -> String {
     click_ref_stale: !!click.stale,
     click_note: click.note || ''
   }};
-  try {{ fetch(POST, {{ method: 'POST', headers: {{ 'Content-Type': 'text/plain' }}, body: JSON.stringify(payload) }}); }} catch (e) {{}}
+  try {{ fetch(POST, {{ method: 'POST', headers: {{ 'Content-Type': 'text/plain' }}, body: JSON.stringify(lwScrub(payload)) }}); }} catch (e) {{}}
 }})();"#
     )
 }
@@ -1594,7 +1639,31 @@ mod tests {
         let snap = build_snapshot_script("http://127.0.0.1:1/collect/x");
         assert!(snap.contains("type === 'file'"), "{snap}");
         assert!(snap.contains("click_note"), "{snap}");
+        // 2026-08-22 三修的形状守卫(改回去就红):
+        assert!(snap.contains("function visible(el)"), "fixed 定位的按钮要认成可见:{snap}");
+        assert!(!snap.contains("el.offsetParent === null && !isFile"), "别退回只看 offsetParent");
+        assert!(snap.contains("removeAttribute('data-lw-ref')"), "编号前要清上一张快照的:{snap}");
+        assert!(snap.contains("lwScrub(payload)"), "出站要清落单代理项:{snap}");
         println!("__SCRIPT_SNAP__\n{snap}\n__END__");
+    }
+
+    /// 四个 collect 脚本**都**要清落单代理项 —— 只要有一处漏了,那条路上一个 emoji
+    /// 被切一半就能让整份回传被 serde_json 拒收、症状伪装成「渲染超时/反爬」。
+    #[test]
+    fn every_collect_script_scrubs_lone_surrogates() {
+        // submit 探针那条内联在异步函数里、单测调不到 —— 它同样按 `{SCRUB_JS}` 插值,
+        // 常量没了会直接编译不过,算是另一种守卫。
+        let scripts = [
+            ("snapshot", build_snapshot_script("http://127.0.0.1:1/collect/x")),
+            ("read", build_read_script("http://127.0.0.1:1/collect/x")),
+            ("resolve", build_resolve_script(Some(3), None, "http://127.0.0.1:1/collect/x")),
+        ];
+        for (tag, js) in &scripts {
+            assert!(js.contains("function lwScrub"), "{tag} 少了清洗函数");
+            assert!(js.contains("JSON.stringify(lwScrub(payload))"), "{tag} 出站没过清洗");
+            assert!(!js.contains("JSON.stringify(payload)"), "{tag} 还有没过清洗的出站");
+            println!("__SCRUB_{tag}__\n{js}\n__END__");
+        }
     }
 
     /// 确认闸脚本(两段式点击 + submit 探针)的形状守卫;`--nocapture` 倒出成品脚本

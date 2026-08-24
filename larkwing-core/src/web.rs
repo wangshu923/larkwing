@@ -161,6 +161,11 @@ pub struct Page {
     pub text: String,
     #[serde(default)]
     pub links: Vec<PageLink>,
+    /// 页内**合格**链接的总数(去重后)。`links` 只列前 `LINKS_MAX` 条 —— 这个数是用来
+    /// 如实告诉模型「后面还有」的(§7.2 量约束:截断必须说,否则模型会当成全部)。
+    /// `serde(default)` 让改之前存下的缓存照样能读回来(读回来是 0 = 不知道,那就不报)。
+    #[serde(default)]
+    pub links_total: usize,
 }
 
 /// 页内链接收集上限(给模型的预算闸,取文档序前 N 条)。
@@ -574,8 +579,8 @@ pub(crate) fn percent_decode(s: &str) -> String {
 fn extract_page(html: &str, base_url: &str) -> Page {
     let doc = Html::parse_document(html);
     let (title, text) = extract_text_from(&doc);
-    let links = extract_links(&doc, base_url);
-    Page { title, text, links }
+    let (links, links_total) = extract_links(&doc, base_url);
+    Page { title, text, links, links_total }
 }
 
 /// 正文抽取(readability 简化版):正文形元素的文本聚合;太少则退化为全文压平。
@@ -698,10 +703,11 @@ fn table_to_markdown(table: &scraper::ElementRef) -> Option<String> {
 /// 页内链接:`<a href>` 解析成绝对地址(相对地址按最终 URL 拼),按文档序取前
 /// `LINKS_MAX` 条;js/mailto/纯锚点丢弃、同地址去重。无文字的锚(图片按钮)用链接
 /// 目标文件名顶名字 —— 图标式"下载"按钮常是这种。
-fn extract_links(doc: &Html, base_url: &str) -> Vec<PageLink> {
+fn extract_links(doc: &Html, base_url: &str) -> (Vec<PageLink>, usize) {
     let base = url::Url::parse(base_url).ok();
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
+    let mut total = 0usize;
     for a in doc.select(&sel("a[href]")) {
         let Some(href) = a.value().attr("href").map(str::trim) else { continue };
         if href.is_empty()
@@ -734,12 +740,14 @@ fn extract_links(doc: &Html, base_url: &str) -> Vec<PageLink> {
                 .map(percent_decode)
                 .unwrap_or_default();
         }
-        out.push(PageLink { text: clip(&text, 60), url: abs_s });
-        if out.len() >= LINKS_MAX {
-            break;
+        total += 1;
+        // 超了上限就只数不收 —— 数目要报给模型(截断不说 = 模型以为链接就这些,
+        // 「下载按钮不在前 25 个里」时它会认定页面上没有,2026-08-22 修)
+        if out.len() < LINKS_MAX {
+            out.push(PageLink { text: clip(&text, 60), url: abs_s });
         }
     }
-    out
+    (out, total)
 }
 
 /// 按字符数截断(给模型的预算闸)。

@@ -212,6 +212,16 @@ impl Tool for WebFetch {
             for l in &page.links {
                 out.push_str(&format!("- {} → {}\n", l.text, l.url));
             }
+            // 只列了前 N 条就得说清楚(§7.2 量约束):不说的话,模型看不到「下载」就会
+            // 认定这页压根没有,而它可能只是排在第 26 位(2026-08-22 修)
+            if page.links_total > page.links.len() {
+                out.push_str(&format!(
+                    "(这页一共 {} 个链接,上面只列了前 {} 个——没找到要的就说得更具体些,\
+                     或者用 web_render 打开页面点)\n",
+                    page.links_total,
+                    page.links.len()
+                ));
+            }
         }
         Ok(out.trim_end().to_string())
     }

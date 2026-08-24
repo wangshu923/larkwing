@@ -433,10 +433,15 @@ impl WebRender {
             press_key.as_deref(),
             upload_ref,
         );
-        // 模型自报(§7.8 确认闸的自报半边):只对真有「落地动作」的调用生效(点击/提交);
+        // 模型自报(§7.8 确认闸的自报半边):只对真有「落地动作」的调用生效(点击/提交/按键);
         // 纯看页/填字带 confirm 没有可确认的动作,忽略。单向阀:词表命中自报压不掉。
+        // ⚠️ `press_key` 必须算在内(2026-08-22 修):在表单里按回车就是提交,§7.8 白纸黑字
+        // 写着「press_key(无目标文本,自报仍拦〔kind=press〕)」—— 而这里漏了它,模型自报
+        // confirm=true 会被**静默丢弃**,闸压根不响。它恰恰是词表兜不住的那一类(没有按钮
+        // 文字可查),自报是唯一的信号,漏掉等于这条路上没有闸。
         let self_report = super::arg_bool(&args, "confirm", false);
-        let force_confirm = self_report && (click_ref.is_some() || click_text.is_some() || submit);
+        let force_confirm = self_report
+            && (click_ref.is_some() || click_text.is_some() || submit || press_key.is_some());
         let mut req = RenderRequest {
             url: url.clone().unwrap_or_default(),
             session,
