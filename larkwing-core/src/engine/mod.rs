@@ -452,6 +452,36 @@ struct TurnHandle {
     join: tokio::task::JoinHandle<()>,
 }
 
+/// 把新回合登记进会话槽,返回**该被取消的那一支**(None = 无人需要取消)。
+///
+/// 抽成独立函数只为一件事:这段判定住在 `launch` 的竞态窗口里(忙检与登记之间隔着 open_stream
+/// 整次 HTTP 建连),真实竞态没法确定性复现,但**判定表本身**是会写错的地方 —— 单测钉住它。
+///
+/// 规则(2026-08-22 审计:原先是直接 `slot.inflight = Some(...)` 覆盖):
+/// · `TurnHandle` 的 drop 既不 abort join 也不 cancel token → 被覆盖掉的回合会继续在同一会话里
+///   跑,而**再没人持有它的 token**:停止按钮、delete/rollback 的 `cancel().await` 全够不到它,
+///   它还会往已被截断的会话里接着插行。所以任何一支都不许无主地跑下去。
+/// · 普通回合撞上在飞 → 新的赢(与 send_message 先 cancel 的语义一致),挤掉旧的;
+/// · **旁听仲裁撞上在飞 → 旁听让路**(机会性的,真输入优先 §8.2)—— 取消刚起的自己,
+///   绝不能反过来把用户的真回合杀掉。
+/// · 旧句柄已经跑完(is_finished)= 不算在飞,既不算忙、也不需要取消。
+fn register_inflight(
+    slot: &mut SessionSlot,
+    new_handle: TurnHandle,
+    is_overheard: bool,
+    inject: Arc<Mutex<InjectState>>,
+) -> Option<TurnHandle> {
+    let busy = slot.inflight.as_ref().is_some_and(|h| !h.join.is_finished());
+    if is_overheard && busy {
+        return Some(new_handle); // 让路:不登记,取消刚起的仲裁
+    }
+    let old = slot.inflight.replace(new_handle);
+    // 旁听仲裁不收插队:用户此刻打字 = inject 落空 → 前端走普通发送 →
+    // send_message 的 cancel 把未转正的仲裁整轮挤掉(真输入优先,零痕迹)。
+    slot.inject = if is_overheard { None } else { Some(inject) };
+    old.filter(|h| !h.join.is_finished())
+}
+
 /// 每隔这么多用户回合,后台自动提炼一次记忆(PLAN §13 Phase 3 自动触发)。
 /// 偏稀:蒸馏 = 花钱的 LLM 调用,且 lookback 50 条本就覆盖多轮 → 稀一点、重叠靠去重兜。
 const CONSOLIDATE_EVERY_TURNS: u32 = 12;
@@ -2505,13 +2535,28 @@ impl Engine {
             }
             .run(),
         );
-        {
+        // 登记在飞句柄。**绝不能直接覆盖**(2026-08-22 审计):TurnHandle drop 既不 abort join
+        // 也不 cancel token,被挤掉的回合会继续在同一会话里跑、而**再没有人持有它的 token**——
+        // 停止按钮(cancel_generation)、delete/rollback 的 `cancel().await` 全都够不到它,
+        // 它还会往已被截断的会话里接着插行。忙检(is_finished)与真正登记之间隔着 open_stream
+        // 整次 HTTP 建连,这个窗口里谁都看不见对方(渠道同 chat 连发两条最容易撞)。
+        //
+        // 谁让路就取消谁,任何一支都不许无主地跑下去:
+        //   · 普通回合撞上在飞 → 新的赢(与 send_message 先 cancel 的语义一致),挤掉旧的;
+        //   · **旁听仲裁撞上在飞 → 旁听让路**(它是机会性的,真输入优先 §8.2)——取消刚起的自己,
+        //     绝不能反过来把用户真回合杀掉。
+        let loser = {
             let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
             let slot = sessions.entry(conv_id).or_default();
-            slot.inflight = Some(TurnHandle { token, join });
-            // 旁听仲裁不收插队:用户此刻打字 = inject 落空 → 前端走普通发送 →
-            // send_message 的 cancel 把未转正的仲裁整轮挤掉(真输入优先,零痕迹)。
-            slot.inject = if is_overheard { None } else { Some(inject) };
+            register_inflight(slot, TurnHandle { token, join }, is_overheard, inject)
+        };
+        if let Some(h) = loser {
+            h.token.cancel();
+            // 不在这里 await 收尾:launch 的调用方正等 rx(await 会把新回合的起播卡在旧回合上)。
+            // 协作式取消 + partial 落库由被取消方自己走完,这里只保证它**有人取消过**。
+            tokio::spawn(async move {
+                let _ = h.join.await;
+            });
         }
         Ok(rx)
     }
@@ -3456,6 +3501,64 @@ mod tests {
         assert_eq!(out[2].message_id, a3);
         assert_eq!(sketch(&out[2]), ["media_play"]);
         assert_eq!(tools(&out[2])[0].result, "播放中");
+    }
+
+    /// 登记在飞句柄的判定表(2026-08-22 审计:原先直接覆盖 → 被挤掉的回合无人持 token、
+    /// 停止按钮够不到它,还会往已截断的会话里接着插行)。真实竞态窗口不可确定性复现,
+    /// 但判定表能钉:**任何一支都不许无主地跑下去,且旁听绝不许杀掉真回合。**
+    #[tokio::test]
+    async fn register_inflight_never_leaves_an_unowned_turn() {
+        // 造句柄:running = 永不结束;done = 已跑完(is_finished 为真)
+        fn running() -> TurnHandle {
+            TurnHandle {
+                token: CancellationToken::new(),
+                join: tokio::spawn(async { std::future::pending::<()>().await }),
+            }
+        }
+        async fn done() -> TurnHandle {
+            let h = TurnHandle { token: CancellationToken::new(), join: tokio::spawn(async {}) };
+            for _ in 0..100 {
+                if h.join.is_finished() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(h.join.is_finished(), "夹具:这支应已跑完");
+            h
+        }
+        let q = || Arc::new(Mutex::new(InjectState::default()));
+
+        // ① 空槽 + 普通:登记,无人被取消
+        let mut slot = SessionSlot::default();
+        assert!(register_inflight(&mut slot, running(), false, q()).is_none(), "空槽无 loser");
+        assert!(slot.inflight.is_some() && slot.inject.is_some(), "登记上了,且收插队");
+
+        // ② 在飞 + 普通:新的赢,**旧的必须被交出来取消**(否则它无主地跑)
+        let old_tok = slot.inflight.as_ref().unwrap().token.clone();
+        let loser = register_inflight(&mut slot, running(), false, q()).expect("旧的要被交出来");
+        loser.token.cancel();
+        assert!(old_tok.is_cancelled(), "被挤掉的那支必须有人取消它");
+
+        // ③ 在飞 + **旁听**:旁听让路 —— 交出来的是「新来的」,槽里仍是原来那支
+        let kept = slot.inflight.as_ref().unwrap().token.clone();
+        let new_tok = CancellationToken::new();
+        let newcomer =
+            TurnHandle { token: new_tok.clone(), join: tokio::spawn(async { std::future::pending::<()>().await }) };
+        let loser = register_inflight(&mut slot, newcomer, true, q()).expect("旁听自己让路");
+        loser.token.cancel();
+        assert!(new_tok.is_cancelled(), "让路的是刚起的仲裁");
+        assert!(!kept.is_cancelled(), "真回合绝不能被旁听杀掉");
+        // 槽里还是原来那支:token 是克隆、共享取消状态 —— 取消槽里的那个,kept 必须跟着变
+        slot.inflight.as_ref().unwrap().token.cancel();
+        assert!(kept.is_cancelled(), "槽里留的必须是原来那支(不是新来的)");
+
+        // ④ 旧句柄已跑完:不算忙 → 旁听也能登记,且没有谁需要取消
+        let mut slot = SessionSlot { inflight: Some(done().await), ..Default::default() };
+        assert!(register_inflight(&mut slot, running(), true, q()).is_none(), "跑完的不需取消");
+        assert!(slot.inject.is_none(), "旁听回合不收插队");
+        // ⑤ 普通回合同理:跑完的旧句柄不当 loser 交出去
+        let mut slot = SessionSlot { inflight: Some(done().await), ..Default::default() };
+        assert!(register_inflight(&mut slot, running(), false, q()).is_none());
     }
 }
 

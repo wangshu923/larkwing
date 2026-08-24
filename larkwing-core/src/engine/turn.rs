@@ -280,8 +280,15 @@ impl Turn {
             bus.publish(AppEvent::Mood(Mood::Thinking));
         }
         let _mood = (!ephemeral).then(|| MoodGuard(bus.clone()));
-        // 回合任一出口闸上注入队列(Failed/Cancelled 退出后别再往死队列里塞)
-        let _inject_guard = InjectGuard(inject.clone());
+        // 回合任一出口闸上注入队列(Failed/Cancelled 退出后别再往死队列里塞),
+        // 并把队列里没来得及处理的消息补落库(inject 已返回过 true,不能凭空丢)。
+        let _inject_guard = InjectGuard {
+            inject: inject.clone(),
+            store: store.clone(),
+            conv_id,
+            tx: tx.clone(),
+            persist: !ephemeral,
+        };
         let meta = usage::RoundMeta { user_id, conv_id, user_msg_id, provider_id, model };
         let mut round_start = first_round_start;
         let ctx = ToolCtx { user_id, conv_id, store: store.clone(), media, web, voice, confirm, grants, agent };
@@ -615,11 +622,43 @@ impl Turn {
 }
 
 /// 回合任一出口闸上注入队列:此后 inject 命令一律拒绝(防往已死回合的队列里塞而丢消息)。
-struct InjectGuard(Arc<Mutex<super::InjectState>>);
+/// 回合任一出口都要闸上插队队列(收尾/取消/失败/panic 都走 drop,不必逐个出口写)。
+/// **并且把队列里没来得及处理的消息补落库** —— `engine.inject()` 已经对调用方返回过 true
+/// (前端据此不再重发、手机渠道直接 `return Ok(None)`),这些话不能随 Arc 一起蒸发(§3.5)。
+struct InjectGuard {
+    inject: Arc<Mutex<super::InjectState>>,
+    store: Store,
+    conv_id: i64,
+    tx: mpsc::Sender<TurnEvent>,
+    /// 与 Turn 的 ephemeral 密封面一致:子回合不落库(它今天也没有插队入口)。
+    persist: bool,
+}
+
 impl Drop for InjectGuard {
     fn drop(&mut self) {
-        if let Ok(mut st) = self.0.lock() {
-            st.finishing = true;
+        let leftovers = {
+            let Ok(mut st) = self.inject.lock() else { return };
+            st.finishing = true; // 原子闸上:此后 inject 一律拒绝,改由前端起新回合
+            std::mem::take(&mut st.buffer)
+        };
+        if leftovers.is_empty() {
+            return;
+        }
+        tracing::error!(
+            conv = self.conv_id,
+            n = leftovers.len(),
+            "回合收尾/中断时插队队列还有没处理的消息,补落库(inject 已返回过 true,不能凭空丢)"
+        );
+        let (store, conv_id, tx, persist) =
+            (self.store.clone(), self.conv_id, self.tx.clone(), self.persist);
+        // drop 是同步的、落库要 await → 交给运行时。运行时正在关停(拿不到 handle)就只剩日志 ——
+        // 那种时刻进程本就要没了,DB 也写不进去,不硬试(spawn 在关停后会 panic)。
+        if let Ok(h) = tokio::runtime::Handle::try_current() {
+            h.spawn(async move {
+                for it in leftovers {
+                    persist_and_announce(&store, conv_id, &tx, it, persist).await;
+                }
+            });
         }
     }
 }
@@ -665,8 +704,22 @@ async fn apply_injection(
     it: super::InjectReady,
     persist: bool,
 ) {
-    // 落库用 llm_content(含文档文字)→ 注入的文档也进 history、多轮还在(与主发送路径一致,§9);
-    // UI 事件仍用 display(用户原文,不灌文档正文)。无文档时 llm_content == display,行为不变。
+    let (llm_content, parts) = persist_and_announce(store, conv_id, tx, it, persist).await;
+    request.messages.push(ChatMessage::user_with_parts(llm_content, parts));
+}
+
+/// 一条注入的「落库 + 通告」半边(`apply_injection` 与 `InjectGuard` 的补落库共用这一份 ——
+/// 后者没有 request 可 append,只需要这半)。返回进 request 的料,调用方自己决定要不要用。
+///
+/// 落库用 llm_content(含文档文字)→ 注入的文档也进 history、多轮还在(与主发送路径一致,§9);
+/// UI 事件仍用 display(用户原文,不灌文档正文)。无文档时 llm_content == display,行为不变。
+async fn persist_and_announce(
+    store: &Store,
+    conv_id: i64,
+    tx: &mpsc::Sender<TurnEvent>,
+    it: super::InjectReady,
+    persist: bool,
+) -> (String, Vec<crate::llm::ContentPart>) {
     if let Some(id) =
         persist_row_if(persist, store, conv_id, "user", &it.llm_content, it.payload.as_deref())
             .await
@@ -675,7 +728,7 @@ async fn apply_injection(
             .send(TurnEvent::Injected { message_id: id, text: it.display, attachments: it.refs })
             .await;
     }
-    request.messages.push(ChatMessage::user_with_parts(it.llm_content, it.parts));
+    (it.llm_content, it.parts)
 }
 
 #[cfg(test)]
@@ -722,6 +775,52 @@ mod tests {
         }
         let msgs = store.chat.recent_messages(conv.id, 10).unwrap();
         assert!(msgs.iter().any(|m| m.role == "user" && m.content == "插一句:主角叫小七"), "落库一条 user 行");
+    }
+
+    /// **回合死在半路时,插队队列里的消息不许凭空消失(2026-08-22 审计)**。
+    ///
+    /// `engine.inject()` 已经对调用方返回过 true(= 我接住了),前端据此把气泡压进 pendingInjects
+    /// 等 `Injected` 事件、**不会再重发**;手机渠道则直接 `return Ok(None)`(那句话既没进库也没人回,
+    /// 表现成「发过去没反应」)。而队列只在轮间 `drain_injections` 与收尾前 `take_or_finish`
+    /// 两个点排空 —— 落在「本轮排空之后、下一轮排空之前」的消息,只要回合走取消/失败出口
+    /// (用户点停止 / 新 send 抢占 / 下一轮开流失败 / 流中途断)就随 Arc 一起没了,违 §3.5。
+    ///
+    /// 修法:Guard 在 drop 时把剩余项**补落库**(DB 是真相源 §6.4)。drop 是同步的、落库要 await
+    /// → 交给运行时;`Injected` 事件尽力发(此刻终态事件多半已发、接收端可能已走,发不到也不影响
+    /// 「话没丢」这件事)。
+    #[tokio::test]
+    async fn inject_guard_persists_leftovers_instead_of_dropping_them() {
+        let store = temp_store("guard_leftover");
+        let uid = store.users.ensure_default_user().unwrap().id;
+        let conv = store.chat.create_conversation(uid, "companion").unwrap();
+        let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+        let inject = Arc::new(Mutex::new(InjectState::default()));
+        inject.lock().unwrap().buffer.push(ready("等下,换成粤语"));
+
+        {
+            let _guard = InjectGuard {
+                inject: inject.clone(),
+                store: store.clone(),
+                conv_id: conv.id,
+                tx: tx.clone(),
+                persist: true,
+            };
+            // 回合在这里死掉(取消/失败出口都走同一条 drop)
+        }
+        assert!(inject.lock().unwrap().finishing, "收尾闸照旧置位");
+        assert!(inject.lock().unwrap().buffer.is_empty(), "剩余项被取走(不留在内存里等人捡)");
+
+        // 落库经运行时异步完成:有界轮询,别用固定 sleep(慢机器上会假红)
+        let mut found = false;
+        for _ in 0..200 {
+            let msgs = store.chat.recent_messages(conv.id, 10).unwrap();
+            if msgs.iter().any(|m| m.role == "user" && m.content == "等下,换成粤语") {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(found, "回合死了也要把插队消息落库 —— inject 已返回过 true,不能凭空丢");
     }
 
     // 收尾闸:空队列 → 置 finishing 收尾(原子防丢:此后 inject 命令一律拒绝)

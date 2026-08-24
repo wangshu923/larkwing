@@ -346,6 +346,21 @@ pub(super) fn build_context(
     // 工具轮回放:assistant 行的 payload 带 tool_calls + reasoning(坑 #4:DeepSeek
     // 要求工具轮回传 reasoning),'tool' 行配对回放;孤儿 tool 行跳过(防 400)。
     let mut open_calls: HashSet<String> = HashSet::new();
+    // **先扫一遍:窗口内有 tool 行配对的 call_id**(防悬空 tool_call,2026-08-22)。
+    // 写侧是「先落 assistant(tool_calls) 行 → 跑工具 → 再逐条落 tool 行」,两次写库之间隔着
+    // 整轮工具执行时长(web_render 那档以百秒计)—— 期间进程被杀/断电/更新重启就留下「assistant
+    // 带 tool_calls 却没有 tool 行」的残缺轮。原先这里**无条件**原样回放 tool_calls(只防了反
+    // 方向的孤儿 tool 行),于是该会话此后每次开流都带悬空 call → DeepSeek/OpenAI 兼容端点直接
+    // 400,窗口滑过去之前**每一条消息都报错 = 这个话题被永久打死**。取消路早就为此专门合成
+    // 「已取消」结果保历史完形(turn.rs「孤儿 tool_call 会 400」),崩溃路是漏掉的同族缺口。
+    // 健康历史里配对齐全 → 过滤是 no-op → **前缀字节不变、缓存零损伤**。
+    let paired: HashSet<String> = history
+        .iter()
+        .filter(|m| m.role == "tool")
+        .filter_map(|m| m.payload.as_deref())
+        .filter_map(|p| serde_json::from_str::<ToolRowPayload>(p).ok())
+        .map(|p| p.call_id)
+        .collect();
     for msg in history {
         match msg.role.as_str() {
             // 语音会话模式(PLAN §11)+ 渠道归人:payload 里的形态/说话人翻成确定性标记——
@@ -388,11 +403,27 @@ pub(super) fn build_context(
             // 定时任务的触发行:回放成 user 形 + 机制标记(与 wake 注入同一翻译)
             "event" => messages.push(ChatMessage::user(event_injection(&msg.content))),
             "assistant" => {
-                let payload: AssistantPayload = msg
+                let mut payload: AssistantPayload = msg
                     .payload
                     .as_deref()
                     .and_then(|p| serde_json::from_str(p).ok())
                     .unwrap_or_default();
+                // 悬空 call(没有配对 tool 行)摘掉 —— 不静默:摘了就记一行,便于事后知道
+                // 这个会话曾经崩在工具轮里(§3.5)。
+                let before = payload.tool_calls.len();
+                payload.tool_calls.retain(|c| paired.contains(&c.id));
+                if payload.tool_calls.len() != before {
+                    tracing::warn!(
+                        msg = msg.id,
+                        dropped = before - payload.tool_calls.len(),
+                        "assistant 行有悬空 tool_call(缺配对 tool 行),回放时摘掉(防 400)"
+                    );
+                }
+                // 摘完既没正文也没 call = 这条什么都没承载(纯工具轮崩在半路)→ 整轮丢弃,
+                // 别往上送一个空 assistant(有些端点连空 content 都不收)。
+                if payload.tool_calls.is_empty() && msg.content.trim().is_empty() {
+                    continue;
+                }
                 open_calls.extend(payload.tool_calls.iter().map(|c| c.id.clone()));
                 messages.push(ChatMessage::Assistant {
                     content: msg.content.clone(),
@@ -925,6 +956,94 @@ mod tests {
             other => panic!("应是带 tool_calls 的 Assistant,实际 {other:?}"),
         }
         assert!(matches!(&tail[2], ChatMessage::ToolResult { call_id, .. } if call_id == "call_a"));
+    }
+
+    /// **悬空 tool_calls 不许回放(2026-08-22 审计)**。
+    ///
+    /// 原先只防反方向(孤儿 tool 行跳过),assistant 行的 tool_calls 是**无条件**原样回放的。
+    /// 而写侧是「先落 assistant(tool_calls) 行、跑完工具再逐条落 tool 行」,两次写库之间
+    /// 隔着整轮工具执行时长(web_render 那档以百秒计)—— 期间进程被杀/断电就留下「assistant
+    /// 带 tool_calls 却没有 tool 行」的残缺轮。此后该会话每次开流都带着悬空 call 发给严格端点,
+    /// DeepSeek / OpenAI 兼容端点直接 400 → **这个话题被永久打死**(窗口没滑过去之前每条都报错)。
+    /// 项目自己在取消路上专门合成过「已取消」结果来保历史完形(turn.rs 注释点名「孤儿 tool_call
+    /// 会 400」),崩溃路是漏掉的同族缺口。
+    ///
+    /// 兼带钉住**缓存不变量**:健康历史里配对齐全 → 过滤是 no-op → 前缀字节不变。
+    #[test]
+    fn dangling_tool_calls_are_dropped_not_replayed() {
+        let scenes = Scenes::builtin();
+        let scene = scenes.default_scene();
+        // 残缺轮夹在历史中间(最危险的形态:窗口很久滑不过去),后面还有正常轮次。
+        let history = vec![
+            msg(1, "user", "放歌", None),
+            msg(
+                2,
+                "assistant",
+                "",
+                Some(r#"{"tool_calls":[{"id":"call_dead","name":"media_play","args":{}}]}"#),
+            ),
+            msg(3, "user", "在吗", None),
+            msg(4, "assistant", "在的", None),
+        ];
+        let req = bc(scene, None, None, &[], &[], &history, &[]);
+        let tail = &req.messages[scene.few_shots.len()..];
+        for m in tail {
+            if let ChatMessage::Assistant { tool_calls, .. } = m {
+                assert!(
+                    tool_calls.is_empty(),
+                    "悬空 tool_call 绝不能回放(会让严格端点 400、话题永久打死):{tool_calls:?}"
+                );
+            }
+        }
+        // 那条只有悬空 call、正文为空的 assistant 行 = 什么都没承载 → 整轮丢弃
+        assert_eq!(tail.len(), 3, "残缺轮整轮丢弃,只留两条 user + 一条 assistant:{tail:?}");
+        assert_eq!(tail[0], ChatMessage::user("放歌"));
+        assert_eq!(tail[1], ChatMessage::user("在吗"));
+
+        // 健康历史:配对齐全 → 一个都不许少(过滤是 no-op,前缀字节不变 = 缓存不破)
+        let healthy = vec![
+            msg(1, "user", "今天几号", None),
+            msg(
+                2,
+                "assistant",
+                "",
+                Some(r#"{"tool_calls":[{"id":"call_a","name":"now","args":{}}],"reasoning":"查一下"}"#),
+            ),
+            msg(3, "tool", "2026-08-22", Some(r#"{"call_id":"call_a","name":"now","status":"ok"}"#)),
+            msg(4, "assistant", "8 月 22 号", None),
+        ];
+        let req = bc(scene, None, None, &[], &[], &healthy, &[]);
+        let tail = &req.messages[scene.few_shots.len()..];
+        assert_eq!(tail.len(), 4, "健康历史一条不少:{tail:?}");
+        match &tail[1] {
+            ChatMessage::Assistant { tool_calls, reasoning, .. } => {
+                assert_eq!(tool_calls.len(), 1, "配对齐全的 call 必须留着");
+                assert_eq!(tool_calls[0].id, "call_a");
+                assert_eq!(reasoning.as_deref(), Some("查一下"), "坑 #4:工具轮 reasoning 照旧回放");
+            }
+            other => panic!("应是带 tool_calls 的 Assistant,实际 {other:?}"),
+        }
+
+        // 正文非空、只是 call 悬空:保住正文(它是模型真说过的话),只摘掉 call
+        let partial = vec![
+            msg(1, "user", "放歌", None),
+            msg(
+                2,
+                "assistant",
+                "我找一下",
+                Some(r#"{"tool_calls":[{"id":"call_dead","name":"media_play","args":{}}]}"#),
+            ),
+        ];
+        let req = bc(scene, None, None, &[], &[], &partial, &[]);
+        let tail = &req.messages[scene.few_shots.len()..];
+        assert_eq!(tail.len(), 2, "正文非空 → 留下这条、只摘 call:{tail:?}");
+        match &tail[1] {
+            ChatMessage::Assistant { content, tool_calls, .. } => {
+                assert_eq!(content, "我找一下");
+                assert!(tool_calls.is_empty(), "悬空 call 摘掉");
+            }
+            other => panic!("应是 Assistant,实际 {other:?}"),
+        }
     }
 
     #[test]
