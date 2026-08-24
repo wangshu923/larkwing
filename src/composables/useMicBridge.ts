@@ -18,6 +18,8 @@ import { useWakeCalib } from './useWakeCalib'
 
 let wired = false
 let running = false
+let cancelGen = 0 // 收摊代次:stopInner 递增,在飞的 start 过每个 await 都核对一次
+let want: string | null = null // 最新意愿:需要采集时=目标 deviceId,不需要=null(reconcile 据此对账)
 let starting = false
 let currentDev = '' // 正在用的 deviceId(''=系统默认);换麦 = 停旧起新,core 推流管不动
 let failedOnce = false // 自愈只做一次,避免失败循环刷 toast
@@ -69,8 +71,26 @@ function toI16Bytes(f32: Float32Array): Uint8Array {
 async function start(dev: string) {
   if (running || starting) return
   starting = true
+  // ⚠️ **在飞的 start() 必须能被作废(2026-08-22 修)**:getUserMedia 与 addModule 都要 await,
+  // 那段窗口里 `stream`/`ctx` 还没赋值 —— 此时条件变了(唤醒关掉/听写结束/换麦/切回 cpal)
+  // watchEffect 调 stopInner(),它看到的全是 null、纯属空转;await 回来后照样把麦点亮并
+  // 置 running=true → **麦克风一直亮着、AudioContext 也漏着**,与模块开头「条件消失即停、
+  // 不常驻占麦」的承诺正相反。修 = stopInner 递代次,start 每过一个 await 就核对一次,
+  // 作废了就把**自己开出来的**那份就地收干净(别碰模块态,那可能已属于新一轮 start)。
+  const myGen = cancelGen
+  let localStream: MediaStream | null = null
+  let localCtx: AudioContext | null = null
+  let threw = false
+  const abandon = () => {
+    localStream?.getTracks().forEach((t) => t.stop())
+    void localCtx?.close()
+  }
+  const stale = () => {
+    abandon()
+    console.info('[micBridge] 起麦途中条件已变,收摊')
+  }
   try {
-    stream = await navigator.mediaDevices.getUserMedia({
+    localStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
         noiseSuppression: false,
@@ -80,27 +100,50 @@ async function start(dev: string) {
         ...(dev ? { deviceId: { ideal: dev } } : {}),
       },
     })
-    ctx = new AudioContext({ sampleRate: 16000 })
+    if (myGen !== cancelGen) return stale()
+    localCtx = new AudioContext({ sampleRate: 16000 })
     const url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: 'application/javascript' }))
-    await ctx.audioWorklet.addModule(url)
+    await localCtx.audioWorklet.addModule(url)
     URL.revokeObjectURL(url)
-    const src = ctx.createMediaStreamSource(stream)
-    node = new AudioWorkletNode(ctx, 'lw-mic-16k')
-    const rate = ctx.sampleRate
-    node.port.onmessage = (e: MessageEvent<Float32Array>) => {
+    if (myGen !== cancelGen) return stale()
+    const src = localCtx.createMediaStreamSource(localStream)
+    const n = new AudioWorkletNode(localCtx, 'lw-mic-16k')
+    const rate = localCtx.sampleRate
+    n.port.onmessage = (e: MessageEvent<Float32Array>) => {
       const pcm = resampleTo16k(e.data, rate)
       void api.voicePushAudio(toI16Bytes(pcm)).catch(() => {})
     }
-    src.connect(node) // 不接 destination:纯采集,绝不回放
+    src.connect(n) // 不接 destination:纯采集,绝不回放
+    // 全部就绪了才交给模块态 —— 在此之前 stopInner() 拿不到半成品,由上面的代次核对负责
+    stream = localStream
+    ctx = localCtx
+    node = n
     currentDev = dev
     running = true
     console.info(`[micBridge] 浏览器采集开(AEC on / NS off,ctx=${rate}Hz,dev=${dev || '默认'})`)
   } catch (e) {
+    threw = true // 失败别回头对账 —— 否则「起→失败→对账→再起」会变成死循环轰炸 getUserMedia
+    abandon() // 半成品(可能只开出了 stream)也要收干净
     stopInner()
-    void fallbackToCpal(e)
+    void fallbackToCpal(e) // 它会把采集源切成 cpal,need 随之落下来
   } finally {
     starting = false
+    if (!threw) reconcile() // 起的这一路上条件可能又变了,按最新意愿对一次账(见 reconcile)
   }
+}
+
+/** 意愿 → 实际的对账。`want` = 需要采集时的目标 deviceId,不需要则 null。
+ *  必要的原因:`start()` 有 await 窗口,窗口里 `starting` 挡着新的 start —— 若期间条件
+ *  「不要 → 要」翻回来,watchEffect 那一趟只是空转,而 watchEffect 不会再自己跑一次
+ *  → **麦永远不开(聋)**。所以 start 收尾时回来对账,把最后的意愿落实。 */
+function reconcile() {
+  if (starting) return
+  if (want === null) {
+    if (running) stopInner()
+    return
+  }
+  if (running && want !== currentDev) stopInner() // 换麦:停旧起新
+  if (!running) void start(want)
 }
 
 /** 自愈回落(§3.5 绝不静默聋):浏览器麦起不来(权限拒/无设备)→ 切回系统采集(cpal)
@@ -123,6 +166,7 @@ async function fallbackToCpal(err: unknown) {
 }
 
 function stopInner() {
+  cancelGen++ // 让 await 窗口里在飞的 start() 知道自己已作废(见 start 的代次核对)
   node?.disconnect()
   node = null
   stream?.getTracks().forEach((t) => t.stop())
@@ -154,11 +198,7 @@ export function useMicBridge() {
         voice.state.phase !== 'idle' ||
         ['preparing', 'recording'].includes(voice.state.enroll.stage) ||
         calib.state.running)
-    if (!need) {
-      stopInner()
-      return
-    }
-    if (running && dev !== currentDev) stopInner() // 换麦:停旧起新(core 推流管不动,帧无缝续)
-    void start(dev)
+    want = need ? dev : null
+    reconcile() // 起停一律经它(换麦 = 停旧起新,core 推流管不动、帧无缝续)
   })
 }

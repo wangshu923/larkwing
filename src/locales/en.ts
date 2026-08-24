@@ -438,6 +438,8 @@ export default {
     restoreFailed: 'The restore didn’t finish — your data is unchanged',
     // don't just sit there black (§3.5): this used to only flip the status to paused
     mediaFailed: 'Can’t play “{title}” — the file may be damaged or in a format we can’t handle',
+    // don't silently drop oversized attachments either (§3.5)
+    attTooBig: '“{name}” is over {limit} — it wasn’t attached',
   },
   // one-click update (backlog ⑤·A): the "new version" card + manual-check feedback
   update: {

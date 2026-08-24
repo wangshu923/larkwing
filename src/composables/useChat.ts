@@ -111,6 +111,16 @@ const state = reactive({
 let localId = -1 // 本地占位 id 用负数,与落库的正数 id 永不冲突
 let turnSeq = 0 // 回合序号:流中再发会开新回合,旧回合的迟到事件按此作废,不串台(并发发送防竞态)
 let turnInFlight = false // 回合是否在飞:打字发送遇它=进排队区(Phase A:整轮结束自动合并发)
+// 消息列表的「代次」:每次**整表换掉** state.messages(切会话/回溯/分叉/boot/后台回合刷新)就 +1。
+// 在飞回合的闭包攥着 `wang`(数组里那个响应式对象的引用),整表一换它就成了**脱离数组的孤儿**
+// ——再往里写字一个都不会上屏,`state.messages.pop()` 更会削掉刚载入的真实历史。回合回调按
+// 代次闸一道:代次变了就只做不碰视图的收尾(2026-08-22 修「切走再切回,在飞回复永久不上屏」)。
+let listGen = 0
+/** 整表替换 state.messages 的**唯一**入口(收口在这里,免得将来新加一处又漏掉 listGen)。 */
+function setMessages(list: UiMessage[]) {
+  listGen++
+  state.messages = list
+}
 // 在飞的**语音(唤醒)回合**目标会话;null = 当前没有。确认闸(§7.8)据此判「这张确认卡
 // 属于当前语音回合」→ 念出来问 + 开口头确认听音(人可能不在屏幕前);打字/mic 回合只卡片。
 let voiceTurnConv: number | null = null
@@ -601,7 +611,7 @@ async function boot() {
       api
         .loadConversation(state.convId)
         .then((msgs) => {
-          state.messages = toUiList(msgs)
+          setMessages(toUiList(msgs))
           void hydrateStats(state.convId) // 提醒/自启回合的气泡也带上 hover 读数
           void hydrateTrace(state.convId) // …和「想了想」轨迹
           void resolveThumbs() // 历史图缩略图回填
@@ -634,7 +644,7 @@ async function boot() {
     // 皮肤改由 useSettings.load() 经 api.skin() 拉取并应用(主窗 & 悬浮窗同一路径,不再走 boot 过桥)
     state.hasApiKey = snap.hasApiKey
     state.convId = snap.conversation.id
-    state.messages = toUiList(snap.messages)
+    setMessages(toUiList(snap.messages))
     void resolveThumbs() // 历史图缩略图回填
     if (snap.openingLine) {
       state.openingLine = snap.openingLine
@@ -670,13 +680,26 @@ function settleInFlight() {
   voiceTurnConv = null
   flushQueue()
 }
-/** 把排队区攒的消息合并成一条作为下一轮发出(文本换行拼接,附件并起来);在飞或空则不动。 */
+/** 把排队区攒的消息合并成一条作为下一轮发出(文本换行拼接,附件并起来);在飞或空则不动。
+ *
+ *  ⚠️ **必须推迟一个微任务再发(2026-08-22 修)**:本函数的调用点在 `settleInFlight`,而它
+ *  常挂在打字机的收尾回调上 —— 那个回调又是被 `twFlush()` 同步调起来的,`twFlush()` 本身
+ *  恰恰是「起新回合」和「切会话」的头一句。同步发出去就是**重入**,两条真实路径:
+ *  ① 上一轮的字还在放时用语音打断(mic/wake 不排队、直接 send)→ twFlush → 收尾回调 →
+ *     flushQueue 起了排队轮 C(C 已 `twStart(wang_C)`)→ 返回后语音轮再 `twStart(wang_voice)`
+ *     把打字机绑走 → **C 的回答打进语音轮的气泡(错位),C 自己的气泡永远空着(丢一条)**;
+ *  ② `selectConversation` 是先 `twFlush()` 后 `state.queue.splice(0)` → 重入时队列还没清,
+ *     排队的话会被发进**正要离开的那个会话**。
+ *  推迟一拍后:①里 `turnInFlight` 已被语音轮置 true → 老实等它结束再合并;②里队列已清空。 */
 function flushQueue() {
   if (turnInFlight || !state.queue.length) return
-  const items = state.queue.splice(0, state.queue.length)
-  const text = items.map((it) => it.text).filter(Boolean).join('\n')
-  const attachments = items.flatMap((it) => it.attachments)
-  send(text, 'typed', undefined, attachments)
+  queueMicrotask(() => {
+    if (turnInFlight || !state.queue.length) return // 这一拍里情况可能已经变了,再判一次
+    const items = state.queue.splice(0, state.queue.length)
+    const text = items.map((it) => it.text).filter(Boolean).join('\n')
+    const attachments = items.flatMap((it) => it.attachments)
+    send(text, 'typed', undefined, attachments)
+  })
 }
 /** 排队区移除一条(还没发出前反悔)。 */
 function dequeue(i: number) {
@@ -751,11 +774,20 @@ function send(
   const wakeFollowUp = (endSession = false) => {
     if (!wakeTurn || wakeSettled) return
     wakeSettled = true
-    const stop = watch(
+    // ⚠️ **不能写成 `const stop = watch(..., {immediate:true})` 然后在回调里 `stop()`**
+    // (2026-08-22 修):immediate 的回调是**同步**跑在 `watch()` 返回之前的,那时 `stop`
+    // 还在 TDZ 里 → 一旦调用这一刻 speech 已经不 busy(没开语音 / 没什么可念 / 已念完),
+    // 回调当场 ReferenceError,收尾通知就永远发不出去、core 卡 AwaitTurn 到 180s 兜底
+    // ——正是 §7.5「唤醒收尾通知一个都不能漏」点名的那种漏法。
+    // 改法:先声明 `stop`,用 `fired` 旗兜住「同步已触发但 stop 还没赋值」,watch 返回后补停。
+    let stop: (() => void) | undefined
+    let fired = false
+    stop = watch(
       () => speech.state.busy,
       (busy) => {
-        if (busy) return
-        stop()
+        if (busy || fired) return
+        fired = true
+        stop?.()
         if (endSession) {
           api.voiceWakeResume().catch(() => {}) // 收尾:念完 → 回待唤醒,不开跟进窗
         } else {
@@ -765,6 +797,7 @@ function send(
       },
       { immediate: true },
     )
+    if (fired) stop() // 同步触发那一路:回调里 stop 还是 undefined,这里补停,别留个空转的 watcher
   }
   const wakeResume = () => {
     if (!wakeTurn || wakeSettled) return
@@ -806,6 +839,7 @@ function send(
   }
 
   const sentConv = state.convId // 话题快照只认发送时的会话:流中切走了别把旧账写到新话题上
+  const myList = listGen // 视图代次快照:整表被换过就说明闭包里的 wang 已成孤儿(见下面的闸)
   const outAtts: OutAttachment[] = attachments
     .filter((a) => a.base64)
     .map((a) => ({ name: a.name, mime: a.mime || '', data: a.base64! }))
@@ -833,6 +867,31 @@ function send(
         // 旧回合的迟到事件:新回合已接管,丢弃不串台。但唤醒回合的终态仍要通知唤醒循环
         // (新回合已占麦 → 不开跟进窗,直接回待唤醒;否则 core 同样卡到 180s 兜底)。
         if (ev.type === 'done' || ev.type === 'failed' || ev.type === 'cancelled') wakeResume()
+        return
+      }
+      if (myList !== listGen) {
+        // 会话没变,但**整张消息表被换过**(切走再切回 / 回溯 / 分叉 / 后台回合刷新):
+        // 闭包里的 `wang` 已是脱离数组的孤儿 —— 再写它一个字都不会上屏,而 `messages.pop()`
+        // 更会削掉刚从库载入的真实历史。所以这里一律不碰视图,只做该做的收尾;
+        // 回复本身在 done 时从库重载补上屏(§3.5 不静默丢)。
+        if (ev.type === 'done') {
+          if (speak) speech.endTurn()
+          wakeFollowUp(!!ev.data.end_session)
+          void reloadMessages(sentConv) // 这条回复已落库 → 重载让它真正出现在屏幕上
+          refreshConversations()
+          settleTurn() // 停掉在跑的计时(不传气泡:孤儿身上钉读数没意义)
+          state.mood = 'idle'
+          state.toolAction = ''
+          settleInFlight()
+        } else if (ev.type === 'failed' || ev.type === 'cancelled') {
+          speech.abort()
+          wakeResume()
+          if (ev.type === 'failed') state.convBadges[sentConv] = 'failed'
+          settleTurn()
+          state.mood = 'idle'
+          state.toolAction = ''
+          settleInFlight()
+        }
         return
       }
       switch (ev.type) {
@@ -1040,7 +1099,7 @@ async function resolveUserMsgId(msgId: number, localText: string): Promise<numbe
   const idxFromEnd = users.length - 1 - users.findIndex((m) => m.id === msgId)
   if (idxFromEnd >= users.length) return null
   const msgs = await api.loadConversation(state.convId)
-  state.messages = toUiList(msgs)
+  setMessages(toUiList(msgs))
   void resolveThumbs()
   const fresh = state.messages.filter((m) => m.role === 'user')
   const target = fresh[fresh.length - 1 - idxFromEnd]
@@ -1078,7 +1137,7 @@ async function rollbackTo(msgId: number, localText: string): Promise<boolean> {
     }
     await api.rollbackConversation(state.convId, id)
     const msgs = await api.loadConversation(state.convId)
-    state.messages = toUiList(msgs)
+    setMessages(toUiList(msgs))
     void resolveThumbs()
     void hydrateStats(state.convId)
     void hydrateTrace(state.convId)
@@ -1101,7 +1160,7 @@ async function forkFrom(msgId: number, localText: string): Promise<boolean> {
   if (!state.inTauri) {
     const idx = state.messages.findIndex((m) => m.id === msgId)
     if (idx < 0) return false
-    state.messages = state.messages.slice(0, idx)
+    setMessages(state.messages.slice(0, idx))
     if (!state.messages.length) pushOpening()
     return true
   }
@@ -1132,13 +1191,20 @@ async function selectConversation(convId: number) {
   delete state.convBadges[convId] // 进入会话即清「有动静」标
   loadConvUsage(convId) // 灯带"话题"段跟着切
   if (!state.inTauri) return
+  await reloadMessages(convId, { openingIfEmpty: true })
+}
+
+/** 从库重载某会话的消息到视图(切会话用;也给「在飞时被切走又切回」的回合收尾时补上屏用)。
+ *  只在它仍是当前会话时才落地 —— 加载期间又切走了就别把旧会话的内容写到新视图上。 */
+async function reloadMessages(convId: number, opts: { openingIfEmpty?: boolean } = {}) {
   try {
     const msgs = await api.loadConversation(convId)
-    state.messages = toUiList(msgs)
+    if (state.convId !== convId) return // 加载期间又切走了
+    setMessages(toUiList(msgs))
     void resolveThumbs() // 历史图缩略图回填
     void hydrateStats(convId) // 切回的历史会话:气泡 hover 读数从库回填
     void hydrateTrace(convId) // …和「想了想」轨迹
-    if (!msgs.length) pushOpening()
+    if (opts.openingIfEmpty && !msgs.length) pushOpening()
     state.mood = 'idle'
   } catch (e) {
     console.error('加载会话失败', e)
@@ -1153,14 +1219,14 @@ async function newConversation(channel?: string) {
   voiceTurnConv = null
   state.usage.conv = null // 新话题还没花过,熄灯
   if (!state.inTauri) {
-    state.messages = []
+    setMessages([])
     pushOpening()
     return
   }
   try {
     const conv = await api.newConversation(channel)
     state.convId = conv.id
-    state.messages = []
+    setMessages([])
     pushOpening()
     await refreshConversations()
   } catch (e) {

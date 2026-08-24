@@ -330,9 +330,17 @@ export async function playAdaptive(
           { once: true },
         )
       }
+      // 元素报错(解码失败 / 源不可用)= **确定**放不下去了 —— 以前只写一行日志就完事:
+      // 不回落、不提示,用户对着一块黑屏毫无线索(§3.5)。而 `fail()`(它调 onError)本来就
+      // 在手边、看门狗一直在用。走它 = 立刻回落 muxed HLS 那条能放的老路,比干等 12s 看门狗
+      // 快得多;真连 muxed 也不行,useMedia 那层还会给一句 toast(2026-08-22 修)。
       el.addEventListener(
         'error',
-        () => dlog(`element error code=${el.error?.code} msg=${el.error?.message ?? ''}`),
+        () => {
+          const why = `element error code=${el.error?.code} msg=${el.error?.message ?? ''}`
+          dlog(why)
+          fail(why)
+        },
         { once: true },
       )
       pump() // 首泵:两轨段从起播位喂起(无 startAt 时即 t=0)

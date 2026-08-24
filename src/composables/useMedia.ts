@@ -93,21 +93,37 @@ function fadeToLive(ms: number) {
     if (k >= 1) cancelFade()
   }, STEP_MS)
 }
+/** 在飞的起播定位监听(只可能有一个;换播放/换路一律先摘掉,见 clearPendingResume)。 */
+let pendingResume: { el: HTMLMediaElement; fn: () => void } | null = null
+
+/** 摘掉还没等到 `loadedmetadata` 的起播定位监听。
+ *
+ *  ⚠️ **必须有(2026-08-22 修)**:`{ once: true }` 只保证「触发一次后自动摘」,**没触发就
+ *  一直挂着**。而 `<audio>` 是单例、`<video>` 也常被复用,`loadedmetadata` 又不是每次都来
+ *  (换路 / 起播失败 / 中途停了 / 自适应那条路压根不用 applyResume)。残留下来的监听会在
+ *  **下一次**加载时被触发,把播放头挪到一个**上一首/上一集**的旧秒数上 —— 表现就是「点开
+ *  一首歌,它自己跳到中间去了」。 */
+function clearPendingResume() {
+  if (!pendingResume) return
+  pendingResume.el.removeEventListener('loadedmetadata', pendingResume.fn)
+  pendingResume = null
+}
+
 /** 一次性起播定位:元数据就绪后把播放头挪到 at 秒(切音轨重建管线后 core 经
  *  NowPlaying.resume_at 要求「接着刚才的位置放」)。at 无效 = no-op。 */
 function applyResume(el: HTMLMediaElement, at?: number) {
+  clearPendingResume() // 上一次没等到元数据的残留先摘掉,免得它跳到旧位置
   if (!at || at <= 0) return
-  el.addEventListener(
-    'loadedmetadata',
-    () => {
-      try {
-        el.currentTime = at
-      } catch {
-        /* 元数据异常时放弃回跳,从头播也比不播强 */
-      }
-    },
-    { once: true },
-  )
+  const fn = () => {
+    pendingResume = null // 已触发,{once:true} 会自动摘,这里只清记录
+    try {
+      el.currentTime = at
+    } catch {
+      /* 元数据异常时放弃回跳,从头播也比不播强 */
+    }
+  }
+  pendingResume = { el, fn }
+  el.addEventListener('loadedmetadata', fn, { once: true })
 }
 
 /** 多音轨收敛:用 audioTracks API 只启用选中那条(WKWebView/Safari 支持;Chromium 没有 = no-op)。
@@ -186,6 +202,7 @@ function destroyAdaptive() {
 async function loadVideoInto(el: HTMLVideoElement) {
   const cur = state.current
   if (!cur || cur.kind !== 'video') return
+  clearPendingResume() // 换元素/换路:旧的起播定位监听先摘,别让它在新一次加载时跳到旧位置
   el.playbackRate = 1
   el.volume = liveVolume()
   // 起播定位(切音轨重建管线的「接着放」):消费一次即清,防浮层重挂载重复回跳
@@ -398,6 +415,7 @@ function play(np: NowPlaying) {
   state.shuffle = np.shuffle ?? false
   syncLoopToEl()
   videoBase = 0
+  clearPendingResume() // 换播放:上一次没等到元数据的起播定位先摘掉(自适应那条路不走 applyResume,只能在这收口)
   if (!continuation) videoWasHidden = false // 新播放复位;续播保留首集起的"是否藏着"
   syncToPeers() // 广播"在放这个"给悬浮窗镜像
   if (np.kind === 'audio') {

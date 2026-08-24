@@ -11,6 +11,7 @@ import { useConfirm, confirmActionPhrase } from '../composables/useConfirm'
 import { useContextMenu, type MenuItem } from '../composables/useContextMenu'
 import { useCharacter } from '../composables/useCharacter'
 import { useMedia } from '../composables/useMedia'
+import { useToast } from '../composables/useToast'
 import { fmtMs, fmtTokens, fmtUsd } from '../lib/fmt'
 import { onFloatSay, openExternal, api, isMacOS, type SearchHit } from '../lib/backend'
 import { renderMarkdown } from '../lib/md'
@@ -229,7 +230,12 @@ function onPick(e: Event) {
 }
 function addFiles(files: FileList | File[]) {
   for (const f of Array.from(files)) {
-    if (f.size > MAX_ATT) continue // 超限静默跳过(将来给个轻提示)
+    if (f.size > MAX_ATT) {
+      // 超限不能不吭声(§3.5):以前直接 continue,小票上没有这个文件、用户却以为加上了,
+      // 发出去才发现它没跟着走。点名是哪个 + 上限多少,用户才知道该怎么办(压缩/换个方式发)。
+      useToast().error(t('toast.attTooBig', { name: f.name || '?', limit: `${MAX_ATT / 1024 / 1024}MB` }))
+      continue
+    }
     const reader = new FileReader()
     reader.onload = () => {
       const dataUrl = String(reader.result)
