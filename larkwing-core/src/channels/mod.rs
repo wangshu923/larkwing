@@ -301,19 +301,58 @@ pub async fn run(
 /// 提醒推回手机(A1):听全局事件车道,自启回合(提醒/盯天气)收尾且目标是渠道映射会话时,
 /// 把回复主动推到平台。Done 推最后一条 assistant 文本;Failed 推提醒原文保底(§3.5 不静默——
 /// 到点了人必须收到动静,哪怕回合没跑成)。推送失败只 warn(渠道断线时提醒仍在桌面)。
+/// outbound_loop 派给工作任务的活(FIFO,保序)。
+enum OutJob {
+    /// 自启回合收尾 → 把回复推回那台手机。
+    Reminder { conv_id: i64, outcome: crate::bus::TurnOutcome },
+    /// 确认卡 → 推到发起的 chat 等回话 / 终态清等待表。
+    Confirm(Box<crate::confirm::ConfirmCard>),
+}
+
 async fn outbound_loop(ctx: Arc<ChannelCtx>, ct: CancellationToken) {
     let mut rx = ctx.engine.bus().subscribe();
     let net = net::Client::new(|b| b.timeout(std::time::Duration::from_secs(30)));
+    // ⚠️ **推送必须搬出事件循环(2026-08-22 修)**:原先是在收事件的同一条线里直接
+    // `await` 推送,而一次推送最长能耗 30s(超时)。这期间广播车道照样在进事件 —— 车道是
+    // 有界的,满了就按 `Lagged` **直接丢**,而这里对 Lagged 只是 `continue`:到点的提醒、
+    // 忙完的汇报、甚至等着回话的确认卡,就这么**无声无息地没了**(§3.5 到点必有动静)。
+    // 修 = 事件循环只往队列里塞(纳秒级),推送交给一条 FIFO 工作任务;顺带把 Lagged
+    // 也如实喊出来 —— 真丢了至少日志里查得到。
+    let (tx, mut jobs) = tokio::sync::mpsc::unbounded_channel::<OutJob>();
+    let worker = {
+        let ctx = ctx.clone();
+        let ct = ct.clone();
+        tokio::spawn(async move {
+            while let Some(job) = jobs.recv().await {
+                if ct.is_cancelled() {
+                    return;
+                }
+                match job {
+                    OutJob::Reminder { conv_id, outcome } => {
+                        if let Err(e) = push_reminder(&ctx, &net, conv_id, outcome).await {
+                            tracing::warn!(err = %scrub(&e), conv = conv_id, "提醒推回渠道失败");
+                        }
+                    }
+                    OutJob::Confirm(card) => handle_confirm_card(&ctx, &net, *card).await,
+                }
+            }
+        })
+    };
     loop {
         let ev = tokio::select! {
-            _ = ct.cancelled() => return,
+            _ = ct.cancelled() => break,
             r = rx.recv() => match r {
                 Ok(ev) => ev,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    // 丢了就是丢了(broadcast 语义),但绝不能一声不吭:这条日志是
+                    // 「到点了手机没收到」唯一查得到的线索。
+                    tracing::warn!(dropped = n, "事件车道积压,丢了 {n} 条事件——期间的提醒/汇报/确认可能没推到手机");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
         };
-        match ev {
+        let job = match ev {
             crate::bus::AppEvent::Conversation(act) => {
                 // 只管自启回合(提醒/盯天气 = reminder,后台差事忙完汇报 = report);渠道入站
                 // 回合(kind="channel")drive_turn 内回过了。⚠️ 两类都要推:手机上支使它下东西,
@@ -321,16 +360,19 @@ async fn outbound_loop(ctx: Arc<ChannelCtx>, ct: CancellationToken) {
                 if act.kind != "reminder" && act.kind != "report" {
                     continue;
                 }
-                if let Err(e) = push_reminder(&ctx, &net, act.conv_id, act.outcome).await {
-                    tracing::warn!(err = %scrub(&e), conv = act.conv_id, "提醒推回渠道失败");
-                }
+                OutJob::Reminder { conv_id: act.conv_id, outcome: act.outcome }
             }
             // 确认闸(§7.8):渠道来源的确认请求推回发起的那个 chat 等回话;
             // 终态卡(超时/桌面先点)清等待表。桌面来源的卡归前端,这里不管。
-            crate::bus::AppEvent::Confirm(card) => handle_confirm_card(&ctx, &net, card).await,
+            crate::bus::AppEvent::Confirm(card) => OutJob::Confirm(Box::new(card)),
             _ => continue,
+        };
+        if tx.send(job).is_err() {
+            break; // 工作任务没了(只可能是收摊),别空转
         }
     }
+    drop(tx);
+    let _ = worker.await;
 }
 
 /// 确认卡的渠道半边:pending → 反查映射、把「要点『X』,回『确认』继续」推到发起 chat、

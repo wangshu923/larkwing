@@ -54,6 +54,12 @@ const QR_CLIENT_TIMEOUT_S: u64 = 45;
 /// 微信单条文本发送切片上限(字符;远小于平台上限,保守稳妥)。
 const WX_MAX: usize = 2000;
 /// 入站媒体下载上限(与桌面同缝;超大件如实退回)。
+/// 连着错几次就认定这条绑定真出事了(往状态行写红字)。一两次抖动不惊动用户。
+const ERR_STREAK_TO_REPORT: u32 = 3;
+/// 错误退避:头几次快些重试(抖动),判定出事之后拉长(别 2s 一次刷日志刷到天荒地老)。
+const ERR_BACKOFF_SHORT: Duration = Duration::from_secs(2);
+const ERR_BACKOFF_LONG: Duration = Duration::from_secs(30);
+
 const MEDIA_MAX_BYTES: u64 = 50 * 1024 * 1024;
 /// 出站文件上限(超限如实退回,绝不静默截断)。
 const FILE_MAX_BYTES: u64 = 50 * 1024 * 1024;
@@ -272,6 +278,7 @@ async fn serve(
         "微信绑定在线"
     );
 
+    let mut fails = 0u32; // 连续 API 错误计数(见下面的状态行/退避)
     loop {
         if ct.is_cancelled() {
             return Ok(());
@@ -281,17 +288,37 @@ async fn serve(
             _ = ct.cancelled() => return Ok(()),
             r = get_updates(net, &base, &token, &buf) => r?,
         };
-        // API 错误(ret/errcode != 0):退避重试(stale token 由此浮现到状态行,重新扫码即可)
+        // API 错误(ret/errcode != 0):退避重试。
+        // ⚠️ **必须往状态行冒(2026-08-22 修)**:原先只 warn 一句就 2s 一次无限重试 ——
+        // 令牌失效/被踢下线时,设置页那行**一直显示「在线」**,用户完全不知道要重新扫码
+        // (注释当年写的「stale token 由此浮现到状态行」其实没有兑现,没人写过 set_state)。
+        // 连着错几次就判定这条绑定真出事了:如实写进状态行 + 退避拉长(别 2s 一次刷日志)。
         let ret = resp.get("ret").and_then(Value::as_i64).unwrap_or(0);
         let errcode = resp.get("errcode").and_then(Value::as_i64).unwrap_or(0);
         if ret != 0 || errcode != 0 {
             let errmsg = resp.get("errmsg").and_then(Value::as_str).unwrap_or("");
-            tracing::warn!(ret, errcode, errmsg, "微信 getupdates 返回错误,2s 后重试");
+            fails += 1;
+            let wait = if fails >= ERR_STREAK_TO_REPORT {
+                ctx.set_state(
+                    "weixin",
+                    false,
+                    Some(format!("微信连不上了(ret={ret} errcode={errcode} {errmsg})——多半是绑定失效,重新扫一次码")),
+                );
+                ERR_BACKOFF_LONG
+            } else {
+                ERR_BACKOFF_SHORT
+            };
+            tracing::warn!(ret, errcode, errmsg, fails, "微信 getupdates 返回错误,{}s 后重试", wait.as_secs());
             tokio::select! {
                 _ = ct.cancelled() => return Ok(()),
-                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                _ = tokio::time::sleep(wait) => {}
             }
             continue;
+        }
+        if fails > 0 {
+            // 又通了:把状态行改回在线(否则一次抖动之后永远挂着红字)
+            fails = 0;
+            ctx.set_state("weixin", true, None);
         }
         // 推进游标并持久化(空串不覆盖;per-account 键)
         if let Some(nb) = resp.get("get_updates_buf").and_then(Value::as_str) {
@@ -371,7 +398,7 @@ async fn handle_message(
                 }
             }
             _ => match download_media(net, media).await {
-                Ok(bytes) if bytes.len() as u64 <= MEDIA_MAX_BYTES => {
+                Ok(Some(bytes)) => {
                     attachments.push(InAttachment {
                         name: media.name.clone(),
                         mime: media.mime.clone(),
@@ -1090,21 +1117,37 @@ fn media_type_by_name(name: &str) -> i64 {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// 下载 CDN 媒体并(有 aes_key 时)AES-128-ECB 解密,返回明文字节。
-async fn download_media(net: &net::Client, r: &MediaRef) -> Result<Vec<u8>> {
+/// 下载(必要时解密)一条入站媒体。`Ok(None)` = 超过 `MEDIA_MAX_BYTES`(调用方据此回
+/// 「太大了」的提示,与下载失败区分开)。
+///
+/// ⚠️ **上限要在收字节的过程中判,不能先收完再判(2026-08-22 修)**:原先是
+/// `resp.bytes()` 一口气读进内存、交给调用方比大小 —— 家里人随手转发一个几个 G 的视频,
+/// 这边就先老老实实把几个 G 全吃进内存,然后才说「太大了」。先看 Content-Length 早退,
+/// 没报长度(或报了假的)也不赌:边收边判,过线立刻停手(web_download 同款纪律)。
+async fn download_media(net: &net::Client, r: &MediaRef) -> Result<Option<Vec<u8>>> {
     let url = match (&r.full_url, &r.encrypt_query_param) {
         (Some(full), _) => full.clone(),
         (None, Some(eqp)) => format!("{CDN_BASE_URL}/download?encrypted_query_param={}", enc(eqp)),
         (None, None) => bail!("媒体无下载地址"),
     };
-    let resp = net.send(&url, |c| c.get(&url)).await.context("CDN 下载请求失败")?;
+    let mut resp = net.send(&url, |c| c.get(&url)).await.context("CDN 下载请求失败")?;
     ensure!(resp.status().is_success(), "CDN 下载 HTTP {}", resp.status());
-    let bytes = resp.bytes().await.context("读媒体字节失败")?.to_vec();
+    if resp.content_length().is_some_and(|n| n > MEDIA_MAX_BYTES) {
+        return Ok(None); // 报了长度且超限:一个字节都不用收
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.context("读媒体字节失败")? {
+        if bytes.len() as u64 + chunk.len() as u64 > MEDIA_MAX_BYTES {
+            return Ok(None); // 没报长度 / 报了假的:收到过线就停手,别把内存吃光
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     match &r.aes_key {
         Some(k) => {
             let key = parse_aes_key(k)?;
-            aes_ecb_decrypt(&bytes, &key)
+            aes_ecb_decrypt(&bytes, &key).map(Some)
         }
-        None => Ok(bytes),
+        None => Ok(Some(bytes)),
     }
 }
 
