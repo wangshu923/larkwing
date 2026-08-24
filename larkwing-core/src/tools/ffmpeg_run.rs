@@ -215,6 +215,45 @@ const BANNED: &[(&str, &str)] = &[
     ("-fpre", "-fpre 从文件读预设,不开放"),
 ];
 
+/// **已知吃一个值的 flag**(base 名,`:spec` 后缀按前缀比)。用途只有一个:判断紧跟其后的裸值
+/// 是不是「这个 flag 的值」。
+///
+/// 为什么不是「已知布尔 flag」黑名单:ffmpeg 的布尔 flag 列不全(-an/-vn/-sn/-dn/-shortest/
+/// -nostdin/-re/-xerror…还在长),漏一个就等于默认放行 —— 而放行的后果是那个裸值被 ffmpeg 当成
+/// **第二个输出文件**写出去,绕过 output/dir 那道授权圈(§7.2)。
+///
+/// 但也不做「白名单之外一律拒」:那会把没列进表的**合法**吃值 flag 弄坏(音视频加工是刚上线的
+/// 功能,不能为了这条闸把正常配方拦掉)。折中 = 不在表里的 flag,其后的裸值**只在不像路径时放行**
+/// (见 `looks_like_write_target`)—— 真实威胁的形状都是路径,而数值/枚举值放行无害。
+const VALUE_FLAGS: &[&str] = &[
+    "-ss", "-sseof", "-t", "-to", "-itsoffset", "-map", "-map_metadata", "-map_chapters",
+    "-f", "-c", "-codec", "-vcodec", "-acodec", "-scodec", "-b", "-crf", "-cq", "-qp", "-q",
+    "-global_quality", "-preset", "-profile", "-level", "-tune", "-pix_fmt", "-r", "-g",
+    "-keyint_min", "-sc_threshold", "-bf", "-maxrate", "-minrate", "-bufsize", "-rc_lookahead",
+    "-vf", "-af", "-filter", "-filter_complex", "-s", "-aspect", "-sws_flags", "-swr_flags",
+    "-vframes", "-aframes", "-frames", "-ac", "-ar", "-sample_fmt", "-channel_layout",
+    "-movflags", "-flags", "-fflags", "-frag_duration", "-threads", "-loglevel",
+    "-metadata", "-disposition", "-tag", "-bsf", "-start_number", "-loop", "-stream_loop",
+    "-hwaccel", "-hwaccel_device", "-init_hw_device", "-filter_hw_device",
+    "-max_muxing_queue_size", "-vsync", "-fps_mode", "-async", "-muxdelay", "-muxpreload",
+    "-pass", "-force_key_frames", "-x264opts", "-x264-params", "-x265-params",
+    "-framerate", "-video_size", "-pixel_format", "-sample_rate", "-channels", "-pattern_type",
+    "-cpu-used", "-deadline", "-lag-in-frames", "-top", "-copytb", "-dframes", "-vtag", "-atag",
+];
+
+/// 这个裸值像不像「要写/读的文件」= 绝对路径形(`/…`、`~…`、`X:\…`/`X:/…`)。
+/// 只认**绝对**形:相对形(`16/9` 这类)在滤镜/参数里太常见,认了会把 `setdar=16/9`
+/// 之类的正常用法误判成路径。相对文件名(`evil.mp4`)因此仍是残留面 —— 已知且记档:
+/// 已知布尔 flag 那条路已经拦住(它们不在 VALUE_FLAGS 里 → 裸值必须不像路径 → 但 `evil.mp4`
+/// 不像绝对路径…)故对**未知** flag + 相对文件名仍会放行,落点是进程 CWD、攻击者选不了目录。
+fn looks_like_write_target(v: &str) -> bool {
+    let b = v.as_bytes();
+    v.starts_with('/')
+        || v.starts_with('~')
+        || v.starts_with("\\\\") // UNC
+        || (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\'))
+}
+
 fn scan_args(raw: &[String]) -> anyhow::Result<Scan> {
     anyhow::ensure!(!raw.is_empty(), "args 不能为空");
     let mut args = Vec::with_capacity(raw.len() + 2);
@@ -222,6 +261,8 @@ fn scan_args(raw: &[String]) -> anyhow::Result<Scan> {
     let mut filter_reads = Vec::new();
     let mut wants_h264 = false;
     let mut prev_was_flag = false;
+    // 前一个 flag 是不是「已知吃值」的(决定紧跟的裸值算不算它的值,见 VALUE_FLAGS)
+    let mut prev_flag_takes_value = false;
     let mut i = 0;
     while i < raw.len() {
         let t = raw[i].trim();
@@ -243,6 +284,7 @@ fn scan_args(raw: &[String]) -> anyhow::Result<Scan> {
             args.push(p);
             i += 2;
             prev_was_flag = false;
+            prev_flag_takes_value = false;
             continue;
         }
         if t.starts_with('-') && t.len() > 1 {
@@ -268,6 +310,7 @@ fn scan_args(raw: &[String]) -> anyhow::Result<Scan> {
             args.push(t.to_string());
             i += 1;
             prev_was_flag = true;
+            prev_flag_takes_value = VALUE_FLAGS.contains(&base);
             continue;
         }
         // 不带 - 的裸值必须紧跟 flag(ffmpeg 的值都是单 token;孤零零的裸值 = 多半想把
@@ -275,6 +318,14 @@ fn scan_args(raw: &[String]) -> anyhow::Result<Scan> {
         anyhow::ensure!(
             prev_was_flag,
             "参数「{t}」孤零零的:输出文件别写进 args(用 output 参数),值要紧跟它的 flag"
+        );
+        // 「紧跟 flag」不等于「是那个 flag 的值」:ffmpeg 一大票布尔 flag(-an/-vn/-sn/-shortest…)
+        // 不吃值,它后面的裸值会被 ffmpeg 当成**第二个输出文件**写出去 —— 绕过 output/dir 那道
+        // 授权圈。故:不在 VALUE_FLAGS 里的 flag,其后的裸值只在**不像绝对路径**时放行(2026-08-22)。
+        anyhow::ensure!(
+            prev_flag_takes_value || !looks_like_write_target(t),
+            "参数「{t}」看着是个文件路径,但它前面那个 flag 不吃值(ffmpeg 会把它当成第二个输出\
+             文件写出去):输出文件别写进 args,用 output 参数"
         );
         for path in find_filter_paths(t)? {
             anyhow::ensure!(
@@ -330,6 +381,47 @@ fn find_filter_paths(token: &str) -> anyhow::Result<Vec<String>> {
             found.push(path);
             i += pat.len() + consumed;
         }
+    }
+    // **第二道网(2026-08-22 审计)**:会读文件的滤镜选项**永远列不全** —— 上面那张表只有
+    // subtitles/amovie/movie/ass 四个,而 `drawtext=textfile=…`(把圈外任意文本渲进画面)、
+    // `drawtext=fontfile=…`、`haldclut` 之类都没在内,等于绕过授权圈直接读圈外文件。
+    // 故不再靠枚举:扫**所有** `key=` 处的值,凡长得像绝对路径的一律交出去过闸 —— 与是哪个
+    // 滤镜无关。只认**绝对**形:相对形在滤镜里太常见(`setdar=16/9`、`scale=640:-2`),
+    // 认了会把正常参数误判成文件。这一道**只加不减**:解析不出来就跳过(上面对已知滤镜
+    // 仍是严格报错,语义与测试都不变)。
+    let is_key_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    let is_bound = |c: char| matches!(c, ',' | ';' | '[' | ']' | '\'' | '"' | ':' | '=');
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '=' {
+            i += 1;
+            continue;
+        }
+        // 往前认一段选项名,再确认它前面是分隔位(防把路径里的 `=` 当选项)
+        let mut k = i;
+        while k > 0 && is_key_char(chars[k - 1]) {
+            k -= 1;
+        }
+        if k == i || !(k == 0 || is_bound(chars[k - 1])) {
+            i += 1;
+            continue;
+        }
+        if let Ok((value, _)) = extract_filter_value(&chars[i + 1..]) {
+            // 嵌套选项名逐层剥(`drawtext=textfile=/x` → `/x`);路径自带的 `=` 不会被误剥
+            // (那一段含 `/` 之类,认不成选项名就停)。
+            let mut v = value.as_str();
+            while let Some(p) = v.find('=') {
+                if p > 0 && v[..p].chars().all(is_key_char) {
+                    v = &v[p + 1..];
+                } else {
+                    break;
+                }
+            }
+            if looks_like_write_target(v) && !found.iter().any(|f| f == v) {
+                found.push(v.to_string());
+            }
+        }
+        i += 1;
     }
     Ok(found)
 }
@@ -509,5 +601,65 @@ mod tests {
         assert_eq!(find_filter_paths("[0:v]movie=/m/b.mp4[ov]").unwrap(), vec!["/m/b.mp4"]);
         // 引号没闭合 = 拒
         assert!(find_filter_paths("subtitles='/a/b.srt").is_err());
+    }
+
+    /// **布尔 flag 后面不许夹带裸值(2026-08-22 审计)**。
+    ///
+    /// 「孤裸值」闸原先假设「每个 flag 都吃一个值」:只要前一个 token 以 `-` 开头就放行下一个裸值。
+    /// 而 ffmpeg 有一大票**布尔 flag**(-an/-vn/-sn/-dn/-shortest/-nostdin…),它们不吃值 ——
+    /// 于是 `-an /tmp/x.mp4` 能过闸,而 ffmpeg 会把那个裸值当成**第二个输出文件**写出去:
+    /// 绕过 output/dir 参数那道授权圈(§7.2),往圈外落盘。
+    /// 判定必须反过来:**认得的吃值 flag 才放行下一个裸值,不认得的一律按布尔处理**(失败即拒)。
+    #[test]
+    fn bare_value_after_boolean_flag_is_rejected() {
+        let (p, _d) = temp_input("in.mp4");
+        let inp = p.to_string_lossy().to_string();
+        for boolean in ["-an", "-vn", "-sn", "-shortest", "-nostdin"] {
+            let err = scan_args(&s(&["-i", &inp, boolean, "/tmp/lw-evil.mp4"])).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("输出文件别写进 args"),
+                "{boolean} 是布尔 flag,后面的裸值必须被当成偷渡的输出文件拒掉,实际:{err:#}"
+            );
+        }
+        // 不认得的 flag 也按布尔处理(失败即拒),别默认放行
+        let err = scan_args(&s(&["-i", &inp, "-some_future_bool_flag", "/tmp/lw-evil.mp4"]))
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("输出文件别写进 args"),
+            "未知 flag + 路径形裸值也要拒:{err:#}"
+        );
+        // 真吃值的 flag 照常放行(别把正常用法拦了)
+        for (flag, val) in
+            [("-ss", "3"), ("-t", "5"), ("-b:a", "192k"), ("-vf", "scale=640:-2"), ("-map", "0:a:0")]
+        {
+            scan_args(&s(&["-i", &inp, flag, val]))
+                .unwrap_or_else(|e| panic!("{flag} {val} 应放行,却被拦:{e:#}"));
+        }
+    }
+
+    /// **滤镜里读文件的形不许靠枚举(2026-08-22 审计)**。
+    ///
+    /// `FILE_FILTERS` 原先只列了 4 个(subtitles/amovie/movie/ass),而会读文件的滤镜选项远不止:
+    /// `drawtext=textfile=…` 能把圈外任意文本渲进画面、`drawtext=fontfile=…`、`haldclut`…
+    /// 永远列不全。改成**扫所有 `key=value`、凡 value 长得像路径就一律过闸** —— 与是哪个滤镜无关。
+    #[test]
+    fn any_pathlike_filter_value_goes_through_the_gate() {
+        let dir = tempfile_dir::Dir::new("lw-ffilter");
+        let txt = dir.path().join("words.txt");
+        std::fs::write(&txt, b"hi").unwrap();
+        let abs = txt.to_string_lossy().to_string();
+
+        // drawtext=textfile= —— 原先完全不进扫描
+        let got = find_filter_paths(&format!("drawtext=textfile={abs}:fontsize=24")).unwrap();
+        assert!(got.contains(&abs), "textfile 的路径必须交出来过闸,实际:{got:?}");
+        // fontfile 同理
+        let got = find_filter_paths(&format!("drawtext=fontfile={abs}:text=hi")).unwrap();
+        assert!(got.contains(&abs), "fontfile 的路径必须交出来过闸,实际:{got:?}");
+        // 非路径的值不该被当路径(别把正常滤镜参数当文件去查)
+        assert!(find_filter_paths("scale=640:-2").unwrap().is_empty());
+        assert!(find_filter_paths("volume=5dB").unwrap().is_empty());
+        assert!(find_filter_paths("atempo=1.5").unwrap().is_empty());
+        // 老的四个照旧
+        assert_eq!(find_filter_paths(&format!("subtitles={abs}")).unwrap(), vec![abs.clone()]);
     }
 }
