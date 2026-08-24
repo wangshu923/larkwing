@@ -167,6 +167,10 @@ impl Tool for MediaDownload {
                     crate::media::LyricsResult::NotFound => {
                         ";这首没找到歌词(歌名/歌手给得更准可能找得到)"
                     }
+                    // 找到词却写不进去 ≠ 没找到:如实说,别让模型换源重试白忙
+                    crate::media::LyricsResult::WriteFailed => {
+                        ";歌词找到了但写不进去(那个文件夹可能没有写权限或磁盘满了),歌本身已存好"
+                    }
                 });
                 out
             }

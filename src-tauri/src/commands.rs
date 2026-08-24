@@ -411,13 +411,19 @@ pub fn list_fsops(state: State<'_, AppState>) -> Result<Vec<FsOpRow>, AppError> 
 
 /// 操作记录页「撤销」:把某批文件操作退回去(功能性,非安全承诺)。
 #[tauri::command]
-pub fn fsops_undo(state: State<'_, AppState>, id: i64) -> Result<(), AppError> {
+pub fn fsops_undo(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<larkwing_core::files::OpReport, AppError> {
     state.engine.fsops_undo(id)
 }
 
 /// 操作记录页「重做」:把撤销过的那批再做一遍。
 #[tauri::command]
-pub fn fsops_redo(state: State<'_, AppState>, id: i64) -> Result<(), AppError> {
+pub fn fsops_redo(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<larkwing_core::files::OpReport, AppError> {
     state.engine.fsops_redo(id)
 }
 

@@ -431,6 +431,7 @@ export default {
   toast: {
     deleteFailed: 'Couldn’t delete that… try again?',
     actionFailed: 'That didn’t go through… try again?',
+    opsPartial: "{n} item(s) couldn't be reverted (moved or gone); the rest are done",
     captureFallback: 'Browser capture didn’t start — switched back to the system microphone',
     restoreOk: 'Restored from backup',
     restoreFailed: 'The restore didn’t finish — your data is unchanged',

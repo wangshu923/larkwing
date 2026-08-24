@@ -130,6 +130,13 @@ export interface SkillItem {
 /** 一批文件操作(操作记录页,PLAN §9 文件能力)。功能性历史,非安全承诺。
  *  kind: move|copy|mkdir|trash|write|append|edit;state: 'applied'(已生效)|'undone'(已撤销,可重做);
  *  ops = FsOpItem[] 的 JSON 串(前端不解析,只用 kind/n 展示)。 */
+/** 一批撤销/重做的结果:成功几条 / 跳过几条(不可逆、文件被移动过或已不在)。
+ *  skipped > 0 必须如实告诉用户 —— 以前 core 把这个报告丢了,一项没还原也报成功。 */
+export interface OpReport {
+  done: number
+  skipped: number
+}
+
 export interface FsOp {
   id: number
   user_id: number
@@ -1259,8 +1266,9 @@ export const api = {
   cancelReminder: (id: number) => invoke<void>('cancel_reminder', { id }),
   /** 操作记录页(文件能力):最近的文件操作批次 + 撤销/重做(功能性,非安全承诺)。 */
   listFsops: () => invoke<FsOp[]>('list_fsops'),
-  fsopsUndo: (id: number) => invoke<void>('fsops_undo', { id }),
-  fsopsRedo: (id: number) => invoke<void>('fsops_redo', { id }),
+  // 返回逐条结果:skipped > 0 = 有文件没能还原(被移动过/已不在/不可逆),要如实告诉用户
+  fsopsUndo: (id: number) => invoke<OpReport>('fsops_undo', { id }),
+  fsopsRedo: (id: number) => invoke<OpReport>('fsops_redo', { id }),
   /** 确认卡应答(§7.8):HUD 卡/悬浮窗按钮直连;false = 卡已收尾(过期/别处先点)。
    *  choice:'always' = 一直允许(文件授权圈入表)| 'once' = 仅这次 | 'deny' = 先不要。 */
   confirmAction: (id: number, choice: 'always' | 'once' | 'deny', via: string) =>

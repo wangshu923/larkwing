@@ -388,7 +388,9 @@ pub fn edit_text(path: &Path, find: &str, replace: &str) -> Result<FsOpItem> {
 // ---------------------------------------------------------------------------
 
 /// 一批撤销/重做的结果:成功几条、跳过几条(不可逆/环境已变/出错)。
-#[derive(Debug, Clone, Copy, Default)]
+/// **要过桥**(2026-08-22 审计):原先 engine 把它丢掉,于是「一项没还原」也报成功 ——
+/// 用户以为撤干净了,实际有文件还在原样(§3.5)。序列化给命令层/前端如实显示。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct OpReport {
     pub done: usize,
     pub skipped: usize,

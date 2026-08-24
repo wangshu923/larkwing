@@ -238,9 +238,14 @@ impl MediaRuntime {
                                     &file.path,
                                 )
                                 .await;
+                                // WriteFailed 也计入「没配上」(汇报要如实,不能算成配好了),
+                                // 但日志分开记 —— 真因不同,排障时要看得出是没词还是写不进。
                                 if got == LyricsResult::NotFound {
                                     lyr_missing += 1;
                                     tracing::info!(title = %file.title, "批量下载:这首没找到歌词");
+                                } else if got == LyricsResult::WriteFailed {
+                                    lyr_missing += 1;
+                                    tracing::warn!(title = %file.title, "批量下载:歌词找到了但写不进去");
                                 }
                             }
                             Err(err) => {

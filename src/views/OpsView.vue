@@ -74,7 +74,9 @@ async function undo(o: FsOp) {
   o.state = 'undone' // 乐观更新
   if (isTauri()) {
     try {
-      await api.fsopsUndo(o.id)
+      // 如实说:有条目没能还原(文件被移动过/已不在/本就不可撤)就别让人以为撤干净了
+      const r = await api.fsopsUndo(o.id)
+      if (r && r.skipped > 0) toast.error(t('toast.opsPartial', { n: r.skipped }))
     } catch (e) {
       console.error('撤销失败', e)
       o.state = prev
@@ -91,7 +93,8 @@ async function redo(o: FsOp) {
   o.state = 'applied'
   if (isTauri()) {
     try {
-      await api.fsopsRedo(o.id)
+      const r = await api.fsopsRedo(o.id)
+      if (r && r.skipped > 0) toast.error(t('toast.opsPartial', { n: r.skipped }))
     } catch (e) {
       console.error('重做失败', e)
       o.state = prev

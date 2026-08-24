@@ -90,8 +90,35 @@ impl OpenAiResponsesProvider {
         let mut items: Vec<Value> = Vec::new();
         for msg in messages {
             match msg {
-                ChatMessage::User { content, .. } => {
-                    items.push(json!({ "role": "user", "content": content }));
+                // 用户发的图**必须带上**(2026-08-22 审计):这里原先是 `User { content, .. }`,
+                // 把 parts 整个忽略了 —— 四个方言里只有它漏了(openai_compat / anthropic_compat /
+                // gemini 都翻译或降级 User.parts)。后果:用 OpenAI 当大脑时「发图问它」整条链
+                // 失效,而且连「图没送到」都不说,模型只能按文字硬答或顺着路径瞎猜画面内容 ——
+                // 正是 §6.3「丢图必留话」要根治的形态(同文件里 vision 早就算出来了,只给了 ToolResult 用)。
+                ChatMessage::User { content, parts } => {
+                    if parts.is_empty() {
+                        items.push(json!({ "role": "user", "content": content }));
+                    } else if !vision {
+                        // 非视觉模型:丢图但**如实留话**(与 ToolResult 同一个单源函数)
+                        items.push(json!({
+                            "role": "user",
+                            "content": super::tool_result_text(content, parts, vision),
+                        }));
+                    } else {
+                        let mut arr = Vec::with_capacity(parts.len() + 1);
+                        arr.push(json!({ "type": "input_text", "text": content }));
+                        for p in parts {
+                            match p {
+                                super::ContentPart::ImageUrl { url } => {
+                                    arr.push(json!({ "type": "input_image", "image_url": url }));
+                                }
+                                super::ContentPart::Text { text } => {
+                                    arr.push(json!({ "type": "input_text", "text": text }));
+                                }
+                            }
+                        }
+                        items.push(json!({ "role": "user", "content": arr }));
+                    }
                 }
                 ChatMessage::Assistant { content, tool_calls, reasoning_state, .. } => {
                     // 1) reasoning item 先回放(逐字保真:encrypted_content 不能改、不能丢)
@@ -186,7 +213,7 @@ impl LlmProvider for OpenAiResponsesProvider {
                         return;
                     }
                     Ok(None) => {
-                        finalize(&tx, usage, calls, reasoning_items).await;
+                        finalize(&tx, usage, calls, reasoning_items, None).await;
                         return;
                     }
                     Ok(Some(Err(e))) => {
@@ -253,7 +280,12 @@ async fn parse_event(
             }
         }
         // 收尾:usage 在此,output 数组兜底再扫一遍(防只在此出现的 item)
-        "response.completed" => {
+        // `response.incomplete` = 服务端**截断**收尾(max_output_tokens 用满、内容策略拦下…)。
+        // 它原先落进 `_ => {}` 被忽略(2026-08-22 审计):于是流就那么结束了 —— usage 还是全 0
+        // (这一轮的 token 与花费凭空消失),stop_reason 按「没有 tool_call」报成 end_turn,
+        // **截断被当成正常说完**。§4.5「绝不接受静默降质」+ §3.5 都在这条上。
+        // 与 completed 走同一段 usage 解析(载荷同形),只是收尾原因如实标出来。
+        "response.completed" | "response.incomplete" => {
             if let Some(resp) = value.get("response") {
                 if let Some(u) = resp.get("usage") {
                     let g = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0) as i64;
@@ -266,8 +298,22 @@ async fn parse_event(
                         .unwrap_or(0) as i64;
                 }
             }
-            finalize(tx, std::mem::take(usage), std::mem::take(calls), std::mem::take(reasoning_items))
-                .await;
+            // 截断原因原样带出(max_output_tokens / content_filter …),缺失给个兜底串
+            let truncated = (ty == "response.incomplete").then(|| {
+                value
+                    .pointer("/response/incomplete_details/reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("incomplete")
+                    .to_string()
+            });
+            finalize(
+                tx,
+                std::mem::take(usage),
+                std::mem::take(calls),
+                std::mem::take(reasoning_items),
+                truncated,
+            )
+            .await;
             return Flow::Stop;
         }
         "response.failed" | "error" => {
@@ -316,9 +362,15 @@ async fn finalize(
     usage: Usage,
     calls: Vec<ToolCall>,
     reasoning_items: Vec<Value>,
+    // truncated:Some = 服务端按「未说完」收尾(`response.incomplete`),值 = 它给的原因。
+    // 有值时**必须**盖过「end_turn/tool_use」—— 否则截断被当成正常说完(§4.5 不静默降质)。
+    truncated: Option<String>,
 ) {
-    let stop_reason =
-        Some(if calls.is_empty() { "end_turn".into() } else { "tool_use".to_string() });
+    let stop_reason = Some(match truncated {
+        Some(why) => why,
+        None if calls.is_empty() => "end_turn".to_string(),
+        None => "tool_use".to_string(),
+    });
     if !reasoning_items.is_empty() {
         let _ = tx
             .send(ChatEvent::ReasoningState(json!({ ITEMS_KEY: reasoning_items })))
@@ -434,6 +486,65 @@ mod tests {
         let out = wire["input"][0]["output"].as_str().unwrap();
         assert!(out.starts_with("页面截图"), "{out}");
         assert!(out.contains("没能传给当前模型"), "{out}");
+    }
+
+    /// **用户发的图不许静默丢(2026-08-22 审计)**:这个方言的 User 臂原先写成
+    /// `User { content, .. }`,parts 整个被忽略 —— 四家里只有它漏了。用 OpenAI 当大脑时
+    /// 「发图问它」整条链失效,而且连「图没送到」都不说(§6.3 丢图必留话)。
+    #[test]
+    fn user_images_are_sent_and_never_silently_dropped() {
+        let img = crate::llm::ContentPart::ImageUrl { url: "data:image/png;base64,AAAA".into() };
+        let p = OpenAiResponsesProvider::new(cfg()); // gpt-5 = 视觉
+        let wire = p.to_wire(&req(vec![ChatMessage::user_with_parts("这是什么", vec![img.clone()])]));
+        let c = &wire["input"][0]["content"];
+        assert_eq!(c[0]["type"], "input_text");
+        assert_eq!(c[0]["text"], "这是什么");
+        assert_eq!(c[1]["type"], "input_image", "图必须真进请求体:{c}");
+        assert_eq!(c[1]["image_url"], "data:image/png;base64,AAAA");
+
+        // 无图:仍是纯字符串 content(字节不变 = 前缀缓存零损伤)
+        let plain = p.to_wire(&req(vec![ChatMessage::user("你好")]));
+        assert_eq!(plain["input"][0]["content"], "你好");
+
+        // 非视觉模型:丢图但**如实留话**(与 ToolResult 同一个单源函数)
+        let mut c2 = cfg();
+        c2.model = "unknown-text-model".into();
+        let nv = OpenAiResponsesProvider::new(c2);
+        let wire = nv.to_wire(&req(vec![ChatMessage::user_with_parts("这是什么", vec![img])]));
+        let s = wire["input"][0]["content"].as_str().expect("非视觉回字符串");
+        assert!(s.starts_with("这是什么"), "{s}");
+        assert!(s.contains("没能传给当前模型"), "丢图必须留话,实际:{s}");
+    }
+
+    /// **`response.incomplete` 不许当成正常说完(2026-08-22 审计)**:它原先落进 `_ => {}`
+    /// 被忽略,于是流就那么结束 —— usage 全 0(这一轮 token 与花费凭空消失)、stop_reason
+    /// 按「没有 tool_call」报成 end_turn,**截断被当成说完了**(§4.5 不静默降质 + §3.5)。
+    #[tokio::test]
+    async fn incomplete_response_is_not_reported_as_a_normal_finish() {
+        let (tx, mut rx) = mpsc::channel::<ChatEvent>(8);
+        let mut usage = Usage::default();
+        let mut calls = Vec::new();
+        let mut items = Vec::new();
+        let ev = json!({
+            "type": "response.incomplete",
+            "response": {
+                "usage": { "input_tokens": 30, "output_tokens": 128 },
+                "incomplete_details": { "reason": "max_output_tokens" }
+            }
+        });
+        assert!(matches!(
+            parse_event(&ev, &tx, &mut usage, &mut calls, &mut items).await,
+            Flow::Stop
+        ));
+        drop(tx);
+        match rx.recv().await {
+            Some(ChatEvent::Done { usage, stop_reason, .. }) => {
+                assert_eq!(stop_reason.as_deref(), Some("max_output_tokens"), "收尾原因要如实带出");
+                assert_eq!(usage.input_tokens, 30, "usage 不能记成 0");
+                assert_eq!(usage.output_tokens, 128);
+            }
+            other => panic!("应收到 Done,实际 {other:?}"),
+        }
     }
 
     #[tokio::test]

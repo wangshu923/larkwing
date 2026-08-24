@@ -37,6 +37,10 @@ pub enum LyricsResult {
     Existed,
     /// 两级来源都没找到(或纯音乐)。
     NotFound,
+    /// **找到了词,但写不进去**(权限/磁盘满/路径问题)。与 NotFound 分开(2026-08-22 审计):
+    /// 原先写盘失败也回 NotFound → 话术说成「没找到歌词」,模型和用户都以为是没词,
+    /// 于是去做无用的重试/换源,真因(写不进)一个字都没说(§3.5)。
+    WriteFailed,
 }
 
 /// 存量批量的单文件结论。
@@ -218,6 +222,8 @@ pub(crate) fn compose_batch_summary(results: &[(PathBuf, LyricsFileResult)]) -> 
     let mut plain = 0usize;
     let mut existed = 0usize;
     let (mut not_found, mut missing, mut unusable) = (Vec::new(), Vec::new(), Vec::new());
+    // 「找到词却写不进去」单独一档:与「没找到」混报会让人去改歌名重试,而真因是写权限/磁盘。
+    let mut write_failed: Vec<String> = Vec::new();
     let stem = |p: &Path| p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     for (path, r) in results {
         match r {
@@ -228,6 +234,7 @@ pub(crate) fn compose_batch_summary(results: &[(PathBuf, LyricsFileResult)]) -> 
             }
             LyricsFileResult::Got(LyricsResult::Existed) => existed += 1,
             LyricsFileResult::Got(LyricsResult::NotFound) => not_found.push(stem(path)),
+            LyricsFileResult::Got(LyricsResult::WriteFailed) => write_failed.push(stem(path)),
             LyricsFileResult::MissingTitle => missing.push(stem(path)),
             LyricsFileResult::Unusable(why) => unusable.push(format!("{}({why})", stem(path))),
         }
@@ -241,6 +248,13 @@ pub(crate) fn compose_batch_summary(results: &[(PathBuf, LyricsFileResult)]) -> 
     }
     if !not_found.is_empty() {
         out.push_str(&format!(";没找到歌词 {} 个:{}", not_found.len(), cap_names(&not_found)));
+    }
+    if !write_failed.is_empty() {
+        out.push_str(&format!(
+            ";找到歌词但写不进去 {} 个(那个文件夹可能没写权限或磁盘满了):{}",
+            write_failed.len(),
+            cap_names(&write_failed)
+        ));
     }
     if !missing.is_empty() {
         out.push_str(&format!(
@@ -295,7 +309,7 @@ pub(super) async fn lyrics_for_download(
             Ok(false) => LyricsResult::Existed,
             Err(e) => {
                 tracing::warn!("写歌词文件失败: {e:#}");
-                LyricsResult::NotFound
+                LyricsResult::WriteFailed
             }
         },
         Ok(None) => LyricsResult::NotFound,

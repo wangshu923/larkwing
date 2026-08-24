@@ -183,7 +183,9 @@ impl Tool for SkillWrite {
         let store = ctx.store.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             // 总量 backstop:满了如实退回(绝不静默折叠索引);覆盖已有条不占新额度
-            let exists = store.skills.find(&name)?.is_some_and(|(s, _)| s.name == name);
+            // 存在性判定**不能**用 `find`(它带 `enabled = 1` 过滤):停用的同名条也占着那一行,
+            // 用 find 会把「覆盖停用同名条」误判成新增 → 满 64 条时被 backstop 拦掉(2026-08-22 审计)。
+            let exists = store.skills.name_taken(&name)?;
             if !exists && store.skills.count()? >= SKILLS_MAX {
                 anyhow::bail!(
                     "技能已有 {SKILLS_MAX} 条(上限),没有写入。请用户先在技能页清理不用的,再教新的。"

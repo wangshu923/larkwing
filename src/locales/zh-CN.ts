@@ -432,6 +432,7 @@ export default {
   toast: {
     deleteFailed: '没删掉,再试一下?',
     actionFailed: '刚才那下没成功,再试一次?',
+    opsPartial: '有 {n} 项没能还原(文件被移动过或已不在了),其余已处理',
     captureFallback: '浏览器采集没起来,已切回系统麦克风',
     restoreOk: '已从备份恢复',
     restoreFailed: '从备份恢复没成功,数据保持原样',

@@ -511,6 +511,15 @@ async fn reply_webhook(net: &net::Client, webhook: &str, text: &str) -> Result<(
     if !resp.status().is_success() {
         anyhow::bail!("钉钉 sessionWebhook HTTP {}", resp.status());
     }
+    // **HTTP 200 不等于发出去了**(2026-08-22 审计):钉钉把业务错放在响应体的 errcode 里
+    // (会话过期、内容被拦、频率超限…),原先只看状态码 → 这些一律被当成功,用户那边什么都没
+    // 收到、我们这边也一声不响(§3.5)。同族口径见微信 `send_item` 的 ret/errcode 双字段判定。
+    // 响应体不是 JSON / 没有 errcode:按成功放过(别为一个字段解析失败把真发出去的消息报成失败)。
+    let v: Value = resp.json().await.unwrap_or(Value::Null);
+    if let Some(code) = v.get("errcode").and_then(Value::as_i64) {
+        let msg = v.get("errmsg").and_then(Value::as_str).unwrap_or("");
+        anyhow::ensure!(code == 0, "钉钉 sessionWebhook 业务失败 errcode={code} {msg}");
+    }
     Ok(())
 }
 

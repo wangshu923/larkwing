@@ -1929,18 +1929,26 @@ impl Engine {
     }
 
     /// 撤销一批(操作记录页「撤销」按钮;模型侧另有 fs_undo 工具)。
-    pub fn fsops_undo(&self, id: i64) -> Result<(), AppError> {
+    /// 返回**逐条结果**:有 skipped 就说明有文件没能还原(被移动过/已不在/不可逆),
+    /// 调用方要如实告诉用户 —— 原先这个报告被丢掉,一项没还原也报成功(§3.5)。
+    pub fn fsops_undo(&self, id: i64) -> Result<crate::files::OpReport, AppError> {
         self.apply_fsops(id, "applied", "undone", true)
     }
 
-    /// 重做一批(「重做」按钮)。功能性,非安全承诺。
-    pub fn fsops_redo(&self, id: i64) -> Result<(), AppError> {
+    /// 重做一批(「重做」按钮)。功能性,非安全承诺。返回同上。
+    pub fn fsops_redo(&self, id: i64) -> Result<crate::files::OpReport, AppError> {
         self.apply_fsops(id, "undone", "applied", false)
     }
 
     /// 撤销/重做共用:校归属 + 校当前状态(已是目标态 = 幂等返回)→ 执行 → 翻状态。
     /// 文件 I/O 直接在此(同 delete_* 等阻塞域方法,Tauri 在工作线程跑同步 command)。
-    fn apply_fsops(&self, id: i64, from: &str, to: &str, undo: bool) -> Result<(), AppError> {
+    fn apply_fsops(
+        &self,
+        id: i64,
+        from: &str,
+        to: &str,
+        undo: bool,
+    ) -> Result<crate::files::OpReport, AppError> {
         let user = self.store.users.ensure_default_user()?;
         let row = self.store.fsops.get(id)?.ok_or_else(|| AppError {
             kind: ErrorKind::NotFound,
@@ -1950,17 +1958,22 @@ impl Engine {
             return Err(AppError { kind: ErrorKind::NotFound, message: "不是你的操作记录".into() });
         }
         if row.state != from {
-            return Ok(()); // 已是目标状态 → 幂等(前端刷新即可)
+            return Ok(crate::files::OpReport::default()); // 已是目标状态 → 幂等(前端刷新即可)
         }
         let items: Vec<crate::files::FsOpItem> =
             serde_json::from_str(&row.ops).map_err(AppError::internal)?;
-        if undo {
-            crate::files::undo_batch(&items);
+        let report = if undo {
+            crate::files::undo_batch(&items)
         } else {
-            crate::files::redo_batch(&items);
+            crate::files::redo_batch(&items)
+        };
+        if report.skipped > 0 {
+            tracing::warn!(id, done = report.done, skipped = report.skipped,
+                "撤销/重做有条目没能处理(不可逆/文件已不在),已如实回报前端");
         }
+        // 状态照翻:这一批确实走过一遍,剩下的条目也不会自己好起来;差异由 report 如实说。
         self.store.fsops.set_state(id, to)?;
-        Ok(())
+        Ok(report)
     }
 
     pub fn rename_user(&self, name: &str) -> Result<User, AppError> {

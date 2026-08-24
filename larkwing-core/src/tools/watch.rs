@@ -104,6 +104,15 @@ impl Tool for WatchSet {
         if !["below", "above", "is"].contains(&op) {
             anyhow::bail!("未知 op: {op},可用 below/above/is");
         }
+        // **(metric, op) 的组合也要校(2026-08-22 审计)**:求值器 `WatchCondition::evaluate` →
+        // `cmp` 只认 below/above,温度指标配 `is` 落进 `_ => false` = **这条提醒永远不会响**,
+        // 而原先照样回报「已盯上了」、7 天后静默作废(§3.5:接受一个永不生效的设置就是静默失败)。
+        // rain 不吃 op(求值器只看天气文本里有没有雨雪雷),传什么都行,不拦。
+        if matches!(metric, "low_temp" | "high_temp") && op == "is" {
+            anyhow::bail!(
+                "metric={metric} 不能配 op=is(温度要比大小):降到某度以下用 below、升到某度以上用 above"
+            );
+        }
         let value_opt = args.get("value").and_then(serde_json::Value::as_f64);
         if metric != "rain" && value_opt.is_none() {
             anyhow::bail!("metric={metric} 需要 value(温度阈值 ℃)");
@@ -228,6 +237,27 @@ mod tests {
             .is_err(),
             "温度型缺 value 应报错"
         );
+    }
+
+    /// **不许接受一个永远不会响的条件(2026-08-22 审计)**:求值器 `cmp` 只认 below/above,
+    /// 温度指标配 `is` 恒为 false —— 而原先照样回报「已盯上了」,7 天后静默作废(§3.5)。
+    #[tokio::test]
+    async fn temp_metric_rejects_is_because_evaluator_never_matches() {
+        let ctx = ctx("is");
+        let tool = WatchSet::new(Arc::new(WeatherClient::new()));
+        for metric in ["low_temp", "high_temp"] {
+            let err = tool
+                .run(
+                    serde_json::json!({"content": "提醒我", "metric": metric, "op": "is",
+                                       "value": 10, "city": "北京"}),
+                    &ctx,
+                )
+                .await
+                .unwrap_err();
+            let m = format!("{err:#}");
+            assert!(m.contains("不能配 op=is"), "{metric} 配 is 必须当场拒:{m}");
+            assert!(m.contains("below") && m.contains("above"), "错误要指出该用什么:{m}");
+        }
     }
 
     #[tokio::test]

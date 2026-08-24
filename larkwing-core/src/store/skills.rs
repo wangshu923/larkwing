@@ -260,24 +260,38 @@ impl SkillRepo {
     }
 
     /// 用户教的技能写入:同名 user 条整体覆盖(返回旧内容供回显,§3.5 不静默吃数据);
-    /// 同名撞内置 → Err(工具层话术引导换名或关内置)。
+    /// 同名撞内置 → Err(工具层话术引导换名)。
+    ///
+    /// ⚠️ 这个 SELECT **有意不带 `enabled` 过滤**(与两条读路径 `list_enabled_index` / `find` 不同):
+    /// 停用的同名条也要认出来,否则会插出第二行同名条互相遮挡。但认出来之后必须**把 enabled 拨回 1**
+    /// —— 2026-08-22 审计:原先 UPDATE 不写 enabled,于是「教一条与已停用同名技能」时内容确实落库了,
+    /// 却既不进 L1 索引也查不到(两条读路径都 `enabled = 1`),模型永远看不见,而工具层照报
+    /// 「ok,已更新技能」= 静默失败(§3.5)。用户重新教一遍,本意就是要它生效。
     pub fn upsert_user(&self, name: &str, when_to_use: &str, content: &str) -> Result<Option<String>> {
         self.db.with(|c| {
             let now = now_ms();
-            let existing: Option<(i64, String, String)> = c
+            let existing: Option<(i64, String, String, i64)> = c
                 .query_row(
-                    "SELECT id, source, content FROM skills WHERE name = ?1 ORDER BY id LIMIT 1",
+                    "SELECT id, source, content, enabled FROM skills WHERE name = ?1 ORDER BY id LIMIT 1",
                     [name],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
                 .rusqlite_optional()?;
             match existing {
-                Some((_, source, _)) if source == SOURCE_BUILTIN => {
-                    anyhow::bail!("已有同名的内置技能「{name}」,换个名字,或先在技能页把内置那条关掉。")
+                // 内置同名:换名。**停用的内置也一样拦** —— 原先话术写「或先在技能页把内置那条关掉」,
+                // 而关掉并不改变这个查询的结果:照着做完重试还是同一个错(死循环)。所以停用态给
+                // 另一句实话:同名会互相遮挡,只能换名。
+                Some((_, source, _, en)) if source == SOURCE_BUILTIN => {
+                    if en == 0 {
+                        anyhow::bail!(
+                            "已有同名的内置技能「{name}」(那条已停用,但同名会互相遮挡)——换个名字。"
+                        )
+                    }
+                    anyhow::bail!("已有同名的内置技能「{name}」,换个名字。")
                 }
-                Some((id, _, old)) => {
+                Some((id, _, old, _)) => {
                     c.execute(
-                        "UPDATE skills SET when_to_use = ?2, content = ?3, updated_at = ?4 WHERE id = ?1",
+                        "UPDATE skills SET when_to_use = ?2, content = ?3, updated_at = ?4, enabled = 1 WHERE id = ?1",
                         rusqlite::params![id, when_to_use, content, now],
                     )?;
                     Ok(Some(old))
@@ -291,6 +305,19 @@ impl SkillRepo {
                     Ok(None)
                 }
             }
+        })
+    }
+
+    /// 这个名字是否已被占用(**不看 enabled** —— 停用的条也占着那一行,同名会互相遮挡)。
+    /// 与 `find`(带 enabled 过滤,给模型查手册用)分工明确:这个是给「写入前判新增/覆盖」用的。
+    pub fn name_taken(&self, name: &str) -> Result<bool> {
+        self.db.with(|c| {
+            let n: i64 = c.query_row(
+                "SELECT COUNT(1) FROM skills WHERE name = ?1",
+                [name],
+                |r| r.get(0),
+            )?;
+            Ok(n > 0)
         })
     }
 
@@ -489,6 +516,51 @@ mod tests {
         assert!(s.skills.upsert_user("洗照片", "整理照片时", "v1").unwrap().is_none());
         let old = s.skills.upsert_user("洗照片", "整理照片时", "v2").unwrap();
         assert_eq!(old.as_deref(), Some("v1"));
+    }
+
+    /// **教一条与「已停用」同名的技能,必须真的生效(2026-08-22 审计)**。
+    ///
+    /// `upsert_user` 的 SELECT 有意不带 enabled 过滤(要认出同名停用条,否则插出第二行互相遮挡),
+    /// 但原先 UPDATE 不写 enabled —— 内容落库了却 enabled 还是 0:两条读路径
+    /// (`list_enabled_index` / `find`)都过滤 enabled=1 → **模型永远看不见**,而工具层照报
+    /// 「ok,已更新技能」= 静默失败。用户重新教一遍,本意就是要它生效。
+    #[test]
+    fn reteaching_a_disabled_skill_re_enables_it() {
+        let s = store("reteach");
+        s.skills.upsert_user("洗照片", "整理照片时", "v1").unwrap();
+        let row = s.skills.find("洗照片").unwrap().expect("刚教的能查到");
+        s.skills.set_enabled(row.0.id, false).unwrap();
+        assert!(s.skills.find("洗照片").unwrap().is_none(), "停用后查不到(既有行为)");
+
+        // 再教一遍 → 内容更新 + 重新启用 + 旧内容如实回显
+        let old = s.skills.upsert_user("洗照片", "整理照片时", "v2").unwrap();
+        assert_eq!(old.as_deref(), Some("v1"), "旧内容照旧回显");
+        let (row, _) = s.skills.find("洗照片").unwrap().expect("重教之后必须查得到 —— 否则模型永远看不见");
+        assert!(row.enabled, "重教 = 重新启用");
+        // L1 索引里也得有(装配走的正是这条路)
+        assert!(
+            s.skills.list_enabled_index().unwrap().iter().any(|i| i.name == "洗照片"),
+            "重教后必须回到 L1 索引"
+        );
+        // 名字占用判定不看 enabled(满额时「覆盖停用条」不该被当成新增)
+        assert!(s.skills.name_taken("洗照片").unwrap());
+        s.skills.set_enabled(row.id, false).unwrap();
+        assert!(s.skills.name_taken("洗照片").unwrap(), "停用了名字照样占着");
+        assert!(!s.skills.name_taken("没教过的").unwrap());
+    }
+
+    /// 同名内置**停用后**照样拦(同名会互相遮挡),但话术不能再指一条死路 ——
+    /// 原先写「或先在技能页把内置那条关掉」,而关掉并不改变查询结果,照着做完重试还是同一个错。
+    #[test]
+    fn disabled_builtin_name_is_still_refused_with_honest_advice() {
+        let s = store("bi_off");
+        s.skills.sync_builtins(&[builtin("a", "放歌放视频", "出厂做法")]).unwrap();
+        let (row, _) = s.skills.find("放歌放视频").unwrap().unwrap();
+        s.skills.set_enabled(row.id, false).unwrap();
+        let err = s.skills.upsert_user("放歌放视频", "x", "y").unwrap_err();
+        let m = format!("{err:#}");
+        assert!(m.contains("换个名字"), "要指出唯一可行的出路:{m}");
+        assert!(!m.contains("关掉"), "别再指那条死路(关掉没用):{m}");
     }
 
     #[test]
