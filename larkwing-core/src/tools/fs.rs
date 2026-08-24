@@ -360,6 +360,49 @@ const BATCH_MAX: usize = 300;
 /// fs_read_text 返回上限(字符):够模型读文档/清单,超了截断并标注。
 const READ_TEXT_MAX_CHARS: usize = crate::files::TEXT_PAGE_MAX_CHARS;
 
+/// 文档类(docx/pptx/xlsx/pdf)整份读进内存的上限。**沿用既有的 50MB「单文件」口径**
+/// (webrender 上传 / web_download 同步档 / 渠道媒体都是这个数),不另造第二个(§4.11)。
+const DOC_MAX_BYTES: u64 = 50 * 1024 * 1024;
+
+/// 流式读一页文本:返回 `(第 offset 字起的 want 个字, 全文总字数)`。
+///
+/// 内存只与「一页」有关 —— 整份 `read_to_string` 会让一份几十 G 的日志把进程 OOM 掉。
+/// 顺带保留原来的「不是文本就如实说」语义:遇到非 UTF-8 字节即报错(不是被切断的多字节尾巴)。
+fn read_text_window(p: &Path, offset: usize, want: usize) -> anyhow::Result<(String, usize)> {
+    use std::io::Read;
+    let f = std::fs::File::open(p).map_err(|_| anyhow::anyhow!("读不了这个文件"))?;
+    let mut r = std::io::BufReader::new(f);
+    let mut buf = [0u8; 64 * 1024];
+    let mut carry: Vec<u8> = Vec::new(); // 上一块末尾被切断的多字节字符
+    let mut total = 0usize;
+    let mut out = String::new();
+    let mut taken = 0usize;
+    loop {
+        let n = r.read(&mut buf).map_err(|_| anyhow::anyhow!("读这个文件时出错了"))?;
+        if n == 0 {
+            break;
+        }
+        carry.extend_from_slice(&buf[..n]);
+        // 只吃掉能完整解码的前缀,尾巴留给下一块(块边界正好切在一个汉字中间是常态)
+        let valid = match std::str::from_utf8(&carry) {
+            Ok(s) => s.len(),
+            Err(e) if e.error_len().is_none() => e.valid_up_to(), // 只是被切断
+            Err(_) => anyhow::bail!("这看起来不是文本文件,读不了内容"),
+        };
+        for ch in std::str::from_utf8(&carry[..valid]).expect("上面已验证").chars() {
+            if total >= offset && taken < want {
+                out.push(ch);
+                taken += 1;
+            }
+            total += 1;
+        }
+        carry.drain(..valid);
+    }
+    // 文件末尾还挂着半个字符 = 截断/不是文本
+    anyhow::ensure!(carry.is_empty(), "这看起来不是文本文件,读不了内容");
+    Ok((out, total))
+}
+
 /// 顶层或数组项里取一个非空字符串字段。
 fn arg_str(v: &serde_json::Value, key: &str) -> anyhow::Result<String> {
     v.get(key)
@@ -424,11 +467,33 @@ fn finish_batch(
     }
     let mut msg = format!("{verb}了 {n} 个");
     if !fails.is_empty() {
-        let shown: Vec<String> = fails.iter().take(8).cloned().collect();
-        msg.push_str(&format!(";{} 个没成功:{}", fails.len(), shown.join(" | ")));
+        // 点名有上限,但**必须说清楚被截了**(§3.5):原先只 take(8) 就完事,模型看到
+        // 「12 个没成功:<8 个名字>」会以为名字给全了,转述给用户时那 4 个就凭空消失了。
+        // 用字数封顶而非条数(名字长短能差十倍,条数封顶要么白砍短名单、要么被长路径撑爆——
+        // 与 bgtasks::cap_names 同一条教训,2026-08-15)。
+        let shown = crate::bgtasks::cap_names(&fails);
+        msg.push_str(&format!(";{} 个没成功:{}", fails.len(), shown));
     }
     if overflow > 0 {
         msg.push_str(&format!(";另有 {overflow} 个这次没处理(一次太多),需要的话再喊我接着弄"));
+    }
+    // **覆盖了但没留下旧内容 = 这一步撤不回来,当场就要说(§3.5)**。
+    // §7.2 可逆三规③ 承诺「文本写/改前把旧内容快照进记录」,但快照对**超大**或**二进制/
+    // 非 UTF-8** 的原文件会放弃(read_snapshot 返回 None)。此前这事只有 fs_undo 那天才
+    // 暴露(「有 N 项没能还原」)—— 而那时原内容早没了。现在写完立刻点名,模型能如实转告,
+    // 用户也还来得及自己备份一份。
+    let no_undo: Vec<String> = items
+        .iter()
+        .filter_map(|it| match it {
+            files::FsOpItem::Write { path, old: None, was_new: false, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+    if !no_undo.is_empty() {
+        msg.push_str(&format!(
+            ";注意:{} 的原内容太大或不是纯文本,没能留下备份——这一步**撤不回来**",
+            crate::bgtasks::cap_names(&no_undo)
+        ));
     }
     Ok(msg)
 }
@@ -486,22 +551,37 @@ impl Tool for FsReadText {
             anyhow::ensure!(p.is_file(), "{path} 不是文件或不存在");
             // 文档类(docx/pptx/xlsx/pdf)走抽取器(同聊天上传那条路);纯文本直读。
             let lower = path.to_ascii_lowercase();
-            let full = if lower.ends_with(".docx")
+            let (slice, total) = if lower.ends_with(".docx")
                 || lower.ends_with(".pptx")
                 || lower.ends_with(".xlsx")
                 || lower.ends_with(".pdf")
             {
+                // 文档类必须整份读进内存(抽取器要完整的包/交叉引用表),所以这条路要有上限。
+                // 用既有的 50MB「单文件」口径(上传 / web_download 同步档 / 渠道媒体都是它),
+                // **不另造第二个数**(§4.11,archive 沿用 torrent 的 50GB 同理)。
+                let len = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+                anyhow::ensure!(
+                    len <= DOC_MAX_BYTES,
+                    "这个文档 {} 太大了(上限 {}),抽文字要整份读进内存,这台机器扛不住",
+                    crate::files::human_size(len),
+                    crate::files::human_size(DOC_MAX_BYTES)
+                );
                 let bytes = std::fs::read(p).map_err(|_| anyhow::anyhow!("读不了这个文件"))?;
-                crate::attach::extract_doc_text(&path, "", &bytes).ok_or_else(|| {
+                let full = crate::attach::extract_doc_text(&path, "", &bytes).ok_or_else(|| {
                     anyhow::anyhow!("这个文档没抽出文字(可能是扫描成图的 PDF,或是老格式 .doc/.xls/.ppt)")
-                })?
+                })?;
+                let total = full.chars().count();
+                (full.chars().skip(offset).take(READ_TEXT_MAX_CHARS).collect::<String>(), total)
             } else {
-                std::fs::read_to_string(p)
-                    .map_err(|_| anyhow::anyhow!("这看起来不是文本文件,读不了内容"))?
+                // 纯文本**流式**读:只留要给的那一页,不把整个文件搬进内存。
+                // ⚠️ 原来是 `read_to_string` 整份读 —— 模型指着一份几十 G 的日志/备份,
+                // 进程当场被 OOM 打死(不是报错,是**直接没了**,§3.5 连话都留不下)。
+                // 流式之后内存只与一页有关,几百兆的日志也能靠 offset 一页页翻;真大到读不完
+                // 就撞工具超时,那是一次诚实的失败。
+                read_text_window(p, offset, READ_TEXT_MAX_CHARS)?
             };
             // 续读 = 换切片起点重抽一遍(文件本身就是持久层,不另建抽取缓存);
             // 字符计数口径与 web_fetch 一致(CJK 安全)。
-            let total = full.chars().count();
             if total == 0 {
                 anyhow::ensure!(offset == 0, "这是个空文件,没有第 {offset} 字");
                 return Ok("(空文件)".into());
@@ -510,7 +590,6 @@ impl Tool for FsReadText {
                 offset == 0 || offset < total,
                 "全文约 {total} 字,offset={offset} 超出末尾——已经读完了"
             );
-            let slice: String = full.chars().skip(offset).take(READ_TEXT_MAX_CHARS).collect();
             let end = offset + slice.chars().count();
             let mut out = if offset > 0 {
                 format!("(从第 {offset} 字接着读,全文约 {total} 字)\n{slice}")
@@ -1223,6 +1302,67 @@ mod tests {
     use super::*;
     use crate::media::MediaRuntime;
     use crate::store::Store;
+
+    /// **流式读一页(2026-08-22)**:原来是 `read_to_string` 整份读,几十 G 的日志会把进程
+    /// OOM 掉。这里钉住换成流式后语义不变 —— 尤其 64KB 块边界正好切在一个汉字中间时
+    /// (最容易写错的一处),必须靠 carry 拼回来,不能吐乱码也不能误判成「不是文本文件」。
+    #[test]
+    fn read_text_window_pages_and_survives_chunk_split_cjk() {
+        let dir = std::env::temp_dir().join(format!("lw-readwin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("big.txt");
+        // 每个汉字 3 字节 × 30000 = 90000 字节 > 64KB 块 → 块边界必然切在某个汉字中间
+        let text: String = std::iter::repeat_n('中', 30_000).collect();
+        std::fs::write(&p, &text).unwrap();
+
+        let (head, total) = read_text_window(&p, 0, 10).unwrap();
+        assert_eq!(total, 30_000, "总字数按**字符**数(CJK 安全),不是字节数");
+        assert_eq!(head, "中".repeat(10));
+        // 跨过块边界取一页:能拼回完整汉字才说明 carry 对了
+        let (mid, _) = read_text_window(&p, 25_000, 5).unwrap();
+        assert_eq!(mid, "中".repeat(5));
+        // 越过末尾 = 空窗(调用方另有 offset 越界的 ensure 兜)
+        let (tail, _) = read_text_window(&p, 30_000, 5).unwrap();
+        assert!(tail.is_empty());
+
+        // 二进制照旧如实退回(这半句语义不能因为改流式就丢了)
+        let b = dir.join("blob.bin");
+        std::fs::write(&b, [0xff, 0xfe, 0x00, 0x01]).unwrap();
+        let err = read_text_window(&b, 0, 10).unwrap_err().to_string();
+        assert!(err.contains("不是文本文件"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **覆盖了却没留下旧内容 → 当场说清「撤不回来」(§3.5)**。
+    /// 此前只有等到 fs_undo 那天才暴露,而那时原内容早没了。
+    #[test]
+    fn finish_batch_warns_when_overwrite_has_no_snapshot() {
+        let dir = std::env::temp_dir().join(format!("lw-nosnap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("t.db")).unwrap();
+        let uid = store.users.ensure_default_user().unwrap().id;
+        let lost = files::FsOpItem::Write {
+            path: "/tmp/巨大的日志.txt".into(),
+            old: None, // 超限/二进制 → 没快照
+            new: None,
+            was_new: false,
+        };
+        let msg = finish_batch(&store, uid, "write", "写入", vec![Ok(lost)], 0).unwrap();
+        assert!(msg.contains("撤不回来"), "得当场说清,实际:{msg}");
+        assert!(msg.contains("巨大的日志.txt"), "还要点名是哪个,实际:{msg}");
+
+        // 新建文件本来就靠「删掉」撤销,不该报这句
+        let fresh = files::FsOpItem::Write {
+            path: "/tmp/新的.txt".into(),
+            old: None,
+            new: Some("x".into()),
+            was_new: true,
+        };
+        let msg = finish_batch(&store, uid, "write", "写入", vec![Ok(fresh)], 0).unwrap();
+        assert!(!msg.contains("撤不回来"), "新建文件不该报,实际:{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn arg_path_expands_home_prefix() {
