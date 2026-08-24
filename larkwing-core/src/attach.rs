@@ -39,10 +39,31 @@ pub fn image_mime_by_ext(name: &str) -> Option<&'static str> {
     MAP.iter().find(|(e, _)| lower.ends_with(e)).map(|(_, m)| *m)
 }
 
+/// 附件文档 → 文字。**出口统一有界**(见 `cap_doc_text`);分发在 `extract_doc_text_raw`。
+pub fn extract_doc_text(name: &str, mime: &str, bytes: &[u8]) -> Option<String> {
+    extract_doc_text_raw(name, mime, bytes).map(cap_doc_text)
+}
+
+/// 抽出来的文字**必须有上限**(2026-08-22 审计):它会拼进 user 消息的内容、**进 history**
+/// (§9 有意:文档文字进历史,多轮追问还在)—— 也就是**之后每一轮都回放给模型**。一个大 xlsx
+/// 转出来的 CSV 能有几十 MB,那是每轮几十 MB 的上下文与账单;attach.rs 原先一处上限都没有。
+/// 按**字符**切(中文安全)并**如实标注**(§3.5:外部内容读取允许截断,但必须告知)。
+/// 上限派生自 `files::TEXT_PAGE_MAX_CHARS`——「一页外部文本多长」与 fs_read_text 是同一个
+/// 产品决策,不另造第二个数。
+fn cap_doc_text(s: String) -> String {
+    let max = crate::files::TEXT_PAGE_MAX_CHARS;
+    let total = s.chars().count();
+    if total <= max {
+        return s;
+    }
+    let head: String = s.chars().take(max).collect();
+    format!("{head}\n\n(文档太长,这里只到第 {max} 字;全文约 {total} 字。要看后面的部分就把文件存到本地再分段读。)")
+}
+
 /// 文档抽文字(0.2.0「文档支持」):txt/md/源码直读;OOXML(docx/pptx/xlsx)解 zip 取正文,
 /// xlsx 转 CSV 保住行列结构;PDF 抽文字层(扫描件无文字层 → None,栅格化转图是 stretch)。
 /// 老二进制 .doc/.ppt/.xls 不支持。None = 抽不出文字,调用方按「读不出内容」兜底。
-pub fn extract_doc_text(name: &str, mime: &str, bytes: &[u8]) -> Option<String> {
+fn extract_doc_text_raw(name: &str, mime: &str, bytes: &[u8]) -> Option<String> {
     let lower = name.to_ascii_lowercase();
     // PDF:文字层(pdf-extract);扫描件没有文字层 → 抽空 → None(按读不出兜底)
     if mime == "application/pdf" || lower.ends_with(".pdf") {
@@ -305,5 +326,24 @@ mod tests {
         assert_eq!(csv_escape("a,b"), "\"a,b\"");
         assert_eq!(csv_escape("说\"引号\""), "\"说\"\"引号\"\"\"");
         assert_eq!(csv_escape("换\n行"), "\"换\n行\"");
+    }
+
+    /// **抽出来的文档文字必须有界(2026-08-22 审计)**:它会进 history、之后每轮回放给模型,
+    /// 一个大表格转出来的 CSV 能有几十 MB。截断按**字符**切(中文安全)且**如实标注**。
+    #[test]
+    fn doc_text_is_capped_and_says_so() {
+        let max = crate::files::TEXT_PAGE_MAX_CHARS;
+        // 短文原样返回,一个字不动
+        let short = "第一行\n第二行".to_string();
+        assert_eq!(cap_doc_text(short.clone()), short);
+        // 全中文超长:按字符切(不是字节),不许切在半个字上
+        let long: String = "中".repeat(max + 500);
+        let got = cap_doc_text(long);
+        assert!(got.starts_with(&"中".repeat(max)), "前 max 个字符原样保留");
+        assert!(got.contains(&format!("只到第 {max} 字")), "必须如实说截断了:{}", &got[got.len() - 120..]);
+        assert!(got.contains(&format!("全文约 {} 字", max + 500)), "并给出总量,好让人判断");
+        // 恰好等于上限:不加尾注(别对没截断的说截断了)
+        let exact: String = "a".repeat(max);
+        assert_eq!(cap_doc_text(exact.clone()), exact);
     }
 }

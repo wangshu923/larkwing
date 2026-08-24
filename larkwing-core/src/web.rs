@@ -165,6 +165,8 @@ pub struct Page {
 
 /// 页内链接收集上限(给模型的预算闸,取文档序前 N 条)。
 const LINKS_MAX: usize = 25;
+/// 单页字节上限(边收边判 —— 见 `fetch` 里的注释:先收完再判等于没闸)。
+const PAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
 
 pub struct WebClient {
     net: crate::net::Client,
@@ -296,9 +298,21 @@ impl WebClient {
             .unwrap_or("")
             .trim()
             .to_ascii_lowercase();
-        // 体积闸:10MB 封顶,防超大页面拖死
-        let bytes = resp.bytes().await?;
-        anyhow::ensure!(bytes.len() <= 10 * 1024 * 1024, "页面超过 10MB,放弃");
+        // 体积闸:10MB 封顶,防超大页面拖死。**必须边收边判**(2026-08-22 审计):
+        // 原先是 `resp.bytes().await?` 先把整个 body 收进内存、再看长度 —— 闸形同虚设,
+        // 一个几 GB 的响应(或谎报 Content-Type 的大文件)先把进程撑爆才轮到这句。
+        // 服务器也可能压根不报 Content-Length,所以判据只能是「已经收了多少」。
+        let mut resp = resp;
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            anyhow::ensure!(
+                buf.len() + chunk.len() <= PAGE_MAX_BYTES,
+                "页面超过 {}MB,放弃",
+                PAGE_MAX_BYTES / 1024 / 1024
+            );
+            buf.extend_from_slice(&chunk);
+        }
+        let bytes = buf;
         // 搜索结果/页内链接常直指 PDF 等文件:当 HTML 解析只会出乱码,如实拦下指路
         if let Some(hint) = non_page_hint(&ctype, &bytes) {
             bail!("{hint}");

@@ -177,6 +177,37 @@ fn resolve_into_dir(src: &Path, dst_req: &Path) -> PathBuf {
     dst_req.to_path_buf()
 }
 
+/// 「把目录复制进自己里面」判定(纯谓词,可单测 —— 真跑一次会填满磁盘,所以逻辑单独钉)。
+///
+/// dst 还不存在,所以拿它**已存在的最深祖先**去规范化再拼回剩下的段(datadir::norm 同思路),
+/// 免得 `.`/`..`/符号链接让比较落空。src 不是目录 = 不可能递归(复制单文件到自己里面无从谈起)。
+fn copy_would_recurse(src: &Path, dst: &Path) -> bool {
+    if !src.is_dir() {
+        return false;
+    }
+    let Ok(s) = src.canonicalize() else { return false };
+    // dst 的已存在祖先 + 剩余段
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    let mut probe = dst.to_path_buf();
+    let d = loop {
+        if let Ok(c) = probe.canonicalize() {
+            break c;
+        }
+        match (probe.file_name().map(|n| n.to_os_string()), probe.parent()) {
+            (Some(n), Some(p)) => {
+                rest.push(n);
+                probe = p.to_path_buf();
+            }
+            _ => return false, // 走到根还规范不出来 = 不比了(照原路走,别把正常复制拦了)
+        }
+    };
+    let mut d = d;
+    for n in rest.iter().rev() {
+        d.push(n);
+    }
+    d.starts_with(&s)
+}
+
 /// 递归复制(文件或目录);跨卷移动的兜底也用它。
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     let md = std::fs::symlink_metadata(src)?;
@@ -244,6 +275,10 @@ pub fn move_one(src: &Path, dst_req: &Path) -> Result<FsOpItem> {
     })
 }
 
+/// 「一页外部文本」的字符上限(单源):`fs_read_text` 的每页长度、以及附件文档抽出来的
+/// 文字上限都取它 —— 同一个产品决策,不造第二个数(§4.11 派生而非复制)。
+pub(crate) const TEXT_PAGE_MAX_CHARS: usize = 40_000;
+
 /// 复制(文件或目录)。语义同 move 的目标解析;永不覆盖。
 pub fn copy_one(src: &Path, dst_req: &Path) -> Result<FsOpItem> {
     ensure!(src.exists(), "源不存在:{}", src.display());
@@ -252,6 +287,15 @@ pub fn copy_one(src: &Path, dst_req: &Path) -> Result<FsOpItem> {
         validate_name(name)?;
     }
     let dst = dedupe_path(&dst_req);
+    // 目录**不许复制进自己的子树**(2026-08-22 审计):`copy_tree` 先 `create_dir_all(dst)`、
+    // 再 `read_dir(src)` 惰性遍历 —— dst 落在 src 里就会被自己遍历到,于是 dst/dst/dst…
+    // 无界递归,把磁盘写满(不是「复制两份」那么轻)。
+    ensure!(
+        !copy_would_recurse(src, &dst),
+        "不能把文件夹复制到它自己里面(会没完没了地复制自己):{} → {}",
+        src.display(),
+        dst.display()
+    );
     copy_tree(src, &dst)?;
     Ok(FsOpItem::Copy {
         src: src.to_string_lossy().into_owned(),
@@ -618,5 +662,46 @@ mod tests {
         assert!(j.contains("\"op\":\"move\""));
         let back: FsOpItem = serde_json::from_str(&j).unwrap();
         assert_eq!(item, back);
+    }
+
+    /// **把目录复制进自己里面 = 无界递归(2026-08-22 审计)**。
+    ///
+    /// `copy_tree` 先 `create_dir_all(dst)` 再 `read_dir(src)` 惰性遍历 —— dst 落在 src 里就会
+    /// 被自己遍历到,dst/dst/dst… 停不下来、把磁盘写满。
+    /// ⚠️ **刻意不写「先跑红」的那一半**:真触发一次就是填满这台机器的磁盘。所以判定抽成纯谓词
+    /// 单独钉(下面),外加一条 `copy_one` 返回 Err 的断言。
+    #[test]
+    fn copy_into_own_subtree_is_refused() {
+        let base = std::env::temp_dir().join(format!("lw-cp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("相册");
+        std::fs::create_dir_all(src.join("子")).unwrap();
+        std::fs::write(src.join("a.txt"), b"x").unwrap();
+
+        // 直接复制进自己里面
+        assert!(copy_would_recurse(&src, &src.join("备份")), "dst 在 src 里 = 会递归");
+        // 更深一层也算
+        assert!(copy_would_recurse(&src, &src.join("子").join("备份")), "深一层同样会递归");
+        // 经 `.` / `..` 绕回来也要认出来(规范化后比较)
+        assert!(
+            copy_would_recurse(&src, &src.join("子").join("..").join("绕回来")),
+            "绕一圈还在 src 里,照样递归"
+        );
+        // 兄弟目录 / 上一层 = 正常复制,不许误拦
+        assert!(!copy_would_recurse(&src, &base.join("相册备份")), "兄弟目录是正常复制");
+        assert!(!copy_would_recurse(&src, &base.join("相册 (2)")), "同名加序号是正常复制");
+        // 前缀相同但不是子目录(相册2 蹭不上 相册)—— 按路径**组件**比,不是字符串前缀
+        std::fs::create_dir_all(base.join("相册2")).unwrap();
+        assert!(!copy_would_recurse(&src, &base.join("相册2").join("x")), "相册2 不是 相册 的子树");
+        // 单文件源:谈不上递归
+        assert!(!copy_would_recurse(&src.join("a.txt"), &src.join("a2.txt")));
+
+        // 整条路也拒(不是只有谓词对)
+        let err = copy_one(&src, &src.join("备份")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("复制到它自己里面"),
+            "copy_one 要如实拒掉,实际:{err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

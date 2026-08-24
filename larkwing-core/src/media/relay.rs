@@ -220,6 +220,12 @@ const AUDIO_PREROLL: f64 = 0.5;
 /// 故粗切只切到 `ss − 这个值`,余下交给输出侧 `-ss` 按时间戳精确丢弃(音频每包都是同步点)。
 /// 取小:丢弃量由关键帧间距决定、与本值无关,本值只影响粗切落点离目标多近。
 const AUDIO_FINE_SEEK: f64 = 0.1;
+/// ffmpeg stderr 的有界收集上限(只为拿错误尾巴记日志)。有界是因为 stderr 现在**并发排空**:
+/// 排空是为了防挂死,但不能反过来让一个疯狂刷 stderr 的进程把内存吃掉。
+const STDERR_TAIL_CAP: usize = 8 * 1024;
+/// HLS 播放列表的段数上限(≈ 33 小时 @6s)。存在的理由不是「片子不会更长」,而是 duration
+/// 来自**文件自报**的元数据:坏文件能报出天文数字,而列表是照着它逐段拼字符串的。
+const HLS_MAX_SEGMENTS: u64 = 20_000;
 
 /* ——— 进度条 hover 缩略图的四道闸(单源在此;要调回来问,§4.11)———
  * 抽一帧本身很快(输入 seek 直落关键帧再解一帧),贵的是**次数** —— 光标横穿一条进度条能
@@ -1140,9 +1146,20 @@ async fn run_ffmpeg_collect(mut cmd: tokio::process::Command, cap: usize) -> Opt
     super::no_console(&mut cmd);
     let mut child = cmd.spawn().ok()?;
     let mut stdout = child.stdout.take()?;
-    let mut stderr = child.stderr.take()?;
+    let stderr = child.stderr.take()?;
+    // **stderr 必须并发排空**(2026-08-22 审计):只读 stdout 的话,ffmpeg 一旦把 stderr 管道
+    // 写满(管道缓冲 ~64KB)就会阻塞在写 stderr 上 → 它也不再产 stdout → 我们的 `stdout.read()`
+    // 永远等下去,后面的 `child.wait()` 也永远等不到退出 = **整条 HTTP 请求永久挂死**
+    // (播放器那边就是转圈到超时)。`-loglevel error` 平时只有几行,但坏文件/坏参数能刷满。
+    // 有界收集:错误尾巴用不了那么多,别让一个疯狂刷 stderr 的 ffmpeg 把内存吃掉。
+    let err_task = tokio::spawn(async move {
+        let mut s = String::new();
+        let _ = stderr.take(STDERR_TAIL_CAP as u64).read_to_string(&mut s).await;
+        s
+    });
     let mut buf = Vec::new();
     let mut chunk = vec![0u8; 64 * 1024];
+    let mut truncated = false;
     loop {
         match stdout.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
@@ -1150,15 +1167,20 @@ async fn run_ffmpeg_collect(mut cmd: tokio::process::Command, cap: usize) -> Opt
                 buf.extend_from_slice(&chunk[..k]);
                 if buf.len() > cap {
                     tracing::warn!("ffmpeg 输出超上限 {cap} 字节,截断");
+                    truncated = true;
                     break;
                 }
             }
         }
     }
+    // 超上限提前收手后**必须杀掉它**:我们不再读 stdout 了,不杀它就会卡在写 stdout 上、
+    // 于是 `wait()` 永远等不到退出(与上面同族的第二处挂死)。
+    if truncated {
+        let _ = child.start_kill();
+    }
     let _ = child.wait().await;
     if buf.is_empty() {
-        let mut err = String::new();
-        let _ = stderr.read_to_string(&mut err).await;
+        let err = err_task.await.unwrap_or_default();
         if !err.trim().is_empty() {
             tracing::warn!("HLS ffmpeg stderr: {}", err.trim());
         }
@@ -1180,7 +1202,24 @@ fn bytes_response(body: Vec<u8>, content_type: &'static str) -> Response {
 /// 合成完整 VOD HLS 播放列表(纯函数,可测):**fMP4 段**——EXT-X-MAP 指共享 init,段为 `s{N}.m4s`。
 /// 全段列出 → shaka 知道完整时长、可任意 seek。段数 = ceil(duration/seg);末段时长 = 余量。
 fn build_hls_playlist(duration: f64, seg: f64) -> String {
-    let n = (duration / seg).ceil().max(1.0) as u64;
+    // 段数**必须有上限**(2026-08-22 审计):duration 来自文件自报的元数据(mvhd/ffmpeg),
+    // 坏文件/被构造的文件可以报出天文数字 → 这个循环就照着它逐段拼字符串,直接把内存吃光。
+    // 顺手把非有限值挡掉:`duration/seg` 出 inf/NaN 时 `as u64` 会饱和成 u64::MAX / 0。
+    let bogus = !duration.is_finite() || duration <= 0.0 || !seg.is_finite() || seg <= 0.0;
+    if bogus {
+        // 拼不出可信的清单就给个最小合法清单,让上层的「没时长 → 回落 muxed」那条路接手
+        return String::from(
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:0\n\
+             #EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-ENDLIST\n",
+        );
+    }
+    let want = (duration / seg).ceil().max(1.0);
+    let n = if want > HLS_MAX_SEGMENTS as f64 {
+        tracing::warn!(duration, seg, "文件自报时长离谱,HLS 段数按上限截断");
+        HLS_MAX_SEGMENTS
+    } else {
+        want as u64
+    };
     let mut s = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
     s.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", seg.ceil() as u64));
     s.push_str("#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n");
@@ -1589,6 +1628,27 @@ mod tests {
         assert!(build_hls_playlist(3.0, 6.0).contains("s0.m4s"));
     }
 
+    /// **自报时长离谱时段数必须有上限(2026-08-22 审计)**:duration 来自文件自报的元数据,
+    /// 坏文件能报出天文数字,而这个列表是照着它逐段拼字符串的 —— 没上限就是把内存吃光。
+    /// 同时挡掉非有限值(`duration/seg` 出 inf/NaN 时 `as u64` 会饱和成 u64::MAX / 0)。
+    #[test]
+    fn hls_playlist_is_bounded_against_bogus_duration() {
+        // 一个「1e12 秒」的自报时长:段数按上限截断,而不是拼出上亿行
+        let m = build_hls_playlist(1e12, 6.0);
+        let segs = m.matches(".m4s\n").count();
+        assert_eq!(segs, HLS_MAX_SEGMENTS as usize, "段数应截到上限,实际 {segs}");
+        assert!(m.len() < 2 * 1024 * 1024, "列表大小要有界,实际 {} 字节", m.len());
+        // 非有限 / 非正:给最小合法清单,别拼出 u64::MAX 段
+        for bad in [f64::INFINITY, f64::NAN, 0.0, -5.0] {
+            let m = build_hls_playlist(bad, 6.0);
+            assert!(m.starts_with("#EXTM3U") && m.contains("#EXT-X-ENDLIST"), "{bad} 应给最小清单");
+            assert!(!m.contains(".m4s"), "{bad} 不该列出任何段");
+        }
+        // seg 非法(除零)同样不许炸
+        let m = build_hls_playlist(20.0, 0.0);
+        assert!(!m.contains(".m4s"), "seg=0 不该列段");
+    }
+
     #[test]
     fn apply_video_encode_maps_each_encoder() {
         let args_for = |enc| {
@@ -1899,6 +1959,46 @@ mod tests {
         assert_eq!(past.status().as_u16(), 404);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **子进程 stderr 必须并发排空,否则整条请求永久挂死(2026-08-22 审计)**。
+    ///
+    /// 原先只在循环里读 stdout、`child.wait()` 之后才读 stderr:子进程把 stderr 管道写满
+    /// (~64KB)就阻塞在写 stderr 上 → 它也不再产 stdout → `stdout.read()` 永远等 → `wait()`
+    /// 也永远等不到退出。播放器那边表现为一直转圈到超时。
+    /// 这里不用 ffmpeg,用 `sh` 造一个「先猛刷 stderr、再吐一点 stdout」的进程 —— 病灶与被测
+    /// 程序无关,是**读管道的姿势**。修之前这条测试会卡到 timeout 而红。
+    /// (`#[cfg(unix)]`:Windows 没有 sh;死锁逻辑与平台无关,mac/Linux 上钉住即可。)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn collect_drains_stderr_concurrently_and_does_not_hang() {
+        let mut cmd = tokio::process::Command::new("sh");
+        // 200KB 到 stderr(远超管道缓冲),然后才往 stdout 写
+        cmd.arg("-c").arg("head -c 200000 /dev/zero | tr '\\0' 'E' >&2; printf OK");
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_ffmpeg_collect(cmd, 8 * 1024 * 1024),
+        )
+        .await
+        .expect("stderr 没被并发排空 → 卡在写管道上、整条请求挂死");
+        assert_eq!(got.as_deref(), Some(&b"OK"[..]), "stdout 要完整收到");
+    }
+
+    /// 同族第二处:**超上限提前收手后必须杀掉子进程**。不再读 stdout 了却只 `wait()`,
+    /// 子进程会卡在写 stdout 上、`wait()` 永远等不到退出。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn collect_kills_child_when_output_exceeds_cap() {
+        let mut cmd = tokio::process::Command::new("sh");
+        // 无限往 stdout 灌:cap 一到就该被杀掉,而不是等它自己结束(它永远不结束)
+        cmd.arg("-c").arg("yes X");
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_ffmpeg_collect(cmd, 64 * 1024),
+        )
+        .await
+        .expect("超上限后没杀子进程 → wait() 永远等不到退出");
+        assert!(got.is_some_and(|b| b.len() > 64 * 1024), "截断处收到的那截照样返回");
     }
 
     /// **契约③的音频半边(2026-08-22 真机实锤后补)**:copy 音频段必须**恰好**是计划的长度。

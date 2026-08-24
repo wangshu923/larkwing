@@ -358,7 +358,7 @@ impl Tool for FsFind {
 /// 单次工具调用的条数上限(防单次参数过大/单轮过久;超出部分如实告知"再喊我接着弄")。
 const BATCH_MAX: usize = 300;
 /// fs_read_text 返回上限(字符):够模型读文档/清单,超了截断并标注。
-const READ_TEXT_MAX_CHARS: usize = 40_000;
+const READ_TEXT_MAX_CHARS: usize = crate::files::TEXT_PAGE_MAX_CHARS;
 
 /// 顶层或数组项里取一个非空字符串字段。
 fn arg_str(v: &serde_json::Value, key: &str) -> anyhow::Result<String> {
