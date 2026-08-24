@@ -66,9 +66,113 @@ impl Tool for Open {
         if !is_url && looks_like_path(&target) {
             super::guard::ensure(ctx, super::guard::Access::Read, std::slice::from_ref(&target)).await?;
         }
+        // **打开可执行文件 = 让 OS 运行它**(2026-08-22 审计 PARK-1,用户拍板 B + 可信任):
+        // `open setup.exe` 在 Windows 上就是启动这个程序 —— 而下载夹/桌面出厂免授权,模型能
+        // 「web_download 一个 exe → open 它」全程不问用户。所以打开可执行类文件先弹确认;
+        // 但**可信任**:选「一直允许」就把这个文件路径记进信任清单,以后 open 它不再问
+        // (用户「每次都打开也没必要」)。照片/PDF/文档/网址/打开应用一律照旧不问。
+        if !is_url && looks_like_path(&target) && is_executable_file(&target) {
+            confirm_open_executable(ctx, &target).await?;
+        }
         open_target(&target).await?;
         // 结果是喂给模型的观察(不是 UI 文案),模型用当前人格的语言转述
         Ok(format!("已打开 {target}"))
+    }
+}
+
+/// 可执行类文件扩展名(打开 = 运行,要过确认闸)。Windows 的 PATHEXT 家族 + 各平台脚本/安装包。
+/// 大小写不敏感;判据是**扩展名**(跨平台一致,不看当前 OS —— NAS 上的 .exe 在 mac 端也该谨慎)。
+const EXECUTABLE_EXTS: &[&str] = &[
+    "exe", "bat", "cmd", "com", "scr", "msi", "msix", "ps1", "vbs", "vbe", "js", "jse", "wsf",
+    "wsh", "cpl", "jar", "sh", "bash", "zsh", "command", "app", "run", "bin", "appimage", "pif",
+    "reg", "lnk", "hta", "gadget",
+];
+
+/// target 是不是可执行类文件(按扩展名)。目录 / 无扩展名 / 普通文档 → false。
+fn is_executable_file(target: &str) -> bool {
+    std::path::Path::new(target)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| EXECUTABLE_EXTS.contains(&e.as_str()))
+}
+
+/// settings key:已信任、可直接 open 的可执行文件绝对路径清单(app 级 JSON 数组)。
+/// 同 `fs.scopes` 先例;走 settings 而非 keyring(不是秘密,是「用户点过一直允许」的记录)。
+const TRUSTED_EXEC_KEY: &str = "desktop.trusted_exec";
+
+fn load_trusted_exec(ctx: &ToolCtx) -> Vec<String> {
+    ctx.store
+        .settings
+        .get(None, TRUSTED_EXEC_KEY)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default()
+}
+
+/// 打开可执行文件前的确认(可信任):已在清单 → 直接放行;否则弹确认闸,
+/// 「一直允许」入清单、「仅这次」放行本次、拒/超时 = 观察退回(不静默,§3.5)。
+async fn confirm_open_executable(ctx: &ToolCtx, target: &str) -> anyhow::Result<()> {
+    // 规范化到绝对路径当清单键(与 open 真正交给 OS 的路径同源;canonicalize 失败退回原串)。
+    let key = std::fs::canonicalize(target)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| target.to_string());
+    if load_trusted_exec(ctx).iter().any(|t| t == &key) {
+        return Ok(()); // 之前点过「一直允许」,信任它,不再问
+    }
+    let Some(confirmer) = ctx.confirm.as_ref() else {
+        // 没有确认通道(headless/单测):可执行文件不能默认放行 —— 如实退回,别静默运行。
+        anyhow::bail!("要运行可执行文件 {target},但现在没有可用的确认途径,这步没做");
+    };
+    let origin = ctx
+        .store
+        .chat
+        .get_conversation(ctx.conv_id)
+        .ok()
+        .flatten()
+        .map(|c| c.channel)
+        .unwrap_or_else(|| "ui".into());
+    let timeout = if matches!(origin.as_str(), "ui" | "system") {
+        crate::confirm::DESKTOP_TIMEOUT
+    } else {
+        crate::confirm::CHANNEL_TIMEOUT
+    };
+    let decision = confirmer
+        .ask(
+            crate::confirm::ConfirmAsk {
+                user_id: ctx.user_id,
+                conv_id: ctx.conv_id,
+                origin,
+                host: String::new(),
+                action: target.to_string(), // 页面/路径数据,非 core 文案(§6.6);前端按 kind 组动词
+                kind: "open_exec".into(),
+            },
+            timeout,
+        )
+        .await;
+    use crate::confirm::ConfirmDecision::*;
+    match decision {
+        Allowed { always: true, .. } => {
+            // 记进信任清单(读改写;去重)——以后 open 这个文件不再问
+            let mut list = load_trusted_exec(ctx);
+            if !list.iter().any(|t| t == &key) {
+                list.push(key);
+                if let Ok(json) = serde_json::to_string(&list) {
+                    let _ = ctx.store.settings.set(None, TRUSTED_EXEC_KEY, &json);
+                }
+            }
+            Ok(())
+        }
+        Allowed { .. } => Ok(()), // 仅这次:开,但不记住
+        Denied { via } if via == "unreachable" => {
+            anyhow::bail!("要运行 {target} 需要确认,但确认没能送到用户那(渠道断线)——这步没做,如实说明")
+        }
+        Denied { .. } => {
+            anyhow::bail!("用户没同意运行 {target},这步没做(不要绕路去运行它,如实告诉用户)")
+        }
+        TimedOut => anyhow::bail!("等运行 {target} 的确认超时了,这步没做"),
+        NoUi => anyhow::bail!("要运行可执行文件 {target},但没有可用的确认途径,这步没做"),
     }
 }
 
@@ -80,6 +184,27 @@ fn looks_like_path(s: &str) -> bool {
         || s.contains('/')
         || s.contains('\\')
         || (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':') // 盘符 C:\…
+}
+
+/// 拼 `cmd /C` 后面那一整串(Windows 用;抽成平台无关纯函数才好在 Mac 上单测)。
+///
+/// ⚠️ **必须自己加引号,不能用 `Command::args([...])`(2026-08-22 修)**:Rust 的 Windows
+/// 参数转义按 MSVCRT 规则,只在含空格/引号时才补引号 —— 而 `cmd.exe` 的解析器不吃那套,
+/// 它先按 `& | ^ < >` 劈命令行。于是**不含空格但带 `&`** 的 target 会被劈成两条命令:
+/// ① 安全洞(`notepad&calc` = 任意命令执行);② **日常正确性 bug** —— 带查询参数的普通
+/// 网址(`?a=1&b=2`)在 Windows 上一直是从 `&` 处断开的。
+/// 修 = 调用方用 `raw_arg` 绕开 Rust 的转义,由这里把 launch 包进双引号(引号内 cmd 对
+/// `& | ^ < >` 一律按字面处理);`start` 的头一个 `""` 仍是占位窗口标题。
+/// 记档:引号内 `%VAR%` 仍会展开,但**未定义**的变量原样保留 → 百分号编码的网址安全;
+/// 名字里真带 `%环境变量%` 的文件是极冷门情形,不为它把 URL 编码弄坏。
+#[cfg_attr(not(windows), allow(dead_code))] // 只有 Windows 臂用它;抽出来是为了能在 Mac 上单测
+fn win_start_command_line(launch: &str) -> anyhow::Result<String> {
+    // Windows 文件名本就不允许 `"` 与控制字符 → 出现即非常规,如实退回不硬拼(§3.5)。
+    anyhow::ensure!(
+        !launch.contains('"') && !launch.contains(['\r', '\n', '\0']),
+        "这个名字/路径里有不该出现的字符(引号或换行),没法安全地交给系统打开:{launch}"
+    );
+    Ok(format!("start \"\" \"{launch}\""))
 }
 
 async fn open_target(target: &str) -> anyhow::Result<()> {
@@ -111,8 +236,14 @@ async fn open_target(target: &str) -> anyhow::Result<()> {
         } else {
             target.to_string()
         };
+        let line = win_start_command_line(&launch)?;
         let mut c = tokio::process::Command::new("cmd");
-        c.args(["/C", "start", "", &launch]);
+        {
+            use std::os::windows::process::CommandExt;
+            let std_cmd = c.as_std_mut();
+            std_cmd.raw_arg("/C");
+            std_cmd.raw_arg(line);
+        }
         c
     };
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
@@ -615,6 +746,56 @@ async fn power_cancel() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **可执行类文件判定(2026-08-22 PARK-1)**:open 打开这些 = 让 OS 运行,要过确认闸。
+    /// 判据是扩展名,跨平台一致(NAS 上的 .exe 在 mac 端也该谨慎),大小写不敏感。
+    #[test]
+    fn executable_files_are_recognized_across_platforms() {
+        for p in [
+            "/tmp/setup.exe",
+            "D:\\dl\\installer.MSI",
+            "/home/u/run.sh",
+            "C:\\x\\a.bat",
+            "/Applications/Foo.app",
+            "~/x.command",
+            "/tmp/x.AppImage",
+            "C:\\a\\shortcut.lnk",
+            "/tmp/macro.ps1",
+        ] {
+            assert!(is_executable_file(p), "{p} 应判为可执行(打开=运行,要确认)");
+        }
+        // 照片 / 文档 / 无扩展名 / 目录 —— 一律不是可执行,照旧不问
+        for p in [
+            "/tmp/photo.jpg",
+            "D:\\单据\\发票.pdf",
+            "~/Music/song.flac",
+            "/home/u/notes.txt",
+            "D:\\电影\\a.mkv",
+            "/Users/x/Downloads", // 目录,无扩展名
+            "照片/2024",
+        ] {
+            assert!(!is_executable_file(p), "{p} 不该被当可执行(会平白弹确认)");
+        }
+    }
+
+    /// **cmd 命令行拼装(2026-08-22 修)**:target 恒被包进双引号 —— 这既堵住
+    /// `notepad&calc` 那类注入,也修好「带 `&` 查询参数的网址在 Windows 被从 & 劈断」。
+    #[test]
+    fn win_start_line_quotes_target_against_cmd_metachars() {
+        // 带 & 的网址(日常最常见的一种):必须整条在引号里,cmd 才不会劈开
+        let line = win_start_command_line("https://x.com/a?b=1&c=2").unwrap();
+        assert_eq!(line, "start \"\" \"https://x.com/a?b=1&c=2\"");
+        // 注入形:同样被包住 → cmd 只会把它当一个要打开的名字,不会执行 calc
+        let line = win_start_command_line("notepad&calc").unwrap();
+        assert_eq!(line, "start \"\" \"notepad&calc\"");
+        // 带空格的中文路径:占位标题 "" 保证它不被 start 当成窗口标题
+        let line = win_start_command_line("D:\\我 的 电影\\a.mkv").unwrap();
+        assert_eq!(line, "start \"\" \"D:\\我 的 电影\\a.mkv\"");
+        // 引号 / 换行:Windows 文件名本就不允许 → 如实退回,不硬拼
+        for bad in ["a\"&calc&\"b", "a\nstart calc", "a\r\nb"] {
+            assert!(win_start_command_line(bad).is_err(), "{bad} 该被退回");
+        }
+    }
 
     #[test]
     fn looks_like_path_distinguishes_app_names_from_paths() {

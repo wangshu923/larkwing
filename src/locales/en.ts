@@ -154,6 +154,7 @@ export default {
       submit: 'Submit “{text}”',
       submitBare: 'Submit this form',
       press: 'Press {text}',
+      openExec: 'Run program {text}',
       fsRead: 'Look inside {text}',
       fsCreate: 'Save files into {text}',
       fsModify: 'Change files in {text}',

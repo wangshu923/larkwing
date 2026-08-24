@@ -136,6 +136,7 @@ fn confirm_action_phrase(kind: &str, action: &str) -> String {
         ("submit", true) => "提交这个表单".to_string(),
         ("submit", false) => format!("提交『{action}』"),
         ("press", _) => format!("按 {action} 键"),
+        ("open_exec", _) => format!("运行程序 {action}"),
         _ => format!("点『{action}』"),
     }
 }

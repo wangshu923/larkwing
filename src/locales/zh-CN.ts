@@ -154,6 +154,7 @@ export default {
       submit: '提交「{text}」',
       submitBare: '提交这个表单',
       press: '按 {text} 键',
+      openExec: '运行程序 {text}',
       fsRead: '查看文件夹 {text}',
       fsCreate: '在 {text} 存入文件',
       fsModify: '修改 {text} 里的文件',

@@ -18,6 +18,7 @@ export function confirmActionPhrase(card: Pick<ConfirmCard, 'kind' | 'action'>):
     return card.action ? t('confirm.act.submit', { text: card.action }) : t('confirm.act.submitBare')
   }
   if (card.kind === 'press') return t('confirm.act.press', { text: card.action })
+  if (card.kind === 'open_exec') return t('confirm.act.openExec', { text: card.action })
   return t('confirm.act.click', { text: card.action })
 }
 

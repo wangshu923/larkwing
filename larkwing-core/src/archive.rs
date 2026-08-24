@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use anyhow::{bail, Context, Result};
 
@@ -80,6 +80,9 @@ pub struct Overview {
 pub struct Progress {
     pub done: AtomicUsize,
     pub cancel: AtomicBool,
+    /// 已**实际写入磁盘**的字节累计(zip 炸弹防线,2026-08-22 PARK-2):
+    /// preflight 的总量是**声明值**,zip 炸弹正是「声明小、解开爆炸」——所以按写入实测,超闸即停。
+    pub written: AtomicU64,
 }
 
 impl Progress {
@@ -89,6 +92,33 @@ impl Progress {
     fn tick(&self) {
         self.done.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// 把 `reader` 拷进 `writer`,同时把实际写入字节累进 `prog.written`;累计超 `ARCHIVE_MAX_BYTES`
+/// 立即中止并报错(zip 炸弹防线,2026-08-22 用户拍板 B「按实际写入字节」)。返回本条实际写入字节。
+/// 逐块拷(64KB),超闸在**写满上限前**就停 —— 不是等写完整个巨型条目才发现。
+fn copy_capped<R: std::io::Read + ?Sized, W: std::io::Write>(
+    r: &mut R,
+    w: &mut W,
+    prog: &Progress,
+) -> Result<u64> {
+    let mut buf = [0u8; 64 * 1024];
+    let mut this = 0u64;
+    loop {
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        w.write_all(&buf[..n])?;
+        this += n as u64;
+        let total = prog.written.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+        anyhow::ensure!(
+            total <= ARCHIVE_MAX_BYTES,
+            "解压时实际写入已超过 {} 上限(压缩包声明的大小可能是假的,像是 zip 炸弹)——已停下",
+            crate::files::human_size(ARCHIVE_MAX_BYTES)
+        );
+    }
+    Ok(this)
 }
 
 /// 解压结果(量约束:数字汇总 + 封顶点名)。
@@ -250,11 +280,11 @@ fn extract_zip(
         // 目标目录是全新的,但包内可能有重名条目 → 加序号,永不覆盖
         let out = crate::files::dedupe_path(&out);
         let mut w = File::create(&out).with_context(|| format!("建不出 {}", out.display()))?;
-        std::io::copy(&mut f, &mut w).with_context(|| {
+        let wrote = copy_capped(&mut f, &mut w, prog).with_context(|| {
             format!("解出「{name}」失败(带密码的包多半是密码不对,不然就是包坏了)")
         })?;
         report.files += 1;
-        report.bytes = report.bytes.saturating_add(f.size());
+        report.bytes = report.bytes.saturating_add(wrote);
         prog.tick();
     }
     Ok(report)
@@ -299,11 +329,11 @@ fn extract_7z(
                 let out = crate::files::dedupe_path(&out);
                 let mut w =
                     File::create(&out).with_context(|| format!("建不出 {}", out.display()))?;
-                std::io::copy(r, &mut w).with_context(|| {
+                let wrote = copy_capped(r, &mut w, prog).with_context(|| {
                     format!("解出「{name}」失败(带密码的包多半是密码不对,不然就是包坏了)")
                 })?;
                 report.files += 1;
-                report.bytes = report.bytes.saturating_add(entry.size());
+                report.bytes = report.bytes.saturating_add(wrote);
                 prog.tick();
                 Ok(())
             })();
@@ -352,6 +382,16 @@ fn extract_rar(
             })?;
             report.files += 1;
             report.bytes = report.bytes.saturating_add(size);
+            // ⚠️ rar 由 unrar 库自己写盘,拿不到 reader/writer 插 copy_capped → 只能按**声明**
+            // 的 unpacked_size 事后累计(2026-08-22 PARK-2)。这能挡住「多条累计爆」,但挡不了
+            // 「单条声明小、实际解出巨大」的 rar 炸弹(unrar 是黑盒);已如实记档,zip/7z 走
+            // copy_capped 是按实测的。
+            let total = prog.written.fetch_add(size, Ordering::Relaxed) + size;
+            anyhow::ensure!(
+                total <= ARCHIVE_MAX_BYTES,
+                "解压时累计已超过 {} 上限(可能是 rar 炸弹)——已停下",
+                crate::files::human_size(ARCHIVE_MAX_BYTES)
+            );
             prog.tick();
             next
         } else {
@@ -614,6 +654,30 @@ mod tests {
         std::fs::write(root.join("a.txt"), b"AAA").unwrap();
         std::fs::write(root.join("子 目录").join("b.txt"), b"BBBB").unwrap();
         root
+    }
+
+    /// **zip 炸弹防线按实际写入字节记账(2026-08-22 PARK-2,用户拍板 B)**:
+    /// preflight 报的是**声明值**,炸弹正是「声明小、解开爆炸」→ 记账必须走实测。
+    /// 这里钉两件:① 累计器真的按写入字节涨(跨条目累加,不是每条清零);
+    /// ② 累计撞上 `ARCHIVE_MAX_BYTES` 立即 Err(预置到只差 8 字节,写 64 字节必超)。
+    #[test]
+    fn copy_capped_counts_written_bytes_and_stops_at_cap() {
+        let prog = Progress::default();
+        // ① 两次拷贝累加(第二次接着第一次涨)
+        let mut sink = Vec::new();
+        let n1 = copy_capped(&mut &b"hello"[..], &mut sink, &prog).unwrap();
+        let n2 = copy_capped(&mut &b"world!"[..], &mut sink, &prog).unwrap();
+        assert_eq!((n1, n2), (5, 6));
+        assert_eq!(prog.written.load(Ordering::Relaxed), 11);
+        assert_eq!(sink, b"helloworld!");
+
+        // ② 撞闸即停:把累计器顶到只差 8 字节,再拷 64 字节 → 必须 Err 而不是写完才发现
+        let prog = Progress::default();
+        prog.written.store(ARCHIVE_MAX_BYTES - 8, Ordering::Relaxed);
+        let big = [0u8; 64];
+        let mut sink = Vec::new();
+        let err = copy_capped(&mut &big[..], &mut sink, &prog).unwrap_err().to_string();
+        assert!(err.contains("zip 炸弹"), "撞闸要给明白话(§3.5),实际:{err}");
     }
 
     #[test]
