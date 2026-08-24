@@ -1104,6 +1104,14 @@ impl VoiceRuntime {
     }
 
     pub fn wake_stop(&self) {
+        // ⚠️ **光发 Stop 不够(2026-08-22 修)**:`Stop` 只在唤醒循环**每轮开头**被读到,而
+        // 一旦进了 `on_wake`,它要跑完整整一轮交互 —— 两次 `collect_utterance`(各自等到
+        // 超时 + hangover)再加一句**出声**的告退。用户关掉免手唤醒后的十几秒里:麦一直开着
+        // (灯亮着)、末了还冲人说一句「先这样」—— 都是关掉之后不该有的动静。
+        // `wake_ctl` 本来就是「停」的通道(前端 ✕ 用它,`collect_utterance` 认 CTL_CANCEL
+        // 立刻收摊、且那条路是**安静回待唤醒:不追问不告退**),正好是关机要的语义 → 一并写它,
+        // 在录的那一轮当场断掉,循环随即回到轮首读到 Stop 退出。
+        self.listen_stop(false);
         self.wake_cmd(wake::WakeCmd::Stop);
         self.wake_cleanup(); // sender 一并丢弃,线程见 Disconnected 也会退
         // stop 是用户意图点,同步广播「停了」;loop 稍后退出时 slot 已空、认领失败不重发
@@ -1338,6 +1346,12 @@ impl VoiceRuntime {
         tokio::spawn(async move {
             let mirrors = this.mirrors();
             let m = &this.inner.models;
+            // 「重试」= 真的重来:先把这个模型的落盘目录清掉(2026-08-22 修)。
+            // 否则 ensure 看见文件「在」就直接返回 Ok —— 而按重试的人恰恰是因为这份文件有毛病
+            // (镜像截断 / 顶包 / 半截),不清就是个空操作,**点到天荒地老也修不好**;而它坏了
+            // 的表现是 sherpa 加载回 None,在 Windows 正式版里连报错都会蒸发(§8.1)。
+            // 模型本来就是「用时下载」的可再生资产,清了照着 spec 重下即可。
+            m.purge(&id).await;
             let r = match id.as_str() {
                 i if i == models::SILERO_VAD.id => {
                     m.ensure(&models::SILERO_VAD, &mirrors).await.map(|_| ())

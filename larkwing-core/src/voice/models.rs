@@ -295,7 +295,10 @@ impl VoiceModels {
 
     pub fn is_tar_ready(&self, spec: &TarModelSpec) -> bool {
         let dir = self.dir.join(spec.id);
-        spec.files.iter().all(|f| dir.join(f).is_file())
+        // 同 all_present:0 字节的残件不算就绪(2026-08-22)
+        spec.files
+            .iter()
+            .all(|f| std::fs::metadata(dir.join(f)).is_ok_and(|m| m.is_file() && m.len() > 0))
     }
 
     /// tar.bz2 整包就绪:下载(gh 镜像候选)→ 解包抽取目标文件 → 原子就位。
@@ -435,9 +438,12 @@ impl VoiceModels {
         // 包外单文件(如 vocos 声码器):解包后单独拉进同一 model 目录。
         for file in spec.extra {
             let dest = dir.join(file.name);
-            if dest.is_file() {
+            // 已经下好的跳过;但 0 字节的残件要删掉重下 —— 否则它会被一路跳过、
+            // 末尾的校验又救不了它(2026-08-22,与 all_present 的「非空」是一对)
+            if std::fs::metadata(&dest).is_ok_and(|m| m.is_file() && m.len() > 0) {
                 continue;
             }
+            let _ = tokio::fs::remove_file(&dest).await;
             let part = dir.join(format!("{}.part", file.name));
             let urls: Vec<String> = file.urls.iter().flat_map(|u| candidates(u, mirrors)).collect();
             fetch_candidates(&self.net, &urls, &part, task)
@@ -464,8 +470,29 @@ impl VoiceModels {
         Ok(())
     }
 
+    /// 全部文件在位 **且非空**。
+    ///
+    /// ⚠️ 「非空」这半句是 2026-08-22 补的:原先只查 `is_file()` —— 一个 0 字节的残件也算
+    /// 「就绪」,于是 `ensure()` 直接短路返回 Ok、`is_ready()` 报绿、**连重试按钮也修不回来**
+    /// (重试走的就是 ensure),真正的报错要等到 sherpa 加载时才冒出来,而它在 Windows 正式版
+    /// 里连报错都会蒸发(§8.1 /MT 私有 fd 表)。0 字节的模型文件不可能是对的,这是事实判断、
+    /// 不是拍脑袋定的阈值(更严的尺寸下限得有真实数据支撑,`ModelSpec` 眼下也没有 ready 表;
+    /// 真正的兜底是「重试 = 先清空再下」,见 `VoiceRuntime::retry_model`)。
     fn all_present(&self, spec: &ModelSpec, dir: &Path) -> bool {
-        spec.files.iter().all(|f| dir.join(f.name).is_file())
+        spec.files
+            .iter()
+            .all(|f| std::fs::metadata(dir.join(f.name)).is_ok_and(|m| m.is_file() && m.len() > 0))
+    }
+
+    /// 清掉某个模型的落盘目录(「重试」用:文件看着在、其实坏了时,不清就永远短路)。
+    /// 尽力件:清不掉(Windows 上可能正被 sherpa mmap 着)只 warn,后续 ensure 照跑。
+    pub async fn purge(&self, id: &str) {
+        let dir = self.dir.join(id);
+        if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(id, err = %e, "清模型目录失败(可能正被占用),继续尝试重下");
+            }
+        }
     }
 
     async fn download(
@@ -478,9 +505,12 @@ impl VoiceModels {
         tokio::fs::create_dir_all(dir).await?;
         for file in spec.files {
             let dest = dir.join(file.name);
-            if dest.is_file() {
+            // 已经下好的跳过;但 0 字节的残件要删掉重下 —— 否则它会被一路跳过、
+            // 末尾的校验又救不了它(2026-08-22,与 all_present 的「非空」是一对)
+            if std::fs::metadata(&dest).is_ok_and(|m| m.is_file() && m.len() > 0) {
                 continue;
             }
+            let _ = tokio::fs::remove_file(&dest).await;
             let part = dir.join(format!("{}.part", file.name));
             let urls: Vec<String> = file.urls.iter().flat_map(|u| candidates(u, mirrors)).collect();
             fetch_candidates(&self.net, &urls, &part, task)

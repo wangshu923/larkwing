@@ -73,7 +73,24 @@ pub fn set(settings: &SettingsRepo, name: &str, value: &str) -> anyhow::Result<(
                 let _ = settings.delete(None, name); // 清明文残留(迁移/覆盖)
                 return Ok(());
             }
-            Err(err) => tracing::warn!(name, err = %err, "keyring 写失败,回落 settings"),
+            Err(err) => {
+                tracing::warn!(name, err = %err, "keyring 写失败,回落 settings");
+                // ⚠️ **回落前必须把 keyring 里的旧条目清掉(2026-08-22 修)**:`get()` 是
+                // keyring 优先 —— 留着旧条目 = 新值写进了 settings、读出来的却还是旧值。
+                // 用户改完密钥看到「保存好了」,实际用的还是老密钥(**静默回滚**),而新密钥
+                // 的明文已经落进 DB 了,两头都坏。
+                match e.delete_credential() {
+                    Ok(()) | Err(keyring::Error::NoEntry) => {}
+                    Err(derr) => {
+                        // 旧条目既写不动也删不掉:写进 settings 也会被它盖住(等于没保存),
+                        // 还白留一份明文 → 如实报错,别假装成功(§3.5)。
+                        anyhow::bail!(
+                            "没能保存到系统密钥串({err}),旧的那条也删不掉({derr})——\
+                             硬写进数据库会被旧值盖掉、还会留下明文,所以这次没有保存"
+                        );
+                    }
+                }
+            }
         }
     }
     settings.set(None, name, value)
