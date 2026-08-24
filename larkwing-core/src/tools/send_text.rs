@@ -112,7 +112,7 @@ impl Tool for SendText {
             Err(e) if outbound::is_stale_weixin(&e) => {
                 outbound::queue_weixin_pending_text(&ctx.store, &target, text)
                     .await
-                    .map_err(|qe| anyhow::anyhow!("没发出去({e:#});挂起也失败:{qe:#}"))?;
+                    .map_err(|qe| anyhow::anyhow!("没发出去({});挂起也失败:{}", crate::net::scrub(&e), crate::net::scrub(&qe)))?;
                 Ok(format!(
                     "没能马上送到、已挂起——微信限制 bot 只能在对方最近说过话的会话窗口内\
                      主动发消息,现在窗口过期了;{who}在微信上随便发来一句话就会自动补送\

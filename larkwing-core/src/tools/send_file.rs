@@ -147,10 +147,10 @@ impl Tool for SendFile {
                 Err(e) if outbound::is_stale_weixin(&e) => {
                     match outbound::queue_weixin_pending(&ctx.store, &target, p, cap).await {
                         Ok(()) => queued.push(name),
-                        Err(qe) => failed.push(format!("{name}({e:#};挂起也失败:{qe:#})")),
+                        Err(qe) => failed.push(format!("{name}({};挂起也失败:{})", crate::net::scrub(&e), crate::net::scrub(&qe))),
                     }
                 }
-                Err(e) => failed.push(format!("{name}({e:#})")),
+                Err(e) => failed.push(format!("{name}({})", crate::net::scrub(&e))),
             }
         }
         // 全军覆没 = 错误观察(模型换路/如实说);部分失败 = 汇总 + 点名失败(fs 批量纪律)

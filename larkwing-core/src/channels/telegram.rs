@@ -18,6 +18,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use super::{drive_turn, render, split_message, ChannelCtx, ATTACH_HINT};
+use crate::net::scrub;
 use crate::engine::InAttachment;
 use crate::net;
 
@@ -59,7 +60,7 @@ pub(super) async fn run(ctx: Arc<ChannelCtx>, ct: CancellationToken) {
         match serve(&ctx, &net, &ct).await {
             Ok(()) => break, // 正常返回 = 被取消
             Err(e) => {
-                let msg = format!("{e:#}");
+                let msg = scrub(&e);
                 tracing::warn!(err = %msg, "Telegram 渠道出错,5s 后重连");
                 ctx.set_state(CHANNEL, false, Some(msg));
                 tokio::select! {
@@ -239,12 +240,12 @@ async fn reply_turn(
     match drive_turn(&ctx.engine, CHANNEL, chat, text, sender, attachments, input, single).await {
         Ok(Some(reply)) => {
             if let Err(e) = send_rich(net, token, chat_id, &reply).await {
-                tracing::warn!(err = %format!("{e:#}"), "Telegram 发送失败");
+                tracing::warn!(err = %scrub(&e), "Telegram 发送失败");
             }
         }
         Ok(None) => {} // 折进在飞回合(inject),不单独回
         Err(e) => {
-            tracing::warn!(err = %format!("{e:#}"), "Telegram 回合失败");
+            tracing::warn!(err = %scrub(&e), "Telegram 回合失败");
             let _ = send_message(net, token, chat_id, ERR_HINT).await;
         }
     }
@@ -277,7 +278,7 @@ async fn handle_voice(
     let text = match voice_to_text(ctx, net, token, file_id).await {
         Ok(t) => t,
         Err(e) => {
-            tracing::warn!(err = %format!("{e:#}"), "Telegram 语音转写失败");
+            tracing::warn!(err = %scrub(&e), "Telegram 语音转写失败");
             let _ = send_message(net, token, chat_id, ERR_HINT).await;
             return;
         }
@@ -318,7 +319,7 @@ async fn handle_photo(
     let bytes = match download_file(net, token, file_id).await {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!(err = %format!("{e:#}"), "Telegram 照片下载失败");
+            tracing::warn!(err = %scrub(&e), "Telegram 照片下载失败");
             let _ = send_message(net, token, chat_id, ERR_HINT).await;
             return;
         }
@@ -364,7 +365,7 @@ async fn handle_document(
     let bytes = match download_file(net, token, file_id).await {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!(err = %format!("{e:#}"), "Telegram 文件下载失败");
+            tracing::warn!(err = %scrub(&e), "Telegram 文件下载失败");
             let _ = send_message(net, token, chat_id, ERR_HINT).await;
             return;
         }
@@ -386,7 +387,7 @@ async fn latest_offset(net: &net::Client, token: &str) -> i64 {
             .map(|id| id + 1)
             .unwrap_or(0),
         Err(e) => {
-            tracing::warn!(err = %format!("{e:#}"), "Telegram 取初始 offset 失败,从 0 开始");
+            tracing::warn!(err = %scrub(&e), "Telegram 取初始 offset 失败,从 0 开始");
             0
         }
     }
@@ -445,7 +446,7 @@ async fn send_rich(net: &net::Client, token: &str, chat_id: i64, text: &str) -> 
             continue;
         }
         if let Err(e) = send_html(net, token, chat_id, &html).await {
-            tracing::warn!(err = %format!("{e:#}"), "Telegram HTML 发送失败,该片降级纯文本重发");
+            tracing::warn!(err = %scrub(&e), "Telegram HTML 发送失败,该片降级纯文本重发");
             send_message(net, token, chat_id, &piece).await?;
         }
     }

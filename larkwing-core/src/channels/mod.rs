@@ -57,7 +57,7 @@ use anyhow::Context;
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::{Engine, InAttachment, TurnEvent, UserMeta};
-use crate::net;
+use crate::net::{self, scrub};
 
 /// 攒批提示(§6.6 债:渠道操作性话术,不经模型;三渠道共用)。用户 2026-07-11 选定「极简功能」版。
 /// 时机 = 纯文件消息到达、缓冲从空变满那一刻(防抖:连发多个只第一个提示,后续静默并入)。
@@ -321,7 +321,7 @@ async fn outbound_loop(ctx: Arc<ChannelCtx>, ct: CancellationToken) {
                     continue;
                 }
                 if let Err(e) = push_reminder(&ctx, &net, act.conv_id, act.outcome).await {
-                    tracing::warn!(err = %format!("{e:#}"), conv = act.conv_id, "提醒推回渠道失败");
+                    tracing::warn!(err = %scrub(&e), conv = act.conv_id, "提醒推回渠道失败");
                 }
             }
             // 确认闸(§7.8):渠道来源的确认请求推回发起的那个 chat 等回话;
@@ -364,7 +364,7 @@ async fn handle_confirm_card(ctx: &Arc<ChannelCtx>, net: &net::Client, card: cra
     // 先登记再推(推到与用户回话之间没有空窗);推失败立刻摘掉
     ctx.confirm_wait_set(&thread.channel, &thread.ext_id, card.id);
     if let Err(e) = push_text_to_thread(ctx, net, &thread, &prompt).await {
-        tracing::warn!(err = %format!("{e:#}"), conv = conv_id, "确认请求推不到手机,按送达失败收");
+        tracing::warn!(err = %scrub(&e), conv = conv_id, "确认请求推不到手机,按送达失败收");
         ctx.confirm_wait_clear(card.id);
         let _ = ctx.engine.confirmer().resolve(card.id, crate::confirm::ConfirmReply::Deny, "unreachable");
     }

@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use super::{drive_turn, split_message, ChannelCtx, ATTACH_HINT};
+use crate::net::scrub;
 use crate::engine::InAttachment;
 use crate::net;
 
@@ -119,7 +120,7 @@ pub(super) fn load_accounts(settings: &crate::store::SettingsRepo) -> Vec<Accoun
         settings.get(None, "remote.weixin.base_url").ok().flatten().unwrap_or_default();
     let migrated = vec![Account { token, base_url, user_id: String::new() }];
     if let Err(e) = save_accounts(settings, &migrated) {
-        tracing::warn!(err = %format!("{e:#}"), "旧微信 token 迁移绑定列表失败(下次再试)");
+        tracing::warn!(err = %scrub(&e), "旧微信 token 迁移绑定列表失败(下次再试)");
     } else {
         tracing::info!("旧微信单 token 已迁移成绑定列表(身份未知,重新扫码可补齐)");
     }
@@ -233,7 +234,7 @@ async fn run_account(ctx: Arc<ChannelCtx>, acc: Account, ct: CancellationToken) 
         match serve(&ctx, &net, &acc, &ct).await {
             Ok(()) => break, // 正常返回 = 被取消
             Err(e) => {
-                let msg = format!("{who}: {e:#}");
+                let msg = format!("{who}: {}", scrub(&e));
                 tracing::warn!(err = %msg, "微信绑定出错,5s 后重连");
                 ctx.set_state(CHANNEL, true, Some(msg));
                 tokio::select! {
@@ -384,7 +385,7 @@ async fn handle_message(
                     return;
                 }
                 Err(e) => {
-                    tracing::warn!(err = %format!("{e:#}"), "微信媒体下载/解密失败");
+                    tracing::warn!(err = %scrub(&e), "微信媒体下载/解密失败");
                     let _ = send_text(net, base, token, &p.from_user_id, &p.context_token, ERR_HINT).await;
                     persist_context_token(ctx, &p.from_user_id, &p.context_token);
                     return;
@@ -432,14 +433,14 @@ async fn handle_message(
         Ok(Some(reply)) => {
             for piece in split_message(&reply, WX_MAX) {
                 if let Err(e) = send_text(net, base, token, &p.from_user_id, &p.context_token, &piece).await {
-                    tracing::warn!(err = %format!("{e:#}"), "微信发送失败");
+                    tracing::warn!(err = %scrub(&e), "微信发送失败");
                     break;
                 }
             }
         }
         Ok(None) => {} // 折进在飞回合(inject),不单独回
         Err(e) => {
-            tracing::warn!(err = %format!("{e:#}"), "微信回合失败");
+            tracing::warn!(err = %scrub(&e), "微信回合失败");
             let _ = send_text(net, base, token, &p.from_user_id, &p.context_token, ERR_HINT).await;
         }
     }
@@ -956,7 +957,7 @@ async fn flush_pending_sends(
             return; // 没我的件、也没过期件要清
         }
         if let Err(e) = save_pending(settings, &keep) {
-            tracing::warn!(err = %format!("{e:#}"), "挂起列表写回失败,本轮不补发");
+            tracing::warn!(err = %scrub(&e), "挂起列表写回失败,本轮不补发");
             return;
         }
         mine
@@ -967,7 +968,7 @@ async fn flush_pending_sends(
             match push(net, base, token, ext_id, context_token, &text).await {
                 Ok(()) => tracing::info!("挂起的消息已补发(对方开口刷新了会话)"),
                 Err(err) => {
-                    tracing::warn!(err = %format!("{err:#}"), "消息补发失败,回炉等下一条消息");
+                    tracing::warn!(err = %scrub(&err), "消息补发失败,回炉等下一条消息");
                     let _g = PENDING_MU.lock().await;
                     let mut list = load_pending(settings);
                     list.push(e);
@@ -985,7 +986,7 @@ async fn flush_pending_sends(
         {
             Ok(()) => tracing::info!(path = %e.path, "挂起的文件已补发(对方开口刷新了会话)"),
             Err(err) => {
-                tracing::warn!(err = %format!("{err:#}"), path = %e.path, "补发失败,回炉等下一条消息");
+                tracing::warn!(err = %scrub(&err), path = %e.path, "补发失败,回炉等下一条消息");
                 let _g = PENDING_MU.lock().await;
                 let mut list = load_pending(settings);
                 list.push(e);
@@ -1237,7 +1238,7 @@ pub(super) async fn qr_poll_and_store(
         Ok(v) => v,
         // 网关超时(524)/网络抖动:当 wait 继续轮(镜像插件 pollQRStatus 兜底)
         Err(e) => {
-            tracing::debug!(err = %format!("{e:#}"), "扫码状态轮询网络错误,当 wait 重试");
+            tracing::debug!(err = %scrub(&e), "扫码状态轮询网络错误,当 wait 重试");
             return Ok(QrPoll { status: "wait".into(), base_url: None });
         }
     };

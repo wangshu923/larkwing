@@ -11,6 +11,7 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 
+use crate::net::scrub;
 use crate::net;
 use crate::store::Store;
 
@@ -266,7 +267,7 @@ pub(crate) async fn send_file(
             if let Some(cap) = caption.filter(|s| !s.is_empty()) {
                 if let Err(e) = super::dingtalk::push(net, app_key, app_secret, staff_id, cap).await
                 {
-                    tracing::warn!(err = %format!("{e:#}"), "钉钉文件已送达,附言补推失败");
+                    tracing::warn!(err = %scrub(&e), "钉钉文件已送达,附言补推失败");
                 }
             }
             Ok(())

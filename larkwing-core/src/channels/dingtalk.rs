@@ -21,6 +21,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
 use super::{drive_turn, render, ChannelCtx, ATTACH_HINT};
+use crate::net::scrub;
 use crate::engine::InAttachment;
 use crate::net;
 
@@ -48,8 +49,8 @@ pub(super) async fn run(ctx: Arc<ChannelCtx>, ct: CancellationToken) {
         ctx.set_state(CHANNEL, true, None);
         if let Err(e) = serve(&ctx, &net, &ct).await {
             // 出错(含正常的网关轮换断开抛错):记错 + 状态行可见,5s 后重连
-            tracing::warn!(err = %format!("{e:#}"), "钉钉渠道出错,5s 后重连");
-            ctx.set_state(CHANNEL, false, Some(format!("{e:#}")));
+            tracing::warn!(err = %scrub(&e), "钉钉渠道出错,5s 后重连");
+            ctx.set_state(CHANNEL, false, Some(scrub(&e)));
         }
         if ct.is_cancelled() {
             break;
@@ -226,12 +227,12 @@ async fn run_reply(
     {
         Ok(Some(reply)) => {
             if let Err(e) = reply_webhook(net, &m.webhook, &reply).await {
-                tracing::warn!(err = %format!("{e:#}"), "钉钉回复失败");
+                tracing::warn!(err = %scrub(&e), "钉钉回复失败");
             }
         }
         Ok(None) => {} // 折进在飞回合
         Err(e) => {
-            tracing::warn!(err = %format!("{e:#}"), "钉钉回合失败");
+            tracing::warn!(err = %scrub(&e), "钉钉回合失败");
             let _ = reply_webhook(net, &m.webhook, ERR_HINT).await;
         }
     }
@@ -254,7 +255,7 @@ async fn handle_picture(
     let bytes = match download_media(net, app_key, app_secret, download_code).await {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!(err = %format!("{e:#}"), "钉钉图片下载失败");
+            tracing::warn!(err = %scrub(&e), "钉钉图片下载失败");
             let _ = reply_webhook(net, &m.webhook, ERR_HINT).await;
             return;
         }
@@ -302,7 +303,7 @@ async fn handle_audio(
     let text = match audio_to_text(ctx, net, app_key, app_secret, code).await {
         Ok(t) => t,
         Err(e) => {
-            tracing::warn!(err = %format!("{e:#}"), "钉钉语音转写失败");
+            tracing::warn!(err = %scrub(&e), "钉钉语音转写失败");
             let _ = reply_webhook(net, &m.webhook, ERR_HINT).await;
             return;
         }
@@ -334,7 +335,7 @@ async fn handle_file(
     let bytes = match download_media(net, app_key, app_secret, download_code).await {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!(err = %format!("{e:#}"), "钉钉文件下载失败");
+            tracing::warn!(err = %scrub(&e), "钉钉文件下载失败");
             let _ = reply_webhook(net, &m.webhook, ERR_HINT).await;
             return;
         }

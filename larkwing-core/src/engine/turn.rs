@@ -882,7 +882,7 @@ async fn run_tools(
             Ok(Err(e)) => {
                 // 观测:工具失败原因进日志(之前只回喂模型,控制台看不见 → 用户"看不出问题")。
                 // 错误仍当观察喂回模型(截断 500),但全量进日志便于排障。
-                let full = format!("{e:#}");
+                let full = crate::net::scrub(&e);
                 tracing::warn!(tool = %call.name, "工具执行出错: {full}");
                 let msg: String = full.chars().take(500).collect();
                 (call.clone(), "error".to_string(), ToolOutput::text(msg))

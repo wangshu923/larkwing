@@ -37,7 +37,7 @@ pub fn set_proxy(url: Option<String>) {
     let g = global();
     let mut cur = g.proxy.write().expect("net proxy lock");
     if *cur != url {
-        tracing::info!(proxy = ?url, "代理设置更新");
+        tracing::info!(proxy = ?url.as_deref().map(scrub_secrets), "代理设置更新");
         *cur = url;
         g.gen.fetch_add(1, Ordering::SeqCst);
         g.sticky.lock().expect("net sticky lock").clear();
@@ -109,7 +109,7 @@ impl Client {
             let built = match reqwest::Proxy::all(&url) {
                 Ok(p) => (self.configure)(reqwest::Client::builder()).proxy(p).build().ok(),
                 Err(e) => {
-                    tracing::warn!(proxy = %url, err = %e, "代理 URL 非法,忽略(本次直连)");
+                    tracing::warn!(proxy = %scrub_secrets(&url), err = %scrub_secrets(&e.to_string()), "代理 URL 非法,忽略(本次直连)");
                     None
                 }
             };
@@ -156,6 +156,92 @@ impl Client {
     }
 }
 
+/// 渲染后的错误/日志文本里把 URL 携带的凭证抹掉(**唯一收口**,2026-08-22)。
+///
+/// **为什么必须有这道**:Telegram 把 bot token 放在 URL 路径里(`/bot{token}/getUpdates`,共 6 处),
+/// 而 `reqwest` 的 `Error` Display **必带完整 URL** —— 0.12.28 的 `src/error.rs` 里就是
+/// `write!(f, " for url ({url})")`。于是任何 `format!("{e:#}")` 都会把 token 写进
+/// ① `larkwing.log`;② `ctx.set_state` 的渠道状态行(**设置页直接显示**);
+/// ③ `send_file` 失败时的工具结果 —— 那是**喂给模型的观察、还会落进 tool 行**。
+/// 钉钉的 Stream 握手 URL 同理带 `?ticket=<凭证>`。
+///
+/// 放在 net(出站 HTTP 的唯一接缝 §4.6)而不是 channels:引擎侧渲染工具错误也要用它,
+/// 而 engine 不该反向依赖 channels(§6.1 方向)。收在「错误变成字符串」这一层而不是逐个调用点 map_err:错误对象本身不出进程,只以字符串出去,
+/// 所以这一层盖住就没有漏网的;新增日志点照抄 `scrub(&e)` 即可。
+pub(crate) fn scrub_secrets(s: &str) -> String {
+    const MASK: &str = "<已隐去>";
+    // ⓪ URL 里的 userinfo(`scheme://user:pass@host`)—— 代理地址就常是这形状,而它会被打进日志
+    //    (`代理 URL 非法,忽略`)。只在 `://` 与随后第一个 `/`/空白之前找 `@`,免得把正文里的
+    //    邮箱地址也抹掉。
+    let s = &{
+        let mut out = String::with_capacity(s.len());
+        let mut rest = s;
+        while let Some(i) = rest.find("://") {
+            let (head, tail) = rest.split_at(i + 3);
+            out.push_str(head);
+            let stop = tail
+                .find(|c: char| c == '/' || c.is_whitespace() || c == ')' || c == '"')
+                .unwrap_or(tail.len());
+            match tail[..stop].find('@') {
+                Some(at) => {
+                    out.push_str(MASK);
+                    out.push('@');
+                    rest = &tail[at + 1..];
+                }
+                None => {
+                    out.push_str(&tail[..stop]);
+                    rest = &tail[stop..];
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }[..];
+    // ① Telegram 的 `/bot<token>` 路径段(api 与 file 两种 URL 同形)。
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("/bot") {
+        let (head, tail) = rest.split_at(i + 4);
+        out.push_str(head);
+        // token 到下一个 `/` 或空白/括号为止;紧跟 `/` 说明不是 token(如 `/bot/xxx`),原样留。
+        let end = tail
+            .find(|c: char| c == '/' || c.is_whitespace() || c == ')' || c == '"')
+            .unwrap_or(tail.len());
+        if end == 0 {
+            rest = tail;
+            continue;
+        }
+        out.push_str(MASK);
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    // ② query 里的敏感参数(钉钉 ticket、各家 token/secret/sign…)。
+    const SENSITIVE: [&str; 7] = ["ticket", "token", "access_token", "session", "secret", "sign", "key"];
+    let Some(q) = out.find('?') else { return out };
+    let (head, query) = out.split_at(q + 1);
+    let mut scrubbed = String::with_capacity(out.len());
+    scrubbed.push_str(head);
+    for (i, pair) in query.split('&').enumerate() {
+        if i > 0 {
+            scrubbed.push('&');
+        }
+        match pair.split_once('=') {
+            Some((k, _)) if SENSITIVE.iter().any(|s| k.to_ascii_lowercase().contains(s)) => {
+                scrubbed.push_str(k);
+                scrubbed.push('=');
+                scrubbed.push_str(MASK);
+            }
+            _ => scrubbed.push_str(pair),
+        }
+    }
+    scrubbed
+}
+
+/// `scrub_secrets(&format!("{e:#}"))` 的简写 —— 渠道里渲染错误一律走它,别再裸 `format!`。
+pub(crate) fn scrub(e: &anyhow::Error) -> String {
+    scrub_secrets(&format!("{e:#}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +260,46 @@ mod tests {
         std::env::set_var("HTTPS_PROXY", "  http://127.0.0.1:7890  ");
         assert_eq!(env_proxy().as_deref(), Some("http://127.0.0.1:7890"));
         std::env::remove_var("HTTPS_PROXY");
+    }
+
+    /// 凭证脱敏:用**真实形状**的 reqwest 错误串钉住 —— reqwest 0.12 的 Error Display 是
+    /// 「…… for url (<完整 URL>)」,Telegram 的 token 就在路径里。
+    #[test]
+    fn scrub_strips_bot_token_and_sensitive_query() {
+        const TOKEN: &str = "123456789:AAEhBOweik6ad9r_jsbHNTaWzS0jLmNQpEo";
+        let err = format!(
+            "getUpdates 请求失败: error sending request for url \
+             (https://api.telegram.org/bot{TOKEN}/getUpdates?offset=1&timeout=50)"
+        );
+        let got = scrub_secrets(&err);
+        assert!(!got.contains(TOKEN), "token 必须被抹掉:{got}");
+        assert!(got.contains("/bot<已隐去>/getUpdates"), "只抹 token、保留可诊断的形状:{got}");
+        assert!(got.contains("offset=1"), "无害参数不动:{got}");
+
+        // 文件下载 URL 同形(/file/bot<token>/<path>)
+        let dl = format!("下载失败 for url (https://api.telegram.org/file/bot{TOKEN}/photos/x.jpg)");
+        assert!(!scrub_secrets(&dl).contains(TOKEN));
+
+        // 钉钉 Stream 握手:凭证在 query
+        let ding = "连接失败 for url (wss://x.dingtalk.com/connect?ticket=abc123XYZ&uid=7)";
+        let got = scrub_secrets(ding);
+        assert!(!got.contains("abc123XYZ"), "ticket 必须被抹掉:{got}");
+        assert!(got.contains("uid=7"), "无害参数不动:{got}");
+
+        // 幂等 + 不误伤普通文本
+        assert_eq!(scrub_secrets(&got), got, "抹过再抹结果不变");
+        assert_eq!(scrub_secrets("钉钉回复失败:HTTP 500"), "钉钉回复失败:HTTP 500");
+        // `/bot/` 后面没东西 = 不是 token,原样留(别把正常路径抹花)
+        assert_eq!(scrub_secrets("see /bot/docs"), "see /bot/docs");
+
+        // 代理地址里的 userinfo(会被打进日志)—— 只抹 URL 里的,正文邮箱不动
+        let px = scrub_secrets("代理 URL 非法 http://alice:s3cr3t@127.0.0.1:7890 忽略");
+        assert!(!px.contains("s3cr3t"), "代理口令必须抹掉:{px}");
+        assert!(px.contains("@127.0.0.1:7890"), "主机保留可诊断:{px}");
+        assert_eq!(
+            scrub_secrets("联系 a@b.com 报错"),
+            "联系 a@b.com 报错",
+            "正文里的邮箱不该被当 userinfo"
+        );
     }
 }
