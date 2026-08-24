@@ -93,6 +93,19 @@ pub struct UsageRepo {
 }
 
 impl UsageRepo {
+    /// 某人的用量流水行数(删家人清理的验证 / 可观测用)。
+    pub fn count_for_user(&self, user_id: i64) -> Result<i64> {
+        self.db.with(|c| {
+            Ok(c.query_row("SELECT COUNT(1) FROM usage_rounds WHERE user_id = ?1", [user_id], |r| r.get(0))?)
+        })
+    }
+
+    /// 删某人的用量流水(删家人时连带清;users.id 会复用,不清则新家人继承旧账)。
+    /// 只删 usage_rounds —— balance_snapshots 是按供应商的全局余额,不归人。
+    pub fn delete_for_user(&self, user_id: i64) -> Result<usize> {
+        self.db.with(|c| Ok(c.execute("DELETE FROM usage_rounds WHERE user_id = ?1", [user_id])?))
+    }
+
     pub(super) fn new(db: Db) -> Self {
         Self { db }
     }

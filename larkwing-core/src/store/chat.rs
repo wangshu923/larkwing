@@ -566,17 +566,43 @@ impl ChatRepo {
 }
 
 /// 命中片段:短则原样;长则取命中词附近一窗(字符级,避免切碎多字节 UTF-8)。展示标签,非数据。
+///
+/// ⚠️ 命中位置**必须在 `content` 自己的字符序列上算**,不能拿 `content.to_lowercase()` 的位置
+/// 去索引 `content` 的 chars(2026-08-22 审计):有些字符转小写后**字符数会变**(土耳其 `İ`→
+/// `i̇` 一个变俩、德语 ß 等),`lower` 比 `content` 长时,在 lower 里算出的 `hit_char` 会超过
+/// `content` 的 chars.len(),`chars[start..end]` 里 `start > end` 直接 panic —— 而这个函数在
+/// `db.with` 的**持锁闭包**里跑(聊天全文搜索),panic 会 poison DB 的全局 Mutex、之后所有 DB
+/// 操作跟着崩。聊天内容含这类字符是完全现实的输入。
+/// 修法:在 `chars`(content 自己的字符)上逐字符做大小写不敏感匹配,位置与被索引的序列同源。
 fn snippet_around(content: &str, query_lower: &str, radius: usize) -> String {
     let chars: Vec<char> = content.chars().collect();
     let qn = query_lower.chars().count();
     if chars.len() <= radius * 2 + qn {
         return content.to_string();
     }
-    let lower = content.to_lowercase();
-    let hit_char =
-        lower.find(query_lower).map(|bp| lower[..bp].chars().count()).unwrap_or(0);
+    // 在 `chars`(content 自己的字符)上找命中起点:对每个起点 i,把 chars[i..] 逐字符转小写
+    // 展开,看是否以 query 打头。命中返回的是 chars 上的下标 → 恒 ≤ chars.len(),不会越界。
+    let q: Vec<char> = query_lower.chars().collect();
+    let hit_char = (0..chars.len())
+        .find(|&i| {
+            let mut qi = 0usize;
+            for c in &chars[i..] {
+                for lc in c.to_lowercase() {
+                    if qi >= q.len() {
+                        return true;
+                    }
+                    if lc != q[qi] {
+                        return false;
+                    }
+                    qi += 1;
+                }
+            }
+            qi >= q.len()
+        })
+        .unwrap_or(0);
     let start = hit_char.saturating_sub(radius);
     let end = (hit_char + qn + radius).min(chars.len());
+    let end = end.max(start); // 双保险:任何情况下 start ≤ end,永不 panic
     let mut s = String::new();
     if start > 0 {
         s.push('…');
@@ -701,6 +727,23 @@ mod tests {
         let ux = store.chat.append_message(conv2.id, "user", "别的会话").unwrap();
         assert!(store.chat.truncate_from(conv.id, ux.id).is_err());
         assert_eq!(store.chat.count_messages(conv2.id).unwrap(), 1); // 拒了就一根手指都不动
+    }
+
+    /// **snippet 不许因大小写变长而越界 panic(2026-08-22 审计)**。
+    /// 有些字符转小写会一变多(土耳其 `İ`→`i̇`),原实现拿 `to_lowercase()` 的位置索引原串 chars,
+    /// `start > end` 直接 panic —— 而这函数在 db.with 持锁闭包里跑,panic 会毒化 DB 全局锁。
+    #[test]
+    fn snippet_survives_case_expanding_chars() {
+        // İ×100(每个转小写变俩)+ zzz:内容够长过早返回闸,lower 里 hit 位置远超原串长度
+        let content = format!("{}zzz", "İ".repeat(100));
+        let s = snippet_around(&content, "zzz", 36); // 修前:这行 panic
+        assert!(s.contains("zzz"), "命中词应在片段里:{s}");
+        // 普通 ASCII 与中文照常
+        let cn = "今天天气不错适合出门散步".repeat(20);
+        assert!(snippet_around(&cn, "散步", 8).contains("散步"));
+        assert_eq!(snippet_around("短文本散步", "散步", 36), "短文本散步", "短内容原样返回");
+        // 大小写不敏感命中(英文)
+        assert!(snippet_around(&format!("{}Hello", "x".repeat(100)), "hello", 4).contains("Hello"));
     }
 
     /// `delete_message`:精确删一条、按会话双限、不碰别的会话(wake_turn 建连失败撤 event 行用)。

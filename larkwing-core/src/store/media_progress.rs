@@ -56,6 +56,11 @@ pub struct MediaProgressRepo {
 }
 
 impl MediaProgressRepo {
+    /// 删某人的续播进度(删家人时连带清;同 todos 的 id 复用理由)。
+    pub fn delete_for_user(&self, user_id: i64) -> Result<usize> {
+        self.db.with(|c| Ok(c.execute("DELETE FROM media_progress WHERE user_id = ?1", [user_id])?))
+    }
+
     pub(super) fn new(db: Db) -> Self {
         Self { db }
     }

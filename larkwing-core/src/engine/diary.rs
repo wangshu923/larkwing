@@ -116,14 +116,15 @@ fn collect_materials(store: &Store, from_ms: i64, end_ms: i64) -> Result<Vec<Day
             }
         }
     }
-    // 待办动静(记下想办 / 办完了)
-    for (content, done, created_at, updated_at) in store.todos.changed_between(from_ms, end_ms)? {
+    // 待办动静(记下想办 / 办完了)。**过期自清不算办完**(2026-08-22 审计):`expired=1` 是
+    // 30 天没动静被系统静默了结,不是用户真做了 —— 写进日记就是「从未发生的完成事件」。
+    for (content, done, expired, created_at, updated_at) in store.todos.changed_between(from_ms, end_ms)? {
         if created_at >= from_ms && created_at < end_ms {
             if let Some(date) = local_date(created_at).map(|d| d.to_string()) {
                 days.entry(date).or_default().push(format!("(记下想办:{content})"));
             }
         }
-        if done && updated_at >= from_ms && updated_at < end_ms && updated_at != created_at {
+        if done && !expired && updated_at >= from_ms && updated_at < end_ms && updated_at != created_at {
             if let Some(date) = local_date(updated_at).map(|d| d.to_string()) {
                 days.entry(date).or_default().push(format!("(办完了:{content})"));
             }

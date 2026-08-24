@@ -14,9 +14,10 @@ use serde::Serialize;
 use super::db::{m, now_ms, Db, Migration};
 use super::like_escape;
 
-pub const MIGRATIONS: &[Migration] = &[m(
-    "0020_todos_init",
-    "CREATE TABLE todos (
+pub const MIGRATIONS: &[Migration] = &[
+    m(
+        "0020_todos_init",
+        "CREATE TABLE todos (
         id          INTEGER PRIMARY KEY,
         user_id     INTEGER NOT NULL,
         content     TEXT    NOT NULL,
@@ -25,7 +26,17 @@ pub const MIGRATIONS: &[Migration] = &[m(
         updated_at  INTEGER NOT NULL
     );
     CREATE INDEX idx_todos_open ON todos(user_id, done, created_at);",
-)];
+    ),
+    // `expired`:这条待办是**过期自清**(1)还是**真办完/了结**(0)—— 两者原先都写 done=1,
+    // 家庭日记无从区分,把 30 天过期的待办写成「办完了」= 日记里出现从未发生的完成事件
+    // (2026-08-22 审计)。存量已 done 的行按「真办完」(0)处理:分不清的老数据宁可当办完,
+    // 也别把用户真做过的事诬成过期(前者只是日记里多一条,后者是抹掉真实功劳)。
+    m("0031_todos_expired", "ALTER TABLE todos ADD COLUMN expired INTEGER NOT NULL DEFAULT 0;"),
+];
+
+/// 家庭日记取料的一条待办动静:(内容, 是否 done, 是否过期自清, 创建时刻, 更新时刻)。
+/// expired=true 是「30 天没动被系统了结」,不是用户真办完 —— 日记据此不写「办完了」。
+pub type TodoChange = (String, bool, bool, i64, i64);
 
 /// 一条未了的事(只在 open 态进前缀;done 后不再露面)。
 #[derive(Debug, Clone, Serialize)]
@@ -41,6 +52,11 @@ pub struct TodoRepo {
 }
 
 impl TodoRepo {
+    /// 删某人的全部待办(删家人时连带清 —— users.id 会复用,不清则新家人继承旧待办)。
+    pub fn delete_for_user(&self, user_id: i64) -> Result<usize> {
+        self.db.with(|c| Ok(c.execute("DELETE FROM todos WHERE user_id = ?1", [user_id])?))
+    }
+
     pub(super) fn new(db: Db) -> Self {
         Self { db }
     }
@@ -141,21 +157,24 @@ impl TodoRepo {
     }
 
     /// 区间内有动静的待办(创建或了结落在 `[from_ms, to_ms)`,全家不分人):家庭日记取料用。
-    /// 返回 (content, done, created_at, updated_at)。
-    pub fn changed_between(
-        &self,
-        from_ms: i64,
-        to_ms: i64,
-    ) -> Result<Vec<(String, bool, i64, i64)>> {
+    /// 返回 (content, done, expired, created_at, updated_at)。`expired`=过期自清(≠真办完),
+    /// 日记据此不把过期写成「办完了」。
+    pub fn changed_between(&self, from_ms: i64, to_ms: i64) -> Result<Vec<TodoChange>> {
         self.db.with(|c| {
             let mut stmt = c.prepare(
-                "SELECT content, done, created_at, updated_at FROM todos
+                "SELECT content, done, expired, created_at, updated_at FROM todos
                  WHERE (created_at >= ?1 AND created_at < ?2)
                     OR (updated_at >= ?1 AND updated_at < ?2)
                  ORDER BY updated_at ASC",
             )?;
             let rows = stmt.query_map(rusqlite::params![from_ms, to_ms], |r| {
-                Ok((r.get(0)?, r.get::<_, i64>(1)? != 0, r.get(2)?, r.get(3)?))
+                Ok((
+                    r.get(0)?,
+                    r.get::<_, i64>(1)? != 0,
+                    r.get::<_, i64>(2)? != 0,
+                    r.get(3)?,
+                    r.get(4)?,
+                ))
             })?;
             let mut out = Vec::new();
             for r in rows {
@@ -166,11 +185,12 @@ impl TodoRepo {
     }
 
     /// 过期自清:open 且创建至今超过 `max_age_ms` 的,静默了结,免无限累积。返回清掉条数。
-    /// 搭后台维护轮跑(注入 `now` 可单测)。
+    /// 搭后台维护轮跑(注入 `now` 可单测)。**标 `expired=1`**(区别于真办完的 done):
+    /// 家庭日记据此不把过期误写成「办完了」(2026-08-22 审计)。
     pub fn expire_stale(&self, user_id: i64, now: i64, max_age_ms: i64) -> Result<usize> {
         self.db.with(|c| {
             let n = c.execute(
-                "UPDATE todos SET done=1, updated_at=?2
+                "UPDATE todos SET done=1, expired=1, updated_at=?2
                  WHERE user_id=?1 AND done=0 AND ?2 - created_at > ?3",
                 rusqlite::params![user_id, now, max_age_ms],
             )?;
@@ -254,5 +274,29 @@ mod tests {
         // 到期 → 静默了结
         assert_eq!(s.todos.expire_stale(1, t + 20_000, 10_000).unwrap(), 1);
         assert!(s.todos.list_open(1, 10).unwrap().is_empty());
+    }
+
+    /// **过期自清 ≠ 办完(2026-08-22 审计)**:两者原先都写 done=1,家庭日记把 30 天过期的
+    /// 待办写成「办完了」= 从未发生的完成事件。`changed_between` 的 expired 位要区分开。
+    #[test]
+    fn expire_is_distinguishable_from_real_done() {
+        let s = store("expire-vs-done");
+        s.todos.add(1, "真办完的事").unwrap();
+        s.todos.add(1, "过期的事").unwrap();
+        assert!(s.todos.mark_done(1, "真办完的事").unwrap()); // done=1, expired=0
+        // 让「过期的事」到期:用它的 created_at 往后推足够久当 now(不碰私有 now_ms)
+        let base = s.todos.list_open(1, 10).unwrap()[0].created_at;
+        let now = base + 40 * 24 * 3600 * 1000;
+        s.todos.expire_stale(1, now, 30 * 24 * 3600 * 1000).unwrap(); // done=1, expired=1
+
+        let rows = s.todos.changed_between(0, now + 1000).unwrap();
+        let real_done: Vec<&str> = rows
+            .iter()
+            .filter(|(_, done, expired, ..)| *done && !*expired)
+            .map(|(c, ..)| c.as_str())
+            .collect();
+        assert_eq!(real_done, vec!["真办完的事"], "只有真办完的才算完成,过期的不算");
+        // 过期那条确实 done 了(不再 open),只是标了 expired
+        assert!(rows.iter().any(|(c, done, expired, ..)| c == "过期的事" && *done && *expired));
     }
 }

@@ -375,7 +375,10 @@ async fn parse_chunk(
     if let Some(um) = value.get("usageMetadata") {
         let g = |k: &str| um.get(k).and_then(Value::as_u64).unwrap_or(0) as i64;
         usage.input_tokens = g("promptTokenCount");
-        usage.output_tokens = g("candidatesTokenCount");
+        // 输出 = 可见回复(candidates)+ **思考**(thoughts)。推理模型的思考 token 计在单独的
+        // `thoughtsTokenCount` 字段(2026-08-22 审计:原先只取 candidates → 漏掉思考那部分,
+        // 记账偏低、费用低估;而思考 token 是真花了钱的)。非推理模型该字段缺省 = 0,无影响。
+        usage.output_tokens = g("candidatesTokenCount") + g("thoughtsTokenCount");
         usage.cache_hit_tokens = g("cachedContentTokenCount");
     }
     Ok(())
@@ -565,5 +568,28 @@ mod tests {
         assert_eq!(calls[0].name, "now");
         assert_eq!(sigs["gm_0"], "SIG123", "签名按 call id 攒下");
         assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 3, "无 thoughts 时 = candidates(零回归)");
+    }
+
+    /// **思考 token 要计进 output(2026-08-22 审计)**:推理模型的思考计在 `thoughtsTokenCount`,
+    /// 原先只取 candidates → 记账偏低、费用低估;思考 token 是真花了钱的。
+    #[tokio::test]
+    async fn thoughts_tokens_count_toward_output() {
+        let (tx, _rx) = mpsc::channel::<ChatEvent>(4);
+        let mut usage = Usage::default();
+        let (mut finish, mut calls, mut sigs) = (None, Vec::new(), Map::new());
+        let chunk = json!({
+            "candidates": [{ "content": { "parts": [{ "text": "答" }] }, "finishReason": "STOP" }],
+            "usageMetadata": {
+                "promptTokenCount": 20,
+                "candidatesTokenCount": 5,
+                "thoughtsTokenCount": 100,
+                "cachedContentTokenCount": 8
+            }
+        });
+        parse_chunk(&chunk, &tx, &mut usage, &mut finish, &mut calls, &mut sigs).await.unwrap();
+        assert_eq!(usage.input_tokens, 20);
+        assert_eq!(usage.output_tokens, 105, "candidates 5 + thoughts 100 都要算");
+        assert_eq!(usage.cache_hit_tokens, 8);
     }
 }

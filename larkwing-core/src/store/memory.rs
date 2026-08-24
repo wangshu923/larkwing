@@ -242,12 +242,15 @@ impl MemoryRepo {
     pub fn recall(&self, user: i64, query: &str) -> Result<Vec<Memory>> {
         self.db.with(|c| {
             let now = now_ms();
-            let pat = format!("%{query}%");
+            // LIKE 通配符要转义(2026-08-22 审计):query 是模型给的,带 `%`/`_` 会放大命中 ——
+            // 而 recall **命中即 salience +1**,无关记忆被刷进高层前缀。配 SQL 里 ESCAPE '\'。
+            // (聊天搜索 search_messages 早就转义了,recall 漏了,同族补齐。)
+            let pat = format!("%{}%", super::like_escape(query));
             let hits: Vec<Memory> = {
                 let mut stmt = c.prepare(
                     "SELECT id, user_id, kind, content, resident, salience, source, last_used_at, created_at, updated_at
                      FROM memories
-                     WHERE user_id = ?1 AND (content LIKE ?2 OR kind LIKE ?2)
+                     WHERE user_id = ?1 AND (content LIKE ?2 ESCAPE '\\' OR kind LIKE ?2 ESCAPE '\\')
                      ORDER BY id ASC",
                 )?;
                 let rows = stmt
@@ -651,6 +654,23 @@ mod tests {
         let store = Store::open(&dir.join("t.db")).unwrap();
         let me = store.users.ensure_default_user().unwrap();
         (store, me.id)
+    }
+
+    /// **recall 的 LIKE 通配符要转义(2026-08-22 审计)**:query 里的 `%`/`_` 不转义会当成
+    /// SQL 通配符放大命中,而 recall **命中即 salience +1** → 无关记忆被刷进常驻前缀。
+    #[test]
+    fn recall_treats_wildcards_as_literals() {
+        let (store, me) = store("recall-like");
+        store.memory.add(me, KIND_FACT, "喜欢吃苹果", "explicit").unwrap();
+        store.memory.add(me, KIND_FACT, "喜欢打篮球", "explicit").unwrap();
+        // `%` 当字面量:库里没有含 `%` 的记忆 → 一条都不该命中(不转义的话 `%` 会匹配全部)
+        assert!(store.memory.recall(me, "%").unwrap().is_empty(), "`%` 应当字面量,不该匹配全部");
+        assert!(store.memory.recall(me, "苹%果").unwrap().is_empty(), "`苹%果` 字面不存在");
+        assert!(store.memory.recall(me, "_").unwrap().is_empty(), "`_` 应当字面量");
+        // 正常子串照常命中,且没有连带把无关那条也强化
+        let hits = store.memory.recall(me, "苹果").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].content, "喜欢吃苹果");
     }
 
     #[test]
