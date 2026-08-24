@@ -2703,9 +2703,24 @@ impl Engine {
 
         // 自启回合也带「此刻」背景(任务到点时音乐可能正放着);不落库、不破缓存
         self.inject_ambient(conv_id, &mut request);
-        let mut rx = self
+        let mut rx = match self
             .launch(conv_id, user_id, candidates, request, tool_subset, event_msg_id, None)
-            .await?;
+            .await
+        {
+            Ok(rx) => rx,
+            // 建连失败(没 key / 401 / 连不上):event 行已经落了,但回合根本没起来。调度器的 Err
+            // 分支不推进 due_at(留着重试),所以下个 tick 会再进来一次、再落一行 —— 撤掉这行,
+            // 否则「⏰ 到点了」每 30s 堆一条、还全进后续回合上下文(2026-08-22 审计)。
+            // 回合真起来后的失败(Failed 事件)不走这里,那种「到点必有动静」的系统线要留(§3.5)。
+            Err(e) => {
+                let store = self.store.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    store.chat.delete_message(conv_id, event_msg_id)
+                })
+                .await;
+                return Err(e);
+            }
+        };
 
         // 无人挂流:自己消费到收尾,记下终态,然后经全局事件车道喊一声
         // (UI 据此刷新列表;用户不在该会话时按 outcome 在列表项打标)

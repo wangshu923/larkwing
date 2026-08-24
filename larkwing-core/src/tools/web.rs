@@ -444,6 +444,7 @@ impl WebDownload {
         let name = t.filename.clone();
         let join = tokio::spawn(async move {
             let part = part_path(&dir_owned);
+            let mut part_guard = PartGuard::new(part.clone()); // abort/drop 兜底清 .part
             let outcome = async {
                 let got = crate::ftp::download_to(
                     &t,
@@ -454,6 +455,7 @@ impl WebDownload {
                 .await?;
                 let dest = crate::files::dedupe_path(&dir_owned.join(&name));
                 std::fs::rename(&part, &dest).context("落盘改名失败")?;
+                part_guard.disarm();
                 Ok::<_, anyhow::Error>((dest, got))
             }
             .await;
@@ -540,6 +542,8 @@ impl WebDownload {
         let name_owned = name.clone();
         let join = tokio::spawn(async move {
             let part = part_path(&dir_owned);
+            // abort/drop 也要清 .part(见 PartGuard):成功 rename 后 disarm。
+            let mut part_guard = PartGuard::new(part.clone());
             let report = async {
                 let resp = net
                     .send(&url_owned, |c| match cred.as_ref() {
@@ -554,6 +558,7 @@ impl WebDownload {
                         .await?;
                 let dest = crate::files::dedupe_path(&dir_owned.join(&name_owned));
                 std::fs::rename(&part, &dest).context("落盘改名失败")?;
+                part_guard.disarm(); // 已改名落位,别再删
                 // 回一个 (路径, 字节) 元组,**不要**把两者拼成一个字符串再 split ——
                 // mac/Linux 的文件名允许含 `|`,拼串会在这种路径上切错。
                 Ok::<_, anyhow::Error>((dest, got))
@@ -613,14 +618,35 @@ fn download_client(total_timeout: Option<Duration>) -> crate::net::Client {
 
 /// 临时件路径:半截下载绝不顶着正式名躺在下载夹里。
 fn part_path(dir: &std::path::Path) -> PathBuf {
+    // 进程内单调序号(subsec_nanos 在快速连发时会撞;同族坑见 lyrics 临时名),防两个 job
+    // 的 .part 撞名。
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     dir.join(format!(
         ".lw-download-{}-{}.part",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0)
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ))
+}
+
+/// 后台下载 job 的 .part 清理守卫:任务被**看门狗 abort / 回合 drop** 时,async 块在 `.await`
+/// 中途被丢弃,Err 分支的 `remove_file` 根本不执行 —— 半截 .part 就留在用户下载夹里
+/// (2026-08-22 审计)。这个 guard 在 drop 时兜底删;正常落盘后 `disarm()` 解除。
+/// (edit.rs 的 `TempGuard` 同款范式;那边给 ffmpeg 临时件,这边给下载 .part。)
+struct PartGuard(Option<PathBuf>);
+impl PartGuard {
+    fn new(p: PathBuf) -> Self {
+        PartGuard(Some(p))
+    }
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+impl Drop for PartGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 use crate::files::{default_download_dir, sanitize_filename};

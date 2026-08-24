@@ -538,11 +538,25 @@ fn write_lrc_beside(audio: &Path, content: &str) -> Result<bool> {
     }
     // 落盘前统一字形(所有写 .lrc 的路都过这儿,不会漏一条)
     let content = &to_simplified_lyrics(content);
-    let tmp = dest.with_file_name(format!(".lw-lrc-{}.tmp", std::process::id()));
+    // 临时名要**并发唯一**(2026-08-22 审计):批量配词是同进程内多个 spawn_blocking 并发跑,
+    // 只带 process::id() 的话同一目录里两首歌的临时名相同 → 互相踩(A 写的临时件被 B 覆盖/删掉,
+    // rename 出去的可能是另一首的词)。补一个进程内单调序号,且临时名带上目标 stem —— 同目录
+    // (保证与 dest 同卷、rename 原子),`.lw-lrc-` 前缀 + 隐藏,清扫也认得出。
+    static LRC_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = LRC_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stem = dest.file_stem().and_then(|s| s.to_str()).unwrap_or("x");
+    let tmp = dest.with_file_name(format!(".lw-lrc-{}-{seq}-{stem}.tmp", std::process::id()));
     std::fs::write(&tmp, content)
         .with_context(|| format!("写不进歌词临时文件 {}", tmp.display()))?;
-    std::fs::rename(&tmp, &dest).or_else(|_| {
-        std::fs::copy(&tmp, &dest).map(|_| ()).and_then(|()| std::fs::remove_file(&tmp))
+    std::fs::rename(&tmp, &dest).or_else(|e| {
+        // rename 失败(跨卷等)走 copy+删;但 copy 也失败时别把临时件留在用户目录里
+        std::fs::copy(&tmp, &dest)
+            .map(|_| ())
+            .and_then(|()| std::fs::remove_file(&tmp))
+            .map_err(|_| {
+                let _ = std::fs::remove_file(&tmp);
+                e
+            })
     })?;
     Ok(true)
 }

@@ -199,7 +199,18 @@ async fn tick_cond(
     let store = engine.store().clone();
     let qw = tokio::task::spawn_blocking(move || qweather_cfg(&store.settings)).await??;
 
-    let w = weather.report_for(&city, qw, When::Today).await?;
+    // 取天气失败**必须推进 due_at**(2026-08-22 审计):原先这里用 `?` 把错误抛回 tick,
+    // due_at 一步没动 → 下个 30s tick 同一条 job 又 due,退化成**每 30 秒打一次第三方天气 API**
+    // (断网/限流/城市解析抖动时最长打到 7 天过期为止)。改成:失败就当这次没测成,推迟到
+    // 下次常规检查(CHECK_INTERVAL_MS,与「没命中」同一节拍),别把重试压成秒级轮询。
+    let w = match weather.report_for(&city, qw, When::Today).await {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(job = job.id, city = %city, "盯天气取数失败,推迟到下次常规检查: {e:#}");
+            advance(engine, job.id, now + CHECK_INTERVAL_MS).await?;
+            return Ok(());
+        }
+    };
     let (hit, reading) = cond.evaluate(&w);
     if !hit {
         advance(engine, job.id, now + CHECK_INTERVAL_MS).await?;

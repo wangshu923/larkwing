@@ -244,6 +244,19 @@ impl ChatRepo {
     /// (user 行之后必然是整轮,assistant/tool 配对不会拆散;UI 只在用户气泡给入口,
     /// 这里再校验一道)。调用方(engine)负责先取消在飞回合——partial 落库后一并截掉,
     /// 不留僵尸行。返回删了几条。
+    /// 精确删一条消息(按 id + 会话双限,防误删别的会话)。返回是否删到。
+    /// 用途:`wake_turn` 建连失败时,把刚落的 event 行撤掉 —— 否则调度器每 30s 重试一次就
+    /// 落一行「⏰ 到点了」,2 小时能在聊天流里堆几百条并污染后续上下文(2026-08-22 审计)。
+    pub fn delete_message(&self, conv: i64, msg_id: i64) -> Result<bool> {
+        self.db.with(|c| {
+            let n = c.execute(
+                "DELETE FROM messages WHERE conversation_id = ?1 AND id = ?2",
+                rusqlite::params![conv, msg_id],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
     pub fn truncate_from(&self, conv: i64, msg_id: i64) -> Result<usize> {
         self.db.tx(|tx| {
             ensure_user_cut_point(tx, conv, msg_id)?;
@@ -688,6 +701,26 @@ mod tests {
         let ux = store.chat.append_message(conv2.id, "user", "别的会话").unwrap();
         assert!(store.chat.truncate_from(conv.id, ux.id).is_err());
         assert_eq!(store.chat.count_messages(conv2.id).unwrap(), 1); // 拒了就一根手指都不动
+    }
+
+    /// `delete_message`:精确删一条、按会话双限、不碰别的会话(wake_turn 建连失败撤 event 行用)。
+    #[test]
+    fn delete_message_removes_exactly_one_and_is_conv_scoped() {
+        let (store, user) = store("delmsg");
+        let conv = store.chat.create_conversation(user, "companion").unwrap();
+        let u1 = store.chat.append_message(conv.id, "user", "在吗").unwrap();
+        let ev = store.chat.append_message_full(conv.id, "event", "⏰ 到点了", None).unwrap();
+        // 删中间那条 event 行:删到了、只剩 u1
+        assert!(store.chat.delete_message(conv.id, ev.id).unwrap());
+        let rest = store.chat.messages_page(conv.id, 0, 100).unwrap();
+        assert_eq!(rest.iter().map(|m| m.id).collect::<Vec<_>>(), vec![u1.id]);
+        // 重复删同一条 = 删不到(幂等,返回 false 不报错)
+        assert!(!store.chat.delete_message(conv.id, ev.id).unwrap());
+        // 会话双限:拿别的会话 id 来删,一根手指都不动
+        let conv2 = store.chat.create_conversation(user, "companion").unwrap();
+        let x = store.chat.append_message(conv2.id, "user", "别动我").unwrap();
+        assert!(!store.chat.delete_message(conv.id, x.id).unwrap());
+        assert_eq!(store.chat.count_messages(conv2.id).unwrap(), 1);
     }
 
     #[test]

@@ -34,12 +34,62 @@ pub enum ZipOutcome {
     Background { title: String },
 }
 
-/// 看门狗/panic 把守望任务掀了 → 把取消旗递给阻塞线程(它见旗自清半成品)。
-struct CancelOnDrop(Arc<engine::Progress>);
+/// 看门狗/panic 把守望任务掀了、**或回合内 30s 窗被取消**(2026-08-22 审计)→ 把取消旗
+/// 递给阻塞线程(它见旗自清半成品),并兜底删临时件。
+///
+/// 为什么两件都做:阻塞线程(spawn_blocking)一旦启动就**不能被 abort**,只能靠 `cancel` 旗
+/// 协作退出;但外层 future 被 drop 时——
+///   · 阻塞线程还在跑 → 设旗,`create_zip` 见旗 `broken` 自删 tmp;
+///   · 阻塞线程恰好已成功完成(tmp 是完整整包)、只是外层还没 place → 没人删 → **整包大小的
+///     .lw-zip-*.tmp 永久留在用户目录**。所以 guard 再兜底删一次(此时线程已不写,安全)。
+/// 正常落盘 / 转后台后 `disarm()` 交出所有权,别误删成品或后台还在用的 tmp。
+struct CancelOnDrop {
+    prog: Arc<engine::Progress>,
+    tmp: Option<PathBuf>,
+}
+
+impl CancelOnDrop {
+    fn new(prog: Arc<engine::Progress>, tmp: PathBuf) -> Self {
+        CancelOnDrop { prog, tmp: Some(tmp) }
+    }
+    /// 只设旗、不管 tmp(后台守望用:tmp 的清理归后台自己的落盘/失败分支)。
+    fn flag_only(prog: Arc<engine::Progress>) -> Self {
+        CancelOnDrop { prog, tmp: None }
+    }
+    fn disarm(&mut self) {
+        self.tmp = None;
+    }
+}
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
-        self.0.cancel.store(true, Ordering::Relaxed);
+        self.prog.cancel.store(true, Ordering::Relaxed);
+        if let Some(p) = self.tmp.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// extract 侧的回合内 guard(zip 的 `CancelOnDrop` 删单文件,这个删整目录):解压半成品是
+/// 整个新目录,回合内被取消时同样要兜(设旗让阻塞线程见旗自删 + 兜底整删)。
+struct DirCancelOnDrop {
+    prog: Arc<engine::Progress>,
+    dir: Option<PathBuf>,
+}
+impl DirCancelOnDrop {
+    fn new(prog: Arc<engine::Progress>, dir: PathBuf) -> Self {
+        DirCancelOnDrop { prog, dir: Some(dir) }
+    }
+    fn disarm(&mut self) {
+        self.dir = None;
+    }
+}
+impl Drop for DirCancelOnDrop {
+    fn drop(&mut self) {
+        self.prog.cancel.store(true, Ordering::Relaxed);
+        if let Some(d) = self.dir.take() {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 }
 
@@ -95,14 +145,20 @@ impl MediaRuntime {
         });
 
         // —— 回合内窗:解完当场回;没解完转后台 ——
+        // 同 zip:回合内 30s 被取消时,阻塞线程照跑到底、把整个目标目录解满,没人删(2026-08-22)。
+        // guard 设 cancel 旗(线程见旗自删目录)+ 兜底整删目录(线程已完成时的残留;目标恒为
+        // 全新目录,整删安全)。成功/转后台 disarm。
+        let mut turn_guard = DirCancelOnDrop::new(prog.clone(), dest.clone());
         tokio::select! {
             res = &mut work => {
                 let rep = res.context("解压任务挂了")??;
                 anyhow::ensure!(!rep.cancelled, "解压被取消了");
+                turn_guard.disarm();
                 return Ok(ExtractOutcome::Done(rep, dest));
             }
             _ = tokio::time::sleep(IN_TURN_WAIT) => {}
         }
+        turn_guard.disarm(); // 转后台:目录清理归后台守望的落盘/失败分支
 
         let name = dest
             .file_name()
@@ -124,7 +180,7 @@ impl MediaRuntime {
         let (bg_name, dest_disp) = (name.clone(), dest.display().to_string());
         let watch_prog = prog.clone();
         let join = tokio::spawn(async move {
-            let _guard = CancelOnDrop(watch_prog.clone());
+            let _guard = CancelOnDrop::flag_only(watch_prog.clone());
             let mut last = 0usize;
             loop {
                 tokio::select! {
@@ -228,15 +284,21 @@ impl MediaRuntime {
             r
         });
 
+        // 回合内 30s 窗被取消(用户点停/新 send 抢占)→ 外层 future 被 drop,而 spawn_blocking
+        // 线程不能 abort、会照跑到底写完整包 tmp,没人 place 也没人删(2026-08-22 审计)。
+        // guard:drop 时设 cancel 旗(让还在跑的线程见旗自删)+ 兜底删 tmp(线程已完成时的残留)。
+        let mut turn_guard = CancelOnDrop::new(prog.clone(), tmp.clone());
         tokio::select! {
             res = &mut work => {
                 let rep = res.context("打包任务挂了")??;
                 anyhow::ensure!(!rep.cancelled, "打包被取消了");
                 let (path, bytes) = place_zip(&tmp, &dest)?;
+                turn_guard.disarm(); // 成品已落位
                 return Ok(ZipOutcome::Done { path, files: rep.files, bytes, note: plan_note });
             }
             _ = tokio::time::sleep(IN_TURN_WAIT) => {}
         }
+        turn_guard.disarm(); // 转后台:tmp 的所有权交给下面的后台守望
 
         let name = dest
             .file_name()
@@ -258,7 +320,7 @@ impl MediaRuntime {
         let (bg_name, bg_tmp, bg_dest) = (name.clone(), tmp.clone(), dest.clone());
         let watch_prog = prog.clone();
         let join = tokio::spawn(async move {
-            let _guard = CancelOnDrop(watch_prog.clone());
+            let _guard = CancelOnDrop::flag_only(watch_prog.clone());
             let mut last = 0usize;
             loop {
                 tokio::select! {
