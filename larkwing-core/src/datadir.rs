@@ -254,7 +254,25 @@ pub fn perform_move(current_root: &Path, plan: &MovePlan, task: &TaskHandle) -> 
         }
     }
 
-    // 3) 原子就位(同卷 rename)。new_root 应不存在(预检保证非空才拦);稳妥起见空壳先删。
+    // 3) 补漏:把「拷贝那几分钟里新写进来的」再收一遍。
+    // ⚠️ **必须有这一步(2026-08-22 修)**:大媒体树拷起来动辄几分钟,而 app 全程还活着 ——
+    // 这期间新收到的附件 / 收件区文件会落进**旧根**里那个已经拷过的目录,而 DB 快照又是最后
+    // 才出的(比文件树新)→ 新库里记着某个附件、可它的实体从没被拷过去;用户之后选「删除
+    // 旧数据」,那些文件就真没了。顺序也因此重要:**先出 DB 快照、再补文件**,这样
+    // 「文件集合 ⊇ 快照里引用到的一切」;补完之后才写进来的那些是孤儿文件,无害(与恢复
+    // 克隆音色时「多出来的留着,孤儿无害」同一条口径)。
+    // 补漏只看「目标缺了 / 大小不一样」—— 绝大多数文件原样跳过,所以这一趟是秒级的,
+    // 真正的窗口从「几分钟」缩到「几秒」。彻底关掉得让引擎停写(那是另一档改动)。
+    task.step("step.relocate_copy", serde_json::Value::Null);
+    for entry in std::fs::read_dir(current_root)?.flatten() {
+        let name = entry.file_name();
+        if is_skip(&name) {
+            continue;
+        }
+        copy_delta(&entry.path(), &plan.staging.join(&name))?;
+    }
+
+    // 4) 原子就位(同卷 rename)。new_root 应不存在(预检保证非空才拦);稳妥起见空壳先删。
     task.step("step.relocate_commit", serde_json::Value::Null);
     if plan.new_root.exists() {
         std::fs::remove_dir(&plan.new_root).ok(); // 仅删空目录;非空预检已拦
@@ -333,6 +351,29 @@ fn copy_recursive(
         }
     }
     // symlink 等忽略(数据目录里不该有)。
+    Ok(())
+}
+
+/// 补漏拷:只补「目标缺了 / 大小对不上」的,其余原样跳过(所以整趟是秒级的)。
+/// 拷贝期间新写进来的附件、收件区文件靠它兜住(见 `perform_move` 第 3 步)。
+/// 尽力件:单个文件补不过去只当没补(它多半正被写着),不砸掉整次搬家。
+fn copy_delta(from: &Path, to: &Path) -> Result<()> {
+    let Ok(md) = std::fs::symlink_metadata(from) else { return Ok(()) };
+    let ft = md.file_type();
+    if ft.is_dir() {
+        std::fs::create_dir_all(to)?;
+        for e in std::fs::read_dir(from)?.flatten() {
+            copy_delta(&e.path(), &to.join(e.file_name()))?;
+        }
+    } else if ft.is_file() {
+        let same = std::fs::metadata(to).is_ok_and(|d| d.len() == md.len());
+        if !same {
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let _ = std::fs::copy(from, to);
+        }
+    }
     Ok(())
 }
 
@@ -854,6 +895,52 @@ mod tests {
         let c = rusqlite::Connection::open(new_root.join(DB_FILE)).unwrap();
         let n: i64 = c.query_row("SELECT count(*) FROM t", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 2);
+    }
+
+    /// **拷贝期间新写进来的文件不能丢(2026-08-22)**:大媒体树拷几分钟,app 全程活着 ——
+    /// 新收到的附件/收件区文件会落进旧根里**已经拷过的**目录,而 DB 快照最后才出(比文件树
+    /// 新)→ 新库记着某个附件、实体却没跟过去;用户之后选「删除旧数据」就真没了。
+    /// 这里直接模拟那一幕:先跑一遍搬家(等价于「拷完了」),往源目录里塞新文件,再跑一遍 ——
+    /// 补漏那一步必须把它们带上。
+    #[test]
+    fn perform_move_delta_pass_picks_up_files_written_during_the_copy() {
+        let base = tmp("move-delta");
+        let current = base.join("data");
+        std::fs::create_dir_all(current.join("media/attachments")).unwrap();
+        std::fs::write(current.join("media/attachments/老图.jpg"), vec![1u8; 512]).unwrap();
+        {
+            let c = rusqlite::Connection::open(current.join(DB_FILE)).unwrap();
+            c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);").unwrap();
+        }
+        let picked = base.join("dest");
+        std::fs::create_dir_all(&picked).unwrap();
+
+        // 第一趟:等价于「批量拷贝已经把 media/ 拷过去了」
+        let plan = precheck(&current, &picked).unwrap();
+        let task = a_task();
+        perform_move(&current, &plan, &task).unwrap();
+        task.done();
+        let new_root = picked.join(DATA_DIR_NAME);
+        assert!(new_root.join("media/attachments/老图.jpg").is_file());
+        std::fs::remove_dir_all(&new_root).unwrap(); // 清掉,准备重来
+
+        // 拷贝窗口里新到的:一张新附件 + 一个收件区文件 + 旧文件被改大
+        std::fs::create_dir_all(current.join("media/inbox")).unwrap();
+        std::fs::write(current.join("media/attachments/刚收到的.jpg"), vec![2u8; 256]).unwrap();
+        std::fs::write(current.join("media/inbox/发票.pdf"), vec![3u8; 128]).unwrap();
+        std::fs::write(current.join("media/attachments/老图.jpg"), vec![1u8; 1024]).unwrap();
+
+        let plan = precheck(&current, &picked).unwrap();
+        let task = a_task();
+        perform_move(&current, &plan, &task).unwrap();
+        task.done();
+        assert!(new_root.join("media/attachments/刚收到的.jpg").is_file(), "新附件要跟过去");
+        assert!(new_root.join("media/inbox/发票.pdf").is_file(), "收件区新文件要跟过去");
+        assert_eq!(
+            std::fs::metadata(new_root.join("media/attachments/老图.jpg")).unwrap().len(),
+            1024,
+            "改大了的文件要拿最新的那份"
+        );
     }
 
     #[test]

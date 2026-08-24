@@ -1088,7 +1088,22 @@ impl Engine {
         use crate::crypto::{generate_keypair, KEY_ED25519_PRIVATE, KEY_ED25519_PUBLIC};
         if let Some(pubkey) = self.store.settings.get(None, KEY_ED25519_PUBLIC)? {
             if !pubkey.trim().is_empty() {
-                return Ok(pubkey);
+                // ⚠️ **只看公钥就早退是不够的(2026-08-22 修)**:公钥住 settings(在库里,
+                // **备份带得走**),私钥住系统密钥串(**备份带不走**,§6.2 已记档)。于是
+                // 「换台机器从备份恢复」之后,库里有公钥、密钥串里没有私钥 —— 这里直接早退,
+                // 密钥对就**永久错配**:签 JWT 时拿不到私钥,和风天气这类服务一路静默降级,
+                // 用户只觉得「天气怎么不准了」,日志里连句话都没有(§3.5)。
+                // 私钥真的在,才算这对是完好的;不在就往下走、重新生成一对。
+                let has_private = crate::secrets::get(&self.store.settings, KEY_ED25519_PRIVATE)
+                    .is_some_and(|p| !p.trim().is_empty());
+                if has_private {
+                    return Ok(pubkey);
+                }
+                tracing::warn!(
+                    "应用密钥对不完整(库里有公钥、系统密钥串里没有私钥)——多半是把备份恢复到了\
+                     另一台机器。重新生成一对;之前把公钥登记到外部服务(如和风天气)的话,\
+                     要拿设置·服务页上的新公钥再登记一次。"
+                );
             }
         }
         let (private_pem, public_pem) = generate_keypair().map_err(|e| AppError {
@@ -3221,6 +3236,36 @@ mod tests {
         let _ = std::fs::remove_file(dir.join("t.db"));
         let store = Store::open(&dir.join("t.db")).unwrap();
         Engine::new(store, crate::scenes::Scenes::builtin())
+    }
+
+    /// **公钥在库里、私钥在密钥串里 → 换机恢复后不能装作没事(2026-08-22 审计)**。
+    ///
+    /// 备份带得走库(公钥),带不走系统密钥串(私钥)。原先只查公钥在不在就早退,于是
+    /// 恢复到另一台机器后密钥对**永久错配**:签 JWT 拿不到私钥,和风天气这类服务一路
+    /// 静默降级,用户只觉得「天气怎么不准了」。现在要求两半都在,缺一半就重新生成一对。
+    #[test]
+    fn keypair_regenerates_when_only_the_public_half_survived_a_restore() {
+        use crate::crypto::{KEY_ED25519_PRIVATE, KEY_ED25519_PUBLIC};
+        let eng = engine("keypair");
+        let first = eng.ensure_app_keypair().unwrap();
+        assert!(!first.trim().is_empty());
+        // 幂等:两半都在时不该乱换钥匙(用户可能已经把公钥登记到外部服务了)
+        assert_eq!(eng.ensure_app_keypair().unwrap(), first, "都在就别动");
+
+        // 模拟「换台机器从备份恢复」:库(公钥)跟过来了,密钥串(私钥)没有
+        crate::secrets::delete(&eng.store().settings, KEY_ED25519_PRIVATE);
+        assert_eq!(
+            eng.store().settings.get(None, KEY_ED25519_PUBLIC).unwrap().as_deref(),
+            Some(first.as_str()),
+            "公钥还在(它就住在库里)"
+        );
+        let second = eng.ensure_app_keypair().unwrap();
+        assert_ne!(second, first, "私钥没了就得重新生成一对,不能继续用配不上的那把");
+        assert!(
+            crate::secrets::get(&eng.store().settings, KEY_ED25519_PRIVATE)
+                .is_some_and(|p| !p.trim().is_empty()),
+            "新的私钥要落下来"
+        );
     }
 
     /// **删家人要清干净所有按 user_id 归属的表(2026-08-22 审计)**。
