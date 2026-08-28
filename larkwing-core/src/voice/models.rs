@@ -64,58 +64,81 @@ pub const ASR_SENSE_VOICE: ModelSpec = ModelSpec {
     ],
 };
 
-/// 可选 ASR:小红书 FireRedASR2-CTC int8(单文件 ~740MB)。CTC 在 CPU 上快(RTF~0.17)。
+/// 可选 ASR:小红书 FireRedASR2-CTC int8(model.int8.onnx ~740MB)。CTC 在 CPU 上快(RTF~0.17)。
 /// **大陆原生、简体输出、普通话 SOTA**(FireRedASR 论文:比 Whisper-Large-v3 / SenseVoice-L 强
 /// 29–68% CERR;19 个口音/方言基准 11.55% CER),口音/非标准发音最稳 = 现有对「听不清 / 小孩」
 /// 最好的代理(真根治需儿童语料微调,本期不做)。2026-06 起作「更准·听不清选这个」档,**取代原
 /// Whisper 三档**(Whisper 中文偏繁体 + 自回归慢 + 普通话弱于 FireRed,经研究证伪「中文小孩→Whisper」)。
-/// 备用源 = GitHub release 同名 .tar.bz2(已验)。
-pub const ASR_FIRERED_CTC: ModelSpec = ModelSpec {
+///
+/// **源 = GitHub release 整包(2026-08-28 换)**:原 hf-mirror/huggingface 裸文件源已双死 ——
+/// 上游 HF 仓库转 gated,resolve 直链回 401(hf-mirror 又 308 跳回 huggingface,同一个 401),
+/// 这是 HTTP 拒绝不是连通性问题,**代理救不了**(真机实锤「开了代理也下载不下来」)。gh release
+/// 同名 .tar.bz2 仍活(2026-08-28 验:包顶层目录下确有 model.int8.onnx 775,861,420 字节),
+/// 且 github 直链走 gh 镜像展开(ghproxy/ghfast/直连),国内比 HF 更稳。
+pub const ASR_FIRERED_CTC: TarModelSpec = TarModelSpec {
     id: "fire-red-asr2-ctc-2026-02-25",
     label_key: "task.download.voice_asr",
-    files: &[
-        ModelFile {
-            name: "model.int8.onnx",
-            urls: &[
-                "https://hf-mirror.com/csukuangfj/sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25/resolve/main/model.int8.onnx",
-                "https://huggingface.co/csukuangfj/sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25/resolve/main/model.int8.onnx",
-            ],
-            sha256: None,
-        },
-        ModelFile {
-            name: "tokens.txt",
-            urls: &[
-                "https://hf-mirror.com/csukuangfj/sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25/resolve/main/tokens.txt",
-                "https://huggingface.co/csukuangfj/sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25/resolve/main/tokens.txt",
-            ],
-            sha256: None,
-        },
-    ],
+    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25.tar.bz2",
+    files: &["model.int8.onnx", "tokens.txt"],
+};
+
+/// 可选 ASR:Fun-ASR-Nano(阿里 FunAudioLLM 2025-12 新一代,SenseVoice 兼容导出,tar ~179MB /
+/// 落盘 ~264MB)。特长 = **远场/高噪声优化 + 7 大方言 26 地区口音 + 音乐背景下认歌词**(官方
+/// README-nano),正对家庭客厅远距离喊话场景。加载零新架构:sherpa `scripts/sense-voice/
+/// export_onnx_nano.py` 给 onnx 打了 `model_type=sense_voice_ctc`,1.13.2 的
+/// offline-sense-voice-model.cc 按 comment 含 "Nano" 走 nano 分支(2026-08-28 源码核实)→
+/// 复用 sense_voice 构造。源 = gh release(镜像展开;上游 HF 仓 FunAudioLLM/Fun-ASR-Nano-2512
+/// 是原始 PyTorch 权重、非 onnx,不作候选源)。
+pub const ASR_FUNASR_NANO: TarModelSpec = TarModelSpec {
+    id: "sense-voice-funasr-nano-int8-2025-12-17",
+    label_key: "task.download.voice_asr",
+    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17.tar.bz2",
+    files: &["model.int8.onnx", "tokens.txt"],
+};
+
+/// 可选 ASR:阿里 Paraformer-zh int8(FunASR 老牌非流式中文,2025-10-07 版,tar ~218MB)。
+/// 普通话扎实、久经考验;与 SenseVoice/FireRed **不同架构、不同上游血统** —— 这档存在的意义
+/// 一半是备胎冗余(2026-08-28 FireRed HF 源 gated 实锤后,用户拍板「多备几个候选,免得单一
+/// 模型源挂了没得选」),一半是「别的档听不准时换个路子试」。
+pub const ASR_PARAFORMER_ZH: TarModelSpec = TarModelSpec {
+    id: "paraformer-zh-int8-2025-10-07",
+    label_key: "task.download.voice_asr",
+    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-paraformer-zh-int8-2025-10-07.tar.bz2",
+    files: &["model.int8.onnx", "tokens.txt"],
 };
 
 /// 选中的中文 ASR 档(setting `voice.asr.model`,app 级)。默认 SenseVoice(快);加新档 =
-/// 这里加一支 + 一个 `ModelSpec` + `asr.rs` 一个构造分支(架构不同),`X = 数据`(AGENT §1)。
+/// 这里加一支 + 一个 spec + `asr.rs` 一个构造分支(架构不同才要),`X = 数据`(AGENT §1)。
+/// 2026-08-28 由 2 档扩 4 档(用户拍板「多备几个候选,免得单一模型源挂了没得选」):
+/// 四档横跨 3 个架构家族、SenseVoice 走 HF 其余走 gh release —— 源与架构都不同才是真冗余。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AsrModel {
     SenseVoice,
     FireRedCtc,
+    FunAsrNano,
+    ParaformerZh,
 }
 
 impl AsrModel {
-    /// setting 值 → 档(空 / 未知一律回落默认 SenseVoice;值是契约,与前端/engine 校验同源)。
-    /// 旧的 whisper-* 值(已下线)→ 落默认,老用户无感。
+    /// setting 值 → 档(空 / 未知一律回落默认 SenseVoice;值是契约,与前端 option /
+    /// engine `set_setting` 校验同源)。旧的 whisper-* 值(已下线)→ 落默认,老用户无感。
     pub fn from_setting(s: &str) -> AsrModel {
         match s {
             "firered-ctc" => AsrModel::FireRedCtc,
+            "funasr-nano" => AsrModel::FunAsrNano,
+            "paraformer" => AsrModel::ParaformerZh,
             _ => AsrModel::SenseVoice,
         }
     }
 
-    /// 对应的下载规格(就绪检查 / 用时下载都认它)。
-    pub fn spec(self) -> &'static ModelSpec {
+    /// 落盘目录名(各档规格不同型——SenseVoice 裸文件、其余整包,故不给统一 spec();
+    /// 就绪/下载走 `VoiceModels::is_asr_ready` / `ensure_asr` 按档派发)。
+    pub fn id(self) -> &'static str {
         match self {
-            AsrModel::SenseVoice => &ASR_SENSE_VOICE,
-            AsrModel::FireRedCtc => &ASR_FIRERED_CTC,
+            AsrModel::SenseVoice => ASR_SENSE_VOICE.id,
+            AsrModel::FireRedCtc => ASR_FIRERED_CTC.id,
+            AsrModel::FunAsrNano => ASR_FUNASR_NANO.id,
+            AsrModel::ParaformerZh => ASR_PARAFORMER_ZH.id,
         }
     }
 }
@@ -291,6 +314,27 @@ impl VoiceModels {
     /// 不触发下载的就绪检查(设置页状态行用)。
     pub fn is_ready(&self, spec: &ModelSpec) -> bool {
         self.all_present(spec, &self.dir.join(spec.id))
+    }
+
+    /// 选中 ASR 档就绪 + 用时下载:各档规格不同型(SenseVoice 裸文件 / 其余 gh release 整包,
+    /// FireRed 2026-08-28 HF 源 gated 后换),按档派发到对应 ensure;调用点(ensure_engines /
+    /// asr_ready / 标定)一律走这两个口,别再各自摸 spec。
+    pub fn is_asr_ready(&self, model: AsrModel) -> bool {
+        match model {
+            AsrModel::SenseVoice => self.is_ready(&ASR_SENSE_VOICE),
+            AsrModel::FireRedCtc => self.is_tar_ready(&ASR_FIRERED_CTC),
+            AsrModel::FunAsrNano => self.is_tar_ready(&ASR_FUNASR_NANO),
+            AsrModel::ParaformerZh => self.is_tar_ready(&ASR_PARAFORMER_ZH),
+        }
+    }
+
+    pub async fn ensure_asr(&self, model: AsrModel, mirrors: &[String]) -> Result<PathBuf> {
+        match model {
+            AsrModel::SenseVoice => self.ensure(&ASR_SENSE_VOICE, mirrors).await,
+            AsrModel::FireRedCtc => self.ensure_tar(&ASR_FIRERED_CTC, mirrors).await,
+            AsrModel::FunAsrNano => self.ensure_tar(&ASR_FUNASR_NANO, mirrors).await,
+            AsrModel::ParaformerZh => self.ensure_tar(&ASR_PARAFORMER_ZH, mirrors).await,
+        }
     }
 
     pub fn is_tar_ready(&self, spec: &TarModelSpec) -> bool {
@@ -632,19 +676,30 @@ mod tests {
 
     #[test]
     fn specs_have_files_and_sources() {
-        for spec in [&SILERO_VAD, &ASR_SENSE_VOICE, &ASR_FIRERED_CTC] {
+        for spec in [&SILERO_VAD, &ASR_SENSE_VOICE] {
             assert!(!spec.files.is_empty());
             for f in spec.files {
                 assert!(!f.urls.is_empty(), "{}/{} 没有下载源", spec.id, f.name);
             }
         }
-        // 两档 ASR 与 from_setting 的值一一对应(契约同步:前端 option / engine 校验同此二值)。
-        assert_eq!(AsrModel::from_setting("sense-voice").spec().id, ASR_SENSE_VOICE.id);
-        assert_eq!(AsrModel::from_setting("firered-ctc").spec().id, ASR_FIRERED_CTC.id);
-        assert_eq!(AsrModel::from_setting("").spec().id, ASR_SENSE_VOICE.id, "空=默认");
-        assert_eq!(AsrModel::from_setting("bogus").spec().id, ASR_SENSE_VOICE.id, "未知=默认");
+        // 整包档:源必须是 github 直链(gh 镜像展开靠这个前缀;FireRed 的 HF 源已 gated 401)。
+        for spec in [&ASR_FIRERED_CTC, &ASR_FUNASR_NANO, &ASR_PARAFORMER_ZH] {
+            assert!(
+                spec.url.starts_with("https://github.com/"),
+                "{} 必须走 gh release(镜像展开前提)",
+                spec.id
+            );
+            assert!(!spec.files.is_empty(), "{} 抽取清单不能为空", spec.id);
+        }
+        // 四档 ASR 与 from_setting 的值一一对应(契约同步:前端 option / engine 校验同此四值)。
+        assert_eq!(AsrModel::from_setting("sense-voice").id(), ASR_SENSE_VOICE.id);
+        assert_eq!(AsrModel::from_setting("firered-ctc").id(), ASR_FIRERED_CTC.id);
+        assert_eq!(AsrModel::from_setting("funasr-nano").id(), ASR_FUNASR_NANO.id);
+        assert_eq!(AsrModel::from_setting("paraformer").id(), ASR_PARAFORMER_ZH.id);
+        assert_eq!(AsrModel::from_setting("").id(), ASR_SENSE_VOICE.id, "空=默认");
+        assert_eq!(AsrModel::from_setting("bogus").id(), ASR_SENSE_VOICE.id, "未知=默认");
         // 旧 whisper-* 值已下线 → 回落默认(老用户无感)。
-        assert_eq!(AsrModel::from_setting("whisper-small").spec().id, ASR_SENSE_VOICE.id);
+        assert_eq!(AsrModel::from_setting("whisper-small").id(), ASR_SENSE_VOICE.id);
     }
 
     #[test]

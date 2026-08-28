@@ -964,15 +964,18 @@ pub fn media_retry(
 
 /// 失败下载「重试」(PLAN §10):重下一个组件(yt-dlp/ffmpeg…),直连不绕 LLM。
 /// 把「下载」这类 job 也纳入失败可重试(原仅影音);重下自带 HUD 任务(成功 done / 再败再冒重试卡)。
+/// **必须 async**:同步命令跑在 IPC/UI 线程、无 tokio 上下文,而 retry_component 内部是裸
+/// `tokio::spawn` → 同步命令里调必 panic 崩进程(2026-08-28 真机实锤「点重试 100% 崩」的根因,
+/// retry_voice_model 同病);async 命令由 tauri 派发到其 tokio runtime 上,上下文才在。
 #[tauri::command]
-pub fn retry_download(state: State<'_, AppState>, component: String) -> Result<(), AppError> {
+pub async fn retry_download(state: State<'_, AppState>, component: String) -> Result<(), AppError> {
     state.media.retry_component(&component);
     Ok(())
 }
 
-/// 失败语音模型下载「重试」(v0.2.4 补齐三型语音模型;同上直连哲学)。
+/// 失败语音模型下载「重试」(v0.2.4 补齐三型语音模型;同上直连哲学 + 同上必须 async)。
 #[tauri::command]
-pub fn retry_voice_model(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
+pub async fn retry_voice_model(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
     state.voice.retry_model(&id);
     Ok(())
 }

@@ -1228,11 +1228,12 @@ impl Engine {
                 Ok(())
             }
             // 中文 ASR 模型档(app 级,机器属性,2026-06 用户要求放出来选,AGENT §7.5):
-            // sense-voice(快,默认)/ firered-ctc(更准·听不清/孩子选这个;大陆原生简体、普通话
-            // SOTA,~740MB)。模型用时下载;开着唤醒时前端会重启循环让新模型生效(同 sensitivity)。
-            // 漏了这条 → 写被白名单拒 → 前端乐观写回滚。(原 whisper-* 三档已移除,见 asr.rs。)
+            // sense-voice(快,默认)/ firered-ctc(最准·口音/孩子,~740MB)/ funasr-nano(远场
+            // 高噪/方言,~264MB)/ paraformer(老牌备胎,~230MB)——2026-08-28 扩 4 档,值与
+            // models.rs::AsrModel::from_setting 同源。模型用时下载;开着唤醒时前端会重启循环让
+            // 新模型生效(同 sensitivity)。漏了这条 → 写被白名单拒 → 前端乐观写回滚。
             "voice.asr.model" => {
-                if !["sense-voice", "firered-ctc"].contains(&value) {
+                if !["sense-voice", "firered-ctc", "funasr-nano", "paraformer"].contains(&value) {
                     return Err(invalid("未知的识别模型档"));
                 }
                 self.store.settings.set(None, key, value)?;

@@ -217,17 +217,20 @@ function onNightTime(key: string, ev: Event) {
   refreshAudioMode()
 }
 
-// 识别模型档(sense-voice 默认 / firered-ctc 更准):写库 → 开着唤醒就重启循环让新模型生效
+// 识别模型档(四档,见 asrOpts):写库 → 开着唤醒就重启循环让新模型生效
 // (同 sensitivity;新模型首次会用时下载)→ 刷状态行(组件就绪反映的是当前选中的模型)。
 async function onAsrModel(v: string) {
   await settings.set('voice.asr.model', v)
   await restartWakeIfRunning()
   if (isTauri()) voiceInfo.value = await api.voiceStatus().catch(() => voiceInfo.value)
 }
-/** 识别模型下拉项(SkinSelect;两档,文案随 locale)。 */
+/** 识别模型下拉项(SkinSelect;四档 = 名字 + 一句话特点,文案随 locale;
+ *  值与 Rust from_setting / set_setting 白名单同源,2026-08-28 扩 4 档)。 */
 const asrOpts = computed(() => [
-  { value: 'sense-voice', label: t('settings.voice.asr_standard') },
-  { value: 'firered-ctc', label: t('settings.voice.asr_accurate') },
+  { value: 'sense-voice', label: t('settings.voice.asr_sense') },
+  { value: 'firered-ctc', label: t('settings.voice.asr_firered') },
+  { value: 'funasr-nano', label: t('settings.voice.asr_nano') },
+  { value: 'paraformer', label: t('settings.voice.asr_paraformer') },
 ])
 /** 麦克风下拉项(默认 + 设备列表)。 */
 // 麦克风双列表(采集双源,2026-07-06 收尾):browser 源(默认)= enumerateDevices 的
@@ -1804,8 +1807,9 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             >{{ t(`settings.voice.tts_${b}`) }}</button>
           </span>
         </div>
-        <!-- 识别模型(2026-06 用户要求放出来选):默认 SenseVoice 快;Whisper 对小孩/口音更稳;
-             FireRed 中文最准。模型用时下载;换档后开着唤醒会重启循环让新模型生效(同 sensitivity) -->
+        <!-- 识别模型(2026-06 放出来选;2026-08-28 扩 4 档防单一下载源挂掉):SenseVoice 快(默认)/
+             FireRed 最准 / Fun-ASR Nano 远场抗噪方言 / Paraformer 老牌备胎。
+             模型用时下载;换档后开着唤醒会重启循环让新模型生效(同 sensitivity) -->
         <div class="row">
           <span class="label">{{ t('settings.voice.asrModel') }}</span>
           <SkinSelect

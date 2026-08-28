@@ -793,11 +793,14 @@ export default {
       ttsBackend: 'Voice source',
       tts_online: 'Online',
       tts_offline: 'Offline',
-      // recognition model (exposed 2026-06): SenseVoice fast by default; Whisper steadier on kids/accents; FireRed sharpest Chinese
+      // recognition model (exposed 2026-06; 4 tiers since 2026-08-28 — extra candidates so one dead download source never strands you):
+      // dropdown = name + one-line traits, values mirror Rust from_setting/set_setting
       asrModel: 'Recognition model',
-      asr_standard: 'Standard · fast (default)',
-      asr_accurate: 'More accurate · for kids / unclear speech (~740MB)',
-      asrModelHint: 'If speech is hard to catch — a strong local accent, or a young child — pick “More accurate.” It’s currently the steadiest option for Mandarin and regional accents (tuned for Simplified Chinese); the trade-off is a larger model and a bit slower. Switching downloads it on first use; recognition stays fully on this machine.',
+      asr_sense: 'SenseVoice · fast, default',
+      asr_firered: 'FireRedASR · sharpest, accents & kids',
+      asr_nano: 'Fun-ASR Nano · far mics, noisy rooms',
+      asr_paraformer: 'Paraformer · classic, reliable fallback',
+      asrModelHint: 'If one model mishears, try another: FireRedASR is the steadiest for Mandarin and regional accents (larger, a bit slower); Fun-ASR Nano is the new generation — far mics, noisy rooms and dialects are its thing; Paraformer is the dependable classic. Switching downloads the model on first use; recognition stays fully on this machine.',
       component: 'Voice components',
       compReady: 'Ready',
       compMissing: 'Not downloaded · prepared automatically on first use',

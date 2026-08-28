@@ -790,11 +790,14 @@ export default {
       ttsBackend: '嗓音来源',
       tts_online: '在线',
       tts_offline: '离线',
-      // 识别模型档(2026-06 放出来选):默认 SenseVoice 快;Whisper 对小孩/口音更稳;FireRed 中文最准
+      // 识别模型档(2026-06 放出来选;2026-08-28 扩 4 档,多备候选防单一下载源挂掉):
+      // 下拉 = 名字 + 一句话特点(用户拍板「简短点」),值与 Rust from_setting/set_setting 同源
       asrModel: '识别模型',
-      asr_standard: '标准 · 快(默认)',
-      asr_accurate: '更准 · 听不清/孩子选这个(约 740MB)',
-      asrModelHint: '听不清、家里口音重、或小朋友说话时,选「更准」多半会好些——它是目前对普通话和各地口音最稳的一档(简体中文专门优化),代价是模型大一点、稍慢。换了之后第一次用会自动下载,识别全程只在本机。',
+      asr_sense: 'SenseVoice · 快,开箱即用(默认)',
+      asr_firered: 'FireRedASR · 最准,懂口音和孩子',
+      asr_nano: 'Fun-ASR Nano · 远了吵了也听得清',
+      asr_paraformer: 'Paraformer · 老牌扎实,备用之选',
+      asrModelHint: '哪个听不准就换一档试试:FireRedASR 对普通话和各地口音最稳(模型大、稍慢);Fun-ASR Nano 是新一代,离麦远、背景吵、说方言都扛造;Paraformer 老牌可靠。换档后第一次用会自动下载,识别全程只在本机。',
       component: '语音组件',
       compReady: '已就绪',
       compMissing: '未下载 · 首次使用时自动准备',

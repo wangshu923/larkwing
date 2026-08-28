@@ -840,7 +840,7 @@ impl VoiceRuntime {
             self.inner.models.ensure(&models::SILERO_VAD, &mirrors).await?.join("silero_vad.onnx");
         // ASR 只用于"确认这段确实是唤醒词"——已下好才用(顺手把样本质量把一道关);
         // 没下好就跳过这道关(靠 KWS 扫描天然容错:听岔的样本不命中 = 自动降权),不拖慢首次标定。
-        let asr: Option<Arc<SherpaAsr>> = if self.inner.models.is_ready(self.asr_model().spec()) {
+        let asr: Option<Arc<SherpaAsr>> = if self.inner.models.is_asr_ready(self.asr_model()) {
             self.ensure_engines().await.ok().map(|(_, a)| a)
         } else {
             None
@@ -1186,7 +1186,7 @@ impl VoiceRuntime {
     pub fn status(&self) -> VoiceStatus {
         let (keywords, wake_fallback) = self.wake_words_resolved();
         VoiceStatus {
-            asr_ready: self.inner.models.is_ready(self.asr_model().spec()),
+            asr_ready: self.inner.models.is_asr_ready(self.asr_model()),
             vad_ready: self.inner.models.is_ready(&models::SILERO_VAD),
             kws_ready: self.inner.models.is_tar_ready(&models::KWS_ZIPFORMER_ZH),
             wake_running: self.wake_running(),
@@ -1311,7 +1311,7 @@ impl VoiceRuntime {
             }
         }
         // 换档 / 首次:用时下载对应模型(HUD 进度)→ spawn_blocking 加载(秒级,别堵 runtime)。
-        let asr_dir = self.inner.models.ensure(model.spec(), &mirrors).await?;
+        let asr_dir = self.inner.models.ensure_asr(model, &mirrors).await?;
         let asr = tokio::task::spawn_blocking(move || SherpaAsr::load(model, &asr_dir, "zh").map(Arc::new))
             .await
             .context("ASR 加载任务挂了")??;
@@ -1340,7 +1340,8 @@ impl VoiceRuntime {
 
     /// 失败语音模型下载的「重试」直连口(HUD 按钮 → 壳层 `retry_voice_model` → 这里;
     /// 不绕 LLM §7.1)。按 id 找回三型 spec 重跑对应 ensure(自带 HUD:成功 done、再失败仍
-    /// fail_retryable 冒新卡);未知 id(老版本残卡)只记日志。后台 spawn,不阻塞调用方。
+    /// fail_retryable 冒新卡);未知 id(老版本残卡)只记日志。后台 spawn,不阻塞调用方;
+    /// **须在 tokio 上下文内调用**(裸 `tokio::spawn`,壳层同步命令直调会 panic)。
     pub fn retry_model(&self, id: &str) {
         let this = self.clone();
         let id = id.to_string();
@@ -1361,7 +1362,13 @@ impl VoiceRuntime {
                     m.ensure(&models::ASR_SENSE_VOICE, &mirrors).await.map(|_| ())
                 }
                 i if i == models::ASR_FIRERED_CTC.id => {
-                    m.ensure(&models::ASR_FIRERED_CTC, &mirrors).await.map(|_| ())
+                    m.ensure_tar(&models::ASR_FIRERED_CTC, &mirrors).await.map(|_| ())
+                }
+                i if i == models::ASR_FUNASR_NANO.id => {
+                    m.ensure_tar(&models::ASR_FUNASR_NANO, &mirrors).await.map(|_| ())
+                }
+                i if i == models::ASR_PARAFORMER_ZH.id => {
+                    m.ensure_tar(&models::ASR_PARAFORMER_ZH, &mirrors).await.map(|_| ())
                 }
                 i if i == models::SPEAKER_CAMPP_ZH.id => {
                     m.ensure(&models::SPEAKER_CAMPP_ZH, &mirrors).await.map(|_| ())
@@ -1389,7 +1396,7 @@ impl VoiceRuntime {
     /// 选中的 ASR 档已就绪(不触发下载)。渠道语音消息第一次遇到未就绪 → 先回「准备中」
     /// 提示 + `prefetch_asr` 后台下,绝不让手机那头干等几分钟。
     pub fn asr_ready(&self) -> bool {
-        self.inner.models.is_ready(self.asr_model().spec())
+        self.inner.models.is_asr_ready(self.asr_model())
     }
 
     /// 后台预取 ASR(模型下载 + 加载,HUD 进度照常;fire-and-forget,失败留日志)。

@@ -569,7 +569,8 @@ impl MediaRuntime {
     }
 
     /// 失败重下一个组件(前端「重试」按钮直连,§7.1 不绕 LLM)。按组件名找枚举,后台重跑
-    /// `ensure`(自带 HUD 任务:成功 done、再失败仍 fail_retryable 冒新卡)。不阻塞调用方。
+    /// `ensure`(自带 HUD 任务:成功 done、再失败仍 fail_retryable 冒新卡)。不阻塞调用方;
+    /// **须在 tokio 上下文内调用**(裸 `tokio::spawn`,壳层同步命令直调会 panic)。
     pub fn retry_component(&self, name: &str) {
         let Some(c) = Component::from_name(name) else {
             tracing::warn!(component = name, "retry_download:未知组件名,忽略");
