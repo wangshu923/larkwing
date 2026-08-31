@@ -135,8 +135,22 @@ function onVolume(e: Event) {
     >
       ⏭
     </button>
+    <!-- 循环/随机/音量图标走内联 SVG(WindowControls 同款 stroke:currentColor):
+         🔁🔀🔊 这类码位是 emoji 表现形,永远渲染彩色、无视 CSS color,与其余单色按钮打架 -->
     <button class="pbtn" :class="{ on: state.loopMode !== 'off' }" @click="cycleLoop" :title="loopTitle">
-      {{ state.loopMode === 'one' ? '🔂' : '🔁' }}
+      <svg v-if="state.loopMode === 'one'" viewBox="0 0 24 24">
+        <path d="M4 12V9a3 3 0 0 1 3-3h13" />
+        <path d="m17 3 3 3-3 3" />
+        <path d="M20 12v3a3 3 0 0 1-3 3H4" />
+        <path d="m7 15-3 3 3 3" />
+        <path d="m10.8 10.6 1.6-1.2v5.2" />
+      </svg>
+      <svg v-else viewBox="0 0 24 24">
+        <path d="M4 12V9a3 3 0 0 1 3-3h13" />
+        <path d="m17 3 3 3-3 3" />
+        <path d="M20 12v3a3 3 0 0 1-3 3H4" />
+        <path d="m7 15-3 3 3 3" />
+      </svg>
     </button>
     <button
       v-if="playlist"
@@ -145,7 +159,12 @@ function onVolume(e: Event) {
       @click="toggleShuffle"
       :title="state.shuffle ? t('media.shuffleOn') : t('media.shuffleOff')"
     >
-      🔀
+      <svg viewBox="0 0 24 24">
+        <path d="M3 7h4l10 10h4" />
+        <path d="M3 17h4l10-10h4" />
+        <path d="m18 4 3 3-3 3" />
+        <path d="m18 14 3 3-3 3" />
+      </svg>
     </button>
     <button
       v-if="audioTrackCount >= 2"
@@ -203,7 +222,18 @@ function onVolume(e: Event) {
       </div>
     </div>
     <span class="vol" :title="t('media.volume')">
-      <span class="vol-ico">{{ state.volume === 0 ? '🔇' : '🔊' }}</span>
+      <span class="vol-ico">
+        <svg v-if="state.volume === 0" viewBox="0 0 24 24">
+          <path d="M11 5 6.5 8.5H3.5v7h3L11 19z" />
+          <path d="m15.5 9.5 5 5" />
+          <path d="m20.5 9.5-5 5" />
+        </svg>
+        <svg v-else viewBox="0 0 24 24">
+          <path d="M11 5 6.5 8.5H3.5v7h3L11 19z" />
+          <path d="M15 9.5a3.8 3.8 0 0 1 0 5" />
+          <path d="M18 7a7.5 7.5 0 0 1 0 10" />
+        </svg>
+      </span>
       <input
         class="vol-slider"
         type="range"
@@ -228,10 +258,16 @@ function onVolume(e: Event) {
 }
 .pbtn {
   width: 34px; height: 34px; flex: none;
+  display: inline-flex; align-items: center; justify-content: center;
   border: 1px solid var(--line); border-radius: 10px; cursor: pointer; font-size: 13px;
   background: rgba(var(--accent-rgb), 0.1); color: var(--accent);
   transition: border-color .15s, background .15s, box-shadow .15s;
 }
+.pbtn svg, .vol-ico svg {
+  fill: none; stroke: currentColor; stroke-width: 2;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.pbtn svg { width: 15px; height: 15px; }
 .pbtn:hover { border-color: var(--accent); box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.3); }
 .pbtn:disabled { opacity: .32; cursor: default; border-color: var(--line); box-shadow: none; }
 .pbtn.on {
@@ -286,7 +322,8 @@ function onVolume(e: Event) {
 }
 
 .vol { display: inline-flex; align-items: center; gap: 5px; flex: none; }
-.vol-ico { font-size: 11px; opacity: .75; }
+.vol-ico { display: inline-flex; color: var(--accent); opacity: .75; }
+.vol-ico svg { width: 14px; height: 14px; }
 .vol-slider {
   -webkit-appearance: none; appearance: none; width: 64px; height: 3px; border-radius: 2px;
   background: linear-gradient(90deg, var(--accent) var(--pct), rgba(var(--accent-rgb), 0.14) var(--pct));
