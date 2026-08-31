@@ -17,7 +17,7 @@ use anyhow::{anyhow, Context, Result};
 use super::asr::{Asr, SherpaAsr};
 use super::prompts::{PromptBank, PromptKind, SharedPromptBank};
 use super::speaker::SpeakerId;
-use super::{collect_utterance, hangover_secs, new_vad, peak_normalize, CaptureOut};
+use super::{collect_utterance, hangover_secs, new_vad, peak_normalize, CaptureOut, UTTER_PREROLL_S};
 use crate::bus::{VoiceEvent, VoicePhase};
 
 pub(super) enum WakeCmd {
@@ -383,8 +383,15 @@ fn wake_loop(d: &WakeDeps, cmd: &Receiver<WakeCmd>) -> Result<()> {
                 vad.reset();
                 d.rt.arm_wake_ctl(); // 在听时点停也要响应(取消 → 走 None 安静回 Watch;定稿 → 正常识别)
                 d.rt.publish(VoiceEvent::State { phase: VoicePhase::Listening });
-                let out =
-                    collect_utterance(&pipe, &vad, &d.rt, Some(d.rt.wake_ctl()), window, hangover)?;
+                let out = collect_utterance(
+                    &pipe,
+                    &vad,
+                    &d.rt,
+                    Some(d.rt.wake_ctl()),
+                    window,
+                    hangover,
+                    UTTER_PREROLL_S,
+                )?;
                 phase = match transcribe(d, out)? {
                     Some((text, speaker_id)) => {
                         d.rt.publish(VoiceEvent::Transcribed { text, via: "wake".into(), speaker_id });
@@ -421,6 +428,7 @@ fn wake_loop(d: &WakeDeps, cmd: &Receiver<WakeCmd>) -> Result<()> {
                     Some(d.rt.wake_ctl()),
                     CONFIRM_LISTEN_WINDOW,
                     hangover,
+                    UTTER_PREROLL_S,
                 )?;
                 match transcribe(d, out)? {
                     Some((text, _speaker)) => {
@@ -798,7 +806,15 @@ fn on_wake(
     for attempt in 0..2 {
         vad.reset();
         d.rt.publish(VoiceEvent::State { phase: VoicePhase::Listening });
-        let out = collect_utterance(pipe, vad, &d.rt, Some(d.rt.wake_ctl()), WAKE_START_TIMEOUT, hangover)?;
+        let out = collect_utterance(
+            pipe,
+            vad,
+            &d.rt,
+            Some(d.rt.wake_ctl()),
+            WAKE_START_TIMEOUT,
+            hangover,
+            UTTER_PREROLL_S,
+        )?;
         if matches!(out, CaptureOut::Cancelled) {
             // 用户点了「取消」(✕):安静回待唤醒,不追问不告退(定稿键走 CTL_ACCEPT → 落到下面正常识别)
             d.rt.publish(VoiceEvent::ListenEnded { reason: "wake_done".into() });
@@ -826,12 +842,14 @@ fn on_wake(
 }
 
 /// 采集产物 →(文本, 说话人);空段/空文本 = None。
+/// pcm 可能带段前滚(UTTER_PREROLL_S):反幻觉闸/声纹按 speech_from 起的裸段算,
+/// ASR 吃整段(前滚里正躺着被 silero 清零丢掉的开头音节)。
 fn transcribe(d: &WakeDeps, out: CaptureOut) -> Result<Option<(String, Option<i64>)>> {
-    let mut pcm = match out {
-        CaptureOut::Utterance(pcm) => pcm,
+    let (mut pcm, speech_from) = match out {
+        CaptureOut::Utterance { pcm, speech_from } => (pcm, speech_from),
         CaptureOut::Empty | CaptureOut::Cancelled => return Ok(None),
     };
-    if (pcm.len() as f32) < super::MIN_SPEECH_S * super::TARGET_RATE as f32 {
+    if ((pcm.len() - speech_from) as f32) < super::MIN_SPEECH_S * super::TARGET_RATE as f32 {
         return Ok(None);
     }
     d.rt.publish(VoiceEvent::State { phase: VoicePhase::Transcribing });
@@ -840,7 +858,8 @@ fn transcribe(d: &WakeDeps, out: CaptureOut) -> Result<Option<(String, Option<i6
     if text.is_empty() {
         return Ok(None);
     }
-    let speaker_id = d.speaker.as_ref().and_then(|s| s.identify(&pcm, &d.rt.voiceprint_library()));
+    let speaker_id =
+        d.speaker.as_ref().and_then(|s| s.identify(&pcm[speech_from..], &d.rt.voiceprint_library()));
     Ok(Some((text, speaker_id)))
 }
 

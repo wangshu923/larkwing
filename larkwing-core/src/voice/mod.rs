@@ -50,9 +50,17 @@ const MAX_SPEECH_S: f32 = 12.0;
 /// 沿用说话档会把整段唱连成一坨(时间轴就没了句级粒度)。歌声实际手感是真机调参项(§4.11)。
 const SING_HANGOVER_S: f32 = 0.35;
 /// 每段往回多带一点音频再喂 ASR:VAD 的起点卡在能量抬起那一刻,声母/气口在它之前,
-/// 不带就被削掉(实测「跑得快」听成「得快」)。唤醒/听写链早有同款 pre-roll,这条路补上。
+/// 不带就被削掉(实测「跑得快」听成「得快」)。此常量只管 read_audio 的逐段转写;交互
+/// 听音的前滚是下面的 `UTTER_PREROLL_S`(更长——治的病不同,见其注释)。
 /// 时间戳仍用 VAD 起点(唱起来的那一刻),只是给识别器多一点上下文。
 const SEG_PREROLL_S: f32 = 0.2;
+/// 交互听音(唤醒指令/听写/跟进窗/口头确认)出段时往回多带的音频。治的是 silero 触发
+/// 语义 × 断续开头:上游 silero-vad-model.cc 触发前只要有一个 32ms 窗掉下阈值就把已
+/// 积累的人声**清零重计**,报数字式的开头(「一…二…三四五…」)整音节被丢在段外,而
+/// sherpa 内建回退只有 min_speech+64ms、够不着被清零的那些——真机实锤「123456789 →
+/// 3456789」(2026-08-31 用户拍板 1.0s)。前滚只是多给 ASR 上下文:反幻觉闸/声纹按
+/// 裸段(`speech_from` 起)算;录制类采集(标定/克隆参考音/声纹注册)要忠实原声,传 0。
+const UTTER_PREROLL_S: f32 = 1.0;
 const START_TIMEOUT: Duration = Duration::from_secs(6); // 开听后多久没人开口就放弃
 const LEVEL_EVERY_WINDOWS: u32 = 3; // 电平事件节流:每 3 窗 ≈ 96ms ≈ 10Hz
 const ENROLL_SAMPLES: u32 = 3; // 声纹注册录几段取平均(2026-07-04 用户拍板,§4.2「绝不错认」)
@@ -470,10 +478,11 @@ impl VoiceRuntime {
             let vad = new_vad(&vad_model, hangover)?;
             let pipe = rt.open_capture_auto()?;
             rt.publish(VoiceEvent::State { phase: VoicePhase::Listening });
-            let out = collect_utterance(&pipe, &vad, &rt, None, START_TIMEOUT, hangover)?;
+            // 参考音要忠实原声(前滚的房间底噪会被克隆学走)→ preroll 恒 0
+            let out = collect_utterance(&pipe, &vad, &rt, None, START_TIMEOUT, hangover, 0.0)?;
             drop(pipe);
             let mut pcm = match out {
-                CaptureOut::Utterance(p) => p,
+                CaptureOut::Utterance { pcm, .. } => pcm,
                 _ => anyhow::bail!("没有录到声音"),
             };
             anyhow::ensure!(
@@ -749,9 +758,11 @@ impl VoiceRuntime {
                     done: Some(done),
                     total: Some(ENROLL_SAMPLES),
                 });
-                let out = collect_utterance(&pipe, &vad, &rt, None, START_TIMEOUT, hangover)?;
+                // 声纹样本按裸段提 embedding(前滚静音稀释声纹)→ preroll 恒 0;
+                // 且本循环复用同一只 vad 不 reset,段序数本就对不上前滚自缓冲
+                let out = collect_utterance(&pipe, &vad, &rt, None, START_TIMEOUT, hangover, 0.0)?;
                 let mut pcm = match out {
-                    CaptureOut::Utterance(p) => p,
+                    CaptureOut::Utterance { pcm, .. } => pcm,
                     _ => anyhow::bail!("没录到声音,再说一句试试"),
                 };
                 anyhow::ensure!(
@@ -880,11 +891,13 @@ impl VoiceRuntime {
                 rt.publish(VoiceEvent::State { phase: VoicePhase::Listening });
                 let vad = new_vad(&vad_model, hangover)?;
                 let pipe = rt.open_capture_auto()?;
-                let out = collect_utterance(&pipe, &vad, &rt, Some(&ctl), START_TIMEOUT, hangover)?;
+                // 标定样本忠于生产 KWS 输入(RAW)→ preroll 恒 0
+                let out =
+                    collect_utterance(&pipe, &vad, &rt, Some(&ctl), START_TIMEOUT, hangover, 0.0)?;
                 drop(pipe);
                 rt.publish(VoiceEvent::State { phase: VoicePhase::Idle });
                 let pcm = match out {
-                    CaptureOut::Utterance(p) => p,
+                    CaptureOut::Utterance { pcm, .. } => pcm,
                     CaptureOut::Cancelled => bail!("__CANCELLED__"),
                     CaptureOut::Empty => continue, // 没开口:这遍重来(不计 take)
                 };
@@ -1681,7 +1694,10 @@ impl CapturePipe {
 /// 回调在实时线程:只做降声道 + 投递,队列满就丢(绝不阻塞)。
 #[allow(deprecated)] // device.name():设置按人类可读名匹配,见 list_input_devices
 pub(super) fn open_capture(device_name: Option<String>) -> Result<CapturePipe> {
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(64);
+    // 512 帧 × 每回调 ~10ms ≈ 5s 缓冲:唤醒确认层 ASR 同步阻塞期间「录音不断」靠它兜住
+    // (原 64 只兜 ~0.6s,FireRed 档转写更慢时溢出丢新帧 = 用户抢话的头几个字真没录上;
+    // 2026-08-31 与段前滚同批修)。browser 推流管每帧 ~100ms,64 已是 6.4s,不用动。
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(512);
     let host = cpal::default_host();
     let device = match device_name {
         Some(name) => host
@@ -1762,13 +1778,36 @@ pub(super) fn new_vad(
 }
 
 pub(super) enum CaptureOut {
-    Utterance(Vec<f32>),
+    /// pcm = [前滚 | VAD 段];speech_from = VAD 段在 pcm 里的起点。前滚只是给 ASR 的
+    /// 上下文,反幻觉闸/声纹一律按 speech_from 起的裸段算;preroll=0 的调用恒 speech_from=0。
+    Utterance { pcm: Vec<f32>, speech_from: usize },
     Empty,
     Cancelled,
 }
 
+/// 出段音频 = [前滚 | VAD 段]:从自缓冲 fed 里按段起点往回多带 preroll 个样本。
+/// 返回 (pcm, speech_from)。fed 与段序数对不上(调用方复用了没 reset 的 vad,如声纹注册
+/// 循环)或越界 → 回落裸段(speech_from=0),绝不比不带前滚差。
+fn pad_utterance(fed: &[f32], start: usize, samples: Vec<f32>, preroll: usize) -> (Vec<f32>, usize) {
+    if preroll == 0 {
+        return (samples, 0);
+    }
+    let end = start.saturating_add(samples.len());
+    if end > fed.len() {
+        return (samples, 0);
+    }
+    let from = start.saturating_sub(preroll);
+    let mut pcm = Vec::with_capacity(end - from);
+    pcm.extend_from_slice(&fed[from..start]);
+    pcm.extend_from_slice(&samples);
+    (pcm, start - from)
+}
+
 /// 听一轮:窗口化喂 VAD、电平节流上报、首个语段即定稿(听写与唤醒/跟进共用)。
 /// ctl 只有听写会话传(立即定稿/取消按钮);唤醒侧靠时长上限收敛。
+/// preroll_s > 0(交互听音传 `UTTER_PREROLL_S`)= 出段时往回多带这么多秒;**要求调用前
+/// vad 是新建或刚 reset 的**(seg.start 以喂入起点计,对不上会静默退成裸段);录制类
+/// 采集(标定/克隆参考音/声纹注册)要忠实原声,传 0.0 走老路零开销。
 pub(super) fn collect_utterance(
     pipe: &CapturePipe,
     vad: &sherpa_onnx::VoiceActivityDetector,
@@ -1776,21 +1815,27 @@ pub(super) fn collect_utterance(
     ctl: Option<&AtomicU8>,
     start_timeout: Duration,
     hangover_s: f32,
+    preroll_s: f32,
 ) -> Result<CaptureOut> {
     let started = Instant::now();
     let hard_cap = start_timeout + Duration::from_secs_f32(MAX_SPEECH_S + hangover_s + 3.0);
     let mut win_buf: Vec<f32> = Vec::with_capacity(VAD_WINDOW * 8);
+    // 自缓冲:本轮喂过 VAD 的样本原样留一份,出段时按 seg.start() 回切前滚。体积由
+    // hard_cap 封顶(≈20 多秒 × 64KB/s,一次性瞬态),不值得再做环形裁剪。
+    let preroll = (preroll_s * TARGET_RATE as f32) as usize;
+    let mut fed: Vec<f32> = Vec::new();
     let mut speech_started = false;
     let mut windows = 0u32;
     let mut level_peak = 0f32;
 
-    let take_front = |vad: &sherpa_onnx::VoiceActivityDetector| -> Option<Vec<f32>> {
-        let seg = vad.front().map(|s| s.samples().to_vec());
-        if seg.is_some() {
-            vad.pop();
-        }
-        seg
-    };
+    let take_front =
+        |vad: &sherpa_onnx::VoiceActivityDetector, fed: &[f32]| -> Option<(Vec<f32>, usize)> {
+            let seg = vad.front().map(|s| (s.start().max(0) as usize, s.samples().to_vec()));
+            seg.map(|(start, samples)| {
+                vad.pop();
+                pad_utterance(fed, start, samples, preroll)
+            })
+        };
 
     loop {
         if let Some(ctl) = ctl {
@@ -1798,8 +1843,8 @@ pub(super) fn collect_utterance(
                 CTL_CANCEL => return Ok(CaptureOut::Cancelled),
                 CTL_ACCEPT => {
                     vad.flush();
-                    return Ok(match take_front(vad) {
-                        Some(pcm) => CaptureOut::Utterance(pcm),
+                    return Ok(match take_front(vad, &fed) {
+                        Some((pcm, speech_from)) => CaptureOut::Utterance { pcm, speech_from },
                         None => CaptureOut::Empty,
                     });
                 }
@@ -1821,13 +1866,18 @@ pub(super) fn collect_utterance(
                         level_peak = 0.0;
                     }
                     vad.accept_waveform(&win);
+                    if preroll > 0 {
+                        fed.extend_from_slice(&win); // 与 VAD 喂入逐窗对齐(段序数才对得上)
+                    }
                     if !speech_started && vad.detected() {
                         speech_started = true;
                         rt.publish(VoiceEvent::SpeechStarted);
                     }
                     if !vad.is_empty() {
-                        return Ok(match take_front(vad) {
-                            Some(pcm) => CaptureOut::Utterance(pcm), // 单话语:首段即定稿
+                        return Ok(match take_front(vad, &fed) {
+                            Some((pcm, speech_from)) => {
+                                CaptureOut::Utterance { pcm, speech_from } // 单话语:首段即定稿
+                            }
                             None => CaptureOut::Empty,
                         });
                     }
@@ -1843,8 +1893,8 @@ pub(super) fn collect_utterance(
         if started.elapsed() > hard_cap {
             // 兜底:把已有的拿去识别(防一直说话不停顿挂死)
             vad.flush();
-            return Ok(match take_front(vad) {
-                Some(pcm) => CaptureOut::Utterance(pcm),
+            return Ok(match take_front(vad, &fed) {
+                Some((pcm, speech_from)) => CaptureOut::Utterance { pcm, speech_from },
                 None => CaptureOut::Empty,
             });
         }
@@ -1863,16 +1913,17 @@ fn run_session(
     let vad = new_vad(vad_model, hangover)?;
     let pipe = rt.open_capture_auto()?;
     rt.publish(VoiceEvent::State { phase: VoicePhase::Listening });
-    let out = collect_utterance(&pipe, &vad, rt, Some(&ctl), START_TIMEOUT, hangover)?;
+    let out =
+        collect_utterance(&pipe, &vad, rt, Some(&ctl), START_TIMEOUT, hangover, UTTER_PREROLL_S)?;
     drop(pipe); // 识别前先放麦克风
 
-    let mut pcm = match out {
+    let (mut pcm, speech_from) = match out {
         CaptureOut::Cancelled => return Ok(SessionOutcome::Ended("cancelled")),
         CaptureOut::Empty => return Ok(SessionOutcome::Ended("no_speech")),
-        CaptureOut::Utterance(pcm) => pcm,
+        CaptureOut::Utterance { pcm, speech_from } => (pcm, speech_from),
     };
-    if (pcm.len() as f32) < MIN_SPEECH_S * TARGET_RATE as f32 {
-        return Ok(SessionOutcome::Ended("no_speech")); // 双保险(VAD min_speech 之外)
+    if ((pcm.len() - speech_from) as f32) < MIN_SPEECH_S * TARGET_RATE as f32 {
+        return Ok(SessionOutcome::Ended("no_speech")); // 双保险(VAD min_speech 之外),按裸段长判
     }
     rt.publish(VoiceEvent::State { phase: VoicePhase::Transcribing });
     peak_normalize(&mut pcm);
@@ -1880,8 +1931,8 @@ fn run_session(
     if text.is_empty() {
         return Ok(SessionOutcome::Ended("no_speech"));
     }
-    // 声纹识别(同一段 PCM):认出家人 → 记忆归 TA;认不出 → None 走会话用户
-    let speaker_id = spk.and_then(|s| s.identify(&pcm, &rt.voiceprint_library()));
+    // 声纹识别:裸段起(前滚静音不进 embedding);认出家人 → 记忆归 TA;认不出 → None 走会话用户
+    let speaker_id = spk.and_then(|s| s.identify(&pcm[speech_from..], &rt.voiceprint_library()));
     Ok(SessionOutcome::Text { text, speaker_id })
 }
 
@@ -2124,6 +2175,36 @@ mod tests {
             b.rx.recv_timeout(std::time::Duration::from_millis(200)).is_ok(),
             "幸存 tap 不受影响"
         );
+    }
+
+    #[test]
+    fn pad_utterance_prepends_preroll_from_fed_buffer() {
+        // fed = 0..100 递增序,段 = [40..60),前滚 25 → pcm 从 15 起、speech_from=25
+        let fed: Vec<f32> = (0..100).map(|i| i as f32).collect();
+        let seg: Vec<f32> = fed[40..60].to_vec();
+        let (pcm, speech_from) = pad_utterance(&fed, 40, seg, 25);
+        assert_eq!(speech_from, 25);
+        assert_eq!(pcm.len(), 25 + 20);
+        assert_eq!(pcm[0], 15.0, "前滚从 fed 里往回带");
+        assert_eq!(pcm[25], 40.0, "speech_from 起 = 裸段原样");
+        assert_eq!(*pcm.last().unwrap(), 59.0);
+    }
+
+    #[test]
+    fn pad_utterance_clamps_at_buffer_head_and_falls_back_on_misalignment() {
+        let fed: Vec<f32> = (0..50).map(|i| i as f32).collect();
+        // 段起点 10、前滚 100 → 顶到缓冲头,speech_from = 实际带到的 10
+        let (pcm, speech_from) = pad_utterance(&fed, 10, fed[10..30].to_vec(), 100);
+        assert_eq!(speech_from, 10);
+        assert_eq!(pcm[0], 0.0);
+        // 段序数越过 fed(复用未 reset 的 vad,如声纹注册循环)→ 回落裸段
+        let seg = vec![7.0f32; 20];
+        let (pcm, speech_from) = pad_utterance(&fed, 45, seg.clone(), 100);
+        assert_eq!(speech_from, 0, "对不上就裸段兜底,绝不切错音频");
+        assert_eq!(pcm, seg);
+        // preroll=0 = 老路零开销
+        let (pcm, speech_from) = pad_utterance(&fed, 10, seg.clone(), 0);
+        assert_eq!((pcm, speech_from), (seg, 0));
     }
 
     #[test]
