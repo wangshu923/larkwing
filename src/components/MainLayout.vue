@@ -13,7 +13,10 @@ import { useCharacter } from '../composables/useCharacter'
 import { useMedia } from '../composables/useMedia'
 import { useToast } from '../composables/useToast'
 import { fmtMs, fmtTokens, fmtUsd } from '../lib/fmt'
-import { onFloatSay, openExternal, api, isMacOS, type SearchHit } from '../lib/backend'
+import { emitPetBehavior, onFloatSay, openExternal, api, isMacOS, type SearchHit } from '../lib/backend'
+import { useTasks } from '../composables/useTasks'
+import { resolveActivity, usePetDemoShow, type PetActivity } from '../composables/usePetActivity'
+import { usePetBehavior, type PetBehavior } from '../composables/usePetBehavior'
 import { renderMarkdown } from '../lib/md'
 import { copyText } from '../lib/clipboard'
 import MemoryView from '../views/MemoryView.vue'
@@ -707,6 +710,38 @@ async function forkFromHere(g: StreamGroup) {
 const streamEl = ref<HTMLElement | null>(null)
 const { pack, switchCharacter } = useCharacter()
 const petHidden = computed(() => settings.get('ui.pet.hidden') === '1')
+// 桌宠「围观打字」信号(B1):输入框内容在变 = 在写,停 5s 才算结束——**清空(发送)也走
+// 同一个缓释**,不立即掉头:短消息几秒就发出去,立刻退场 = 它才走到半路就回头,等于白演
+// (真机实锤「什么效果都没有」);缓释后变成「看你发完消息才慢慢走开」,也更像陪着。
+const petTyping = ref(false)
+let petTypingTimer = 0
+watch(input, () => {
+  petTyping.value = true
+  clearTimeout(petTypingTimer)
+  petTypingTimer = window.setTimeout(() => (petTyping.value = false), 5000)
+})
+// —— 桌宠决策上移到这里(常驻层),行为算好**广播状态**给悬浮窗(用户拍板:同步动画状态,
+// 不是逐个原始信号跨窗补——单一决策源,两窗永不分裂,以后加行为悬浮窗零改动)。
+// 放 MainLayout 而非 PetRoamer:「隐藏桌宠」只卸渲染,决策与广播照跑(悬浮窗还有脸)。
+const petTasks = useTasks()
+const petDemo = usePetDemoShow()
+const petAct = computed<PetActivity | null>(
+  () =>
+    petDemo.act.value ??
+    resolveActivity(
+      petTasks.state.tasks.filter((t) => t.state === 'running').map((t) => t.kind),
+      chat.mood === 'thinking',
+      media.status === 'playing',
+    ),
+)
+const petB = usePetBehavior(petAct, petTyping)
+const petBehavior = computed<PetBehavior>(
+  () => (petDemo.behavior.value as PetBehavior | null) ?? petB.behavior.value,
+)
+// 变化即播 + 20s 心跳重播绝对态(幂等):悬浮窗后开/错过一条也能追平(emitUpdateState 同款哲学)
+watch(petBehavior, (v) => emitPetBehavior(v))
+const petHeartbeat = window.setInterval(() => emitPetBehavior(petBehavior.value), 20_000)
+onUnmounted(() => clearInterval(petHeartbeat))
 
 // 桌宠 / 头像右键:换形象 / 打开设置 / 隐藏桌宠(隐藏=置 ui.pet.hidden,设置页可恢复)
 function openPetMenu(e: MouseEvent) {
@@ -1029,7 +1064,7 @@ watch(messages, () => nextTick(() => {
           <button v-for="(s, si) in suggestions" :key="si" class="suggest-chip" @click="sendSuggestion(s)">{{ s }}</button>
         </div>
         <!-- 桌宠:漫游边界=聊天滚动区;不在聊天页时 paused 空转;隐藏=v-if 卸载(RAF 停) -->
-        <PetRoamer v-if="!petHidden" :bounds="streamEl" :paused="activeRail !== 'chat'" />
+        <PetRoamer v-if="!petHidden" :bounds="streamEl" :paused="activeRail !== 'chat'" :activity="petAct" :behavior="petBehavior" @interact="petB.markInteraction" />
       </div>
 
       <div class="composer">

@@ -4,17 +4,18 @@
 // 上半 → 向下长;胶囊视觉位置不变 → 不跳)。独立 WebView,订阅同一 app_event。
 // 信息条 = 固定优先级单行(语音/mood > 通知 > 后台 > 待机轮播);头像当状态灯;关闭 = 框外"小耳朵"。
 // 透明度 ui.float.opacity。胶囊位置持久化(只记收起态)。
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useAgentMood } from '../composables/useAgentMood'
 import { confirmActionPhrase, isScopeCard, useConfirm } from '../composables/useConfirm'
 import { planProgress, usePlan } from '../composables/usePlan'
 import { useFloat } from '../composables/useFloat'
 import { useFloatIdle } from '../composables/useFloatIdle'
-import { usePetDemoActivity, resolveActivity, type PetActivity } from '../composables/usePetActivity'
+import { glyphOf, usePetDemoShow, resolveActivity, type PetActivity, type PropGlyph } from '../composables/usePetActivity'
+import type { PetBehavior } from '../composables/usePetBehavior'
 import { useSettings } from '../composables/useSettings'
 import PetProp from './PetProp.vue'
-import { emitFloatSay, emitFloatUpdate, emitOpenConversation, floatWin, type TextRef } from '../lib/backend'
+import { emitFloatSay, emitFloatUpdate, emitOpenConversation, floatWin, onPetBehavior, type TextRef } from '../lib/backend'
 import titanIdle from '../assets/titan-idle-1.png'
 import dogIdle from '../assets/dog-idle.png'
 import catIdle from '../assets/cat-idle.png'
@@ -100,16 +101,65 @@ const orbState = computed(() => {
 
 // 戏份角标(#10 A 层,与主窗桌宠共用 usePetActivity):orb 右下小圆片显示正在搬/查/放歌。
 // think 不出角标——orb 自己的辉光环已表达思考,别重复;主窗藏托盘时这是唯一的「在干活」线索。
-const demoAct = usePetDemoActivity()
+const demo = usePetDemoShow()
 const orbBadge = computed<PetActivity | null>(() => {
   const a =
-    demoAct.value ??
+    demo.act.value ??
     resolveActivity(
       running.value.map((tk) => tk.kind),
       false, // think 走 orbState 光圈,不进角标
       mediaPlaying.value,
     )
   return a === 'think' ? null : a
+})
+// 行为层(B1,2026-08-31 用户点破「悬浮窗没有同步吗」;二改拍板「同步动画状态」):
+// 状态类行为映射到 orb——打盹(变暗慢呼吸 + Zzz)/ 完工蹦一下撒星 / 失败问号 / 送信信封;
+// 跑动类(围观打字/踱步/拖拽)没戏台,不映射。**行为不在本窗算**:主窗 MainLayout 是唯一
+// 决策源(打字/睡意计时/任务边沿都在那),这里只收 lw:pet-behavior 广播做映射渲染——
+// 两窗永不分裂,以后加行为本窗零改动。变化即播 + 20s 心跳,错过一拍也能追平。
+const bcastBehavior = ref<PetBehavior>(null)
+onPetBehavior((v) => (bcastBehavior.value = v as PetBehavior))
+const behavior = computed<PetBehavior>(
+  () => (demo.behavior.value as PetBehavior | null) ?? bcastBehavior.value,
+)
+/** 角标最终图形:蔫「?」> 送信信封 > 打盹 Zzz > 戏份三样(搬/查/音符)。celebrate 不占角标
+ *  (orb 本体蹦 + 星星)。 */
+const orbGlyph = computed<PropGlyph | null>(() => {
+  if (behavior.value === 'dazed') return 'question'
+  if (behavior.value === 'deliver') return 'mail'
+  if (behavior.value === 'sleep') return 'zzz'
+  return orbBadge.value ? glyphOf(orbBadge.value) : null
+})
+const orbImg = ref<HTMLElement | null>(null)
+const orbStars = ref<{ id: number; dx: number; dy: number; delay: number }[]>([])
+let orbStarSeq = 0
+watch(behavior, (nb) => {
+  // 一次性表演打在 img 上(WAAPI;.orb 自身的 translateY(-50%) 是定位,不能被动画覆盖)
+  if (nb === 'celebrate') {
+    orbImg.value?.animate(
+      [
+        { transform: 'translateY(0)' },
+        { transform: 'translateY(-7px)', offset: 0.4 },
+        { transform: 'translateY(0)' },
+      ],
+      { duration: 380, iterations: 2, easing: 'ease-out' },
+    )
+    orbStars.value = Array.from({ length: 5 }, (_, i) => {
+      const a = (Math.PI * 2 * i) / 5 + Math.random() * 0.7
+      return { id: orbStarSeq++, dx: Math.cos(a) * 26, dy: Math.sin(a) * 26, delay: Math.random() * 120 }
+    })
+    window.setTimeout(() => (orbStars.value = []), 1100)
+  } else if (nb === 'dazed') {
+    orbImg.value?.animate(
+      [
+        { transform: 'none' },
+        { transform: 'scaleY(0.88) translateY(2px)', offset: 0.3 },
+        { transform: 'scaleY(0.88) translateY(2px)', offset: 0.8 },
+        { transform: 'none' },
+      ],
+      { duration: 1500, easing: 'ease-out' },
+    )
+  }
 })
 
 // 聆听波形:单个 level 标量 × 固定形状 → 一条随声音起伏的波(胶囊条 + 面板共用)。
@@ -244,9 +294,18 @@ onUnmounted(() => stopMoved())
           <em v-if="bar.pct != null" class="pct">{{ Math.round(bar.pct * 100) }}%</em>
           <span v-if="bar.count" class="bar-dot">{{ bar.count }}</span>
         </div>
-        <div class="orb" :class="orbState" @mousedown="onOrbDown">
-          <img :src="avatar" :alt="petName" />
-          <div v-if="orbBadge" class="orb-badge"><PetProp :activity="orbBadge" /></div>
+        <!-- @click.stop:头像只当拖动手柄,点一下(没拖动)合成的 click 不再冒泡到胶囊
+             触发展开——「头像抓着挪、矮条点开」的职责分区在 mac 上一直漏这条(真机实锤) -->
+        <div class="orb" :class="behavior === 'sleep' ? 'dozing' : orbState" @mousedown="onOrbDown" @click.stop>
+          <img ref="orbImg" :src="avatar" :alt="petName" />
+          <span
+            v-for="s in orbStars"
+            :key="s.id"
+            class="orb-star"
+            :style="{ '--dx': s.dx + 'px', '--dy': s.dy + 'px', animationDelay: s.delay + 'ms' }"
+            >✦</span
+          >
+          <div v-if="orbGlyph" class="orb-badge"><PetProp :glyph="orbGlyph" /></div>
         </div>
       </div>
 
@@ -401,6 +460,27 @@ onUnmounted(() => stopMoved())
   background: var(--f-solid);
   border: 1px solid var(--f-line);
   pointer-events: none;
+}
+/* 打盹(行为层):头像变暗 + 缓慢呼吸;辉光环让位(耳朵也耷拉了),Zzz 角标交代状态 */
+.orb.dozing img { opacity: 0.55; animation: orb-doze 2.6s ease-in-out infinite; }
+@keyframes orb-doze {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(0.94); }
+}
+/* 完工庆祝星星:orb 中心放射即收(主窗桌宠同款语汇,缩小号) */
+.orb-star {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  font-size: 9px;
+  color: var(--accent);
+  opacity: 0;
+  pointer-events: none;
+  animation: orb-star-fly 0.9s ease-out forwards;
+}
+@keyframes orb-star-fly {
+  0% { transform: translate(-50%, -50%) scale(0.4); opacity: 1; }
+  100% { transform: translate(calc(-50% + var(--dx)), calc(-50% + var(--dy))) scale(1); opacity: 0; }
 }
 /* 头像状态灯:语音/mood 给圆头像加辉光环(box-shadow 严格贴圆,不用 drop-shadow 防 WKWebView 方块影) */
 .orb.listen { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 2px var(--f-cy); }

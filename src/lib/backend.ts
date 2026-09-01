@@ -1012,6 +1012,18 @@ export function onFloatSay(cb: (text: string) => void): void {
   void listen<{ text: string }>('lw:float-say', (e) => cb(e.payload.text))
 }
 
+/** 桌宠行为状态 → 悬浮窗镜像(B1;用户拍板「同步动画状态」而非逐个原始信号跨窗):
+ *  主窗 MainLayout 是唯一决策源(打字/睡意计时/任务边沿都在那算),悬浮窗只做映射渲染——
+ *  两窗永不分裂,以后加行为悬浮窗零改动。绝对态幂等;变化即播 + 20s 心跳,错过就等下一拍
+ *  (emitUpdateState 同款哲学:事件不缓存、先到先丢,这条是镜像不是真相源)。 */
+export function emitPetBehavior(behavior: string | null) {
+  if (isTauri()) void emit('lw:pet-behavior', { behavior })
+}
+export function onPetBehavior(cb: (behavior: string | null) => void): void {
+  if (!isTauri()) return
+  void listen<{ behavior: string | null }>('lw:pet-behavior', (e) => cb(e.payload.behavior))
+}
+
 /** 程序更新状态 → 悬浮窗镜像(待机轮播出「发现新版本」可点条)。主窗是唯一更新执行位
  *  (useUpdater 只在主窗跑),状态一变就广播绝对态(available/downloaded/none),幂等不怕重放;
  *  事件不缓存、先到先丢 —— 错过就等下一轮每日复查再发,浮窗这条是锦上添花不是真相源。 */
