@@ -440,11 +440,16 @@ mod win {
                     .pages()
                     .get((pno - 1) as i32)
                     .map_err(|e| anyhow::anyhow!("取第 {pno} 页失败: {e:?}"))?;
-                Ok(page
+                // 拆成显式绑定:bitmap 借着 page,链式 + `?` 会让临时值活过 page(E0597,
+                // Windows 交叉 check 实锤);pdf.rs 渲染同形
+                let bitmap = page
                     .render_with_config(&cfg)
-                    .map_err(|e| anyhow::anyhow!("第 {pno} 页渲染失败: {e:?}"))?
+                    .map_err(|e| anyhow::anyhow!("第 {pno} 页渲染失败: {e:?}"))?;
+                let img = bitmap
                     .as_image()
-                    .to_rgba8())
+                    .map_err(|e| anyhow::anyhow!("第 {pno} 页位图转换失败: {e:?}"))?
+                    .to_rgba8();
+                Ok(img)
             })
         })
     }
@@ -489,7 +494,8 @@ mod win {
         };
         anyhow::ensure!(!hdc.is_invalid(), "连不上打印机「{printer}」(名字对吗?在线吗?)");
         let dc = Dc(hdc);
-        let (pw, ph) = unsafe { (GetDeviceCaps(dc.0, HORZRES), GetDeviceCaps(dc.0, VERTRES)) };
+        let (pw, ph) =
+            unsafe { (GetDeviceCaps(Some(dc.0), HORZRES), GetDeviceCaps(Some(dc.0), VERTRES)) };
         anyhow::ensure!(pw > 0 && ph > 0, "打印机「{printer}」没报出纸张尺寸");
 
         let doc_w = HSTRING::from(doc);

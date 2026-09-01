@@ -548,6 +548,12 @@
 - **同步 `#[tauri::command]` 在 IPC/UI 线程内联执行**(tauri 2.11 源码核实:`on_message` → `run_invoke_handler` 直呼;**只有 async 命令**才被 `async_runtime::spawn` 派发到 tauri 的 tokio runtime),该线程**没有 tokio 上下文** → core 里「后台 spawn、不阻塞调用方」型方法(`VoiceRuntime::retry_model` / `MediaRuntime::retry_component`,开头就是裸 `tokio::spawn`)被同步命令直调 = panic「must be called from the context of a Tokio runtime」→ 穿 FFI 边界 abort = **100% 崩进程**。实锤:语音模型下载失败点 HUD「重试」必崩(`retry_voice_model`);`retry_download` 同病、只是没被点到过。**这类崩溃 Mac dev 也一样崩,但重试卡只在下载失败时出现 → 平时测不到,潜伏到用户真撞下载失败才爆。**
 - **规则:壳层命令要调 core 里会裸 `tokio::spawn` 的方法,命令必须 `async fn`(或显式 `tauri::async_runtime::spawn` 承接,`media_retry` 先例)**;core 侧这类方法 doc 注明「须在 tokio 上下文内调用」。已修(2026-08-28):`retry_download` / `retry_voice_model` 改 async。新写同步命令前过一遍:它调的 core 方法有没有内部 spawn。
 
+### 8.5 `cfg(windows)` 代码别拿 CI 当编译器——mac 上交叉 typecheck 靶场(2026-09-01 实锤立规)
+- **病**:`#[cfg(windows)]` 块在 mac 上只 parse 不 typecheck → Windows-only 代码的类型错(API 签名/生命周期)全潜伏到 CI 的 Windows job 才爆,一来一回 20 分钟,且编译器在前几个错就停 = 一次只见冰山一角。实锤:v0.2.34 首发 CI 挂在 print.rs 三个错(pdfium `as_image()` 返回 Result 要解包、windows 0.61 `GetDeviceCaps` 参数 Option 化),本地靶场随后又抓到 CI 还没跑到的**第四个**(PdfBitmap 借 page 的链式 `?` 临时值 E0597)。
+- **整 crate 交叉 check 是死路**:`cargo check --target x86_64-pc-windows-msvc` 会被依赖树里的原生 C(ring/sherpa)build script 挡死(mac 的 cc 没有 Windows 头文件)。
+- **解 = scratch 靶场**:把新写的 win 模块抽进一个零 C 依赖的临时 crate(只带 windows/winreg/image 等**纯 Rust 绑定**依赖,crate 内引用 stub 成同签名),`rustup target add x86_64-pc-windows-msvc`(纯 std rlib,不需要 MSVC)后 `cargo check --target x86_64-pc-windows-msvc` = 完整 typecheck;**跑完注入一个假类型错验证靶场真在查**(金丝雀),别被缓存假绿骗。配套:API 签名拿不准就 `cargo fetch --target x86_64-pc-windows-msvc` 把 windows crate 源码拉下来直接读(`~/.cargo/registry/src/…/windows-0.61.3/src/Windows/Win32/...`),0.61 世代大量 handle 参数 Option 化、常量是 newtype(`BI_RGB.0`),别凭记忆写。
+- **规则:新写成块的 `cfg(windows)` 代码(工具/模块级),合入前过一遍靶场 check;真机/CI 只留给行为验证,别当第一道编译器。**
+
 ---
 
 ## 9. 边界 / 暂不做 🔒(别擅自做)
