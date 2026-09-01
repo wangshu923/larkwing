@@ -157,11 +157,12 @@ mod tests {
         assert_eq!(
             s.tools,
             ["now", "weather", "media_search", "media_play", "media_control", "media_download", "lyrics_fetch", "torrent_download", "ffmpeg_run", "task_status", "task_cancel", "open", "system_volume", "power",
+             "system_status", "startup_list", "startup_toggle",
              "fs_list", "fs_find",
              "fs_read_text", "fs_stat", "fs_move", "fs_copy", "fs_mkdir", "fs_trash", "fs_write_text",
              "fs_append", "fs_edit", "fs_undo", "fs_unzip", "fs_zip", "fs_usage",
              "reminder_set", "reminder_list", "reminder_cancel", "watch_set", "web_search", "web_fetch",
-             "web_download", "web_render", "qr_decode", "qr_encode", "pdf_to_png", "read_image", "read_audio",
+             "web_download", "web_render", "qr_decode", "qr_encode", "pdf_to_png", "print_file", "read_image", "read_audio",
              "show_image", "send_file", "send_text", "note_todo", "finish_todo"]
         );
         assert!(!s.few_shots.is_empty(), "companion 必须带 few-shot 示范");

@@ -41,6 +41,8 @@ pub struct AppState {
     /// boot 时「从备份恢复」落位结果:Some("ok"/"failed") = 本次启动应用过恢复负载,
     /// 前端 boot 检查据此弹一句结果提示(§3.5 失败绝不静默);None = 无事。
     pub restore_outcome: Option<&'static str>,
+    /// 自动备份器(水位线循环在跑同一份实例;命令「立即备份」与循环共享防重入旗标)。
+    pub autobackup: larkwing_core::autobackup::AutoBackup,
 }
 
 /// 远程渠道的 shell-side 监督器(§6.1:停旧起新的编排在壳层,顶层 spawn 用 tauri runtime;
@@ -1344,6 +1346,30 @@ pub async fn backup_data(
         .map_err(AppError::internal)?; // backup_to 错误
     tracing::info!(zip = %zip.display(), "数据备份完成");
     Ok(zip.to_string_lossy().into_owned())
+}
+
+/// 自动备份状态(设置页:目录 / 上次成功 / 上次失败原因)。
+#[tauri::command]
+pub fn auto_backup_status(
+    state: State<'_, AppState>,
+) -> Result<larkwing_core::autobackup::AutoBackupStatus, AppError> {
+    Ok(state.autobackup.status())
+}
+
+/// 立即跑一次自动备份(用户刚选完目录:马上出第一份,别等下个节拍)。
+/// 成功回 zip 路径;没配置目录/已有一趟在跑 = Err 明白话(§3.5)。
+#[tauri::command]
+pub async fn auto_backup_now(state: State<'_, AppState>) -> Result<String, AppError> {
+    // 壳层不依赖 chrono:epoch millis 用 std 拿(与 core 侧 timestamp_millis 同一语义)。
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    match state.autobackup.tick(now, true).await {
+        Some(Ok(zip)) => Ok(zip.to_string_lossy().into_owned()),
+        Some(Err(e)) => Err(AppError::internal(format!("{e:#}"))),
+        None => Err(AppError::internal("自动备份没配置目录,或已有一趟在跑")),
+    }
 }
 
 /// 唤起系统原生文件选择器挑备份包(zip)。返回绝对路径;用户取消 = None。

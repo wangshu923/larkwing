@@ -617,6 +617,49 @@ async function backupNow() {
     backupBusy.value = false
   }
 }
+// 自动备份(autobackup.rs 水位线):选目标目录即开(每周一份、保留最近 10 份、机器轮转);
+// 清空 = 关。选完立即出第一份(auto_backup_now),别让用户等下个节拍才见着结果。
+const autoBackup = ref<import('../lib/backend').AutoBackupStatus>({ dir: null, lastOkMs: null, lastError: null })
+const autoBackupBusy = ref(false)
+async function refreshAutoBackup() {
+  if (!isTauri()) return
+  try {
+    autoBackup.value = await api.autoBackupStatus()
+  } catch (e) {
+    console.error('自动备份状态拉取失败', e)
+  }
+}
+async function autoBackupPick() {
+  if (autoBackupBusy.value || !isTauri()) return
+  const dest = await api.pickDataFolder()
+  if (!dest) return
+  autoBackupBusy.value = true
+  try {
+    await settings.set('backup.auto.dir', dest)
+    await api.autoBackupNow() // 选完立即出第一份(成功即写水位)
+  } catch (e) {
+    console.error('自动备份首份失败', e)
+    useToast().error(t('settings.system.autoBackupFirstFailed'))
+  } finally {
+    autoBackupBusy.value = false
+    void refreshAutoBackup()
+  }
+}
+async function autoBackupOff() {
+  if (autoBackupBusy.value) return
+  await settings.set('backup.auto.dir', '')
+  void refreshAutoBackup()
+}
+const autoBackupLine = computed(() => {
+  const s = autoBackup.value
+  if (!s.dir) return ''
+  if (s.lastOkMs) {
+    const d = new Date(s.lastOkMs)
+    return t('settings.system.autoBackupLast', { time: d.toLocaleString() })
+  }
+  return s.lastError ? t('settings.system.autoBackupErr', { err: s.lastError }) : t('settings.system.autoBackupPending')
+})
+
 // 从备份恢复:选 zip → 预检(结构/魔数/迁移版本)→ 内联确认 → 负载暂存 + 自动重启,
 // 下次启动开库前落位(现库留 pre-restore 保险副本)。backup 的另一半。
 const restoreBusy = ref(false)
@@ -759,6 +802,7 @@ async function addScopeFolder() {
 const appPublicKey = ref('')
 const pubKeyCopied = ref(false)
 onMounted(async () => {
+  void refreshAutoBackup() // 自动备份状态(目录/上次成功)进页即拉
   // 进设置即 ensure(幂等):服务页一直有公钥可复制。非 Tauri(纯浏览器预览)拿不到后端,留空。
   if (isTauri()) appPublicKey.value = await api.ensureAppKeypair()
 })
@@ -2199,6 +2243,20 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         </div>
         <p v-if="restoreError" class="hint data-err">{{ restoreError }}</p>
         <p class="hint">{{ t('settings.system.dataLocationHint') }}</p>
+        <!-- 自动备份:选目录即开(每周一份、留 10 份、机器轮转);清空 = 关。默认关——目标必须是
+             另一块盘/目录,只有用户知道备到哪(§4.11 2026-08-31)。 -->
+        <div class="row">
+          <span class="label">{{ t('settings.system.autoBackup') }}</span>
+          <span class="key-state">
+            <button class="link" :disabled="autoBackupBusy" @click="autoBackupPick">
+              {{ autoBackupBusy ? t('settings.system.autoBackupWorking') : (autoBackup.dir ? t('settings.system.autoBackupChange') : t('settings.system.autoBackupOn')) }}
+            </button>
+            <button v-if="autoBackup.dir" class="link" :disabled="autoBackupBusy" @click="autoBackupOff">{{ t('settings.system.autoBackupOffBtn') }}</button>
+          </span>
+        </div>
+        <p v-if="autoBackup.dir" class="hint s-mono">{{ autoBackup.dir }}</p>
+        <p v-if="autoBackupLine" class="hint" :class="{ 'data-err': !!autoBackup.lastError && !autoBackup.lastOkMs }">{{ autoBackupLine }}</p>
+        <p class="hint">{{ t('settings.system.autoBackupHint') }}</p>
         <div v-if="oldDataRoot" class="row">
           <span class="label">{{ t('settings.system.oldData') }}</span>
           <span class="key-state">

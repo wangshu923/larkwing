@@ -743,6 +743,9 @@ export type AppEvent =
   | { type: 'confirm'; data: ConfirmCard }
   // 「计划」快照(§6.5):HUD 计划卡 + 悬浮窗一行;items 空 = 收卡
   | { type: 'plan'; data: PlanCard }
+  // 自动备份动静(autobackup.rs):ok=false 且 stale=true = 超期两周仍失败 → toast 一句
+  // 「备份盘还在吗」(频控在 core);ok=true 只用于状态刷新,不打扰
+  | { type: 'backup'; data: { ok: boolean; stale: boolean } }
 
 /** 订阅全局事件车道;未知 type 忽略(与 TurnEvent 同一增量演化约定)。 */
 export function onAppEvent(cb: (ev: AppEvent) => void): void {
@@ -1059,6 +1062,13 @@ export interface RestoreCheck {
   clones: number
 }
 
+/** 自动备份状态(autobackup.rs;dir 空 = 没开)。 */
+export interface AutoBackupStatus {
+  dir: string | null
+  lastOkMs: number | null
+  lastError: string | null
+}
+
 export const api = {
   boot: () => invoke<BootSnapshot>('boot'),
 
@@ -1313,6 +1323,11 @@ export const api = {
   revealDataDir: () => invoke<void>('reveal_data_dir'),
   /** 一键备份:在所选目录导出 larkwing-backup-<时间戳>.zip(DB 快照 + 克隆音色),返回包路径。 */
   backupData: (destDir: string) => invoke<string>('backup_data', { destDir }),
+
+  /** 自动备份状态(设置页:目录 / 上次成功时刻 / 上次失败原因)。 */
+  autoBackupStatus: () => invoke<AutoBackupStatus>('auto_backup_status'),
+  /** 立即跑一次自动备份(刚选完目录马上出第一份;成功回 zip 路径)。 */
+  autoBackupNow: () => invoke<string>('auto_backup_now'),
 
   /** 原生文件选择器挑备份包(zip);取消 = null。 */
   pickBackupFile: () => invoke<string | null>('pick_backup_file'),

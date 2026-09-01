@@ -233,6 +233,17 @@ pub enum AppEvent {
     /// 「计划」快照(§6.5 会话内工作备忘):HUD 计划卡 + 悬浮窗一行。全量快照语义,
     /// items 空 = 无计划/已清空(收卡);回合循环嗅探 plan_set 后发,删会话时发空快照。
     Plan(PlanCard),
+    /// 自动备份动静(autobackup.rs):ok=true 成功(前端只刷新状态、不打扰);
+    /// ok=false 且 stale=true = 超期两周仍失败(前端 toast 一句「目标盘还在吗」,频控在 core)。
+    Backup(BackupNote),
+}
+
+/// 自动备份通知载荷:core 只报事实,文案在前端字典(§6.6)。
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct BackupNote {
+    pub ok: bool,
+    /// 已超期太久(≥ NAG_AFTER):false 的失败不发事件,发出来的失败必 stale=true。
+    pub stale: bool,
 }
 
 /// 计划快照载荷:title/条目全是模型产的数据、不是我们的文案(§6.6 无债);

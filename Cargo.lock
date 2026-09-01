@@ -3541,6 +3541,7 @@ dependencies = [
  "sherpa-onnx",
  "suppaftp",
  "symphonia",
+ "sysinfo",
  "tar",
  "thiserror 1.0.69",
  "tokio",
@@ -3551,6 +3552,7 @@ dependencies = [
  "unrar",
  "url",
  "windows 0.61.3",
+ "winreg 0.55.0",
  "zip 2.4.2",
 ]
 
@@ -4352,6 +4354,15 @@ dependencies = [
  "chrono",
  "rand 0.8.6",
  "time",
+]
+
+[[package]]
+name = "ntapi"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3b335231dfd352ffb0f8017f3b6027a4917f7df785ea2143d8af2adc66980ae"
+dependencies = [
+ "winapi",
 ]
 
 [[package]]
@@ -7102,6 +7113,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "sysinfo"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fc858248ea01b66f19d8e8a6d55f41deaf91e9d495246fd01368d99935c6c01"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+ "memchr",
+ "ntapi",
+ "windows 0.56.0",
 ]
 
 [[package]]

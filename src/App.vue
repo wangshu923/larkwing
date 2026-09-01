@@ -23,6 +23,7 @@ import {
   api,
   isMacOS,
   isTauri,
+  onAppEvent,
   onFloatUpdate,
   onForegroundFullscreen,
   onOpenConversation,
@@ -148,6 +149,12 @@ if (!isFloat && isTauri()) {
       else if (loc.restored === 'failed') useToast().error(t('toast.restoreFailed'))
     } catch (e) {
       console.error('数据位置检查失败', e)
+    }
+  })
+  // 自动备份超期太久仍失败(core 已频控)→ 提醒一句「备份盘还在吗」;成功不打扰(§3.5 两头)。
+  onAppEvent((ev) => {
+    if (ev.type === 'backup' && !ev.data.ok && ev.data.stale) {
+      useToast().error(t('toast.autoBackupStale'))
     }
   })
 }

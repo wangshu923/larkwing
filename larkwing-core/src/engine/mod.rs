@@ -296,6 +296,8 @@ const APP_SETTING_KEYS: &[&str] = &[
     "audio.night_end",
     // 主动关怀总开关(app 级,PLAN ★主动关怀里程碑):0/1,默认开。§6.8 两边各加一行。
     "care.enabled",
+    // 自动备份目标目录(autobackup.rs):非空 = 开、清空 = 关(选了目录即开,无独立开关键)。
+    "backup.auto.dir",
 ];
 
 /// 语音的用户级设置(PLAN §11 逐键放行,不开 voice.* 通配——同前缀跨两个 scope)。
@@ -1334,6 +1336,16 @@ impl Engine {
                     return Err(invalid("时间需为 HH:MM"));
                 }
                 self.store.settings.set(None, key, value)?;
+                Ok(())
+            }
+            // 自动备份目标目录(app 级,autobackup.rs):非空 = 开(须绝对路径,来自原生
+            // 目录选择器)、清空 = 关。水位线循环现读即生效,无需重启。
+            "backup.auto.dir" => {
+                let v = value.trim();
+                if !v.is_empty() && !std::path::Path::new(v).is_absolute() {
+                    return Err(invalid("备份目录需要绝对路径"));
+                }
+                self.store.settings.set(None, key, v)?;
                 Ok(())
             }
             // 远程渠道配置(app 级,PLAN 远程渠道):enabled 校验 0/1;凭证/白名单原样写(trim)。

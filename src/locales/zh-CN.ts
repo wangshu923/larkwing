@@ -32,6 +32,10 @@ export default {
     open: '打开…',
     system_volume: '调音量…',
     power: '电源操作…',
+    system_status: '看电脑状态…',
+    startup_list: '看开机启动项…',
+    startup_toggle: '调开机启动项…',
+    print_file: '打印文件…',
     fs_list: '看文件夹…',
     fs_find: '找文件…',
     fs_read_text: '读文件…',
@@ -441,6 +445,8 @@ export default {
     mediaFailed: '《{title}》放不了,这个文件可能损坏或者格式不支持',
     // 附件超限也别不吭声(§3.5):以前直接跳过,用户以为加上了、发出去才发现没有
     attTooBig: '「{name}」超过 {limit},没能加进来',
+    // 自动备份超期两周仍失败才提一句(core 频控);单次失败静候下轮不烦人
+    autoBackupStale: '自动备份好久没成功了,看看备份的那个盘还在不在',
   },
   // 一键更新(清单 ⑤·A):发现新版的卡片 + 手动检查的反馈
   update: {
@@ -918,6 +924,16 @@ export default {
         bad_db: '备份包里的数据库读不出来,可能已损坏。',
         newer: '这份备份来自更新版本,先把{name}升级到最新再恢复。',
       },
+      autoBackup: '自动备份',
+      autoBackupOn: '开启…',
+      autoBackupChange: '换个地方…',
+      autoBackupOffBtn: '关闭',
+      autoBackupWorking: '备份中…',
+      autoBackupLast: '上次备份:{time} · 每周一份,保留最近 10 份',
+      autoBackupPending: '还没备过,到点会自动备第一份。',
+      autoBackupErr: '上次没备成:{err}',
+      autoBackupFirstFailed: '第一份备份没成功,看看那个文件夹能不能写入。',
+      autoBackupHint: '开启后每周自动备一份到你选的文件夹,只留最近 10 份、更旧的自动清掉(改过名的备份不会动)。备到另一块盘或移动硬盘最保险。',
       oldData: '旧数据',
       oldDataDelete: '删除旧数据',
       oldDataKeep: '保留',

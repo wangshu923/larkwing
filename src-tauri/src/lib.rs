@@ -221,6 +221,13 @@ pub fn run() {
       );
       // 任务调度器(提醒/定时):常驻轮询循环,真相在 jobs 表
       tauri::async_runtime::spawn(larkwing_core::scheduler::run(engine.clone()));
+      // 自动备份(水位线;纯机制不经模型):settings 里选了目标目录才真跑。
+      let autobackup = larkwing_core::autobackup::AutoBackup::new(
+        engine.store().clone(),
+        data_dir.clone(),
+        bus.clone(),
+      );
+      tauri::async_runtime::spawn(autobackup.clone().run());
       // 免手唤醒开机自启(设置开着才会真启动;失败只记日志不挡开机)
       let voice_boot = voice.clone();
       tauri::async_runtime::spawn(async move { voice_boot.boot_wake_if_enabled().await });
@@ -238,6 +245,7 @@ pub fn run() {
         bus: bus.clone(),
         data_missing,
         restore_outcome,
+        autobackup,
       });
 
       let forward = app.handle().clone();
@@ -503,6 +511,8 @@ pub fn run() {
       commands::data_reset_to_default,
       commands::reveal_data_dir,
       commands::backup_data,
+      commands::auto_backup_status,
+      commands::auto_backup_now,
       commands::pick_backup_file,
       commands::restore_precheck,
       commands::restore_data,

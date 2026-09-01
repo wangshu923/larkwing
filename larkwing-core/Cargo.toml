@@ -114,6 +114,10 @@ unrar = "0.5.8"
 # zip 老编码文件名回退解码(国内 zip 文件名常是 GBK,乱码 = 白做):非 UTF-8 按 GB18030 解。
 # 本就在依赖树里(传递依赖),显式声明直接用。
 encoding_rs = "0.8.35"
+# 系统快照(tools/sysstat.rs 的 system_status):CPU/内存/TOP 进程 + 各卷剩余空间。
+# 只开 system+disk 两个面(默认还带 network/component/user/multithread,用不上不背);
+# 版本被 rust-version=1.77.2 钉(sevenz 同款:resolver 尊重 MSRV,新版要 1.85+)。
+sysinfo = { version = "0.33", default-features = false, features = ["system", "disk"] }
 
 # 系统音量(tools/desktop.rs 的 system_volume):Windows 走 Core Audio(IAudioEndpointVolume)。
 # 仅 Windows 编译(Mac 走 osascript、Linux 不支持,都不需要);windows 0.61 与 src-tauri 同版本,
@@ -128,7 +132,12 @@ windows = { version = "0.61", features = [
   "Win32_System_Variant",         # IMMDevice::Activate 的另一半门控(缺它 Activate 方法不生成)
   "Win32_UI_WindowsAndMessaging", # SendMessageW / WM_SYSCOMMAND / SC_MONITORPOWER(power 息屏)
   "Win32_UI_Shell_PropertiesSystem", # IMMDevice::OpenPropertyStore → IPropertyStore(读 FormFactor,voice/output_route「自动」档)
+  "Win32_Graphics_Gdi",           # 打印(tools/print.rs):CreateDCW / StartDocW / StretchDIBits
+  "Win32_Storage_Xps",            # DOCINFOW / StartDocW 一族的归属模块(打印文档生命周期)
+  "Win32_Graphics_Printing",      # EnumPrintersW / GetDefaultPrinterW(列打印机/默认打印机)
 ] }
+# 启动项(tools/startup.rs):读写注册表 Run 键 + StartupApproved 标志位(与任务管理器同一机制)。
+winreg = "0.55"
 
 # 采集路由「自动」档(voice/output_route.rs):问 CoreAudio「默认输出是不是耳机」。
 # cpal 0.17 已把同版本带进树(coreaudio-rs 0.14 → objc2-core-audio 0.3),零新编译面;

@@ -72,6 +72,11 @@ pub const SUB_EXCLUDED: &[&str] = &[
     "open",
     "system_volume",
     "power",
+    // 打印 = 物理世界动作(出纸耗墨),打哪台/几份/要不要先问天然是对话语境的事,
+    // 不该从后台子回合冒出来;startup_toggle 改机器状态且纪律是「用户点名才动」——
+    // 点名发生在主回合的对话里(power/system_volume 同族)。
+    "print_file",
+    "startup_toggle",
 ];
 
 /// 排除表的消费口(engine 侧 runner 过滤子集用;单源判定,别在别处再抄一份名单)。
@@ -234,6 +239,8 @@ mod tests {
             "read_image",
             "recall",
             "skill_lookup",
+            "startup_list",
+            "system_status",
             "torrent_download",
             "weather",
             "web_download",

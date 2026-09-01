@@ -17,8 +17,8 @@ const PDF_MAX_PAGES: usize = 20;
 /// 宽容解析 `pages`(§4.4 Quirks,与 `arg_bool` / `arg_u64` 同族:流式 JSON 里模型常把
 /// 声明为数组的参数发成别的形)。认:数组(元素是数字或数字字符串)、单个数字、
 /// 逗号分隔的字符串(顺带认 `3-5` 这种范围写法)。认不出返回空 —— 调用方据此**如实退回**,
-/// 绝不当成「全转」。0 页不存在(页码从 1 起),丢掉。
-fn parse_pages(v: &serde_json::Value) -> Vec<usize> {
+/// 绝不当成「全转」。0 页不存在(页码从 1 起),丢掉。print_file 选页复用(pub(super))。
+pub(super) fn parse_pages(v: &serde_json::Value) -> Vec<usize> {
     fn from_str(s: &str) -> Vec<usize> {
         let mut out = Vec::new();
         for part in s.split([',', '、', ';', ' ']).filter(|p| !p.trim().is_empty()) {
@@ -62,6 +62,27 @@ static PDFIUM_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// 绑定每进程只许一次(pdfium-render 0.9 二次 bind 报 AlreadyInitialized,e2e 实锤)
 /// → 首次绑定后进程级缓存复用;库文件路径稳定(组件目录),不存在"换路径重绑"。
 static PDFIUM: std::sync::OnceLock<pdfium_render::prelude::Pdfium> = std::sync::OnceLock::new();
+
+/// pdfium 的**唯一**取用口(pdf_to_png 与 print_file 共用):锁全局闸 → 进程级单例绑定 →
+/// 把实例交给闭包。所有要碰 pdfium 的代码一律走这里 —— 各自另开 OnceLock = 第二次 bind
+/// 必炸 AlreadyInitialized(上面那条纪律的模块间版本)。阻塞调用,须在 spawn_blocking 里。
+pub(super) fn with_pdfium<R>(
+    lib: &Path,
+    f: impl FnOnce(&pdfium_render::prelude::Pdfium) -> anyhow::Result<R>,
+) -> anyhow::Result<R> {
+    use pdfium_render::prelude::*;
+    let _gate = PDFIUM_GATE.lock().unwrap_or_else(|p| p.into_inner());
+    let pdfium: &Pdfium = match PDFIUM.get() {
+        Some(p) => p,
+        None => {
+            let bindings = Pdfium::bind_to_library(lib.to_string_lossy().as_ref())
+                .map_err(|e| anyhow::anyhow!("加载 PDF 渲染组件失败: {e:?}"))?;
+            let _ = PDFIUM.set(Pdfium::new(bindings)); // gate 之内,无竞争
+            PDFIUM.get().expect("刚 set 过")
+        }
+    };
+    f(pdfium)
+}
 
 pub(super) struct PdfToPng {
     spec: ToolSpec,
@@ -183,18 +204,16 @@ fn render_pages(
     pages: &[usize],
     out_dir: &Path,
 ) -> anyhow::Result<Vec<PathBuf>> {
-    use pdfium_render::prelude::*;
+    with_pdfium(lib, |pdfium| render_pages_with(pdfium, pdf, pages, out_dir))
+}
 
-    let _gate = PDFIUM_GATE.lock().unwrap_or_else(|p| p.into_inner());
-    let pdfium: &Pdfium = match PDFIUM.get() {
-        Some(p) => p,
-        None => {
-            let bindings = Pdfium::bind_to_library(lib.to_string_lossy().as_ref())
-                .map_err(|e| anyhow::anyhow!("加载 PDF 渲染组件失败: {e:?}"))?;
-            let _ = PDFIUM.set(Pdfium::new(bindings)); // gate 之内,无竞争
-            PDFIUM.get().expect("刚 set 过")
-        }
-    };
+fn render_pages_with(
+    pdfium: &pdfium_render::prelude::Pdfium,
+    pdf: &Path,
+    pages: &[usize],
+    out_dir: &Path,
+) -> anyhow::Result<Vec<PathBuf>> {
+    use pdfium_render::prelude::*;
     let doc = pdfium
         .load_pdf_from_file(pdf, None)
         .map_err(|e| anyhow::anyhow!("打不开 PDF(损坏或带密码?): {e:?}"))?;

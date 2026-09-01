@@ -53,6 +53,10 @@ const DEFAULTS: Record<string, string> = {
   'weather.qweather.host': '',
   'weather.qweather.project_id': '',
   'weather.qweather.credential_id': '',
+  // 自动备份(autobackup.rs 水位线):目标目录,非空 = 开、清空 = 关(选了目录即开,无独立开关键)。
+  // 默认关——备份必须落到另一块盘/目录,只有用户知道备到哪(§4.11 2026-08-31 拍板:每周 / 留 10 份)。
+  // Rust APP_SETTING_KEYS 逐键对应(§6.8 两边各加一行)。
+  'backup.auto.dir': '',
   // 全局代理(传输层):开关 net.proxy_enabled 控总闸,地址 net.proxy 单独保存(始终保留、给默认值免空)。
   // 关 = 一律直连;开 = 直连优先、连不通才兜底走该地址(墙内源永不被代理);地址支持 http(s):// / socks5(h):// / ${ENV}。
   // Rust 白名单 net.proxy / net.proxy_enabled 逐键对应(§6.8 两边各加一行)。

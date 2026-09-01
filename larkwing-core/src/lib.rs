@@ -3,6 +3,7 @@
 
 pub mod archive;
 pub mod attach;
+pub mod autobackup;
 pub mod bgtasks;
 pub mod bus;
 pub mod channels;
