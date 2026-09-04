@@ -314,7 +314,9 @@ pub enum AuthStyle {
 pub struct Quirks {
     /// None = 按协议默认(openai_compat→Bearer,anthropic_compat→XApiKey)。
     pub auth: Option<AuthStyle>,
-    /// DeepSeek 方言:请求体显式带 thinking 字段(坑 #2)。
+    /// DeepSeek 方言:请求体显式带 thinking 字段(坑 #2)**且**带 tool_calls 的 assistant 轮回传
+    /// reasoning_content(坑 #4)—— 语义 = 下面 `thinking_toggle + reasoning_roundtrip` 二合一。老字段,
+    /// 老配置 JSON 里就是它、语义不动;2026-09 起新接的厂商按拆开的两位各自声明,别再借它当 DeepSeek 标。
     /// 默认 false —— 严格 OpenAI 兼容网关遇到未知字段可能 400。
     pub thinking_field: bool,
     /// 端点支持 reasoning_effort(gpt-5 系):思考档位翻成 low/medium/high 字段。
@@ -323,6 +325,15 @@ pub struct Quirks {
     pub no_stream_options: bool,
     /// 中转站常要求的固定附加请求头。
     pub extra_headers: Vec<(String, String)>,
+    /// 请求体带 `thinking: {"type": "enabled" | "disabled"}`(非 Off 即 enabled)—— Kimi K2.x / 智谱 GLM /
+    /// 豆包 / 混元 TokenHub 的开关形(2026-09 各家官方文档核)。只管开关,不回传 reasoning。
+    pub thinking_toggle: bool,
+    /// 带 tool_calls 的 assistant 轮回传 `reasoning_content`(Kimi / 混元官方要求工具循环里原样回传;
+    /// 智谱是否必需未核 → 不回传)。
+    pub reasoning_roundtrip: bool,
+    /// 千问(dashscope 兼容模式)方言:思考档 != Off 时带 `enable_thinking: true`;**Off 不带字段**
+    /// (不发 false —— 对不支持思考的模型传该参会不会报错官方没写,不带最稳)。
+    pub enable_thinking_bool: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -519,5 +530,17 @@ mod tests {
         let noted = tool_result_text("已附上截图", &[img.clone(), img], false);
         assert!(noted.starts_with("已附上截图\n"), "{noted}");
         assert!(noted.contains("2 张图片没能传给当前模型"), "{noted}");
+    }
+
+    // 2026-09 拆开的三个思考方言位:老配置 JSON(只有 thinking_field)照样读、新位默认 false;空对象 = 默认。
+    #[test]
+    fn quirks_new_thinking_bits_default_false_and_old_json_loads() {
+        let q: Quirks = serde_json::from_str(r#"{"thinking_field":true}"#).unwrap();
+        assert!(q.thinking_field);
+        assert!(!q.thinking_toggle && !q.reasoning_roundtrip && !q.enable_thinking_bool);
+        assert_eq!(serde_json::from_str::<Quirks>("{}").unwrap(), Quirks::default());
+        let q: Quirks =
+            serde_json::from_str(r#"{"thinking_toggle":true,"reasoning_roundtrip":true}"#).unwrap();
+        assert!(q.thinking_toggle && q.reasoning_roundtrip && !q.thinking_field);
     }
 }
