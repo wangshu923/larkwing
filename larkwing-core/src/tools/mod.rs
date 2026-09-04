@@ -31,6 +31,7 @@ mod send_file;
 mod send_text;
 mod show_image;
 mod skill;
+mod speak_to_file;
 mod startup;
 mod sysstat;
 mod todo;
@@ -357,6 +358,7 @@ impl Tools {
         tools.register(Arc::new(print::PrintFile::new()));
         tools.register(Arc::new(read_image::ReadImage::new()));
         tools.register(Arc::new(read_audio::ReadAudio::new()));
+        tools.register(Arc::new(speak_to_file::SpeakToFile::new()));
         tools.register(Arc::new(show_image::ShowImage::new()));
         tools.register(Arc::new(send_file::SendFile::new()));
         tools.register(Arc::new(send_text::SendText::new()));

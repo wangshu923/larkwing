@@ -70,6 +70,7 @@ export default {
     pdf_to_png: 'PDF 转图片…',
     read_image: '看图片…',
     read_audio: '听音频…',
+    speak_to_file: '录一段话…',
     show_image: '展示图片…',
     send_file: '发文件到手机…',
     send_text: '发消息到手机…',

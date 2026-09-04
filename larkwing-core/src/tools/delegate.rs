@@ -39,6 +39,8 @@ pub const SUB_REPORT_MAX_CHARS: usize = 4_000;
 /// ④ 现场交互类 —— 全局播放、聊天图卡(子回合不落库、图卡没有落点)、桌面开窗/音量/电源
 ///    是「对着眼前用户」的动作,不该从后台冒出来。
 /// (enter_mode 属 ①,当前单场景未注册,注册之日照类入表。)
+/// 保留的判定范例:speak_to_file(文字→音频文件落盘)是**产物型**、无现场交互,与
+/// qr_encode / pdf_to_png 同族 → 保留;把产物发到手机那步 send_file 归 ③ 主回合。
 pub const SUB_EXCLUDED: &[&str] = &[
     // ① 会话/控制类
     "delegate",
@@ -239,6 +241,8 @@ mod tests {
             "read_image",
             "recall",
             "skill_lookup",
+            // 产物型(文字→音频文件落盘),无现场交互 → 保留;发到手机的 send_file 归主回合
+            "speak_to_file",
             "startup_list",
             "system_status",
             "torrent_download",
