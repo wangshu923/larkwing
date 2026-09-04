@@ -8,7 +8,7 @@
 //!
 //! 价格为编写时快照(USD / 百万 token),发版前人工校对;将来要保鲜再加远程目录刷新。
 
-use std::sync::RwLock;
+use std::sync::{OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -127,54 +127,123 @@ const fn m(
     ModelInfo { family, tier, vision, in_usd_per_m, out_usd_per_m, ctx_window_tokens }
 }
 
+/// 人民币牌价换算用的汇率快照(2026-09,取偏低值让估价偏高——同缓存折扣「宁可高估不低估」口径;
+/// §4.11 待用户确认)。国内厂商(千问 / 豆包 / Kimi / 智谱 / 混元)的牌价全是 CNY / 百万 token,
+/// 目录里一律经 `cny()` 换成 USD 存,**别手算写死美元数**(改汇率只改这一处)。
+pub const CNY_PER_USD: f64 = 7.0;
+
+/// 人民币 / 百万 token → 目录价列(USD / 百万 token)。
+fn cny(yuan_per_m: f64) -> Option<f64> {
+    Some(yuan_per_m / CNY_PER_USD)
+}
+
+/// 目录本体,首次查询时建一次(价列要过 `cny()` 做浮点除法,const fn 里的浮点运算 MSRV 1.77 不许,
+/// 故不再是 `const` 表;语义不变 —— 顺序即匹配优先级)。
+static CATALOG: OnceLock<Vec<ModelInfo>> = OnceLock::new();
+
+fn catalog() -> &'static [ModelInfo] {
+    CATALOG.get_or_init(build_catalog)
+}
+
 /// 顺序即匹配优先级:特异条目(-flash/-mini)必须排在其宽泛家族(deepseek-v4)之前。
-/// 第 5 列 = 上下文窗口(token,2026-06 采集快照,全部 200K–1M;发版前可校)。
-const CATALOG: &[ModelInfo] = &[
-    // DeepSeek(默认供应商;V4 全系 1M 窗口。牌价 = 2026-08-21 调价后的**高峰价**快照
-    // (官方分时计价:空闲时段对折——不建模,同缓存折扣「宁可高估不低估」口径)。
-    // vision-exp 的 id **包含** deepseek-v4-flash 子串:必须排在 flash 行之前,
-    // 否则被错杀成 vision=false、图遭降级(kimi-k2.5 被 kimi-k2 错杀同款坑)。
-    m("deepseek-v4-flash-vision-exp", Tier::Light, true, Some(0.44), Some(1.32), Some(1_000_000)), // 实验性多模态,flash 同价(一张图 ≤384 token)
-    m("deepseek-v4-flash", Tier::Light, false, Some(0.44), Some(1.32), Some(1_000_000)),
-    m("deepseek-v4", Tier::Balanced, false, Some(1.32), Some(3.96), Some(1_000_000)), // V4-Pro 实价
-    m("deepseek-chat", Tier::Balanced, false, Some(0.28), Some(0.42), Some(1_000_000)), // 旧名,2026-07-24 弃用前仍可能遇到
-    m("deepseek-reasoner", Tier::Smart, false, Some(0.28), Some(0.42), Some(1_000_000)),
-    // Anthropic(Opus/Sonnet 1M,Haiku 200K)
-    m("claude-opus", Tier::Smart, true, Some(5.0), Some(25.0), Some(1_000_000)),
-    m("claude-sonnet", Tier::Smart, true, Some(3.0), Some(15.0), Some(1_000_000)),
-    m("claude-haiku", Tier::Light, true, Some(1.0), Some(5.0), Some(200_000)),
-    // 其他常见(经 OpenAI 兼容端点/中转可达)
-    m("gpt-5-mini", Tier::Light, true, Some(0.25), Some(2.0), Some(400_000)),
-    m("gpt-5", Tier::Smart, true, Some(0.625), Some(5.0), Some(400_000)),
-    // Kimi:K2.5/K2.6 起原生多模态(MoonViT,图/视频输入;2026-07 官方 API 核实),
-    // 老 K2 是纯文本 —— 特异在前,免得 k2.5/k2.6 被 kimi-k2 行错杀成不看图。
-    m("kimi-k3", Tier::Smart, true, None, None, Some(1_000_000)), // 2026 旗舰,恒开推理、多模态、1M(官方文档;价存疑不装懂)
-    m("kimi-k2.6", Tier::Smart, true, None, None, Some(256_000)),
-    m("kimi-k2.5", Tier::Smart, true, None, None, Some(256_000)),
-    m("kimi-k2", Tier::Balanced, false, None, None, Some(256_000)),
-    // Qwen:qwen-max 的 API 仍是纯文本;视觉/全模态是独立的 VL / Omni 系(dashscope,
-    // 2026-07 核实)。窗口/价随版本浮动不装懂,留 None。
-    m("qwen3-vl", Tier::Balanced, true, None, None, None),
-    m("qwen-vl", Tier::Balanced, true, None, None, None),
-    m("qwen3-omni", Tier::Balanced, true, None, None, None),
-    m("qwen-omni", Tier::Balanced, true, None, None, None),
-    m("qwen-max", Tier::Balanced, false, None, None, Some(256_000)), // 3.6-Max 256K(3.7-Max 已 1M,保守取低)
-    // Google Gemini(经官方 OpenAI 兼容端点;牌价随版本浮动、存疑就不装懂 → 留 None 只报 token)。
-    // 特异在前、通配在后(子串匹配按顺序)。窗口全系 1M。
-    m("gemini-2.5-flash", Tier::Light, true, None, None, Some(1_000_000)),
-    m("gemini-2.0-flash", Tier::Light, true, None, None, Some(1_000_000)),
-    m("gemini-flash", Tier::Light, true, None, None, Some(1_000_000)), // gemini-flash-latest 等
-    m("gemini-2.5-pro", Tier::Smart, true, None, None, Some(1_000_000)),
-    m("gemini-3", Tier::Smart, true, None, None, Some(1_000_000)), // gemini-3-pro 等
-    m("gemini", Tier::Balanced, true, None, None, Some(1_000_000)), // 通配兜底:未列出的 gemini 版本
-    // Ollama 本地模型(llama/qwen/mistral/…):名字千变万化且本地零计费,故意不列 ——
-    // 命中目录兜底规则(未知 → 均衡档 + 不报钱 + 窗口 None → 预算回落默认),正合"本地、免费"的语义。
-];
+/// 第 5 列 = 上下文窗口(token,2026-06 采集快照;发版前可校)。
+fn build_catalog() -> Vec<ModelInfo> {
+    vec![
+        // DeepSeek(默认供应商;V4 全系 1M 窗口。牌价 = 2026-08-21 调价后的**高峰价**快照
+        // (官方分时计价:空闲时段对折——不建模,同缓存折扣「宁可高估不低估」口径)。
+        // vision-exp 的 id **包含** deepseek-v4-flash 子串:必须排在 flash 行之前,
+        // 否则被错杀成 vision=false、图遭降级(kimi-k2.5 被 kimi-k2 错杀同款坑)。
+        m("deepseek-v4-flash-vision-exp", Tier::Light, true, Some(0.44), Some(1.32), Some(1_000_000)), // 实验性多模态,flash 同价(一张图 ≤384 token)
+        m("deepseek-v4-flash", Tier::Light, false, Some(0.44), Some(1.32), Some(1_000_000)),
+        m("deepseek-v4", Tier::Balanced, false, Some(1.32), Some(3.96), Some(1_000_000)), // V4-Pro 实价
+        m("deepseek-chat", Tier::Balanced, false, Some(0.28), Some(0.42), Some(1_000_000)), // 旧名,2026-07-24 弃用前仍可能遇到
+        m("deepseek-reasoner", Tier::Smart, false, Some(0.28), Some(0.42), Some(1_000_000)),
+        // Anthropic(Opus/Sonnet 1M,Haiku 200K)
+        m("claude-opus", Tier::Smart, true, Some(5.0), Some(25.0), Some(1_000_000)),
+        m("claude-sonnet", Tier::Smart, true, Some(3.0), Some(15.0), Some(1_000_000)),
+        m("claude-haiku", Tier::Light, true, Some(1.0), Some(5.0), Some(200_000)),
+        // 其他常见(经 OpenAI 兼容端点/中转可达)
+        m("gpt-5-mini", Tier::Light, true, Some(0.25), Some(2.0), Some(400_000)),
+        m("gpt-5", Tier::Smart, true, Some(0.625), Some(5.0), Some(400_000)),
+        // Kimi(api.moonshot.cn;2026-09 官方文档核:platform.kimi.com/docs/api/models-overview +
+        // pricing/chat-k26 + pricing/chat-k27-code):K2.5 起原生多模态(MoonViT,图/视频输入),老 K2 纯文本
+        // —— 特异在前,免得 k2.x 被 kimi-k2 行错杀成不看图。K3 / K2.7-code 恒开推理(**没有** thinking 参数;
+        // K3 走 reasoning_effort low/high/max,没 medium → 不开 effort_field,绑机制不绑模型名 §6.3)。
+        m("kimi-k3", Tier::Smart, true, None, None, Some(1_000_000)), // 2026 旗舰,1M;价未核不装懂
+        m("kimi-k2.7-code", Tier::Smart, true, cny(6.5), cny(27.0), Some(256_000)), // ¥6.5 / ¥27
+        m("kimi-k2.6", Tier::Smart, true, cny(6.5), cny(27.0), Some(256_000)), // ¥6.5 / ¥27,图/视频输入
+        m("kimi-k2.5", Tier::Smart, true, None, None, Some(256_000)),
+        m("kimi-k2", Tier::Balanced, false, None, None, Some(256_000)),
+        // Qwen(dashscope 兼容模式;2026-09 核 help.aliyun.com/zh/model-studio 的 models / model-pricing /
+        // vision 页):Qwen3.5 起的商业旗舰原生多模态(视觉文档直接拿 qwen3.8-max / qwen3.7-plus / qwen3.6-plus
+        // 做图片示例,3.8-flash 归「多模态接口」组);老一代 qwen-max / qwen3-max / qwen-plus / qwen-flash 仍纯文本,
+        // 视觉 / 全模态是独立的 VL / Omni 系。牌价只收单档价(北京地域);分段计价(qwen-plus / -flash /
+        // qwen3-max / qwen3.7-plus)存疑不装懂 → None。**不加 qwen3.x 版本宽泛行**:qwen3.7-max 别名仍走
+        // 文本接口,宽泛行会把它错标成能看图(→ 400)。
+        m("qwen3-vl", Tier::Balanced, true, None, None, None),
+        m("qwen-vl", Tier::Balanced, true, None, None, None),
+        m("qwen3.5-omni", Tier::Balanced, true, None, None, None), // 音频另计价 → 不报价
+        m("qwen3-omni", Tier::Balanced, true, None, None, None),
+        m("qwen-omni", Tier::Balanced, true, None, None, None),
+        m("qwen3.8-max", Tier::Smart, true, cny(12.0), cny(36.0), Some(1_000_000)), // ¥12 / ¥36,单档到 1M
+        m("qwen3.8-flash", Tier::Light, true, cny(0.8), cny(2.7), Some(1_000_000)), // ¥0.8 / ¥2.7
+        m("qwen3.7-plus", Tier::Balanced, true, None, None, Some(1_000_000)), // 分段 + 思考/非思考两价 → 不报价
+        m("qwen3.7-max", Tier::Smart, false, None, None, None), // 别名走文本接口(日期快照才多模态)→ 保守 false
+        m("qwen3.6-plus", Tier::Balanced, true, None, None, None),
+        m("qwen3-max", Tier::Smart, false, None, None, Some(256_000)), // 分段计价 → 不报价
+        m("qwen-max", Tier::Balanced, false, None, None, Some(256_000)), // 老别名
+        m("qwen-plus", Tier::Balanced, false, None, None, Some(1_000_000)), // 分段计价 → 不报价
+        m("qwen-flash", Tier::Light, false, None, None, Some(1_000_000)), // 分段计价 → 不报价
+        // 豆包(火山方舟 ark.cn-beijing.volces.com/api/v3;2026-09 核:火山官方文档页是 SPA 抓不到正文,参数
+        // 与 ID 形经 BytePlus 同族 Seed-2.0 文档 + 镜像文档核)。Model ID 官方写法 = 横杠 + 日期后缀
+        // (doubao-seed-2-0-lite-260215),展示名 / 用户手填常见点号(doubao-seed-2.0-lite)—— 子串匹配两种
+        // 写法各列一行(**不做 .→- 归一**:那会把 qwen3-8b 之类错配进 qwen3.8 家族)。`ep-…` 接入点 ID 照旧
+        // unknown。Seed 2.x 全系 256K、图/视频输入、深度思考;牌价:2.1-pro ¥6 / ¥30 为文章转述**待核**,其余 None。
+        m("doubao-seed-2-0-mini", Tier::Light, true, None, None, Some(256_000)),
+        m("doubao-seed-2.0-mini", Tier::Light, true, None, None, Some(256_000)),
+        m("doubao-seed-2-0-lite", Tier::Balanced, true, None, None, Some(256_000)),
+        m("doubao-seed-2.0-lite", Tier::Balanced, true, None, None, Some(256_000)),
+        m("doubao-seed-2-1-pro", Tier::Smart, true, cny(6.0), cny(30.0), Some(256_000)),
+        m("doubao-seed-2.1-pro", Tier::Smart, true, cny(6.0), cny(30.0), Some(256_000)),
+        m("doubao-seed-2", Tier::Smart, true, None, None, Some(256_000)), // 宽泛:2.0-pro / code-preview / 后续 2.x
+        m("doubao-seed-1-6", Tier::Balanced, true, None, None, Some(256_000)), // 上一代多模态全能模型
+        m("doubao-seed-1.6", Tier::Balanced, true, None, None, Some(256_000)),
+        // 智谱 GLM(open.bigmodel.cn/api/paas/v4;2026-09 核 docs.bigmodel.cn 的 glm-5-turbo / glm-5v-turbo 页):
+        // 5v = 视觉版(200K,图/视频)**必须排在 glm-5 前**;glm-5.3 1M(¥8 / ¥28 为搜索结果转述**待核**),
+        // 5.3-flash 特异行先于 5.3。老 4 代只按名字认视觉(4v / 4.5v),其余纯文本、窗口与价不装懂。
+        m("glm-5v-turbo", Tier::Balanced, true, None, None, Some(200_000)),
+        m("glm-5-turbo", Tier::Balanced, false, None, None, Some(200_000)),
+        m("glm-5.3-flash", Tier::Light, false, None, None, None),
+        m("glm-5.3", Tier::Smart, false, cny(8.0), cny(28.0), Some(1_000_000)),
+        m("glm-5", Tier::Balanced, false, None, None, None), // 宽泛:glm-5 / 5.1 / 5.2
+        m("glm-4.5v", Tier::Balanced, true, None, None, None),
+        m("glm-4v", Tier::Balanced, true, None, None, None),
+        m("glm-4", Tier::Balanced, false, None, None, None),
+        // 混元(TokenHub tokenhub.tencentmaas.com/v1;2026-09 核 cloud.tencent.com/document/product/1823):
+        // hy4-preview 1M 默认开思考 ¥6 / ¥18;hy3 256K ¥1 / ¥4;两者视觉未标 → false。老域名的 hunyuan-* 系
+        // 只按名字认视觉(-vision),其余不装懂。
+        m("hy4-preview", Tier::Smart, false, cny(6.0), cny(18.0), Some(1_000_000)),
+        m("hy3", Tier::Balanced, false, cny(1.0), cny(4.0), Some(256_000)),
+        m("hunyuan-turbos-vision", Tier::Balanced, true, None, None, None),
+        m("hunyuan-vision", Tier::Balanced, true, None, None, None),
+        m("hunyuan", Tier::Balanced, false, None, None, None),
+        // Google Gemini(经官方 OpenAI 兼容端点;牌价随版本浮动、存疑就不装懂 → 留 None 只报 token)。
+        // 特异在前、通配在后(子串匹配按顺序)。窗口全系 1M。
+        m("gemini-2.5-flash", Tier::Light, true, None, None, Some(1_000_000)),
+        m("gemini-2.0-flash", Tier::Light, true, None, None, Some(1_000_000)),
+        m("gemini-flash", Tier::Light, true, None, None, Some(1_000_000)), // gemini-flash-latest 等
+        m("gemini-2.5-pro", Tier::Smart, true, None, None, Some(1_000_000)),
+        m("gemini-3", Tier::Smart, true, None, None, Some(1_000_000)), // gemini-3-pro 等
+        m("gemini", Tier::Balanced, true, None, None, Some(1_000_000)), // 通配兜底:未列出的 gemini 版本
+        // Ollama 本地模型(llama/qwen/mistral/…):名字千变万化且本地零计费,故意不列 ——
+        // 命中目录兜底规则(未知 → 均衡档 + 不报钱 + 窗口 None → 预算回落默认),正合"本地、免费"的语义。
+    ]
+}
 
 /// 模糊匹配:归一小写后,目录家族子串出现在模型 id 里即命中(吃掉中转前缀/版本后缀)。
 pub fn lookup(model_id: &str) -> Option<&'static ModelInfo> {
     let id = model_id.to_ascii_lowercase();
-    CATALOG.iter().find(|info| id.contains(info.family))
+    catalog().iter().find(|info| id.contains(info.family))
 }
 
 /// 能不能看图:先看用户覆盖(「高级」里标的,自架 llava / qwen-vl 类靠它),再查目录;
@@ -371,5 +440,75 @@ mod tests {
         assert_eq!(tier_of("qwen2.5-coder:7b"), Tier::Balanced);
         let usage = Usage { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_hit_tokens: 0 };
         assert!(est_cost_usd("llama3.2", &usage).is_none());
+    }
+
+    // 2026-09 国内五家入目录:豆包两种 ID 写法都认、特异行先于宽泛行、glm 5v / 5.3-flash 排序承重、
+    // 混元 / Kimi / 千问 新行的档位 · 看图 · 窗口,接入点 ID(ep-…)照旧 unknown。
+    #[test]
+    fn domestic_families_2026_09() {
+        // 豆包:官方横杠 + 日期后缀 / 手填点号 两形同命中;lite / mini 特异行先于 doubao-seed-2 宽泛行
+        assert_eq!(tier_of("doubao-seed-2-0-mini-260215"), Tier::Light);
+        assert_eq!(tier_of("Doubao-Seed-2.0-mini"), Tier::Light);
+        assert_eq!(tier_of("doubao-seed-2-0-lite-260215"), Tier::Balanced);
+        assert_eq!(tier_of("doubao-seed-2.0-lite"), Tier::Balanced);
+        assert_eq!(tier_of("doubao-seed-2-0-pro-260215"), Tier::Smart);
+        assert_eq!(tier_of("doubao-seed-2.1-pro"), Tier::Smart);
+        assert!(supports_vision("doubao-seed-2-0-lite-260215"));
+        assert!(supports_vision("doubao-seed-1-6-250615") && supports_vision("doubao-seed-1.6"));
+        assert_eq!(ctx_window_of("doubao-seed-2-0-pro-260215"), Some(256_000));
+        assert_eq!(prices_of("doubao-seed-2-0-pro-260215"), (None, None), "2.0-pro 价未核不装懂");
+        assert!(prices_of("doubao-seed-2-1-pro-260515").0.is_some(), "2.1-pro 带(待核)牌价");
+        assert!(lookup("ep-20260904-abcdef").is_none(), "接入点 ID 目录不认识 → unknown");
+        // 智谱:5v(视觉)必须先于 glm-5;5.3-flash 先于 5.3;老 4 代按名字认视觉
+        assert!(supports_vision("glm-5v-turbo"));
+        assert!(!supports_vision("glm-5-turbo"));
+        assert_eq!(tier_of("glm-5.3-flash"), Tier::Light);
+        assert_eq!(tier_of("glm-5.3"), Tier::Smart);
+        assert_eq!(ctx_window_of("glm-5.3"), Some(1_000_000));
+        assert_eq!(ctx_window_of("glm-5v-turbo"), Some(200_000));
+        assert!(supports_vision("glm-4.5v") && supports_vision("glm-4v-plus"));
+        assert!(!supports_vision("glm-4-flash"));
+        // 混元:TokenHub 新名 + 老域名 hunyuan-* 系
+        assert_eq!(tier_of("hy4-preview"), Tier::Smart);
+        assert_eq!(ctx_window_of("hy4-preview"), Some(1_000_000));
+        assert_eq!(tier_of("hy3"), Tier::Balanced);
+        assert_eq!(ctx_window_of("hy3"), Some(256_000));
+        assert!(!supports_vision("hy4-preview") && !supports_vision("hy3"), "混元视觉未标 → false");
+        assert!(supports_vision("hunyuan-turbos-vision") && !supports_vision("hunyuan-turbos-latest"));
+        // Kimi:k2.7-code / k2.6 带价 + 看图;k3 价留 None(未核)
+        assert!(supports_vision("kimi-k2.7-code-preview"));
+        assert_eq!(ctx_window_of("kimi-k2.7-code"), Some(256_000));
+        assert!(prices_of("kimi-k2.6").0.is_some() && prices_of("kimi-k2.7-code").1.is_some());
+        assert_eq!(prices_of("kimi-k3"), (None, None));
+        // 千问:3.5 起商业旗舰原生多模态;老一代 qwen-max / qwen3-max / plus / flash 纯文本;分段计价不报价
+        assert!(supports_vision("qwen3.8-max") && supports_vision("qwen3.7-plus"));
+        assert!(supports_vision("qwen3.6-plus") && supports_vision("qwen3.5-omni-plus"));
+        assert_eq!(tier_of("qwen3.8-max"), Tier::Smart);
+        assert_eq!(tier_of("qwen3.8-flash"), Tier::Light);
+        assert_eq!(ctx_window_of("qwen3.8-max"), Some(1_000_000));
+        assert!(!supports_vision("qwen3-max") && !supports_vision("qwen-plus") && !supports_vision("qwen-flash"));
+        assert!(!supports_vision("qwen3.7-max"), "3.7-max 别名走文本接口,保守 false");
+        assert_eq!(tier_of("qwen3-max"), Tier::Smart);
+        assert_eq!(prices_of("qwen-plus"), (None, None), "分段计价不装懂");
+        // 不做 .→- 归一的理由钉住:qwen3-8b(开源 8B 纯文本)绝不能被 qwen3.8 家族认走
+        assert!(lookup("Qwen/Qwen3-8B").is_none() && !supports_vision("qwen3-8b"));
+    }
+
+    // 人民币牌价经单源汇率换算:hy3 ¥1 / ¥4 → (1 + 4) / CNY_PER_USD 美元;kimi-k2.6 ¥6.5 / ¥27;
+    // 改汇率只改 CNY_PER_USD 一处、断言跟着走(不写死美元数)。
+    #[test]
+    fn cny_prices_convert_through_single_rate() {
+        let usage = Usage { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_hit_tokens: 0 };
+        let hy3 = est_cost_usd("hy3", &usage).unwrap();
+        assert!((hy3 - 5.0 / CNY_PER_USD).abs() < 1e-9, "实际 {hy3}");
+        let k26 = est_cost_usd("kimi-k2.6", &usage).unwrap();
+        assert!((k26 - 33.5 / CNY_PER_USD).abs() < 1e-9, "实际 {k26}");
+        let (i, o) = prices_of("hy4-preview");
+        assert!((i.unwrap() - 6.0 / CNY_PER_USD).abs() < 1e-12);
+        assert!((o.unwrap() - 18.0 / CNY_PER_USD).abs() < 1e-12);
+        let (i, o) = prices_of("qwen3.8-max");
+        assert!((i.unwrap() - 12.0 / CNY_PER_USD).abs() < 1e-12);
+        assert!((o.unwrap() - 36.0 / CNY_PER_USD).abs() < 1e-12);
+        assert_eq!(cny(CNY_PER_USD), Some(1.0), "汇率快照的自洽:¥CNY_PER_USD = $1");
     }
 }

@@ -162,21 +162,25 @@ impl ProviderSpec {
 
     /// 解析发生在这里(重建候选时),存储里永远保留 `${VAR}` 原文。
     fn to_config(&self) -> LlmConfig {
+        let base_url = resolve_env(&self.base_url);
+        // 方言修正:用户没显式设过(仍是默认值)→ 按接入点主机从预设表派生(千问 enable_thinking / Kimi·混元
+        // 开关 + 回传 / 智谱·豆包 开关);显式设过的(哪怕只改了一位)原样尊重、不覆盖;中转站等认不出的
+        // 主机 → 维持默认。解析完 `${ENV}` 再派生,引用形接入点也认得。已接入的卡与「自己接一个大脑」草稿
+        // (engine `list_models_for`)都经 `build()` 走这里 —— 唯一判定处。
+        let mut quirks = if self.quirks == Quirks::default() {
+            quirks_for_base_url(&base_url).unwrap_or_default()
+        } else {
+            self.quirks.clone()
+        };
+        quirks.extra_headers =
+            quirks.extra_headers.iter().map(|(k, v)| (k.clone(), resolve_env(v))).collect();
         LlmConfig {
-            base_url: resolve_env(&self.base_url),
+            base_url,
             api_key: resolve_env(&self.api_key),
             model: self.model.clone(),
             temperature: None,
             thinking: Thinking::Off,
-            quirks: Quirks {
-                extra_headers: self
-                    .quirks
-                    .extra_headers
-                    .iter()
-                    .map(|(k, v)| (k.clone(), resolve_env(v)))
-                    .collect(),
-                ..self.quirks.clone()
-            },
+            quirks,
         }
     }
 
@@ -211,6 +215,10 @@ pub struct ProviderPreset {
     pub base_url: String,
     /// 钥匙占位值:None = 必须用户贴钥匙;Some = 本地服务不验钥匙,用占位让 `usable()` 放行(Ollama)。
     pub key_placeholder: Option<String>,
+    /// 该家接入点的方言修正(思考开关形 / reasoning 回传 / 千问 enable_thinking)。**不过桥**(前端只填名字 /
+    /// 协议 / 接入点;接入时 `ProviderSpec::to_config` 按主机从本表派生,见 `quirks_for_base_url`)。
+    #[serde(skip)]
+    pub quirks: Quirks,
 }
 
 /// 预设表。名单 = 国内主流五家(千问 / 豆包 / Kimi / 智谱 / 混元,用户拍板「主流就行」)+ 已有但此前
@@ -218,31 +226,102 @@ pub struct ProviderPreset {
 /// 后三家的接入点取自 `LlmConfig` 预设构造器(单源,不复制字面量)。国内五家的接入点 = 各家官方文档的
 /// 公开地址(协议事实,非 §4.11 产品默认);千问用百炼旧域名(官方仍可用,新域名带用户 WorkspaceId
 /// 没法预填);豆包 model 填 Model ID(需控制台「开通」)或 `ep-…` 接入点 ID 都行。
+/// 每家的**方言修正(quirks)也在这一张表**(2026-09 各家官方文档核),`quirks_for_base_url` 按接入点
+/// 主机派生,别处不再复制这份判定。
 /// DeepSeek / Anthropic 两张模板卡另走 `engine::effective_specs`,不在此表(免同一家两个入口)。
 pub fn presets() -> Vec<ProviderPreset> {
-    let lit = |id: &str, name: &str, protocol: Protocol, base_url: &str| ProviderPreset {
+    let lit = |id: &str, name: &str, protocol: Protocol, base_url: &str, quirks: Quirks| ProviderPreset {
         id: id.into(),
         name: name.into(),
         protocol,
         base_url: base_url.into(),
         key_placeholder: None,
+        quirks,
     };
+    // 开关形 thinking:{type: enabled|disabled};Kimi / 混元官方还要求工具循环里把 assistant 的
+    // reasoning_content 原样回传(缺了要么 400 要么推理断链)。
+    let toggle = Quirks { thinking_toggle: true, ..Quirks::default() };
+    let toggle_roundtrip =
+        Quirks { thinking_toggle: true, reasoning_roundtrip: true, ..Quirks::default() };
     let openai = LlmConfig::openai(String::new());
     let gemini = LlmConfig::gemini(String::new());
     let ollama = LlmConfig::ollama(String::new());
     vec![
-        lit("qwen", "千问 Qwen", Protocol::OpenaiCompat, "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-        lit("doubao", "豆包 Doubao", Protocol::OpenaiCompat, "https://ark.cn-beijing.volces.com/api/v3"),
-        lit("kimi", "Kimi", Protocol::OpenaiCompat, "https://api.moonshot.cn/v1"),
-        lit("zhipu", "智谱 GLM", Protocol::OpenaiCompat, "https://open.bigmodel.cn/api/paas/v4"),
-        lit("hunyuan", "混元 Hunyuan", Protocol::OpenaiCompat, "https://api.hunyuan.cloud.tencent.com/v1"),
-        lit("openai", "OpenAI", Protocol::OpenaiResponses, &openai.base_url),
-        lit("gemini", "Gemini", Protocol::Gemini, &gemini.base_url),
+        // 千问:enable_thinking: true|false(+thinking_budget);Off **不带字段**
+        // (help.aliyun.com/zh/model-studio/deep-thinking)
+        lit(
+            "qwen",
+            "千问 Qwen",
+            Protocol::OpenaiCompat,
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            Quirks { enable_thinking_bool: true, ..Quirks::default() },
+        ),
+        // 豆包:thinking:{type: enabled|disabled|auto}(Seed 1.6 / 2.x 同形;auto 不用,非 Off 即 enabled;
+        // 2026-09 经 BytePlus 同族文档 + 镜像文档核,火山官方页 SPA 抓不到正文)
+        lit(
+            "doubao",
+            "豆包 Doubao",
+            Protocol::OpenaiCompat,
+            "https://ark.cn-beijing.volces.com/api/v3",
+            toggle.clone(),
+        ),
+        // Kimi:K2.6 thinking:{type} 默认 enabled;K3 / K2.7-code 恒思考**没有** thinking 参数(K3 走
+        // reasoning_effort low/high/max,没 medium → 不开 effort_field;它们收到 thinking:{type} 会不会 400 =
+        // 真机 watch,绑机制不绑模型名 §6.3);工具循环**必须**回传 reasoning_content
+        // (platform.kimi.com/docs/guide/use-thinking-models)
+        lit("kimi", "Kimi", Protocol::OpenaiCompat, "https://api.moonshot.cn/v1", toggle_roundtrip.clone()),
+        // 智谱:thinking:{type:"enabled"} 开思考(docs.bigmodel.cn glm-5-turbo 页);回传 reasoning_content
+        // 是否必需未核 → 不回传
+        lit("zhipu", "智谱 GLM", Protocol::OpenaiCompat, "https://open.bigmodel.cn/api/paas/v4", toggle),
+        // 混元:接入点 = TokenHub(官方文档现只写它,hy3 / hy4-preview 新模型只在这;老域名
+        // api.hunyuan.cloud.tencent.com 2026-09 仍活着但只有 hunyuan-* 老模型,方言经 HOST_ALIASES 同映射);
+        // thinking:{type: enabled|disabled}(无 enable_thinking)+ 工具调用要把 assistant 消息含
+        // reasoning_content 整体回写(cloud.tencent.com/document/product/1823/132252)
+        lit(
+            "hunyuan",
+            "混元 Hunyuan",
+            Protocol::OpenaiCompat,
+            "https://tokenhub.tencentmaas.com/v1",
+            toggle_roundtrip,
+        ),
+        lit("openai", "OpenAI", Protocol::OpenaiResponses, &openai.base_url, Quirks::default()),
+        lit("gemini", "Gemini", Protocol::Gemini, &gemini.base_url, Quirks::default()),
         ProviderPreset {
             key_placeholder: Some(ollama.api_key.clone()),
-            ..lit("ollama", "Ollama", Protocol::OpenaiCompat, &ollama.base_url)
+            ..lit("ollama", "Ollama", Protocol::OpenaiCompat, &ollama.base_url, Quirks::default())
         },
     ]
+}
+
+/// 老域名 / 别名 → 预设 id:接入点换了域名但方言不变的家。
+const HOST_ALIASES: &[(&str, &str)] = &[
+    // 混元老接入点(2026-09 仍活着,但 hy3 / hy4-preview 只在 TokenHub);方言同一套
+    ("api.hunyuan.cloud.tencent.com", "hunyuan"),
+];
+
+/// URL → 小写主机名(去 scheme / 用户信息 / 端口 / 路径);解析不出 → 空串。
+fn host_of(url: &str) -> String {
+    let rest = url.trim();
+    let rest = rest.split_once("://").map(|(_, r)| r).unwrap_or(rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    authority.split(':').next().unwrap_or("").to_ascii_lowercase()
+}
+
+/// 按接入点主机派生该家的方言修正:命中预设表(含 HOST_ALIASES 老域名)→ Some(该家 quirks);中转站 /
+/// 自架 / 认不出的主机 → None(维持现状:用默认或用户显式设的)。**唯一判定处**:`ProviderSpec::to_config`
+/// 在 spec.quirks 仍是默认值时用它 —— 已接入的卡与「自己接一个大脑」草稿(engine `list_models_for`)都经
+/// `build()` → `to_config()`,不长第二处判定。
+pub fn quirks_for_base_url(base_url: &str) -> Option<Quirks> {
+    let host = host_of(base_url);
+    if host.is_empty() {
+        return None;
+    }
+    let all = presets();
+    if let Some((_, id)) = HOST_ALIASES.iter().find(|(alias, _)| *alias == host) {
+        return all.iter().find(|p| p.id == *id).map(|p| p.quirks.clone());
+    }
+    all.iter().find(|p| host_of(&p.base_url) == host).map(|p| p.quirks.clone())
 }
 
 /// 用脑策略:用户可见的唯一路由旋钮(设置页三档,绝不露路由表)。
@@ -496,5 +575,86 @@ mod tests {
         // 自定义远程 Ollama 实例
         let o2 = ProviderSpec::ollama("http://192.168.1.9:11434/v1".into());
         assert_eq!(o2.base_url, "http://192.168.1.9:11434/v1");
+    }
+
+    // 2026-09 国内五家的方言修正随预设表走:Kimi / 混元 = 开关 + 回传,智谱 / 豆包 = 只开关,千问 = enable_thinking;
+    // 混元接入点换 TokenHub;quirks 不过桥(序列化里没有这个字段,前端形状不变)。
+    #[test]
+    fn presets_carry_domestic_quirks_and_hunyuan_tokenhub() {
+        let ps = presets();
+        let by = |id: &str| ps.iter().find(|p| p.id == id).expect(id);
+        let toggle = Quirks { thinking_toggle: true, ..Quirks::default() };
+        let both = Quirks { thinking_toggle: true, reasoning_roundtrip: true, ..Quirks::default() };
+        assert_eq!(by("kimi").quirks, both);
+        assert_eq!(by("hunyuan").quirks, both);
+        assert_eq!(by("zhipu").quirks, toggle);
+        assert_eq!(by("doubao").quirks, toggle);
+        assert_eq!(by("qwen").quirks, Quirks { enable_thinking_bool: true, ..Quirks::default() });
+        for id in ["openai", "gemini", "ollama"] {
+            assert_eq!(by(id).quirks, Quirks::default(), "{id}: 无特殊方言");
+        }
+        assert_eq!(by("hunyuan").base_url, "https://tokenhub.tencentmaas.com/v1");
+        let json = serde_json::to_value(by("kimi")).unwrap();
+        assert!(json.get("quirks").is_none(), "quirks 不过桥,预设 JSON 形状不变");
+        assert_eq!(json["baseUrl"], "https://api.moonshot.cn/v1");
+    }
+
+    // 方言修正按接入点主机派生(单源 = 预设表 + 老域名别名):五家各自的位、老域名同映射、大小写 / 端口 /
+    // 无 scheme 都认;中转站 / 自架 / 空串 → None;DeepSeek 不在预设表(quirks 由构造器给)。
+    #[test]
+    fn quirks_derive_from_base_url_host() {
+        let q = |u: &str| quirks_for_base_url(u).expect(u);
+        let kimi = q("https://api.moonshot.cn/v1");
+        assert!(kimi.thinking_toggle && kimi.reasoning_roundtrip && !kimi.enable_thinking_bool);
+        let hy = q("https://tokenhub.tencentmaas.com/v1");
+        assert!(hy.thinking_toggle && hy.reasoning_roundtrip);
+        assert_eq!(q("https://api.hunyuan.cloud.tencent.com/v1"), hy, "混元老域名同一套方言");
+        let zhipu = q("https://open.bigmodel.cn/api/paas/v4/");
+        assert!(zhipu.thinking_toggle && !zhipu.reasoning_roundtrip, "智谱回传未核 → 只开关");
+        let doubao = q("https://ark.cn-beijing.volces.com/api/v3");
+        assert!(doubao.thinking_toggle && !doubao.reasoning_roundtrip);
+        let qwen = q("https://dashscope.aliyuncs.com/compatible-mode/v1");
+        assert!(qwen.enable_thinking_bool && !qwen.thinking_toggle && !qwen.thinking_field);
+        assert_eq!(q("HTTPS://API.MOONSHOT.CN:443/v1"), kimi, "大小写 / 端口不影响");
+        assert_eq!(q("api.moonshot.cn/v1"), kimi, "无 scheme 也认");
+        assert!(quirks_for_base_url("https://relay.example.com/v1").is_none(), "中转站 → None");
+        assert!(quirks_for_base_url("https://moonshot.cn.evil.example/v1").is_none(), "只认整主机名");
+        assert!(quirks_for_base_url("").is_none());
+        assert_eq!(quirks_for_base_url("https://api.openai.com/v1"), Some(Quirks::default()), "无特殊方言的家 = 默认");
+        assert!(quirks_for_base_url("https://api.deepseek.com").is_none());
+        assert_eq!(host_of("https://user:pw@example.com:8443/x?y#z"), "example.com");
+    }
+
+    // to_config 只在 quirks 仍是默认值时派生;显式设过的(哪怕只一位)原样尊重;${ENV} 接入点先解析再派生;
+    // 认不出的主机维持默认;DeepSeek 预设的 thinking_field 不受影响。
+    #[test]
+    fn to_config_derives_quirks_only_when_unset() {
+        let mut s = spec("kimi", "kimi-k2.6");
+        s.base_url = "https://api.moonshot.cn/v1".into();
+        let cfg = s.to_config();
+        assert!(cfg.quirks.thinking_toggle && cfg.quirks.reasoning_roundtrip, "默认 quirks → 按主机派生");
+        s.quirks = Quirks { no_stream_options: true, ..Quirks::default() };
+        let cfg = s.to_config();
+        assert!(cfg.quirks.no_stream_options && !cfg.quirks.thinking_toggle, "显式设过 → 不派生不覆盖");
+
+        std::env::set_var("LW_TEST_QWEN_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1");
+        let mut e = spec("qwen", "qwen3.8-max");
+        e.base_url = "${LW_TEST_QWEN_URL}".into();
+        let cfg = e.to_config();
+        assert!(cfg.quirks.enable_thinking_bool, "引用形接入点解析后照样派生");
+        assert_eq!(cfg.base_url, "https://dashscope.aliyuncs.com/compatible-mode/v1");
+
+        let mut r = spec("relay", "gpt-5");
+        r.base_url = "https://relay.example.com/v1".into();
+        assert_eq!(r.to_config().quirks, Quirks::default(), "中转站维持默认");
+        assert!(ProviderSpec::deepseek("k".into()).to_config().quirks.thinking_field);
+        // 显式 quirks 里的附加头照旧解析 ${ENV}
+        std::env::set_var("LW_TEST_HDR", "v1");
+        let mut h = spec("relay2", "gpt-5");
+        h.quirks = Quirks {
+            extra_headers: vec![("x-h".into(), "${LW_TEST_HDR}".into())],
+            ..Quirks::default()
+        };
+        assert_eq!(h.to_config().quirks.extra_headers, vec![("x-h".to_string(), "v1".to_string())]);
     }
 }

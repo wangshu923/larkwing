@@ -24,10 +24,24 @@ impl OpenAiCompatProvider {
 
     /// 出向方言翻译:中立 ChatRequest → OpenAI 系请求体。
     fn to_wire(&self, req: &ChatRequest) -> Value {
+        let q = &self.cfg.quirks;
+        // 思考方言两个位(§6.3):`thinking_field` 是 DeepSeek 老字段 = 开关 + 回传二合一(语义不动、老配置零
+        // 迁移);新接的厂商按拆开的 thinking_toggle / reasoning_roundtrip 各自声明(Kimi·混元两个都要,
+        // 智谱·豆包只开关)。
+        let toggle = q.thinking_field || q.thinking_toggle;
+        let roundtrip = q.thinking_field || q.reasoning_roundtrip;
+        // 能不能看图按目录(含用户覆盖)分叉:user 图直接带 / 降级占位;工具图经「转交」user 消息 / 丢图留话。
+        // 按 cfg.model 判(两条路同源;options.model 覆盖极少见,保持一致)。
+        let vision = super::catalog::supports_vision(&self.cfg.model);
+        // 攒当前这组连续 tool 消息里的图,组结束(下一条非 tool 消息之前 / 消息尾)一次性转交。
+        let mut pending_tool_images: Vec<Value> = Vec::new();
         let mut messages = Vec::with_capacity(req.messages.len() + 1);
         // 我们的 system 是独立字段;OpenAI 方言翻成首条 system 消息
         messages.push(json!({ "role": "system", "content": req.system }));
         for msg in &req.messages {
+            if !matches!(msg, super::ChatMessage::ToolResult { .. }) {
+                flush_tool_images(&mut messages, &mut pending_tool_images);
+            }
             messages.push(match msg {
                 super::ChatMessage::User { content, parts } => {
                     if parts.is_empty() {
@@ -49,7 +63,7 @@ impl OpenAiCompatProvider {
                                 // 关键洞察:认二维码/转 PDF 这类**与视觉无关**(有眼睛也读不出码里的 URL,
                                 // 得算法解码),永远走工具;故占位要引导「用工具处理刚发来的图」,别猜画面。
                                 super::ContentPart::ImageUrl { url } => {
-                                    if super::catalog::supports_vision(&self.cfg.model) {
+                                    if vision {
                                         json!({ "type": "image_url", "image_url": { "url": url } })
                                     } else {
                                         json!({ "type": "text", "text":
@@ -80,43 +94,60 @@ impl OpenAiCompatProvider {
                                 })
                                 .collect(),
                         );
-                        // 坑 #4:带 tool_calls 的轮次回传必须附 reasoning(DeepSeek 缺它 400);
-                        // 借 thinking_field quirk 当 DeepSeek 方言标,严格网关不发未知字段
-                        if self.cfg.quirks.thinking_field {
+                        // 坑 #4:带 tool_calls 的轮次回传必须附 reasoning(DeepSeek 缺它 400;Kimi / 混元官方
+                        // 同样要求原样回传);只在声明了回传的方言下发,严格网关不发未知字段
+                        if roundtrip {
                             m["reasoning_content"] = json!(reasoning.clone().unwrap_or_default());
                         }
                     }
                     m
                 }
-                // chat-completions 的 role:tool 消息 content 只认文本 —— 塞 image_url 会 400
-                // (vLLM/多家实测坐实)。故工具结果附带的图在此一律降级丢弃;要让视觉模型看
-                // 工具图走 Responses / Anthropic / Gemini 方言,不走这条。丢图必须留话
-                // (tool_result_text):工具文本可能宣称「已附上截图」,悄悄丢图 = 喂假前提。
+                // chat-completions 的 role:tool 消息 content 只认文本 —— 塞 image_url 会 400(vLLM/多家实测
+                // 坐实),DeepSeek 更明文「图只许出现在 user 消息」。故工具结果附带的图:
+                // - 能看图的模型 → tool 文本原样(不留丢图话),图攒进 pending,这组 tool 消息之后由**一条**
+                //   user 消息「转交」(flush_tool_images;2026-09 用户拍板,read_image / web_render 截图由此打通);
+                // - 非视觉模型 → 照旧丢图 + 留话(tool_result_text),字节不变:工具文本可能宣称「已附上截图」,
+                //   悄悄丢图 = 喂假前提。
                 super::ChatMessage::ToolResult { call_id, content, parts } => {
+                    if vision {
+                        pending_tool_images.extend(parts.iter().filter_map(|p| match p {
+                            super::ContentPart::ImageUrl { url } => {
+                                Some(json!({ "type": "image_url", "image_url": { "url": url } }))
+                            }
+                            super::ContentPart::Text { .. } => None,
+                        }));
+                    }
                     json!({ "role": "tool", "tool_call_id": call_id,
-                            "content": super::tool_result_text(content, parts, false) })
+                            "content": super::tool_result_text(content, parts, vision) })
                 }
             });
         }
+        // 消息尾也要 flush:回合内「assistant 调工具 → tool 结果 → 再问模型」正是最后一组
+        flush_tool_images(&mut messages, &mut pending_tool_images);
         let mut body = json!({
             "model": req.options.model.as_deref().unwrap_or(&self.cfg.model),
             "messages": messages,
             "stream": true,
         });
         // 坑 #8:不显式要,多数 OpenAI 兼容网关流式不给 usage;严格端点不认此字段则按 quirk 省掉
-        if !self.cfg.quirks.no_stream_options {
+        if !q.no_stream_options {
             body["stream_options"] = json!({ "include_usage": true });
         }
-        // 思考档位的两种 OpenAI 系方言:
-        // 坑 #2:DeepSeek 的 thinking 开关永远显式带,不赌默认值(只有开关,非 Off 都算开);
-        // reasoning_effort 端点(gpt-5 系)翻成 low/medium/high,Off 不发字段;
-        // 都没声明的端点什么都不带 —— 未知字段可能被严格网关 400。
+        // 思考档位的三种 OpenAI 系方言(都没声明的端点什么都不带 —— 未知字段可能被严格网关 400):
+        // - 开关形 thinking:{type}(坑 #2:DeepSeek 永远显式带、不赌默认值;Kimi K2.x / 智谱 / 豆包 / 混元同形):
+        //   只有开关,非 Off 都算开;
+        // - 千问 enable_thinking:true(非 Off 才带;**Off 不带字段**——对不支持思考的模型传该参会不会报错官方没写,
+        //   不带最稳;代价 = Qwen3.5+ 默认开思考的旗舰在 Off 档仍会思考,真机 watch);
+        // - reasoning_effort 端点(gpt-5 系)翻成 low/medium/high,Off 不发字段。
         let lvl = req.options.thinking.unwrap_or(self.cfg.thinking);
-        if self.cfg.quirks.thinking_field {
+        if toggle {
             body["thinking"] =
                 json!({ "type": if lvl != Thinking::Off { "enabled" } else { "disabled" } });
         }
-        if self.cfg.quirks.effort_field {
+        if q.enable_thinking_bool && lvl != Thinking::Off {
+            body["enable_thinking"] = json!(true);
+        }
+        if q.effort_field {
             if let Some(e) = lvl.effort_str() {
                 body["reasoning_effort"] = json!(e);
             }
@@ -168,6 +199,23 @@ impl OpenAiCompatProvider {
     fn request_builder(&self, client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
         self.with_auth(client.post(url))
     }
+}
+
+/// 把这一组 tool 消息攒下的图以**一条** user 消息「转交」给能看图的模型(紧跟在那组 tool 消息之后、
+/// 下一条非 tool 消息之前 / 消息尾)。说明文本明写「不是用户发言」,免得模型把它当成用户又说了话。
+/// 没攒到图 = 不追加任何消息(无图回合字节不变,前缀缓存零损伤)。
+fn flush_tool_images(messages: &mut Vec<Value>, pending: &mut Vec<Value>) {
+    if pending.is_empty() {
+        return;
+    }
+    let n = pending.len();
+    let mut blocks = Vec::with_capacity(n + 1);
+    blocks.push(json!({
+        "type": "text",
+        "text": format!("〔转交:上面工具结果附带的 {n} 张图片,供你查看;这不是用户发言〕"),
+    }));
+    blocks.append(pending);
+    messages.push(json!({ "role": "user", "content": blocks }));
 }
 
 /// stop_reason 归一到中立词表(robot 同款):未知值原样透传不丢失,None 不进表。
@@ -850,5 +898,172 @@ mod tests {
         );
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], ChatEvent::Thinking(t) if t == "琢磨一下"));
+    }
+
+    /// 指定模型 + 方言修正的 provider(钥匙 / 接入点沿用 DeepSeek 预设,只换这两样)。
+    fn provider_with(model: &str, quirks: crate::llm::Quirks) -> OpenAiCompatProvider {
+        let mut cfg = LlmConfig::deepseek("sk-test".into());
+        cfg.model = model.into();
+        cfg.quirks = quirks;
+        OpenAiCompatProvider::new(cfg)
+    }
+
+    /// 一轮工具调用的三条消息:user → assistant(tool_calls + reasoning)→ tool 结果。
+    fn tool_round(reasoning: &str) -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::user("我对花生过敏"),
+            ChatMessage::Assistant {
+                content: String::new(),
+                reasoning: Some(reasoning.into()),
+                tool_calls: vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "remember".into(),
+                    args: serde_json::json!({ "fact": "对花生过敏" }),
+                    is_incomplete: false,
+                }],
+                reasoning_state: None,
+            },
+            ChatMessage::tool_result("call_1", "ok"),
+        ]
+    }
+
+    // 2026-09 国内五家的思考方言四形:仅开关(智谱)/ 开关 + 回传(Kimi·混元)/ enable_thinking(千问)/
+    // DeepSeek 老 thinking_field(= 开关 + 回传二合一)整体 golden 逐字节不变。
+    #[test]
+    fn thinking_dialects_for_domestic_providers() {
+        use crate::llm::{ChatOptions, Quirks};
+        let req = |lvl: Thinking| ChatRequest {
+            messages: tool_round("想了想"),
+            options: ChatOptions { thinking: Some(lvl), ..Default::default() },
+            ..Default::default()
+        };
+        // 智谱:带 thinking:{type};带 tool_calls 的 assistant **不带** reasoning_content;无 enable_thinking
+        let zhipu = provider_with("glm-5-turbo", Quirks { thinking_toggle: true, ..Default::default() });
+        let w = zhipu.to_wire(&req(Thinking::Medium));
+        assert_eq!(w["thinking"]["type"], "enabled");
+        assert!(w.get("enable_thinking").is_none() && w.get("reasoning_effort").is_none());
+        assert!(w["messages"][2].get("reasoning_content").is_none(), "智谱回传未核 → 不回传");
+        assert_eq!(zhipu.to_wire(&req(Thinking::Off))["thinking"]["type"], "disabled");
+        // Kimi / 混元:开关 + 回传
+        let kimi = provider_with(
+            "kimi-k2.6",
+            Quirks { thinking_toggle: true, reasoning_roundtrip: true, ..Default::default() },
+        );
+        let w = kimi.to_wire(&req(Thinking::Light));
+        assert_eq!(w["thinking"]["type"], "enabled");
+        assert_eq!(w["messages"][2]["reasoning_content"], "想了想");
+        assert!(w.get("enable_thinking").is_none());
+        // 千问:非 Off 带 enable_thinking:true;Off 不带任何思考字段;不回传
+        let qwen = provider_with("qwen3.8-max", Quirks { enable_thinking_bool: true, ..Default::default() });
+        let w = qwen.to_wire(&req(Thinking::Heavy));
+        assert_eq!(w["enable_thinking"], true);
+        assert!(w.get("thinking").is_none() && w.get("reasoning_effort").is_none());
+        assert!(w["messages"][2].get("reasoning_content").is_none());
+        let off = qwen.to_wire(&req(Thinking::Off));
+        assert!(off.get("enable_thinking").is_none() && off.get("thinking").is_none(), "Off 不带字段");
+        // DeepSeek 老 golden:thinking_field = 开关 + 回传,整个请求体逐字节不变(Value 比较不看键序)
+        let ds = provider().to_wire(&ChatRequest { messages: tool_round("该记下来"), ..Default::default() });
+        assert_eq!(
+            ds,
+            serde_json::json!({
+                "model": "deepseek-v4-pro",
+                "stream": true,
+                "stream_options": { "include_usage": true },
+                "thinking": { "type": "disabled" },
+                "messages": [
+                    { "role": "system", "content": "" },
+                    { "role": "user", "content": "我对花生过敏" },
+                    { "role": "assistant", "content": "", "reasoning_content": "该记下来",
+                      "tool_calls": [{ "id": "call_1", "type": "function",
+                                       "function": { "name": "remember", "arguments": "{\"fact\":\"对花生过敏\"}" } }] },
+                    { "role": "tool", "tool_call_id": "call_1", "content": "ok" }
+                ]
+            }),
+            "DeepSeek 出向 golden 逐字节不变"
+        );
+    }
+
+    // 工具结果里的图 → 能看图的 chat-completions 模型:tool 文本不留丢图话,这组 tool 消息之后追加**一条**
+    // user 消息转交全部图;多轮各自 flush;无图 / 非视觉模型 = 原样(字节不变)。
+    #[test]
+    fn to_wire_forwards_tool_images_to_vision_model_via_one_user_message() {
+        use crate::llm::ContentPart;
+        let call = |id: &str| ToolCall {
+            id: id.into(),
+            name: "read_image".into(),
+            args: serde_json::json!({}),
+            is_incomplete: false,
+        };
+        let asst = |calls: Vec<ToolCall>| ChatMessage::Assistant {
+            content: String::new(),
+            reasoning: None,
+            tool_calls: calls,
+            reasoning_state: None,
+        };
+        let tool_img = |id: &str, text: &str, urls: &[&str]| ChatMessage::ToolResult {
+            call_id: id.into(),
+            content: text.into(),
+            parts: urls.iter().map(|u| ContentPart::ImageUrl { url: (*u).into() }).collect(),
+        };
+        let p = provider_with(
+            "deepseek-v4-flash-vision-exp",
+            crate::llm::Quirks { thinking_field: true, ..Default::default() },
+        );
+        // 一轮两条 tool 各一图 → [system, user, assistant, tool, tool, user(转交 2 图)]
+        let wire = p.to_wire(&ChatRequest {
+            messages: vec![
+                ChatMessage::user("看看这两张"),
+                asst(vec![call("c1"), call("c2")]),
+                tool_img("c1", "已附上截图", &["data:image/png;base64,AAAA"]),
+                tool_img("c2", "第二张", &["data:image/png;base64,BBBB"]),
+            ],
+            ..Default::default()
+        });
+        let msgs = wire["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 6, "{msgs:?}");
+        assert_eq!(msgs[3]["role"], "tool");
+        assert_eq!(msgs[3]["content"], "已附上截图", "视觉模型不留丢图话");
+        assert_eq!(msgs[4]["content"], "第二张");
+        assert_eq!(msgs[5]["role"], "user");
+        let blocks = msgs[5]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["type"], "text");
+        let note = blocks[0]["text"].as_str().unwrap();
+        assert!(note.contains("2 张图片") && note.contains("不是用户发言"), "{note}");
+        assert_eq!(blocks[1]["type"], "image_url");
+        assert_eq!(blocks[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+        assert_eq!(blocks[2]["image_url"]["url"], "data:image/png;base64,BBBB");
+        // 两轮各自 flush:第一轮的转交插在下一条 assistant 之前,第二轮的在末尾
+        let wire2 = p.to_wire(&ChatRequest {
+            messages: vec![
+                ChatMessage::user("先看 A 再看 B"),
+                asst(vec![call("c1")]),
+                tool_img("c1", "A", &["data:image/png;base64,AAAA"]),
+                asst(vec![call("c2")]),
+                tool_img("c2", "B", &["data:image/png;base64,BBBB"]),
+            ],
+            ..Default::default()
+        });
+        let roles: Vec<&str> =
+            wire2["messages"].as_array().unwrap().iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["system", "user", "assistant", "tool", "user", "assistant", "tool", "user"]);
+        assert_eq!(wire2["messages"][4]["content"].as_array().unwrap().len(), 2, "第一轮只转交 1 图");
+        assert_eq!(wire2["messages"][4]["content"][1]["image_url"]["url"], "data:image/png;base64,AAAA");
+        assert_eq!(wire2["messages"][7]["content"][1]["image_url"]["url"], "data:image/png;base64,BBBB");
+        // 无图的工具结果:不追加任何消息(视觉模型也一样)
+        let plain = p.to_wire(&ChatRequest {
+            messages: vec![asst(vec![call("c1")]), ChatMessage::tool_result("c1", "ok")],
+            ..Default::default()
+        });
+        assert_eq!(plain["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(plain["messages"][2]["content"], "ok");
+        // 非视觉模型(deepseek-v4-pro):照旧丢图留话、不追加 user 消息
+        let nv = provider().to_wire(&ChatRequest {
+            messages: vec![asst(vec![call("c1")]), tool_img("c1", "已附上截图", &["data:image/png;base64,AAAA"])],
+            ..Default::default()
+        });
+        assert_eq!(nv["messages"].as_array().unwrap().len(), 3);
+        let text = nv["messages"][2]["content"].as_str().unwrap();
+        assert!(text.contains("1 张图片没能传给当前模型"), "{text}");
     }
 }
