@@ -415,7 +415,7 @@ impl WebDownload {
         }
         let part = part_path(dir);
         let total =
-            match crate::ftp::download_to(&t, &part, DOWNLOAD_SYNC_MAX_BYTES, None).await {
+            match crate::ftp::download_to(&t, &part, DOWNLOAD_SYNC_MAX_BYTES, size, None).await {
                 Ok(n) => n,
                 Err(e) => {
                     let _ = std::fs::remove_file(&part);
@@ -462,7 +462,8 @@ impl WebDownload {
                     &t,
                     &part,
                     DOWNLOAD_JOB_MAX_BYTES,
-                    Some((&ticket, total)),
+                    Some(total),
+                    Some(&ticket),
                 )
                 .await?;
                 let dest = crate::files::dedupe_path(&dir_owned.join(&name));
