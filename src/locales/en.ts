@@ -71,6 +71,7 @@ export default {
     pdf_to_png: 'PDF to images…',
     read_image: 'Viewing the image…',
     read_audio: 'Listening to the audio…',
+    speak_to_file: 'Recording a voice note…',
     show_image: 'Showing the image…',
     send_file: 'Sending the file to the phone…',
     send_text: 'Sending a message to the phone…',

@@ -163,7 +163,7 @@ mod tests {
              "fs_append", "fs_edit", "fs_undo", "fs_unzip", "fs_zip", "fs_usage",
              "reminder_set", "reminder_list", "reminder_cancel", "watch_set", "web_search", "web_fetch",
              "web_download", "web_render", "qr_decode", "qr_encode", "pdf_to_png", "print_file", "read_image", "read_audio",
-             "show_image", "send_file", "send_text", "note_todo", "finish_todo"]
+             "speak_to_file", "show_image", "send_file", "send_text", "note_todo", "finish_todo"]
         );
         assert!(!s.few_shots.is_empty(), "companion 必须带 few-shot 示范");
         // 反例纪律:至少一段"不调工具直接聊"的示范
