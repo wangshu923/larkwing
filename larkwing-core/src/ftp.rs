@@ -18,21 +18,41 @@
 //!
 //! **不走 `net::Client`**(§4.6 管的是出站 HTTP):FTP 不是 HTTP,代理这一块因此缺失
 //! (FTP over SOCKS 要另接)。如实记档。
+//!
+//! **断点续传(同一次下载内)**:影视量级的 ftp 文件一下几十分钟,数据连接被中间设备掐掉、
+//! 服务器主动断、半路停滞都是常态。传输中断不再直接判失败,而是重新连接登录 → `REST <已落盘字节>`
+//! → `RETR`,数据追加写进同一个临时件,最多续 `RESUME_MAX_ATTEMPTS` 次、两次之间指数退避;
+//! **偏移量永远取临时件的真实长度**(不信内存计数)。服务器不支持 REST(没回 350)= 立即退回
+//! 明白话,不空转重试。每次续传都进日志(§3.5 重试不静默)。**跨次调用的续传(重启程序后接着下)
+//! 不在此列**——临时件由调用方在失败时清理,现状不变。
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use suppaftp::tokio::AsyncFtpStream;
 use suppaftp::types::FileType;
+use suppaftp::FtpError;
+
+use crate::files::human_size;
 
 /// 建连 + 登录的总超时。**死链是这里最常见的情形**,要快点失败并给明白话,
 /// 别让用户对着转圈等。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-/// 取体积(SIZE)的超时:连上了就该很快。
+/// 取体积(SIZE)/ REST / 请求文件 这类单条命令的超时:连上了就该很快。
 const CMD_TIMEOUT: Duration = Duration::from_secs(15);
-/// 传输中多久没有新字节判失败(FTP 被动模式的数据连接被中间设备掐掉是常见死法)。
+/// 传输中多久没有新字节判「停滞」——**不再直接判失败**,而是断开重连续传(见下面两常量)。
+/// FTP 被动模式的数据连接被中间设备掐掉是常见死法,掐掉后往往一个字节都不再来、也不关连接。
 const STALL_TIMEOUT: Duration = Duration::from_secs(90);
+/// 断点续传:**同一次下载内**,传输中断(数据连接被掐 / 停滞 / 流提前结束 / 续传阶段重连失败)
+/// 最多重连续传几次。**§4.11 待用户确认** —— 先按「够救几次掐线、别对死服务器空转」定 5。
+pub const RESUME_MAX_ATTEMPTS: u32 = 5;
+/// 两次续传之间的指数退避:2s → 4s → 8s → 封顶 15s。**§4.11 待用户确认**。
+/// (资源站常限「同 IP 连接数」,掐线后立刻重连多半 530,退避是给服务器时间回收旧连接。)
+const RESUME_BACKOFF_BASE: Duration = Duration::from_secs(2);
+const RESUME_BACKOFF_CAP: Duration = Duration::from_secs(15);
+/// 用户取消的统一话术(job 收尾按 `ticket.is_cancelled()` 分流,不靶这句;三处检查点共用一份免漂)。
+const CANCELLED: &str = "按要求停下了";
 
 /// 一个 ftp:// 目标(凭证已解出)。
 #[derive(Clone)]
@@ -171,80 +191,318 @@ pub async fn probe_size(t: &FtpTarget) -> Result<Option<u64>> {
     })
 }
 
-/// 下载到 `dest`(调用方负责临时件与改名)。`cap` = 体积硬闸;
-/// `progress` = 后台档才传 `(票据, 预期总字节)`,每 ~1MB 打点并查取消。
+/// 续传策略。生产恒走 `Default`(= 顶部那几个常量);单测注入零退避 / 短停滞,不真等几十秒。
+#[derive(Clone, Debug)]
+struct ResumePolicy {
+    max_attempts: u32,
+    backoff_base: Duration,
+    backoff_cap: Duration,
+    stall_timeout: Duration,
+}
+
+impl Default for ResumePolicy {
+    fn default() -> Self {
+        ResumePolicy {
+            max_attempts: RESUME_MAX_ATTEMPTS,
+            backoff_base: RESUME_BACKOFF_BASE,
+            backoff_cap: RESUME_BACKOFF_CAP,
+            stall_timeout: STALL_TIMEOUT,
+        }
+    }
+}
+
+impl ResumePolicy {
+    /// 第 `attempt`(1 起)次续传前等多久:base × 2^(attempt−1),封顶 cap。
+    fn backoff(&self, attempt: u32) -> Duration {
+        let shift = attempt.saturating_sub(1).min(16);
+        self.backoff_base
+            .saturating_mul(1u32 << shift)
+            .min(self.backoff_cap)
+    }
+}
+
+/// 一次「连接 → (REST) → RETR → 读到底」尝试的结局,供续传循环分流。
+enum Fault {
+    /// 可续传的中断:数据连接被掐 / 停滞 / 流提前结束 / 续传阶段重连或登录失败。
+    Transient(anyhow::Error),
+    /// 服务器不支持从中间接着传(REST 没回 350,或 REST 之后的 RETR 被拒)—— 重试无意义。
+    NoResume(anyhow::Error),
+    /// 明确失败,不重试:用户取消 / 超体积上限 / 550 找不到文件 / 首连失败 / 本地写盘失败。
+    Fatal(anyhow::Error),
+}
+
+/// 服务器回话原文(带三位应答码),给错误话术用;解不出 UTF-8 就只报码。
+fn reply_text(resp: &suppaftp::types::Response) -> String {
+    resp.as_string()
+        .unwrap_or_else(|_| resp.status.code().to_string())
+}
+
+/// 一次下载的全部状态(跨续传保持:文件句柄 / 打点阈值)。
+struct Transfer<'a> {
+    t: &'a FtpTarget,
+    /// 临时件句柄:首连时建(截断),之后每次续传都在**同一个句柄**上追加。
+    file: std::fs::File,
+    cap: u64,
+    /// 调用方探到的体积(SIZE);None = 服务器不支持 SIZE,那就只能信流的 EOF。
+    expected: Option<u64>,
+    progress: Option<&'a crate::bgtasks::BgTicket>,
+    policy: &'a ResumePolicy,
+    /// 下一次打点的累计字节阈值(跨续传保持,免得每次重连都先打一枪)。
+    next_beat: u64,
+}
+
+impl Transfer<'_> {
+    /// 已落盘字节数 = REST 偏移的**唯一**来源(读文件真实长度,不信内存计数——
+    /// 写盘半途失败 / 上一轮死在哪都由它兜)。
+    fn on_disk(&self) -> Result<u64> {
+        Ok(self.file.metadata().context("读不到临时文件长度")?.len())
+    }
+
+    fn cancelled(&self) -> bool {
+        self.progress.map(|tk| tk.is_cancelled()).unwrap_or(false)
+    }
+
+    /// 一次尝试:连 →(offset>0 则 REST)→ RETR → 追加写到文件末尾直到 EOF,返回累计字节数。
+    /// `resuming` = 这不是首连:首连失败按死链快失败(原话术),续传阶段连不上 / 登不上
+    /// (资源站常限同 IP 连接数,旧连接没回收就 530)算一次可重试的中断。
+    async fn attempt(&mut self, offset: u64, resuming: bool) -> Result<u64, Fault> {
+        use std::io::Write;
+        use tokio::io::AsyncReadExt;
+
+        if self.cancelled() {
+            return Err(Fault::Fatal(anyhow::anyhow!(CANCELLED)));
+        }
+        let t = self.t;
+        let mut ftp = match open(t).await {
+            Ok(ftp) => ftp,
+            Err(e) if resuming => return Err(Fault::Transient(e)),
+            Err(e) => return Err(Fault::Fatal(e)),
+        };
+
+        if offset > 0 {
+            let off = usize::try_from(offset)
+                .map_err(|_| Fault::Fatal(anyhow::anyhow!("续传偏移 {offset} 超出本机可表示范围")))?;
+            match tokio::time::timeout(CMD_TIMEOUT, ftp.resume_transfer(off)).await {
+                Ok(Ok(())) => tracing::debug!(offset, "ftp REST 已接受"),
+                // 非 350 = 服务器不认 REST(502/500/501/504 都有见过),重试无意义
+                Ok(Err(FtpError::UnexpectedResponse(resp))) => {
+                    return Err(Fault::NoResume(anyhow::anyhow!(
+                        "REST {offset} 被拒(服务器回:{})",
+                        reply_text(&resp)
+                    )));
+                }
+                Ok(Err(e)) => {
+                    return Err(Fault::Transient(
+                        anyhow::anyhow!(e).context("发 REST 时连接断了"),
+                    ));
+                }
+                Err(_) => {
+                    return Err(Fault::Transient(anyhow::anyhow!(
+                        "发 REST 后服务器 {} 秒没回应",
+                        CMD_TIMEOUT.as_secs()
+                    )));
+                }
+            }
+        }
+
+        let mut stream = match tokio::time::timeout(CMD_TIMEOUT, ftp.retr_as_stream(&t.path)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(FtpError::UnexpectedResponse(resp))) => {
+                // 550 恒 = 文件不在(首连 / 续传都一样);续传阶段的其他拒绝 = 接受了 REST 却不肯
+                // 从中间发(RFC 3659:有的服务器 REST 回 350、到 RETR 才回 554),同归「不支持续传」。
+                if offset > 0 && resp.status != suppaftp::Status::FileUnavailable {
+                    return Err(Fault::NoResume(anyhow::anyhow!(
+                        "REST {offset} 之后 RETR 被拒(服务器回:{})",
+                        reply_text(&resp)
+                    )));
+                }
+                let msg = if resp.status == suppaftp::Status::FileUnavailable {
+                    format!(
+                        "服务器上找不到这个文件({})。两种可能:① 链接里的文件名已经变了/被删了;\
+                         ② **文件名是中文、而这台服务器用 GBK 编码存文件名** —— 这种我们当前下不了\
+                         (只发 UTF-8 文件名),不是链接死了。(服务器回:{})",
+                        t.path,
+                        reply_text(&resp)
+                    )
+                } else {
+                    format!("服务器拒绝了下载请求(回:{})", reply_text(&resp))
+                };
+                return Err(Fault::Fatal(anyhow::anyhow!(msg)));
+            }
+            Ok(Err(e)) => {
+                let e = anyhow::anyhow!(e)
+                    .context("ftp 数据连接建不起来(被动模式的数据端口被防火墙 / NAT 拦了?)");
+                return Err(if resuming { Fault::Transient(e) } else { Fault::Fatal(e) });
+            }
+            Err(_) => {
+                let e = anyhow::anyhow!("请求文件超时");
+                return Err(if resuming { Fault::Transient(e) } else { Fault::Fatal(e) });
+            }
+        };
+
+        // 累计 = 已落盘 + 本轮收到;每个字节都追加到同一个句柄末尾
+        let mut got = offset;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = match tokio::time::timeout(self.policy.stall_timeout, stream.read(&mut buf)).await
+            {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => {
+                    return Err(Fault::Transient(anyhow::anyhow!(e).context(format!(
+                        "ftp 传输中断(已收到 {})",
+                        human_size(got)
+                    ))));
+                }
+                Err(_) => {
+                    return Err(Fault::Transient(anyhow::anyhow!(
+                        "下到 {} 之后 {} 秒没有新数据(数据连接多半被中间设备掐了)",
+                        human_size(got),
+                        self.policy.stall_timeout.as_secs()
+                    )));
+                }
+            };
+            if n == 0 {
+                break;
+            }
+            got += n as u64;
+            if got > self.cap {
+                return Err(Fault::Fatal(anyhow::anyhow!(
+                    "文件超过 {} 上限,已停止",
+                    human_size(self.cap)
+                )));
+            }
+            if let Err(e) = self.file.write_all(&buf[..n]) {
+                return Err(Fault::Fatal(anyhow::anyhow!(e).context("写临时文件失败")));
+            }
+            if let Some(tk) = self.progress {
+                if tk.is_cancelled() {
+                    return Err(Fault::Fatal(anyhow::anyhow!(CANCELLED)));
+                }
+                if got >= self.next_beat {
+                    self.next_beat = got + 1024 * 1024;
+                    let (pct, text) = match self.expected {
+                        Some(exp) => (
+                            got.saturating_mul(100).checked_div(exp).unwrap_or(0) as usize,
+                            format!("{} / {}", human_size(got), human_size(exp)),
+                        ),
+                        None => (0, human_size(got)),
+                    };
+                    tk.beat(pct, text);
+                }
+            }
+        }
+
+        // EOF。对着 SIZE 核对:比体积少 = 服务器半路关了数据连接(续传接着下);续传后比体积多 =
+        // 服务器接受了 REST 却从头发,拼出来的文件不可信,整份作废(首连多出来的不管,SIZE 偶有虚报)。
+        if let Some(exp) = self.expected {
+            if got < exp {
+                return Err(Fault::Transient(anyhow::anyhow!(
+                    "数据流提前结束:只收到 {} / {}",
+                    human_size(got),
+                    human_size(exp)
+                )));
+            }
+            if offset > 0 && got > exp {
+                return Err(Fault::Fatal(anyhow::anyhow!(
+                    "续传后收到的比文件体积还多({} > {}):服务器没从断点接着发,这份不可信,请整份重下",
+                    human_size(got),
+                    human_size(exp)
+                )));
+            }
+        }
+        // 收尾必须做:不 finalize 服务器不会回最终响应(suppaftp 明示)。收尾 / 告别失败不影响
+        // 已落盘的字节,忽略。
+        let _ = tokio::time::timeout(CMD_TIMEOUT, ftp.finalize_retr_stream(stream)).await;
+        let _ = tokio::time::timeout(CMD_TIMEOUT, ftp.quit()).await;
+        Ok(got)
+    }
+}
+
+/// 退避等待,期间每 250ms 看一眼取消旗标(用户点了停,不该还干等十几秒)。
+async fn wait_or_cancel(wait: Duration, progress: Option<&crate::bgtasks::BgTicket>) -> Result<()> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if progress.map(|tk| tk.is_cancelled()).unwrap_or(false) {
+            return Err(anyhow::anyhow!(CANCELLED));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(());
+        }
+        tokio::time::sleep((deadline - now).min(Duration::from_millis(250))).await;
+    }
+}
+
+/// 下载到 `dest`(调用方负责临时件与改名;失败时临时件也由调用方清理,现状不变)。
+/// `cap` = 体积硬闸;`expected` = 调用方 SIZE 探到的体积(None = 服务器不支持 SIZE);
+/// `progress` = 后台档才传票据,每 ~1MB 打点并查取消。
+///
+/// 传输中断自动断点续传(见模块注释),最多 `RESUME_MAX_ATTEMPTS` 次;服务器不支持 REST 立即退回。
 pub async fn download_to(
     t: &FtpTarget,
     dest: &Path,
     cap: u64,
-    progress: Option<(&crate::bgtasks::BgTicket, u64)>,
+    expected: Option<u64>,
+    progress: Option<&crate::bgtasks::BgTicket>,
 ) -> Result<u64> {
-    use std::io::Write;
-    use tokio::io::AsyncReadExt;
+    download_with(t, dest, cap, expected, progress, &ResumePolicy::default()).await
+}
 
-    let mut ftp = open(t).await?;
-    let mut stream = tokio::time::timeout(CMD_TIMEOUT, ftp.retr_as_stream(&t.path))
-        .await
-        .map_err(|_| anyhow::anyhow!("请求文件超时"))?
-        .with_context(|| {
-            format!(
-                "服务器上找不到这个文件({})。两种可能:① 链接里的文件名已经变了/被删了;\
-                 ② **文件名是中文、而这台服务器用 GBK 编码存文件名** —— 这种我们当前下不了\
-                 (只发 UTF-8 文件名),不是链接死了。",
-                t.path
-            )
-        })?;
-
-    let mut f = std::fs::File::create(dest)
+async fn download_with(
+    t: &FtpTarget,
+    dest: &Path,
+    cap: u64,
+    expected: Option<u64>,
+    progress: Option<&crate::bgtasks::BgTicket>,
+    policy: &ResumePolicy,
+) -> Result<u64> {
+    let file = std::fs::File::create(dest)
         .with_context(|| format!("建不了文件 {}", dest.display()))?;
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut total: u64 = 0;
-    let mut next_beat: u64 = 0;
+    let mut xfer = Transfer { t, file, cap, expected, progress, policy, next_beat: 0 };
+    let mut resumes: u32 = 0;
     loop {
-        let n = tokio::time::timeout(STALL_TIMEOUT, stream.read(&mut buf))
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "下了 {} 之后 {} 秒没有新数据,停了。ftp 的数据连接被中间设备掐掉是常见死法,\
-                     可以再试一次。",
-                    crate::files::human_size(total),
-                    STALL_TIMEOUT.as_secs()
-                )
-            })?
-            .context("ftp 传输中断")?;
-        if n == 0 {
-            break;
-        }
-        total += n as u64;
-        anyhow::ensure!(
-            total <= cap,
-            "文件超过 {} 上限,已停止",
-            crate::files::human_size(cap)
-        );
-        f.write_all(&buf[..n])?;
-        if let Some((ticket, expect)) = progress {
-            if ticket.is_cancelled() {
-                anyhow::bail!("按要求停下了");
+        // REST 偏移 = 临时件此刻的真实长度(每轮现读;上一轮写到哪就从哪接)
+        let offset = xfer.on_disk()?;
+        let fault = match xfer.attempt(offset, resumes > 0).await {
+            Ok(total) => return Ok(total),
+            Err(f) => f,
+        };
+        let on_disk = xfer.on_disk().unwrap_or(offset);
+        match fault {
+            Fault::Fatal(e) => return Err(e),
+            Fault::NoResume(e) => {
+                return Err(e.context(format!(
+                    "这台服务器不支持断点续传,只能整份重下(这次传到 {} 断了、已下的作废;\
+                     可以再试一次,运气好一口气下完)",
+                    human_size(on_disk)
+                )));
             }
-            if total >= next_beat {
-                next_beat = total + 1024 * 1024;
-                let pct = total.saturating_mul(100).checked_div(expect).unwrap_or(0);
-                ticket.beat(
-                    pct as usize,
-                    format!(
-                        "{} / {}",
-                        crate::files::human_size(total),
-                        crate::files::human_size(expect)
-                    ),
+            Fault::Transient(e) => {
+                if resumes >= policy.max_attempts {
+                    let of = expected
+                        .map(|x| format!(" / {}", human_size(x)))
+                        .unwrap_or_default();
+                    return Err(e.context(format!(
+                        "续传了 {resumes} 次仍没下完(落盘 {}{of}),放弃了;可以稍后再试",
+                        human_size(on_disk)
+                    )));
+                }
+                resumes += 1;
+                let wait = policy.backoff(resumes);
+                // §3.5 重试不静默:每次续传都留痕(几次 / 从哪接 / 等多久 / 为什么断)
+                tracing::info!(
+                    host = %t.host,
+                    port = t.port,
+                    attempt = resumes,
+                    max = policy.max_attempts,
+                    on_disk = on_disk,
+                    wait_ms = wait.as_millis() as u64,
+                    "ftp 传输中断,准备断点续传(REST {on_disk}): {e:#}"
                 );
+                wait_or_cancel(wait, progress).await?;
             }
         }
     }
-    f.flush()?;
-    // 收尾必须做:不 finalize 服务器不会回最终响应(suppaftp 明示)
-    let _ = ftp.finalize_retr_stream(stream).await;
-    let _ = ftp.quit().await;
-    Ok(total)
 }
 
 #[cfg(test)]
@@ -317,5 +575,330 @@ mod tests {
         let shown = format!("{t:?}");
         assert!(!shown.contains("s3cr3t"), "内嵌密码不许进日志: {shown}");
         assert!(shown.contains("h.example.com"), "host 该留着好排查: {shown}");
+    }
+
+    #[test]
+    fn backoff_doubles_and_caps() {
+        let p = ResumePolicy::default();
+        let secs: Vec<u64> = (1..=RESUME_MAX_ATTEMPTS).map(|n| p.backoff(n).as_secs()).collect();
+        assert_eq!(secs, [2, 4, 8, 15, 15], "2s/4s/8s… 封顶 15s");
+        // 测试用零退避策略真为零(否则下面的续传测试会白等)
+        assert_eq!(fast_policy().backoff(3), Duration::ZERO);
+    }
+
+    // ───────────── 断点续传:最小假 FTP 服务器 + 端到端 ─────────────
+
+    /// 最小 tokio TCP 假 FTP 服务器(RFC 959 应答码;只实现本模块会发的动词:
+    /// USER/PASS/SITE/TYPE/PASV/SIZE/REST/RETR/QUIT)。剧本按 RETR 次序决定每次传输怎么收场,
+    /// 拿它验续传机器,不碰真网。
+    mod fake_ftp {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::{TcpListener, TcpStream};
+
+        /// 一次 RETR 的收场。
+        #[derive(Clone, Copy)]
+        pub enum Cut {
+            /// 完整发完,回 226
+            Full,
+            /// 发 n 字节后**主动关掉数据连接**(控制连接回 426)
+            Close(usize),
+            /// 发 n 字节后**挂住不动**(数据连接不关、控制连接不回)= 停滞
+            Hang(usize),
+        }
+
+        pub struct Script {
+            pub data: Vec<u8>,
+            /// 按 RETR 次序;用完了按 Full
+            pub cuts: Vec<Cut>,
+            pub rest_supported: bool,
+        }
+
+        pub struct Server {
+            pub port: u16,
+            /// 收到的全部控制命令(所有连接,按到达序)
+            pub log: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl Server {
+            pub fn cmds(&self, verb: &str) -> Vec<String> {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|l| l.starts_with(verb))
+                    .cloned()
+                    .collect()
+            }
+            /// 只留 REST / RETR 两种,看续传时序
+            pub fn transfer_seq(&self) -> Vec<String> {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|l| l.starts_with("REST ") || l.starts_with("RETR "))
+                    .cloned()
+                    .collect()
+            }
+        }
+
+        struct Shared {
+            script: Script,
+            retr_count: Mutex<usize>,
+        }
+
+        pub async fn start(script: Script) -> Server {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let shared = Arc::new(Shared { script, retr_count: Mutex::new(0) });
+            let log2 = log.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((sock, _)) = listener.accept().await else { break };
+                    tokio::spawn(serve(sock, shared.clone(), log2.clone()));
+                }
+            });
+            Server { port, log }
+        }
+
+        async fn serve(sock: TcpStream, shared: Arc<Shared>, log: Arc<Mutex<Vec<String>>>) {
+            let (rd, mut wr) = sock.into_split();
+            let mut rd = BufReader::new(rd);
+            wr.write_all(b"220 fake ftp ready\r\n").await.ok();
+            let mut pasv: Option<TcpListener> = None;
+            let mut rest: usize = 0;
+            // Hang 剧本挂住的数据连接:留着不关,控制连接一断(客户端放弃)随本任务一起丢
+            let mut held: Vec<TcpStream> = Vec::new();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if rd.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let cmd = line.trim_end().to_string();
+                log.lock().unwrap().push(cmd.clone());
+                let (verb, arg) = cmd.split_once(' ').unwrap_or((cmd.as_str(), ""));
+                let reply: String = match verb.to_ascii_uppercase().as_str() {
+                    "USER" => "331 password please".into(),
+                    "PASS" => "230 logged in".into(),
+                    "SITE" | "OPTS" => "200 ok".into(),
+                    "TYPE" => "200 type set".into(),
+                    "SIZE" => format!("213 {}", shared.script.data.len()),
+                    "PASV" => {
+                        let l = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+                        let p = l.local_addr().unwrap().port();
+                        pasv = Some(l);
+                        format!("227 Entering Passive Mode (127,0,0,1,{},{})", p >> 8, p & 0xff)
+                    }
+                    "REST" => {
+                        if shared.script.rest_supported {
+                            rest = arg.parse().unwrap_or(0);
+                            format!("350 Restarting at {rest}")
+                        } else {
+                            "502 REST not implemented".into()
+                        }
+                    }
+                    "RETR" => {
+                        let Some(l) = pasv.take() else {
+                            wr.write_all(b"425 Use PASV first\r\n").await.ok();
+                            continue;
+                        };
+                        let Ok(Ok((mut data, _))) =
+                            tokio::time::timeout(Duration::from_secs(5), l.accept()).await
+                        else {
+                            wr.write_all(b"425 Can't open data connection\r\n").await.ok();
+                            continue;
+                        };
+                        wr.write_all(b"150 Opening BINARY connection\r\n").await.ok();
+                        let idx = {
+                            let mut c = shared.retr_count.lock().unwrap();
+                            let i = *c;
+                            *c += 1;
+                            i
+                        };
+                        let cut = shared.script.cuts.get(idx).copied().unwrap_or(Cut::Full);
+                        let all = &shared.script.data;
+                        // REST 只管紧接着的这一次传输(RFC 3659)
+                        let start = rest.min(all.len());
+                        rest = 0;
+                        let end = match cut {
+                            Cut::Full => all.len(),
+                            Cut::Close(n) | Cut::Hang(n) => (start + n).min(all.len()),
+                        };
+                        data.write_all(&all[start..end]).await.ok();
+                        match cut {
+                            Cut::Hang(_) if end < all.len() => {
+                                held.push(data); // 不关不回 = 停滞
+                                continue;
+                            }
+                            Cut::Close(_) if end < all.len() => {
+                                data.shutdown().await.ok();
+                                drop(data);
+                                "426 Connection closed; transfer aborted".into()
+                            }
+                            _ => {
+                                data.shutdown().await.ok();
+                                drop(data);
+                                "226 Transfer complete".into()
+                            }
+                        }
+                    }
+                    "QUIT" => {
+                        wr.write_all(b"221 Bye\r\n").await.ok();
+                        return;
+                    }
+                    _ => "502 Command not implemented".into(),
+                };
+                wr.write_all(format!("{reply}\r\n").as_bytes()).await.ok();
+            }
+        }
+    }
+
+    use fake_ftp::{Cut, Script};
+
+    /// 有规律但不周期对齐的样本(错位一个字节就对不上)。
+    fn sample(len: usize) -> Vec<u8> {
+        (0..len).map(|i| ((i * 7919) % 251) as u8).collect()
+    }
+
+    fn target(port: u16) -> FtpTarget {
+        FtpTarget {
+            host: "127.0.0.1".into(),
+            port,
+            user: "u".into(),
+            pass: "p".into(),
+            path: "/示例片名.bin".into(),
+            filename: "示例片名.bin".into(),
+        }
+    }
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("lw-ftp-{}-{tag}.part", std::process::id()))
+    }
+
+    /// 零退避 + 短停滞:只验机器,不真等。
+    fn fast_policy() -> ResumePolicy {
+        ResumePolicy {
+            backoff_base: Duration::ZERO,
+            backoff_cap: Duration::ZERO,
+            stall_timeout: Duration::from_millis(400),
+            ..ResumePolicy::default()
+        }
+    }
+
+    async fn run(t: &FtpTarget, dest: &Path, expected: Option<u64>) -> Result<u64> {
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            download_with(t, dest, 1 << 30, expected, None, &fast_policy()),
+        )
+        .await
+        .expect("测试卡住了(30s)")
+    }
+
+    #[tokio::test]
+    async fn resumes_after_server_cuts_data_connection() {
+        let data = sample(10_000);
+        let srv = fake_ftp::start(Script {
+            data: data.clone(),
+            cuts: vec![Cut::Close(3000), Cut::Close(2500), Cut::Full],
+            rest_supported: true,
+        })
+        .await;
+        let t = target(srv.port);
+        // SIZE 探测走同一台假服务器
+        assert_eq!(probe_size(&t).await.unwrap(), Some(10_000));
+
+        let dest = tmp("resume-ok");
+        let got = run(&t, &dest, Some(10_000)).await.unwrap();
+        assert_eq!(got, 10_000);
+        assert_eq!(std::fs::read(&dest).unwrap(), data, "续传拼出来的字节必须与原文逐字节一致");
+        // 时序:每次重新 RETR 之前必先 REST 到已落盘的字节数(3000,再 3000+2500)
+        assert_eq!(
+            srv.transfer_seq(),
+            [
+                "RETR /示例片名.bin",
+                "REST 3000",
+                "RETR /示例片名.bin",
+                "REST 5500",
+                "RETR /示例片名.bin",
+            ]
+        );
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    #[tokio::test]
+    async fn stall_triggers_resume_too() {
+        let data = sample(6_000);
+        let srv = fake_ftp::start(Script {
+            data: data.clone(),
+            cuts: vec![Cut::Hang(2000), Cut::Full],
+            rest_supported: true,
+        })
+        .await;
+        let t = target(srv.port);
+        let dest = tmp("resume-stall");
+        let got = run(&t, &dest, Some(6_000)).await.unwrap();
+        assert_eq!(got, 6_000);
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+        assert_eq!(srv.cmds("REST"), ["REST 2000"], "停滞后从挂住的位置接着传");
+        assert_eq!(srv.cmds("RETR").len(), 2);
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    #[tokio::test]
+    async fn server_without_rest_fails_fast_with_plain_words() {
+        let data = sample(5_000);
+        let srv = fake_ftp::start(Script {
+            data,
+            cuts: vec![Cut::Close(1000), Cut::Full],
+            rest_supported: false,
+        })
+        .await;
+        let t = target(srv.port);
+        let dest = tmp("no-rest");
+        let err = run(&t, &dest, Some(5_000)).await.unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("不支持断点续传"), "要点名不支持续传: {text}");
+        assert!(text.contains("502"), "带上服务器原话方便排查: {text}");
+        assert_eq!(srv.cmds("REST"), ["REST 1000"]);
+        assert_eq!(srv.cmds("RETR").len(), 1, "REST 被拒后不许再发第二次 RETR(不空转)");
+        // 临时件处置与现状一致:download_to 不动它,由调用方清理
+        assert!(dest.exists());
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_max_resumes_and_names_the_count() {
+        let data = sample(20_000);
+        let srv = fake_ftp::start(Script {
+            data,
+            cuts: vec![Cut::Close(1000); 8], // 掐够 6 次(首连 + 5 次续传全掐)
+            rest_supported: true,
+        })
+        .await;
+        let t = target(srv.port);
+        let dest = tmp("give-up");
+        let err = run(&t, &dest, Some(20_000)).await.unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(&format!("续传了 {RESUME_MAX_ATTEMPTS} 次仍没下完")),
+            "错误话术要点名续传次数: {text}"
+        );
+        assert_eq!(
+            srv.cmds("RETR").len(),
+            1 + RESUME_MAX_ATTEMPTS as usize,
+            "首连 + 最多 {RESUME_MAX_ATTEMPTS} 次续传,之后不再重试"
+        );
+        assert_eq!(
+            srv.cmds("REST"),
+            ["REST 1000", "REST 2000", "REST 3000", "REST 4000", "REST 5000"],
+            "每次都从真实落盘长度接着要"
+        );
+        // 临时件处置与现状一致:留给调用方清理;长度 = 六轮各追加 1000 字节
+        assert_eq!(std::fs::metadata(&dest).unwrap().len(), 6_000);
+        let _ = std::fs::remove_file(&dest);
     }
 }
