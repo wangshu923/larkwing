@@ -171,6 +171,26 @@ impl OpenAiResponsesProvider {
 
 #[async_trait::async_trait]
 impl LlmProvider for OpenAiResponsesProvider {
+    /// 模型清单:GET /models(与 Responses 同一 base,OpenAI 形状)。
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        if self.cfg.api_key.trim().is_empty() {
+            return Err(LlmError::NoApiKey);
+        }
+        let url = format!("{}/models", self.cfg.base_url.trim_end_matches('/'));
+        let key = self.cfg.api_key.clone();
+        let resp = self
+            .net
+            .send(&url, |c| c.get(&url).bearer_auth(&key).timeout(std::time::Duration::from_secs(15)))
+            .await
+            .map_err(|e| LlmError::Network(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(super::status_error(status.as_u16(), resp.text().await.unwrap_or_default()));
+        }
+        let v: Value = resp.json().await.map_err(|e| LlmError::Network(e.to_string()))?;
+        Ok(super::parse_openai_models(&v))
+    }
+
     fn model_id(&self) -> &str {
         &self.cfg.model
     }

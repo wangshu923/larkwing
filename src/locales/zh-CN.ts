@@ -684,6 +684,22 @@ export default {
       visionYes: '能看图',
       visionNo: '只看文字',
       auto: '自动:{v}', // {v} 由代码填(目录猜测值,— = 不知道)
+      // 模型下拉:点 ▾ 向接入点拉「这把钥匙能用的模型」,输入框仍可手填
+      pickModel: '选模型',
+      modelsLoading: '正在向接入点拉模型清单…',
+      modelsEmpty: '接入点没返回可用模型;手填也行',
+      modelsNeedKey: '先填钥匙,才能拉到这把钥匙能用的模型',
+      modelsBadKey: '接入点不认这把钥匙',
+      modelsNetwork: '连不上接入点',
+      modelsFailed: '没拉到清单:{err}', // {err} 由代码填(接入点回的状态码 / 原文片段)
+      modelsNoMatch: '清单里没有匹配的;按你填的用也行',
+      modelsRefresh: '重新拉取',
+      modelsNeedEndpoint: '先填接入点,才能拉模型清单',
+      // 「自己接一个大脑」:接入点框的 ▾ 列厂商预设(厂商名是品牌专有名词,随预设表来、不进字典)
+      preset: '选一家厂商预设',
+      presetNoMatch: '没有匹配的预设;按你填的接入点用',
+      protocol: '协议',
+      native: '{vendor} 原生', // 原生方言徽章(Gemini / OpenAI Responses);兼容方言用 compat;{vendor} 由代码填
     },
     family: {
       you: '(你)',

@@ -4,6 +4,7 @@
 //! 1. 协议实现打底:openai_compat / anthropic_compat 两种"方言"覆盖绝大多数端点;
 //! 2. 厂商差异 = Quirks 数据修正(认证头风格、字段缺失、严格网关),不另写代码;
 //! 3. 真不兼容的厂商单独实现 LlmProvider —— trait 本来就是逃生口。
+//!
 //! 供应商本身 = 数据(registry::ProviderSpec),模型档位/价格 = 数据(catalog)。
 
 pub mod anthropic_compat;
@@ -170,6 +171,29 @@ pub(crate) fn tool_result_text(content: &str, parts: &[ContentPart], delivered: 
         "{content}\n〔附带的 {dropped} 张图片没能传给当前模型:你看不到画面,别按看过描述;\
          需要画面信息就如实说明〕"
     )
+}
+
+/// OpenAI 形状的模型清单(`{"data":[{"id":…}]}`:OpenAI / DeepSeek / Ollama `/v1/models`、
+/// Anthropic `/v1/models`、多数中转同形)→ id 列表。保留服务端顺序、去重、跳过没 id 的条目;
+/// **不按名字筛「能不能聊天」**(embedding / tts 之类照列——目录认识的会排前面,不认识的沉底)。
+pub(crate) fn parse_openai_models(v: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in v.get("data").and_then(|d| d.as_array()).into_iter().flatten() {
+        if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
+            if !id.is_empty() && !out.iter().any(|x| x == id) {
+                out.push(id.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// 非 2xx 响应 → LlmError(建连前错误的统一翻译:401/403 = 钥匙不对,其余带状态码与正文片段)。
+pub(crate) fn status_error(status: u16, message: String) -> LlmError {
+    match status {
+        401 | 403 => LlmError::BadApiKey,
+        s => LlmError::Api { status: s, message: message.chars().take(500).collect() },
+    }
 }
 
 /// 思考档位(中立词表,用户侧叫"反应模式":最快/轻度/中度/重度)。
@@ -406,6 +430,14 @@ pub trait LlmProvider: Send + Sync {
         None
     }
 
+    /// 向接入点拉「这把钥匙能用的模型」清单(设置页模型下拉)。真相源在服务商,**不写死名单**——
+    /// 中转 / 自架 / 刚上线的模型都照实列(目录只负责事后贴标签)。各协议端点不同,各实现自翻;
+    /// 默认 = 不支持(空清单)。Err 带 kind(没钥匙 / 钥匙不对 / 网络 / 端点不实现)——调用方如实
+    /// 提示,模型框仍可手填(§3.5 不静默)。
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        Ok(Vec::new())
+    }
+
     /// 非流式便捷口(记忆提炼/摘要等后台用途):drain 流拼完整文本,忽略工具调用。
     async fn chat(&self, req: ChatRequest) -> Result<String, LlmError> {
         let mut rx = self.chat_stream(req).await?;
@@ -427,6 +459,23 @@ pub trait LlmProvider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 模型清单解析:保服务端序、去重、跳过没 id / 空 id 的条目;缺 data 字段不炸;状态码翻译。
+    #[test]
+    fn parse_openai_models_keeps_order_dedupes_and_skips_idless() {
+        let v = serde_json::json!({ "object": "list", "data": [
+            { "id": "deepseek-v4-pro", "object": "model", "owned_by": "deepseek" },
+            { "object": "model" },
+            { "id": "deepseek-v4-flash" },
+            { "id": "deepseek-v4-pro" },
+            { "id": "" }
+        ]});
+        assert_eq!(parse_openai_models(&v), ["deepseek-v4-pro", "deepseek-v4-flash"]);
+        assert!(parse_openai_models(&serde_json::json!({ "error": "x" })).is_empty());
+        assert!(matches!(status_error(401, String::new()), LlmError::BadApiKey));
+        assert!(matches!(status_error(403, String::new()), LlmError::BadApiKey));
+        assert!(matches!(status_error(404, "no".into()), LlmError::Api { status: 404, .. }));
+    }
 
     // few-shot 手写形状的 golden:场景 JSON 里就按这个形写(PLAN §8),改坏即炸
     #[test]

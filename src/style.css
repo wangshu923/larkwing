@@ -284,3 +284,34 @@ input, textarea, [contenteditable="true"] {
 .lp-retry:hover { border-color: var(--accent); background: rgba(var(--accent-rgb), 0.08); }
 .lp-leave-to { opacity: 0; transform: translateX(12px); }
 .lp-leave-active { transition: all .22s ease; }
+
+/* 下拉弹层(设置·大脑的模型 ▾ / 接入点预设 ▾ 共用;ModelPickList.vue 与 SettingsView 两处消费,故放全局
+   而非 scoped):与 SkinSelect / ContextMenu 同款玻璃,全语义 token;锚在调用方 .model-pick(position:relative)
+   的左右缘、吃满整行宽;可滚 + scrollbar-gutter 稳住(§6.7)。 */
+.pick-list {
+  position: absolute; z-index: 40; top: calc(100% + 4px); left: 0; right: 0; padding: 4px;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.4);
+  max-height: 300px; overflow-y: auto; scrollbar-gutter: stable;
+}
+.pick-row {
+  display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: 7px;
+  cursor: pointer; font-size: 12.5px; color: var(--text); transition: background 0.12s;
+}
+.pick-row.active { background: rgba(var(--accent-rgb), 0.14); }
+.pick-row.sel .pick-id, .pick-row.sel .pick-name { color: var(--accent); }
+.pick-row.sel .pick-id::after, .pick-row.sel .pick-name::after { content: ' ✓'; }
+.pick-row.dim .pick-id { color: var(--text-dim); }
+/* 模型行:等宽 id 撑满 + 右侧标签 */
+.pick-id { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, "SF Mono", monospace; font-size: 12px; }
+.pick-tags { display: inline-flex; gap: 5px; flex: 0 0 auto; }
+.pick-tag { border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; font-size: 10.5px; color: var(--text-dim); white-space: nowrap; }
+.pick-tag.vis { border-color: rgba(var(--ok-rgb), 0.5); color: var(--ok); }
+.pick-tag.price { font-family: ui-monospace, "SF Mono", monospace; }
+/* 接入点预设行:厂商名 + 右侧灰色等宽地址(长了截断) */
+.pick-name { flex: 0 0 auto; }
+.pick-url { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; font-family: ui-monospace, "SF Mono", monospace; font-size: 11.5px; color: var(--text-dim); }
+.pick-msg { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 0; padding: 8px 10px; font-size: 12px; color: var(--text-dim); }
+.pick-msg.warn { color: var(--warn); }
+.pick-msg.foot { justify-content: flex-end; margin-top: 4px; padding-top: 6px; border-top: 1px dashed var(--line); }

@@ -682,6 +682,22 @@ export default {
       visionYes: 'Can see images',
       visionNo: 'Text only',
       auto: 'Auto: {v}', // {v} filled by code (catalog guess; — = unknown)
+      // Model picker: ▾ fetches the models this key can use from the endpoint; the field stays free text
+      pickModel: 'Pick a model',
+      modelsLoading: 'Fetching the model list from the endpoint…',
+      modelsEmpty: 'The endpoint returned no models — you can still type one',
+      modelsNeedKey: 'Add a key first — the list shows what that key can use',
+      modelsBadKey: 'The endpoint rejected this key',
+      modelsNetwork: 'Could not reach the endpoint',
+      modelsFailed: 'Could not fetch the list: {err}', // {err} filled by code (status / snippet from the endpoint)
+      modelsNoMatch: 'Nothing in the list matches — what you typed is used as-is',
+      modelsRefresh: 'Refresh',
+      modelsNeedEndpoint: 'Enter an endpoint first to fetch the model list',
+      // "Add your own brain": the endpoint field's ▾ lists vendor presets (vendor names are brand nouns, come from the preset table, not the dictionary)
+      preset: 'Pick a vendor preset',
+      presetNoMatch: 'No preset matches — the endpoint you typed is used as-is',
+      protocol: 'Protocol',
+      native: '{vendor} native', // badge for native dialects (Gemini / OpenAI Responses); compat dialects use `compat`; {vendor} filled by code
     },
     family: {
       you: '(you)',

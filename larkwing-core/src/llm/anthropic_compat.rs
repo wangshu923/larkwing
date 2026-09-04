@@ -160,7 +160,12 @@ impl AnthropicCompatProvider {
     }
 
     fn request_builder(&self, client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
-        let mut builder = client.post(url).header("anthropic-version", "2023-06-01");
+        self.with_auth(client.post(url))
+    }
+
+    /// 版本头 + 鉴权 + 中转附加头(POST 聊天与 GET 列模型共用)。
+    fn with_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let mut builder = builder.header("anthropic-version", "2023-06-01");
         builder = match self.cfg.quirks.auth.unwrap_or(AuthStyle::XApiKey) {
             AuthStyle::Bearer => builder.bearer_auth(&self.cfg.api_key),
             AuthStyle::XApiKey => builder.header("x-api-key", &self.cfg.api_key),
@@ -296,6 +301,26 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 #[async_trait::async_trait]
 impl LlmProvider for AnthropicCompatProvider {
+    /// 模型清单:GET /v1/models(`{"data":[{"id":…}]}` 与 OpenAI 同形;limit 顶到官方上限 1000,
+    /// 免翻页——不认这个参数的兼容端点会忽略,无害)。
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        if self.cfg.api_key.trim().is_empty() {
+            return Err(LlmError::NoApiKey);
+        }
+        let url = format!("{}/v1/models?limit=1000", self.cfg.base_url.trim_end_matches('/'));
+        let resp = self
+            .net
+            .send(&url, |c| self.with_auth(c.get(&url)).timeout(std::time::Duration::from_secs(15)))
+            .await
+            .map_err(|e| LlmError::Network(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(super::status_error(status.as_u16(), resp.text().await.unwrap_or_default()));
+        }
+        let v: Value = resp.json().await.map_err(|e| LlmError::Network(e.to_string()))?;
+        Ok(super::parse_openai_models(&v))
+    }
+
     fn model_id(&self) -> &str {
         &self.cfg.model
     }

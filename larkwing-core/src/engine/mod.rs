@@ -250,6 +250,33 @@ impl std::fmt::Display for AppError {
 
 impl std::error::Error for AppError {}
 
+/// 一个模型 id → 下拉一行:目录(含用户覆盖)贴档位 / 看图 / 牌价;目录不认识 = known:false。
+fn model_choice(id: String) -> ModelChoice {
+    use crate::llm::catalog as cat;
+    let (in_usd_per_m, out_usd_per_m) = cat::prices_of(&id);
+    ModelChoice {
+        known: cat::lookup(&id).is_some(),
+        tier: cat::tier_of(&id),
+        vision: cat::supports_vision(&id),
+        in_usd_per_m,
+        out_usd_per_m,
+        id,
+    }
+}
+
+/// 目录认识的在前、不认识的在后;组内保持服务端原序(稳定分区,不按字母重排 —— Anthropic
+/// 之类按新旧给的顺序有信息量)。
+fn rank_model_choices(mut choices: Vec<ModelChoice>) -> Vec<ModelChoice> {
+    choices.sort_by_key(|c| !c.known);
+    choices
+}
+
+/// 按一条供应商配置拉清单并贴标签(已接入的卡与未接入的草稿共用一条路)。
+async fn list_models_for(spec: &ProviderSpec) -> Result<Vec<ModelChoice>, AppError> {
+    let ids = spec.build().list_models().await?;
+    Ok(rank_model_choices(ids.into_iter().map(model_choice).collect()))
+}
+
 impl From<LlmError> for AppError {
     fn from(e: LlmError) -> Self {
         let kind = match &e {
@@ -368,6 +395,19 @@ pub struct ModelGuess {
 pub struct ModelMeta {
     pub guess: ModelGuess,
     pub over: Option<crate::llm::catalog::ModelOverride>,
+}
+
+/// 设置页模型下拉的一行:接入点报上来的模型 id + 目录贴的标签(档位 / 能不能看图 / 牌价,
+/// 覆盖优先)。`known` = 目录认识它(排序靶前);不认识的照列在后 —— 真相源是服务商,不替它删。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelChoice {
+    pub id: String,
+    pub known: bool,
+    pub tier: crate::llm::catalog::Tier,
+    pub vision: bool,
+    pub in_usd_per_m: Option<f64>,
+    pub out_usd_per_m: Option<f64>,
 }
 
 /// 保存供应商卡的入参:None = 不动;api_key 空串视同 None(掩码回显防误存)。
@@ -1526,6 +1566,47 @@ impl Engine {
             .into_iter()
             .find(|o| o.model.eq_ignore_ascii_case(model));
         ModelMeta { guess, over }
+    }
+
+    /// 设置页模型下拉:向某供应商的接入点拉「这把钥匙能用的模型」,再用目录贴标签。
+    /// 真相源在服务商(不写死名单 —— 中转 / 自架 / 刚上线的都照实列);目录只管排序与标签:
+    /// 认识的在前(组内保服务端原序),不认识的在后。Err 如实带 kind(没钥匙 / 钥匙不对 / 网络 /
+    /// 端点不实现),UI 据此提示、模型框仍可手填(§3.5)。
+    pub async fn list_models(&self, provider_id: &str) -> Result<Vec<ModelChoice>, AppError> {
+        let spec = self
+            .load_registry()?
+            .specs()
+            .iter()
+            .find(|s| s.id == provider_id)
+            .cloned()
+            .ok_or_else(|| AppError {
+                kind: ErrorKind::NotFound,
+                message: format!("没有这个供应商: {provider_id}"),
+            })?;
+        list_models_for(&spec).await
+    }
+
+    /// 同上,但对着**还没接入的草稿配置**(「自己接一个大脑」卡:选了预设、贴了钥匙、还没点接入)
+    /// 现拉清单 —— 预设刻意不带默认模型(2026-09-04 用户拍板不写死),模型就在这一步选。
+    /// 钥匙是前端 → 后端方向(与保存同向),不违「凭证不过桥」;`${ENV}` 引用照样在 build 时解析。
+    pub async fn list_models_draft(
+        &self,
+        protocol: &str,
+        base_url: &str,
+        api_key: &str,
+    ) -> Result<Vec<ModelChoice>, AppError> {
+        let protocol = Protocol::parse(protocol).ok_or_else(|| AppError {
+            kind: ErrorKind::Internal,
+            message: format!("未知协议: {protocol}"),
+        })?;
+        let spec = ProviderSpec {
+            id: "draft".into(),
+            protocol,
+            base_url: base_url.trim().into(),
+            api_key: api_key.trim().into(),
+            ..Default::default()
+        };
+        list_models_for(&spec).await
     }
 
     /// upsert 一条模型覆盖(空壳 = 删该条,回落纯目录)。持久化 + 刷新 overlay + 按新档位重排候选
@@ -3442,6 +3523,24 @@ mod tests {
     }
 
     /// cheap-model 路由(§13.6 变体 A):后台提炼挑**最便宜档** provider,无视候选序(聊天用脑策略);
+    /// 模型下拉排序:目录认识的靶前(组内保服务端原序)、不认识的沉底;标签取自目录(档位 / 看图 / 牌价)。
+    #[test]
+    fn model_choices_rank_known_first_and_keep_server_order() {
+        let ids =
+            ["text-embedding-3-small", "gpt-5", "whisper-1", "gpt-5-mini", "deepseek-v4-flash-vision-exp"];
+        let ranked = rank_model_choices(ids.iter().map(|s| model_choice(s.to_string())).collect());
+        let order: Vec<&str> = ranked.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            order,
+            ["gpt-5", "gpt-5-mini", "deepseek-v4-flash-vision-exp", "text-embedding-3-small", "whisper-1"]
+        );
+        assert!(ranked[0].known && !ranked[3].known && !ranked[4].known);
+        assert_eq!(ranked[1].tier, crate::llm::catalog::Tier::Light);
+        assert!(ranked[2].vision, "vision-exp 目录标能看图");
+        assert_eq!(ranked[2].in_usd_per_m, Some(0.44));
+        assert_eq!(ranked[3].in_usd_per_m, None, "目录不认识 → 不报价");
+    }
+
     /// 同档并列取首个(沿用候选序);单 provider 选它自己(零回归);空 → None。
     #[test]
     fn cheapest_candidate_picks_lowest_tier() {

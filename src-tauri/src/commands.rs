@@ -14,10 +14,11 @@ use larkwing_core::datadir::{self, Pointer};
 use larkwing_core::tasks::Tasks;
 
 use larkwing_core::engine::{
-    AppError, BootSnapshot, DayUsage, Engine, FloatIdle, ModelMeta, MsgStats, ProviderPatch,
+    AppError, BootSnapshot, DayUsage, Engine, FloatIdle, ModelChoice, ModelMeta, MsgStats, ProviderPatch,
     ProviderView, SettingEntry, TurnEvent,
 };
 use larkwing_core::llm::catalog::ModelOverride;
+use larkwing_core::llm::registry::ProviderPreset;
 use larkwing_core::llm::AccountBalance;
 use larkwing_core::media::{CookieRec, MediaRuntime};
 use larkwing_core::store::{
@@ -566,6 +567,33 @@ pub fn remove_provider(
 #[tauri::command]
 pub fn model_meta(state: State<'_, AppState>, model: String) -> Result<ModelMeta, AppError> {
     Ok(state.engine.model_meta(&model))
+}
+
+/// 设置页模型下拉:向该供应商接入点拉「这把钥匙能用的模型」(目录贴档位 / 看图 / 牌价标签)。
+/// async 命令:内部走网络(§8.4 同步命令无 tokio 上下文)。拉不到如实带 kind,前端据此提示。
+#[tauri::command]
+pub async fn list_models(
+    state: State<'_, AppState>,
+    provider_id: String,
+) -> Result<Vec<ModelChoice>, AppError> {
+    state.engine.list_models(&provider_id).await
+}
+
+/// 「自己接一个大脑」的「从预设开始」下拉:厂商预设表(名字 / 协议 / 接入点;刻意不带默认模型)。
+#[tauri::command]
+pub fn provider_presets() -> Vec<ProviderPreset> {
+    larkwing_core::llm::registry::presets()
+}
+
+/// 未接入的草稿配置拉模型清单(选预设 + 贴钥匙后、点接入前);async 同 list_models(§8.4)。
+#[tauri::command]
+pub async fn list_models_draft(
+    state: State<'_, AppState>,
+    protocol: String,
+    base_url: String,
+    api_key: String,
+) -> Result<Vec<ModelChoice>, AppError> {
+    state.engine.list_models_draft(&protocol, &base_url, &api_key).await
 }
 
 /// 设置页「高级」:upsert 一条模型覆盖(空壳 = 删该条)。

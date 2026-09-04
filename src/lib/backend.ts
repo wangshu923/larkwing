@@ -205,11 +205,24 @@ export interface SettingEntry {
   value: string
 }
 
+/** 协议方言(与 Rust registry::Protocol 同名):两种兼容 + 两种原生(Gemini / OpenAI Responses 为 reasoning 保真下楼)。 */
+export type Protocol = 'openai_compat' | 'anthropic_compat' | 'gemini' | 'openai_responses'
+
+/** 厂商预设(「自己接一个大脑」的「从预设开始」):名字 / 协议 / 接入点;刻意不带默认模型(模型靠 ▾ 现查)。 */
+export interface ProviderPreset {
+  id: string
+  name: string
+  protocol: Protocol
+  baseUrl: string
+  /** 非空 = 本地服务不验钥匙,用这个占位值放行(Ollama);null = 必须贴钥匙。 */
+  keyPlaceholder: string | null
+}
+
 /** 供应商卡片(钥匙只来掩码/引用,明文永不过桥)。 */
 export interface ProviderView {
   id: string
   name: string
-  protocol: 'openai_compat' | 'anthropic_compat'
+  protocol: Protocol
   baseUrl: string
   model: string
   enabled: boolean
@@ -260,6 +273,16 @@ export interface ModelGuess {
 export interface ModelMeta {
   guess: ModelGuess
   over: ModelOverride | null
+}
+
+/** 模型下拉一行:接入点报上来的 id + 目录贴的标签(known=false = 目录不认识,不贴标签、沉底)。 */
+export interface ModelChoice {
+  id: string
+  known: boolean
+  tier: ModelTier
+  vision: boolean
+  inUsdPerM: number | null
+  outUsdPerM: number | null
 }
 
 /** 一轮 LLM 调用的消耗摘要;cost_usd null = 模型/价格未知,只报 token。 */
@@ -1141,6 +1164,13 @@ export const api = {
   saveProvider: (patch: ProviderPatch) => invoke<ProviderView[]>('save_provider', { patch }),
   removeProvider: (id: string) => invoke<ProviderView[]>('remove_provider', { id }),
   modelMeta: (model: string) => invoke<ModelMeta>('model_meta', { model }),
+  /** 向该供应商接入点拉「这把钥匙能用的模型」清单(目录贴标签);失败 reject AppError,kind 可判。 */
+  listModels: (providerId: string) => invoke<ModelChoice[]>('list_models', { providerId }),
+  /** 厂商预设表(名字 / 协议 / 接入点),给「自己接一个大脑」的「从预设开始」下拉。 */
+  providerPresets: () => invoke<ProviderPreset[]>('provider_presets'),
+  /** 对还没接入的草稿配置拉清单(选预设 + 贴钥匙后、点接入前选模型);钥匙前端→后端方向,与保存同向。 */
+  listModelsDraft: (protocol: string, baseUrl: string, apiKey: string) =>
+    invoke<ModelChoice[]>('list_models_draft', { protocol, baseUrl, apiKey }),
   setModelOverride: (over: ModelOverride) => invoke<void>('set_model_override', { over }),
   /** 扫码登录窗口;title 从字典取(原生窗口标题没法事后翻译)。 */
   mediaLogin: (source: string, title: string) => invoke<void>('media_login', { source, title }),

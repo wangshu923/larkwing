@@ -328,6 +328,25 @@ impl LlmProvider for OpenAiCompatProvider {
         })
     }
 
+    /// 模型清单:GET /models(OpenAI 形状;DeepSeek / Ollama `/v1` / 多数中转同形),鉴权同 chat。
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        if self.cfg.api_key.trim().is_empty() {
+            return Err(LlmError::NoApiKey);
+        }
+        let url = format!("{}/models", self.cfg.base_url.trim_end_matches('/'));
+        let resp = self
+            .net
+            .send(&url, |c| self.with_auth(c.get(&url)).timeout(std::time::Duration::from_secs(15)))
+            .await
+            .map_err(|e| LlmError::Network(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(super::status_error(status.as_u16(), resp.text().await.unwrap_or_default()));
+        }
+        let v: Value = resp.json().await.map_err(|e| LlmError::Network(e.to_string()))?;
+        Ok(super::parse_openai_models(&v))
+    }
+
     async fn chat_stream(&self, req: ChatRequest) -> Result<mpsc::Receiver<ChatEvent>, LlmError> {
         if self.cfg.api_key.trim().is_empty() {
             return Err(LlmError::NoApiKey);
@@ -414,6 +433,21 @@ impl LlmProvider for OpenAiCompatProvider {
 mod tests {
     use super::*;
     use crate::llm::{ChatMessage, ToolCall};
+
+    /// 真网探针(开发机手动跑:
+    /// `DEEPSEEK_API_KEY=sk-… cargo test -p larkwing-core --lib real_deepseek_list_models -- --ignored --nocapture`)
+    /// GET /models 真能拉到清单,且当前产品线三个 id 都在 —— 少一个 = DeepSeek 又换名单了,目录该复核。
+    #[tokio::test]
+    #[ignore]
+    async fn real_deepseek_list_models() {
+        let key = std::env::var("DEEPSEEK_API_KEY").expect("需要 DEEPSEEK_API_KEY");
+        let p = OpenAiCompatProvider::new(LlmConfig::deepseek(key));
+        let ids = p.list_models().await.expect("拉清单失败");
+        eprintln!("deepseek /models → {ids:?}");
+        for want in ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4-flash-vision-exp"] {
+            assert!(ids.iter().any(|i| i == want), "清单里缺 {want}");
+        }
+    }
 
     fn provider() -> OpenAiCompatProvider {
         OpenAiCompatProvider::new(LlmConfig::deepseek("sk-test".into()))

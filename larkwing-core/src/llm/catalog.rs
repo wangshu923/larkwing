@@ -5,6 +5,7 @@
 //! - 模糊匹配:中转站常给模型名加前缀(`anthropic/claude-…`),按家族子串认;
 //! - 未知模型 → 均衡档,路由永不因目录缺项罢工(容错铁律);
 //! - 价格存疑就不装懂:没把握的条目价格留 None,记账层只报 token 不报钱。
+//!
 //! 价格为编写时快照(USD / 百万 token),发版前人工校对;将来要保鲜再加远程目录刷新。
 
 use std::sync::RwLock;
@@ -129,9 +130,13 @@ const fn m(
 /// 顺序即匹配优先级:特异条目(-flash/-mini)必须排在其宽泛家族(deepseek-v4)之前。
 /// 第 5 列 = 上下文窗口(token,2026-06 采集快照,全部 200K–1M;发版前可校)。
 const CATALOG: &[ModelInfo] = &[
-    // DeepSeek(默认供应商;V4 全系 1M 窗口。flash = 廉价档,v4 = Pro 牌价)
-    m("deepseek-v4-flash", Tier::Light, false, Some(0.14), Some(0.28), Some(1_000_000)),
-    m("deepseek-v4", Tier::Balanced, false, Some(1.74), Some(3.48), Some(1_000_000)), // V4-Pro 实价
+    // DeepSeek(默认供应商;V4 全系 1M 窗口。牌价 = 2026-08-21 调价后的**高峰价**快照
+    // (官方分时计价:空闲时段对折——不建模,同缓存折扣「宁可高估不低估」口径)。
+    // vision-exp 的 id **包含** deepseek-v4-flash 子串:必须排在 flash 行之前,
+    // 否则被错杀成 vision=false、图遭降级(kimi-k2.5 被 kimi-k2 错杀同款坑)。
+    m("deepseek-v4-flash-vision-exp", Tier::Light, true, Some(0.44), Some(1.32), Some(1_000_000)), // 实验性多模态,flash 同价(一张图 ≤384 token)
+    m("deepseek-v4-flash", Tier::Light, false, Some(0.44), Some(1.32), Some(1_000_000)),
+    m("deepseek-v4", Tier::Balanced, false, Some(1.32), Some(3.96), Some(1_000_000)), // V4-Pro 实价
     m("deepseek-chat", Tier::Balanced, false, Some(0.28), Some(0.42), Some(1_000_000)), // 旧名,2026-07-24 弃用前仍可能遇到
     m("deepseek-reasoner", Tier::Smart, false, Some(0.28), Some(0.42), Some(1_000_000)),
     // Anthropic(Opus/Sonnet 1M,Haiku 200K)
@@ -143,6 +148,7 @@ const CATALOG: &[ModelInfo] = &[
     m("gpt-5", Tier::Smart, true, Some(0.625), Some(5.0), Some(400_000)),
     // Kimi:K2.5/K2.6 起原生多模态(MoonViT,图/视频输入;2026-07 官方 API 核实),
     // 老 K2 是纯文本 —— 特异在前,免得 k2.5/k2.6 被 kimi-k2 行错杀成不看图。
+    m("kimi-k3", Tier::Smart, true, None, None, Some(1_000_000)), // 2026 旗舰,恒开推理、多模态、1M(官方文档;价存疑不装懂)
     m("kimi-k2.6", Tier::Smart, true, None, None, Some(256_000)),
     m("kimi-k2.5", Tier::Smart, true, None, None, Some(256_000)),
     m("kimi-k2", Tier::Balanced, false, None, None, Some(256_000)),
@@ -206,18 +212,23 @@ pub fn billing_of(model_id: &str) -> BillingMode {
     override_for(model_id).and_then(|o| o.billing).unwrap_or_default()
 }
 
+/// 牌价(USD / 百万 token,进 / 出)。覆盖价仅当进/出**都**给了才用(避免半价混算),
+/// 否则整体回落目录;None = 未知(记账只报 token、下拉不显价)。
+pub fn prices_of(model_id: &str) -> (Option<f64>, Option<f64>) {
+    if let Some((i, o)) = override_for(model_id).and_then(|o| o.in_usd_per_m.zip(o.out_usd_per_m)) {
+        return (Some(i), Some(o));
+    }
+    match lookup(model_id) {
+        Some(info) => (info.in_usd_per_m, info.out_usd_per_m),
+        None => (None, None),
+    }
+}
+
 /// 按目录牌价估算一轮成本(USD)。None = 模型未知或价格未知 —— 调用方只报 token,不报钱。
 /// 缓存命中部分不另算折扣价(各家折扣率不一),按全价估,宁可高估不低估。
 pub fn est_cost_usd(model_id: &str, usage: &Usage) -> Option<f64> {
-    // 覆盖价仅当进/出**都**给了才用(避免半价混算);否则整体回落目录。
-    let (input, output) = match override_for(model_id).and_then(|o| o.in_usd_per_m.zip(o.out_usd_per_m))
-    {
-        Some(pair) => pair,
-        None => {
-            let info = lookup(model_id)?;
-            (info.in_usd_per_m?, info.out_usd_per_m?)
-        }
-    };
+    let (input, output) = prices_of(model_id);
+    let (input, output) = (input?, output?);
     Some((usage.input_tokens as f64 * input + usage.output_tokens as f64 * output) / 1_000_000.0)
 }
 
@@ -254,7 +265,7 @@ mod tests {
         let usage =
             Usage { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_hit_tokens: 0 };
         let cost = est_cost_usd("deepseek-v4-pro", &usage).unwrap();
-        assert!((cost - 5.22).abs() < 1e-9, "1.74 + 3.48 = 5.22,实际 {cost}");
+        assert!((cost - 5.28).abs() < 1e-9, "1.32 + 3.96 = 5.28(2026-08-21 高峰价),实际 {cost}");
     }
 
     #[test]
@@ -331,6 +342,8 @@ mod tests {
     // 2026-07 校订的视觉家族行:特异在前的排序是承重的(k2.5/k2.6 不被 kimi-k2 错杀)
     #[test]
     fn vision_catalog_families_2026_07() {
+        assert!(supports_vision("kimi-k3"), "K3 旗舰多模态(2026-09 目录)");
+        assert_eq!(ctx_window_of("kimi-k3"), Some(1_000_000));
         assert!(supports_vision("kimi-k2.6-preview"), "K2.6 原生多模态");
         assert!(supports_vision("kimi-k2.5"), "K2.5 原生多模态");
         assert!(!supports_vision("kimi-k2-0711-preview"), "老 K2 纯文本");
@@ -340,7 +353,15 @@ mod tests {
         assert!(!supports_vision("qwen-max"), "qwen-max 的 API 仍纯文本");
         assert!(!supports_vision("llava:13b"), "目录不认识 → false,靠覆盖标");
         assert!(supports_vision("gemini-2.5-flash") && supports_vision("claude-sonnet-5"));
-        assert!(!supports_vision("deepseek-v4"), "DeepSeek API 无图片输入(网页端灰度不算)");
+        // DeepSeek 2026-08-21 起:图片输入只有 vision-exp 一个;flash/pro 仍纯文本。
+        // vision-exp 含 deepseek-v4-flash 子串 → 这条断言同时钉住「特异在前」的排序承重。
+        assert!(
+            supports_vision("deepseek-v4-flash-vision-exp"),
+            "vision-exp 多模态;若失败多半是目录排序被动过(flash 行抢先命中)"
+        );
+        assert!(supports_vision("openrouter/deepseek/deepseek-v4-flash-vision-exp"), "中转前缀照认");
+        assert!(!supports_vision("deepseek-v4-flash"), "flash 本体仍纯文本");
+        assert!(!supports_vision("deepseek-v4"), "V4-Pro 仍纯文本(DeepSeek 图片输入只有 vision-exp)");
     }
 
     #[test]

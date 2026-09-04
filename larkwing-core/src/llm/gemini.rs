@@ -192,6 +192,29 @@ impl GeminiProvider {
     }
 }
 
+/// Gemini ListModels → 能聊天的模型 id:剥 `models/` 前缀;按官方 `supportedGenerationMethods`
+/// 含 generateContent 筛(embedding 类自然落选)—— 靶的是文档化字段,不靶名字。保序去重。
+fn parse_gemini_models(v: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for m in v.get("models").and_then(|d| d.as_array()).into_iter().flatten() {
+        let can_chat = m
+            .get("supportedGenerationMethods")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().any(|x| x.as_str() == Some("generateContent")))
+            .unwrap_or(false);
+        if !can_chat {
+            continue;
+        }
+        if let Some(name) = m.get("name").and_then(|n| n.as_str()) {
+            let id = name.strip_prefix("models/").unwrap_or(name);
+            if !id.is_empty() && !out.iter().any(|x| x == id) {
+                out.push(id.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Gemini Schema 只认一小撮关键字,其余必剥否则 400(考古 robot `_clean_schema`)。
 /// 剥完再修 required:去掉已不在 properties 里的项,空则删 required。
 fn clean_schema(schema: &Value) -> Value {
@@ -256,6 +279,28 @@ fn normalize_finish(raw: &str) -> String {
 
 #[async_trait::async_trait]
 impl LlmProvider for GeminiProvider {
+    /// 模型清单:GET /models(pageSize 顶到官方上限 1000 免翻页),只留会 generateContent 的。
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        if self.cfg.api_key.trim().is_empty() {
+            return Err(LlmError::NoApiKey);
+        }
+        let url = format!("{}/models?pageSize=1000", self.cfg.base_url.trim_end_matches('/'));
+        let key = self.cfg.api_key.clone();
+        let resp = self
+            .net
+            .send(&url, |c| {
+                c.get(&url).header("x-goog-api-key", &key).timeout(std::time::Duration::from_secs(15))
+            })
+            .await
+            .map_err(|e| LlmError::Network(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(super::status_error(status.as_u16(), resp.text().await.unwrap_or_default()));
+        }
+        let v: Value = resp.json().await.map_err(|e| LlmError::Network(e.to_string()))?;
+        Ok(parse_gemini_models(&v))
+    }
+
     fn model_id(&self) -> &str {
         &self.cfg.model
     }
@@ -406,6 +451,20 @@ async fn finalize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ListModels 解析:按 supportedGenerationMethods 筛(embedding 落选)、剥 models/ 前缀、保序去重。
+    #[test]
+    fn parse_gemini_models_filters_by_generate_content_and_strips_prefix() {
+        let v = json!({ "models": [
+            { "name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent", "countTokens"] },
+            { "name": "models/text-embedding-004", "supportedGenerationMethods": ["embedContent"] },
+            { "name": "models/gemini-2.5-pro", "supportedGenerationMethods": ["generateContent"] },
+            { "name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"] },
+            { "name": "models/no-methods" }
+        ]});
+        assert_eq!(parse_gemini_models(&v), ["gemini-2.5-flash", "gemini-2.5-pro"]);
+        assert!(parse_gemini_models(&json!({})).is_empty());
+    }
     use crate::llm::{ChatMessage, ChatOptions, ToolDef};
 
     fn cfg() -> LlmConfig {

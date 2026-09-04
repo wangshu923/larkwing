@@ -3,7 +3,7 @@
 // 暗 tab 可点、进 teaser 页 —— 能点的必有反应(铁律3),绝不放灰掉的死控件。
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { api, appVersion, emitWakeChanged, isTauri, openExternal, setFloatVisible, type ChannelChat, type FamilyMember, type ModelMeta, type ModelOverride, type ModelTier, type ProviderView, type RemoteChannelView, type ScopeEntry, type ScopeMode, type VoiceStatus } from '../lib/backend'
+import { api, appVersion, emitWakeChanged, isTauri, openExternal, setFloatVisible, type AppError, type ChannelChat, type ErrorKind, type FamilyMember, type ModelChoice, type ModelMeta, type ModelOverride, type Protocol, type ProviderPreset, type ModelTier, type ProviderView, type RemoteChannelView, type ScopeEntry, type ScopeMode, type VoiceStatus } from '../lib/backend'
 import { applyLocale } from '../i18n'
 import { useChat } from '../composables/useChat'
 import { hydrateUser, useSettings } from '../composables/useSettings'
@@ -15,6 +15,7 @@ import { useCaptureRoute } from '../composables/useCaptureRoute'
 import { useVoice, onEnrollDone } from '../composables/useVoice'
 import { audioFileToWavBase64 } from '../composables/useAudioDecode'
 import SkinSelect from '../components/SkinSelect.vue'
+import ModelPickList from '../components/ModelPickList.vue'
 
 const emit = defineEmits<{ (e: 'close'): void }>()
 const { t } = useI18n()
@@ -1092,12 +1093,133 @@ function saveKey(p: ProviderView) {
 }
 function saveField(p: ProviderView, field: 'baseUrl' | 'model', ev: Event) {
   const v = (ev.target as HTMLInputElement).value.trim()
-  if (!v || v === p[field]) return
-  settings.saveProvider({ id: p.id, [field]: v })
+  if (!v || v === p[field]) {
+    if (field === 'model') delete modelDraft[p.id] // 空 / 没变 → 草稿退场,回显已存的值
+    return
+  }
+  const saved = settings.saveProvider({ id: p.id, [field]: v })
+  // 模型框:存成了草稿才退场(显示的正是存的那个);没存成留着草稿让人看见自己填的
+  if (field === 'model') saved.then((ok) => { if (ok) delete modelDraft[p.id] })
 }
+
+// 模型下拉(combobox):输入框仍是自由文本(中转 / 自架的名字随便填),行尾 ▾ 向该供应商的
+// 接入点拉「这把钥匙能用的模型」—— 真相源在服务商、不写死名单(DeepSeek 两个月换三次名单的教训);
+// 目录只负责贴档位 / 能看图 / 牌价标签并把认识的排前面。同时只开一个;清单按供应商缓存,重开秒出。
+const pickOpen = ref<string | null>(null)
+const pickLoading = ref(false)
+// 拉清单的错:后端 kind 之外多一档 need_endpoint(草稿卡接入点还没填就点了 ▾)
+const pickErr = ref<{ kind: ErrorKind | 'need_endpoint'; message: string } | null>(null)
+const pickLists = reactive<Record<string, ModelChoice[]>>({})
+const CUSTOM_PICK = 'custom' // 「自己接一个大脑」草稿卡在 pickOpen / pickLists 里的键
+const pickActive = ref(-1) // 键盘高亮行
+// 模型框显示 = 草稿 ?? 已存值。⚠️ 不能像接入点框那样直接 :value="p.model":每敲一字清单要重算 →
+// 组件重渲染 → Vue 把 DOM 值钉回 p.model,打的字被覆盖(首测实锤)。草稿同时就是筛选词。
+const modelDraft = reactive<Record<string, string>>({})
+const modelInputs: Record<string, HTMLInputElement | null> = {} // 打开下拉时聚焦 + 全选用
+const pickFiltered = computed(() => {
+  const id = pickOpen.value
+  const list = id ? pickLists[id] ?? [] : []
+  // 筛选词:已接入的卡 = 该卡的草稿;草稿卡 = 它的模型输入框本身(v-model,重渲染不会钉回旧值)
+  const q = (id === CUSTOM_PICK ? custom.model : id ? modelDraft[id] ?? '' : '').trim().toLowerCase()
+  return q ? list.filter((c) => c.id.toLowerCase().includes(q)) : list
+})
+// 浏览器预览没有后端:一小份假清单看交互(与 FAKE_META 同性质的预览夹具,不是产品数据)
+function fakeModels(p: ProviderView): ModelChoice[] {
+  const row = (id: string, known: boolean, tier: ModelTier, vision: boolean, i: number | null, o: number | null): ModelChoice =>
+    ({ id, known, tier, vision, inUsdPerM: i, outUsdPerM: o })
+  return p.protocol === 'anthropic_compat'
+    ? [row('claude-opus-4-8', true, 'smart', true, 5, 25), row('claude-sonnet-4-6', true, 'smart', true, 3, 15), row('claude-haiku-4-5', true, 'light', true, 1, 5)]
+    : [row('deepseek-v4-pro', true, 'balanced', false, 1.32, 3.96), row('deepseek-v4-flash', true, 'light', false, 0.44, 1.32), row('deepseek-v4-flash-vision-exp', true, 'light', true, 0.44, 1.32), row('some-relay-only-model', false, 'balanced', false, null, null)]
+}
+async function loadPick(p: ProviderView, force = false) {
+  if (!force && pickLists[p.id]) return
+  if (!p.keySet) {
+    pickErr.value = { kind: 'no_api_key', message: '' } // 不白打一次网络:没钥匙必 401
+    return
+  }
+  pickLoading.value = true
+  pickErr.value = null
+  try {
+    pickLists[p.id] = isTauri() ? await api.listModels(p.id) : fakeModels(p)
+  } catch (e) {
+    pickErr.value = e && typeof e === 'object' && 'kind' in e ? (e as AppError) : { kind: 'internal', message: String(e) }
+  } finally {
+    pickLoading.value = false
+  }
+}
+function onPickDocDown(e: PointerEvent) {
+  if (!(e.target as Element | null)?.closest?.('.model-pick')) closePick()
+}
+function closePick() {
+  pickOpen.value = null
+  document.removeEventListener('pointerdown', onPickDocDown, true)
+}
+async function togglePick(p: ProviderView) {
+  if (pickOpen.value === p.id) {
+    closePick()
+    return
+  }
+  pickOpen.value = p.id
+  pickActive.value = -1
+  pickErr.value = null
+  document.addEventListener('pointerdown', onPickDocDown, true)
+  // 打开即聚焦 + 全选:一敲字就是「筛清单」而不是接在旧模型名后面;不敲字点走 = 值没变、不存
+  const el = modelInputs[p.id]
+  el?.focus()
+  el?.select()
+  await loadPick(p)
+}
+function pickModel(p: ProviderView, id: string) {
+  closePick()
+  if (id === p.model) {
+    delete modelDraft[p.id]
+    return
+  }
+  modelDraft[p.id] = id // 立刻显示选中的;存好后草稿让位给 p.model(同一个值,无闪动)
+  settings.saveProvider({ id: p.id, model: id }).then((ok) => { if (ok) delete modelDraft[p.id] })
+  if (advOpen[p.id] && !modelMeta[id]) fetchMeta(id) // 高级区展开着 → 跟着换模型
+}
+function onPickKey(p: ProviderView, e: KeyboardEvent) {
+  if (pickOpen.value !== p.id) {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      togglePick(p)
+    }
+    return
+  }
+  const rows = pickFiltered.value
+  if (e.key === 'Escape') {
+    // Esc = 撤销这次筛选:草稿作废、回显当前模型(点走 / 回车仍按自由文本原语义存)。
+    // stopPropagation:设置页在 window 上听 Esc 关整页(onKeydown),下拉开着时 Esc 只关下拉。
+    e.preventDefault()
+    e.stopPropagation()
+    delete modelDraft[p.id]
+    closePick()
+  } else if (e.key === 'ArrowDown') {
+    e.preventDefault()
+    pickActive.value = Math.min(rows.length - 1, pickActive.value + 1)
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault()
+    pickActive.value = Math.max(0, pickActive.value - 1)
+  } else if (e.key === 'Enter' && pickActive.value >= 0 && rows[pickActive.value]) {
+    e.preventDefault()
+    pickModel(p, rows[pickActive.value].id)
+  }
+  // 没高亮行的回车不拦:原生 change 照常把手填的值存上(自由文本路不受下拉影响)
+}
+onUnmounted(() => document.removeEventListener('pointerdown', onPickDocDown, true))
+/** 卡片头的协议徽章(全大写 mono 风格)。 */
 function protoLabel(p: ProviderView) {
-  const vendor = p.protocol === 'anthropic_compat' ? 'ANTHROPIC' : 'OPENAI'
-  return t('settings.brain.compat', { vendor })
+  return protoName(p.protocol, true)
+}
+/** 协议方言的人话名:兼容方言「X 兼容」、原生方言「X 原生」(Gemini / OpenAI Responses 为保真下楼)。 */
+function protoName(proto: string, upper = false): string {
+  const [vendor, native]: [string, boolean] =
+    proto === 'anthropic_compat' ? ['Anthropic', false]
+    : proto === 'gemini' ? ['Gemini', true]
+    : proto === 'openai_responses' ? ['OpenAI Responses', true]
+    : ['OpenAI', false]
+  return t(native ? 'settings.brain.native' : 'settings.brain.compat', { vendor: upper ? vendor.toUpperCase() : vendor })
 }
 
 // 「高级」:按模型纠正档位/价格/上下文窗口(空 = 用目录猜测)。按 provider 折叠,展开时懒取 meta。
@@ -1203,7 +1325,7 @@ const customReady = computed(() => custom.name.trim() && custom.baseUrl.trim() &
 async function addCustom() {
   if (!customReady.value) return
   const ok = await settings.saveProvider({
-    id: `custom-${Date.now().toString(36)}`,
+    id: `${customPreset.value || 'custom'}-${Date.now().toString(36)}`,
     name: custom.name.trim(),
     protocol: custom.protocol,
     baseUrl: custom.baseUrl.trim(),
@@ -1212,9 +1334,174 @@ async function addCustom() {
   })
   if (ok) {
     adding.value = false
+    customPreset.value = ''
     Object.assign(custom, { name: '', protocol: 'openai_compat', baseUrl: '', model: '', key: '' })
   }
 }
+
+// 「从预设开始」:厂商预设表来自后端(registry::presets,数据单源);选一家 → 名字 / 协议 / 接入点
+// 自动填,**刻意不填模型**(用户拍板不写死:厂商换代频繁、名单必陈)→ 贴钥匙后用模型框 ▾ 现查、选好再接入。
+const presets = ref<ProviderPreset[]>([])
+const customPreset = ref('')
+// 浏览器预览没有后端:两条假预设看交互(预览夹具,产品表在 Rust)
+const FAKE_PRESETS: ProviderPreset[] = [
+  { id: 'qwen', name: '千问 Qwen', protocol: 'openai_compat', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', keyPlaceholder: null },
+  { id: 'ollama', name: 'Ollama', protocol: 'openai_compat', baseUrl: 'http://localhost:11434/v1', keyPlaceholder: 'ollama' },
+]
+async function openCustom() {
+  adding.value = true
+  if (presets.value.length) return
+  try {
+    presets.value = isTauri() ? await api.providerPresets() : FAKE_PRESETS
+  } catch (e) {
+    console.error('预设表加载失败', e) // 拿不到就没下拉,手填照旧
+  }
+}
+function applyProviderPreset(id: string) {
+  customPreset.value = id
+  const p = presets.value.find((x) => x.id === id)
+  if (!p) return
+  custom.name = p.name
+  custom.protocol = p.protocol
+  custom.baseUrl = p.baseUrl
+  custom.key = p.keyPlaceholder ?? ''
+  custom.model = '' // 不预填:靠 ▾ 现查
+}
+// 手改了接入点就不再算「那家预设」(✓ 与 id 前缀都摘掉);改回预设地址不自动认回,重新点选即可
+watch(() => custom.baseUrl, (v) => {
+  const p = presets.value.find((x) => x.id === customPreset.value)
+  if (p && p.baseUrl !== v.trim()) customPreset.value = ''
+})
+
+// 接入点框的 ▾ = 预设清单(入口放在框本身:人到这个框上找快捷选择,用户实锤;首版单独一行「预设」下拉已砍)。
+// 与模型 ▾ 共用 pickOpen / pickActive / closePick 与全局 .pick-* 样式;边打边筛(厂商名或地址子串),Esc 撤销。
+const ENDPOINT_PICK = 'endpoint'
+const endpointInput = ref<HTMLInputElement | null>(null)
+const endpointQuery = ref('') // 打开即清空:不用框里已有的地址去筛(否则只剩当前那家)
+let endpointPrev = ''
+const presetRows = computed(() => {
+  const q = endpointQuery.value.trim().toLowerCase()
+  return q
+    ? presets.value.filter((p) => p.name.toLowerCase().includes(q) || p.baseUrl.toLowerCase().includes(q))
+    : presets.value
+})
+function toggleEndpointPick() {
+  if (pickOpen.value === ENDPOINT_PICK) {
+    closePick()
+    return
+  }
+  pickOpen.value = ENDPOINT_PICK
+  pickActive.value = -1
+  endpointQuery.value = ''
+  endpointPrev = custom.baseUrl
+  document.addEventListener('pointerdown', onPickDocDown, true)
+  endpointInput.value?.focus()
+  endpointInput.value?.select()
+}
+function pickEndpoint(id: string) {
+  applyProviderPreset(id)
+  closePick()
+}
+function onEndpointKey(e: KeyboardEvent) {
+  if (pickOpen.value !== ENDPOINT_PICK) {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      toggleEndpointPick()
+    }
+    return
+  }
+  const rows = presetRows.value
+  if (e.key === 'Escape') {
+    e.preventDefault()
+    e.stopPropagation() // 设置页在 window 上听 Esc 关整页;下拉开着时只关下拉
+    custom.baseUrl = endpointPrev
+    closePick()
+  } else if (e.key === 'ArrowDown') {
+    e.preventDefault()
+    pickActive.value = Math.min(rows.length - 1, pickActive.value + 1)
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault()
+    pickActive.value = Math.max(0, pickActive.value - 1)
+  } else if (e.key === 'Enter' && pickActive.value >= 0 && rows[pickActive.value]) {
+    e.preventDefault()
+    pickEndpoint(rows[pickActive.value].id)
+  }
+}
+const protoOpts = computed(() =>
+  (['openai_compat', 'anthropic_compat', 'gemini', 'openai_responses'] as Protocol[]).map((v) => ({ value: v, label: protoName(v) })),
+)
+
+// 草稿卡的模型 ▾:对着草稿配置(协议 / 接入点 / 钥匙)现拉,选好再接入。与已接入的卡共用弹层组件与
+// pickOpen / pickLists / pickActive 状态;筛选词就是输入框本身。
+let customPickPrev = '' // Esc 撤销用
+const customInput = ref<HTMLInputElement | null>(null)
+async function loadPickCustom(force = false) {
+  if (!force && pickLists[CUSTOM_PICK]) return
+  if (!custom.baseUrl.trim()) {
+    pickErr.value = { kind: 'need_endpoint', message: '' }
+    return
+  }
+  if (!custom.key.trim()) {
+    pickErr.value = { kind: 'no_api_key', message: '' }
+    return
+  }
+  pickLoading.value = true
+  pickErr.value = null
+  try {
+    pickLists[CUSTOM_PICK] = isTauri()
+      ? await api.listModelsDraft(custom.protocol, custom.baseUrl.trim(), custom.key.trim())
+      : fakeModels({ protocol: custom.protocol } as ProviderView)
+  } catch (e) {
+    pickErr.value = e && typeof e === 'object' && 'kind' in e ? (e as AppError) : { kind: 'internal', message: String(e) }
+  } finally {
+    pickLoading.value = false
+  }
+}
+function togglePickCustom() {
+  if (pickOpen.value === CUSTOM_PICK) {
+    closePick()
+    return
+  }
+  pickOpen.value = CUSTOM_PICK
+  pickActive.value = -1
+  pickErr.value = null
+  customPickPrev = custom.model
+  document.addEventListener('pointerdown', onPickDocDown, true)
+  customInput.value?.focus()
+  customInput.value?.select()
+  void loadPickCustom()
+}
+function pickModelCustom(id: string) {
+  custom.model = id
+  closePick()
+}
+function onPickKeyCustom(e: KeyboardEvent) {
+  if (pickOpen.value !== CUSTOM_PICK) {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      togglePickCustom()
+    }
+    return
+  }
+  const rows = pickFiltered.value
+  if (e.key === 'Escape') {
+    e.preventDefault()
+    e.stopPropagation() // 设置页在 window 上听 Esc 关整页;下拉开着时只关下拉
+    custom.model = customPickPrev
+    closePick()
+  } else if (e.key === 'ArrowDown') {
+    e.preventDefault()
+    pickActive.value = Math.min(rows.length - 1, pickActive.value + 1)
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault()
+    pickActive.value = Math.max(0, pickActive.value - 1)
+  } else if (e.key === 'Enter' && pickActive.value >= 0 && rows[pickActive.value]) {
+    e.preventDefault()
+    pickModelCustom(rows[pickActive.value].id)
+  }
+}
+// 草稿的协议 / 接入点 / 钥匙一变,缓存的清单作废(下次点 ▾ 重拉)
+watch(() => [custom.protocol, custom.baseUrl, custom.key], () => { delete pickLists[CUSTOM_PICK] })
 
 // 家人页(渠道归人 = 多用户第一步,声纹后置):家人列表 CRUD + 手机对话指认给家人。
 // 指认后 TA 在手机上说的「提醒我 / 我喜欢…」归 TA 自己(speaker_user 缝,记忆归人 §6)。
@@ -1504,7 +1791,40 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             <label>{{ t('settings.brain.endpoint') }}</label>
             <input class="s-input s-mono-input" :value="p.baseUrl" @change="saveField(p, 'baseUrl', $event)" />
             <label>{{ t('settings.brain.model') }}</label>
-            <input class="s-input s-mono-input" :value="p.model" @change="saveField(p, 'model', $event)" />
+            <!-- 模型:自由文本 + 行尾 ▾ 拉接入点清单(combobox);行/按钮 pointerdown.prevent 保住输入框焦点,
+                 免得点选时 blur 先把打了半截的文字当模型存上 -->
+            <div class="model-pick" :class="{ open: pickOpen === p.id }">
+              <input
+                :ref="(el) => { modelInputs[p.id] = el as HTMLInputElement | null }"
+                class="s-input s-mono-input"
+                :value="modelDraft[p.id] ?? p.model"
+                role="combobox"
+                :aria-expanded="pickOpen === p.id"
+                @change="saveField(p, 'model', $event)"
+                @input="modelDraft[p.id] = ($event.target as HTMLInputElement).value; pickActive = -1"
+                @keydown="onPickKey(p, $event)"
+              />
+              <button
+                type="button"
+                class="pick-btn"
+                :title="t('settings.brain.pickModel')"
+                :aria-label="t('settings.brain.pickModel')"
+                @pointerdown.prevent
+                @click="togglePick(p)"
+              >▾</button>
+              <ModelPickList
+                v-if="pickOpen === p.id"
+                :loading="pickLoading"
+                :err="pickErr"
+                :total="pickLists[p.id]?.length ?? 0"
+                :rows="pickFiltered"
+                :current="p.model"
+                :active="pickActive"
+                @pick="(id: string) => pickModel(p, id)"
+                @refresh="loadPick(p, true)"
+                @hover="(i: number) => (pickActive = i)"
+              />
+            </div>
           </div>
           <!-- 高级:按模型纠正档位/价格/上下文窗口(空 = 用目录猜测,纠错而非配置 §3) -->
           <button class="link adv-toggle" @click="toggleAdv(p)">
@@ -1552,24 +1872,77 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         </div>
 
         <!-- 自己接一个大脑 -->
-        <button v-if="!adding" class="add-card" @click="adding = true">{{ t('settings.brain.addCustom') }}</button>
+        <button v-if="!adding" class="add-card" @click="openCustom">{{ t('settings.brain.addCustom') }}</button>
         <div v-else class="pcard">
           <div class="p-head">
             <b>{{ t('settings.brain.addCustom') }}</b>
-            <span class="seg">
-              <button :class="{ on: custom.protocol === 'openai_compat' }" @click="custom.protocol = 'openai_compat'">{{ t('settings.brain.compat', { vendor: 'OpenAI' }) }}</button>
-              <button :class="{ on: custom.protocol === 'anthropic_compat' }" @click="custom.protocol = 'anthropic_compat'">{{ t('settings.brain.compat', { vendor: 'Anthropic' }) }}</button>
-            </span>
           </div>
-          <div class="p-grid">
+          <!-- 从预设开始:选一家自动填名字 / 协议 / 接入点;模型刻意不预填(不写死),贴钥匙后用 ▾ 现查再接入 -->
+          <div class="p-grid custom-grid">
             <label>{{ t('settings.brain.customName') }}</label>
             <input v-model="custom.name" class="s-input" :placeholder="t('settings.brain.customNamePlaceholder')" />
+            <label>{{ t('settings.brain.protocol') }}</label>
+            <SkinSelect :model-value="custom.protocol" :options="protoOpts" :aria-label="t('settings.brain.protocol')" @update:model-value="(v: string) => (custom.protocol = v)" />
             <label>{{ t('settings.brain.endpoint') }}</label>
-            <input v-model="custom.baseUrl" class="s-input s-mono-input" placeholder="https://…/v1" />
-            <label>{{ t('settings.brain.model') }}</label>
-            <input v-model="custom.model" class="s-input s-mono-input" placeholder="model-id" />
+            <!-- 接入点 ▾ = 厂商预设(千问 / 豆包 / Kimi / 智谱 / 混元 / OpenAI / Gemini / Ollama):选一家连名字 / 协议一起填,
+                 手填任意地址照旧。入口放在接入点框本身——人到这个框上找快捷选择(用户实锤),不另起一行 -->
+            <div class="model-pick" :class="{ open: pickOpen === ENDPOINT_PICK }">
+              <input
+                ref="endpointInput"
+                v-model="custom.baseUrl"
+                class="s-input s-mono-input"
+                placeholder="https://…/v1"
+                role="combobox"
+                :aria-expanded="pickOpen === ENDPOINT_PICK"
+                @input="endpointQuery = ($event.target as HTMLInputElement).value; pickActive = -1"
+                @keydown="onEndpointKey"
+              />
+              <button type="button" class="pick-btn" :title="t('settings.brain.preset')" :aria-label="t('settings.brain.preset')" @pointerdown.prevent @click="toggleEndpointPick">▾</button>
+              <div v-if="pickOpen === ENDPOINT_PICK" class="pick-list" role="listbox" @pointerdown.prevent>
+                <p v-if="!presetRows.length" class="pick-msg">{{ t('settings.brain.presetNoMatch') }}</p>
+                <div
+                  v-for="(pr, i) in presetRows"
+                  :key="pr.id"
+                  class="pick-row"
+                  role="option"
+                  :aria-selected="pr.id === customPreset"
+                  :class="{ sel: pr.id === customPreset, active: i === pickActive }"
+                  @click="pickEndpoint(pr.id)"
+                  @mousemove="pickActive = i"
+                >
+                  <span class="pick-name">{{ pr.name }}</span>
+                  <span class="pick-url">{{ pr.baseUrl }}</span>
+                </div>
+              </div>
+            </div>
             <label>{{ t('settings.brain.keyField') }}</label>
             <input v-model="custom.key" class="s-input" :placeholder="t('settings.brain.keyPlaceholder')" />
+            <label>{{ t('settings.brain.model') }}</label>
+            <div class="model-pick" :class="{ open: pickOpen === CUSTOM_PICK }">
+              <input
+                ref="customInput"
+                v-model="custom.model"
+                class="s-input s-mono-input"
+                placeholder="model-id"
+                role="combobox"
+                :aria-expanded="pickOpen === CUSTOM_PICK"
+                @input="pickActive = -1"
+                @keydown="onPickKeyCustom"
+              />
+              <button type="button" class="pick-btn" :title="t('settings.brain.pickModel')" :aria-label="t('settings.brain.pickModel')" @pointerdown.prevent @click="togglePickCustom">▾</button>
+              <ModelPickList
+                v-if="pickOpen === CUSTOM_PICK"
+                :loading="pickLoading"
+                :err="pickErr"
+                :total="pickLists[CUSTOM_PICK]?.length ?? 0"
+                :rows="pickFiltered"
+                :current="custom.model"
+                :active="pickActive"
+                @pick="pickModelCustom"
+                @refresh="loadPickCustom(true)"
+                @hover="(i: number) => (pickActive = i)"
+              />
+            </div>
           </div>
           <div class="p-foot">
             <button class="link" :disabled="!customReady" @click="addCustom">{{ t('settings.brain.addSave') }}</button>
@@ -2476,6 +2849,19 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .adv-grid { grid-template-columns: 96px minmax(0, 1fr); margin-top: 8px; padding-top: 10px; border-top: 1px dashed var(--line); }
 .adv-grid .adv-hint { grid-column: 1 / -1; margin: 2px 0 0; color: var(--text-dim); font-size: 11.5px; }
 .s-mono-input { font-family: ui-monospace, "SF Mono", monospace; font-size: 12px; }
+/* 模型下拉(combobox):自由文本输入 + 行尾 ▾;弹层本体在 ModelPickList.vue(已接入卡 / 草稿卡两处共用),
+   锚在这个容器的左右缘。 */
+.model-pick { position: relative; display: flex; align-items: center; min-width: 0; }
+.model-pick .s-input { padding-right: 30px; }
+.pick-btn {
+  position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+  width: 22px; height: 22px; padding: 0; border: none; border-radius: 6px;
+  background: none; color: var(--text-dim); cursor: pointer; font-size: 11px; line-height: 22px;
+}
+.pick-btn:hover, .model-pick.open .pick-btn { color: var(--accent); background: rgba(var(--accent-rgb), 0.12); }
+/* 「自己接一个大脑」草稿卡:标签比模板卡长一档(预设 / 协议),两个 SkinSelect 填满单元格 */
+.custom-grid { grid-template-columns: 64px minmax(0, 1fr); }
+.custom-grid .skinsel { width: 100%; }
 /* 微信绑定行:绑定者 id(等宽截断)+ 行尾解绑 */
 .s-mono-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, "SF Mono", monospace; font-size: 12px; color: var(--text-dim); }
 /* 全局应用公钥框:多行 PEM,占满宽、不可拽缩、整段可读(给用户复制到服务控制台) */

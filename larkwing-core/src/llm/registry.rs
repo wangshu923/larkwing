@@ -197,6 +197,54 @@ impl ProviderSpec {
     }
 }
 
+/// 厂商预设 = 数据(§4.4「供应商 = 数据」)。给「自己接一个大脑」卡的「从预设开始」下拉:选一家 →
+/// 名字 / 协议 / 接入点自动填,用户只贴钥匙。**刻意不带默认模型**(2026-09-04 用户拍板「不写死」:
+/// 厂商换代频繁、写死必陈;模型靠设置页 ▾ 向接入点现查,选好再接入)。
+/// 名字 = 品牌专有名词、中英同形,不进 i18n(同 DeepSeek / Anthropic 预设名)。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderPreset {
+    /// 稳定 id(新建卡的 id 前缀;与模板卡 deepseek / anthropic 不撞)。
+    pub id: String,
+    pub name: String,
+    pub protocol: Protocol,
+    pub base_url: String,
+    /// 钥匙占位值:None = 必须用户贴钥匙;Some = 本地服务不验钥匙,用占位让 `usable()` 放行(Ollama)。
+    pub key_placeholder: Option<String>,
+}
+
+/// 预设表。名单 = 国内主流五家(千问 / 豆包 / Kimi / 智谱 / 混元,用户拍板「主流就行」)+ 已有但此前
+/// UI 够不着的 OpenAI / Gemini / Ollama(它们走原生协议 / 本地端点,自定义卡原先只给两种兼容协议选);
+/// 后三家的接入点取自 `LlmConfig` 预设构造器(单源,不复制字面量)。国内五家的接入点 = 各家官方文档的
+/// 公开地址(协议事实,非 §4.11 产品默认);千问用百炼旧域名(官方仍可用,新域名带用户 WorkspaceId
+/// 没法预填);豆包 model 填 Model ID(需控制台「开通」)或 `ep-…` 接入点 ID 都行。
+/// DeepSeek / Anthropic 两张模板卡另走 `engine::effective_specs`,不在此表(免同一家两个入口)。
+pub fn presets() -> Vec<ProviderPreset> {
+    let lit = |id: &str, name: &str, protocol: Protocol, base_url: &str| ProviderPreset {
+        id: id.into(),
+        name: name.into(),
+        protocol,
+        base_url: base_url.into(),
+        key_placeholder: None,
+    };
+    let openai = LlmConfig::openai(String::new());
+    let gemini = LlmConfig::gemini(String::new());
+    let ollama = LlmConfig::ollama(String::new());
+    vec![
+        lit("qwen", "千问 Qwen", Protocol::OpenaiCompat, "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        lit("doubao", "豆包 Doubao", Protocol::OpenaiCompat, "https://ark.cn-beijing.volces.com/api/v3"),
+        lit("kimi", "Kimi", Protocol::OpenaiCompat, "https://api.moonshot.cn/v1"),
+        lit("zhipu", "智谱 GLM", Protocol::OpenaiCompat, "https://open.bigmodel.cn/api/paas/v4"),
+        lit("hunyuan", "混元 Hunyuan", Protocol::OpenaiCompat, "https://api.hunyuan.cloud.tencent.com/v1"),
+        lit("openai", "OpenAI", Protocol::OpenaiResponses, &openai.base_url),
+        lit("gemini", "Gemini", Protocol::Gemini, &gemini.base_url),
+        ProviderPreset {
+            key_placeholder: Some(ollama.api_key.clone()),
+            ..lit("ollama", "Ollama", Protocol::OpenaiCompat, &ollama.base_url)
+        },
+    ]
+}
+
 /// 用脑策略:用户可见的唯一路由旋钮(设置页三档,绝不露路由表)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -313,6 +361,31 @@ mod tests {
             model: model.into(),
             ..Default::default()
         }
+    }
+
+    // 预设表:id 唯一、接入点规整(末尾不带 /,provider 自己拼路径)、协议名能过桥往返、
+    // 模板卡不混进来;本地服务给占位钥匙放行,云厂商必须贴钥匙。
+    #[test]
+    fn presets_are_well_formed_and_distinct() {
+        let ps = presets();
+        let mut ids: Vec<&str> = ps.iter().map(|p| p.id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), ps.len(), "预设 id 必须唯一");
+        for p in &ps {
+            assert!(!p.name.is_empty() && !p.base_url.is_empty(), "{}", p.id);
+            assert!(!p.base_url.ends_with('/'), "{}: 接入点末尾别带 /", p.id);
+            assert!(p.base_url.starts_with("http"), "{}: {}", p.id, p.base_url);
+            assert_eq!(Protocol::parse(p.protocol.as_str()), Some(p.protocol), "{}", p.id);
+            assert!(!["deepseek", "anthropic"].contains(&p.id.as_str()), "模板卡不进预设表");
+        }
+        let by = |id: &str| ps.iter().find(|p| p.id == id).expect(id);
+        assert_eq!(by("ollama").key_placeholder.as_deref(), Some("ollama"));
+        assert!(by("qwen").key_placeholder.is_none());
+        assert_eq!(by("gemini").protocol, Protocol::Gemini, "Gemini 走原生方言(保真铁律)");
+        assert_eq!(by("openai").protocol, Protocol::OpenaiResponses);
+        // 后三家与 LlmConfig 预设同源:构造器改了接入点,这里自动跟着变
+        assert_eq!(by("ollama").base_url, LlmConfig::ollama(String::new()).base_url);
     }
 
     #[test]
