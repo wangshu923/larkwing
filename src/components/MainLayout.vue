@@ -927,6 +927,12 @@ watch(messages, () => nextTick(() => {
         <div class="who"><b>{{ petName }}</b><small><span class="led"></span>{{ statusText }}</small></div>
       </header>
 
+      <!-- 滚动区外再包一层同框的 .stream-wrap:桌宠悬在这一层上、不在滚动内容里。
+           它若挂在 .stream 里(2026-07-04 → 2026-09-04 的老做法),transform 定位盒会算进滚动区的
+           可滚动范围:站到底边附近时看不见的姿态盒探出视口 → 「贴底滚动」把 scrollTop 推下去 →
+           下一帧桌宠随 scrollTop 再探出 → 回合在飞时每条思考增量触发一次贴底 = 聊天流无休止往下
+           滚进空白(2026-09-04 真机实锤)。 -->
+      <div class="stream-wrap">
       <div class="stream" ref="streamEl" @click="onStreamClick">
         <template v-for="(g, gi) in streamGroups" :key="g.key">
           <div v-if="g.sep" class="day-sep"><span>{{ g.sep }}</span></div>
@@ -1071,8 +1077,10 @@ watch(messages, () => nextTick(() => {
         <div v-if="showSuggestions" class="suggest">
           <button v-for="(s, si) in suggestions" :key="si" class="suggest-chip" @click="sendSuggestion(s)">{{ s }}</button>
         </div>
-        <!-- 桌宠:漫游边界=聊天滚动区;不在聊天页时 paused 空转;隐藏=v-if 卸载(RAF 停) -->
-        <PetRoamer v-if="!petHidden" :bounds="streamEl" :paused="activeRail !== 'chat'" :activity="petAct" :behavior="petBehavior" @interact="petB.markInteraction" />
+      </div>
+      <!-- 桌宠:漫游边界=聊天滚动区(bounds 只拿来量视口尺寸/算指针坐标),本体悬在滚动区**外**的
+           同框层上(见上面 .stream-wrap 注释);不在聊天页时 paused 空转;隐藏=v-if 卸载(RAF 停) -->
+      <PetRoamer v-if="!petHidden" :bounds="streamEl" :paused="activeRail !== 'chat'" :activity="petAct" :behavior="petBehavior" @interact="petB.markInteraction" />
       </div>
 
       <div class="composer">
@@ -1333,6 +1341,10 @@ watch(messages, () => nextTick(() => {
 
 /* scrollbar-gutter:stable —— 内容撑满出现滚动条时不再左移跳动(全局 ::-webkit-scrollbar 已统一样式,不再各设一份) */
 /* 间距改走气泡 margin(不用 gap):换角色拉开=turn 分组,同角色收紧;下边距给 hover 浮层留位 */
+/* 滚动区的同框外层 = 桌宠的舞台:与 .stream 同一个盒(flex 列里 .stream 填满它),桌宠按视口坐标
+   绝对定位在这层上、不是滚动内容 → 它的盒子永不撑大 .stream 的 scrollHeight(见模板处注释);
+   overflow:hidden 沿用原先被 .stream 裁切的观感(走到边上被切掉、不盖到输入区)。 */
+.stream-wrap { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; overflow: hidden; }
 .stream { flex: 1; overflow-y: auto; scrollbar-gutter: stable; padding: 22px 20px 22px 26px; display: flex; flex-direction: column; gap: 0; position: relative; }
 /* 起步建议气泡:贴在开场白下方,药丸样式跟随主题色(同 PlayerBar 登录 chip 语言) */
 .suggest { display: flex; flex-wrap: wrap; gap: 8px; padding: 4px 2px; margin-top: 6px; }

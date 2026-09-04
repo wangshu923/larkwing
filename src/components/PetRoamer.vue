@@ -1,7 +1,8 @@
 <script setup lang="ts">
 // 桌宠漫游:旺财在聊天区自由游走(2026-06-17 砍掉「撞气泡」交互 —— 每帧只挪自己一张图,
 // 开销近乎为零)。从 MainLayout 抽出(职责干净 + 自带右键由头像承载)。
-// bounds = 漫游边界容器(聊天滚动区);paused = true 时空转(不在聊天页);
+// bounds = 漫游边界容器(聊天滚动区;只拿它量视口尺寸/算指针坐标——本体挂在它旁边的同框层上,
+// 不是滚动内容,见 roamFrame 末尾的 ⚠️);paused = true 时空转(不在聊天页);
 // 隐藏桌宠由父层 v-if 卸载(RAF 经 useRafLoop 自动停)。形象态读 useCharacter(与头像共用)。
 //
 // 戏份层(2026-08-13,#10 A 层,零新美术):后台任务/思考/放歌 → 线稿 SVG 道具 + CSS 动效
@@ -130,7 +131,7 @@ let falling = false
 const GRAVITY = 0.55
 const FLOOR_MARGIN = 34
 
-/** pointer 事件坐标 → bounds 视口坐标(dogX/dogY 的坐标系;渲染时另加 scrollTop)。 */
+/** pointer 事件坐标 → bounds 视口坐标(= dogX/dogY 的坐标系;.roamer 的舞台层与 bounds 同框同原点,渲染直接用)。 */
 function toLocal(e: PointerEvent): { x: number; y: number } {
   const r = props.bounds?.getBoundingClientRect()
   return r ? { x: e.clientX - r.left, y: e.clientY - r.top } : { x: e.clientX, y: e.clientY }
@@ -373,14 +374,13 @@ function roamFrame() {
     }
   }
   // 图片自身 -50% 居中,这里直接写中心点(蹲/跑画布不同大也不会跳位)。
-  // ⚠️ 叠加 scrollTop:.roamer 绝对定位在 .stream(滚动容器)里,top:0 = 内容顶而非视口顶;
-  // dogX/dogY 是「视口坐标」(newTarget 用 clientHeight 挑落点)→ 写入时加当前 scrollTop,
-  // 桌宠才始终在**可见区**遛弯。否则会话一长它被钉在内容最上方、滚到最新 turn 就看不见了
-  // (2026-07-04 真机实锤)。
-  if (roamer.value) {
-    const off = props.bounds ? props.bounds.scrollTop : 0
-    roamer.value.style.transform = `translate(${dogX}px, ${dogY + off}px)`
-  }
+  // .roamer 悬在滚动区**外**的同框层(MainLayout 的 .stream-wrap)上,dogX/dogY 就是视口坐标,直接写。
+  // ⚠️ 别再把它挂回 .stream 里、每帧加 scrollTop 补偿(2026-07-04 → 2026-09-04 的老做法):
+  // 绝对定位 + transform 的盒子会算进滚动容器的可滚动范围;桌宠站到底边附近时,看不见的姿态盒
+  // (.body 被 img 撑成 px×px、从原点向下延伸半个身位)探出视口 → 「贴底滚动」把 scrollTop 推下去
+  // → 下一帧桌宠随 scrollTop 再探出 → 回合在飞时每条思考增量触发一次贴底 = 聊天流无休止滚进空白
+  // (2026-09-04 真机实锤;预览 1:1 复现:24 条增量 scrollTop 663→844)。
+  if (roamer.value) roamer.value.style.transform = `translate(${dogX}px, ${dogY}px)`
 }
 
 // 换形象:重置步态 + **立即换成新角色静止帧**(不等下一帧;rAF 万一没在跑也立刻反映切换,
@@ -441,8 +441,10 @@ const headStyle = computed(() => {
 
 <template>
   <div class="roamer" ref="roamer">
-    <!-- body = 姿态容器(零尺寸,原点即角色中心):停驻摇摆(放歌)/呼吸(睡)/歪头(围观)
-         走 class;蹦跳/压扁/伸懒腰/蔫这类一次性姿势走 WAAPI;拎着时随甩动速度摆(inline)。 -->
+    <!-- body = 姿态容器(原点即角色中心;注意它**不是**零尺寸——被 block 的 img 撑成 px×px、
+         从原点向右下延伸,img 再 -50% 挪回居中,所以看不见的盒子挂在形象下方半个身位):
+         停驻摇摆(放歌)/呼吸(睡)/歪头(围观)走 class;蹦跳/压扁/伸懒腰/蔫这类一次性姿势走 WAAPI;
+         拎着时随甩动速度摆(inline)。 -->
     <div
       ref="bodyEl"
       class="body"
