@@ -110,6 +110,41 @@ pub trait MediaSource: Send + Sync {
     ) -> Result<Option<(String, Vec<EpisodeRef>)>> {
         Ok(None)
     }
+
+    /// 进度条 hover 预览的**雪碧图**(平台预生成的缩略图拼版,B 站 = `player/videoshot`)。网络流
+    /// 手里只有远端 URL、没帧可抽,预览图只能问平台要 —— 按源分化。**尽力件**:拿不到一律
+    /// `Ok(None)`(= `NowPlaying.thumb_url` 为 None,前端只出时间气泡),绝不挡播放;调用方
+    /// (`play_entry`)另套超时,不拖慢起播。默认无 —— 未实现的源没有预览图。
+    async fn sprites(
+        &self,
+        _page_url: &str,
+        _cookie_header: Option<&str>,
+    ) -> Result<Option<SpriteSheet>> {
+        Ok(None)
+    }
+}
+
+/// 网络源的进度条预览素材:平台**预生成的雪碧图** —— 若干张大图,每张按行优先铺 `x_len × y_len`
+/// 格,一格 = 一帧缩略图;`index` 是各帧的采样时刻。由 `MediaSource::sprites` 产出、relay 消费
+/// (`Entry::Sprites`:`/thumb/{token}?t=秒` 定格 → 下载所在大图 → 裁一格 → JPEG),前端契约与
+/// 本地 ffmpeg 抽帧完全一致(`thumb_url` + `?t=` 回一张 JPEG),前端零改。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpriteSheet {
+    /// 每张大图横向格数。
+    pub x_len: u32,
+    /// 每张大图纵向格数。
+    pub y_len: u32,
+    /// 每格像素宽。
+    pub tile_w: u32,
+    /// 每格像素高。
+    pub tile_h: u32,
+    /// 大图地址(协议已补全);第 j 张装第 `j × x_len × y_len` 帧起的格。
+    pub images: Vec<String>,
+    /// 采样时刻表(秒):`index[k]` = 第 k 帧(全局帧号,跨大图连续)对应视频的第几秒,升序。
+    /// 长度 = 帧数(源解析时已把平台自己的哨兵项剥掉,见 `bilibili::parse_videoshot`)。
+    pub index: Vec<f64>,
+    /// 下载大图要带的头(UA / Referer 防盗链),同 `UpStream.headers` 的用法。
+    pub headers: Vec<(String, String)>,
 }
 
 // ---------- 播放词汇(过桥给前端) ----------
@@ -277,6 +312,11 @@ struct PendingPlay {
 
 /// 待重放有效期:超过即作废。
 const PENDING_PLAY_TTL: Duration = Duration::from_secs(600);
+/// 网络源雪碧图(进度条预览)抓取的总预算(**§4.11 待用户确认**)。它与 yt-dlp 解析**并行**跑:
+/// 解析动辄一两秒,预览图的请求藏在它后面,常态下解析结束前就到手、零额外等待;这个数只兜
+/// 「平台接口卡住」的坏情形 —— 起播最多被拖 3s 减去解析耗时。预览图是锦上添花,超时 = 没有
+/// 缩略图(`thumb_url` None),不是失败、不进任务条。
+const SPRITE_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 前端播放器的「此刻」状态快照。播放真相在前端 WebView(播放在那跑、放完只有它知道);
 /// core 起播时乐观 seed,前端在生命周期切换(playing/paused/ended/stop)+ 音量/倍速/seek 调整
@@ -851,15 +891,43 @@ impl MediaRuntime {
         }
         let ytdlp = self.ensure_component(Component::YtDlp).await?;
 
-        let source_id = self.source_of_url(page_url).map(|s| s.id().to_string());
-        let cookies_file = match source_id
-            .as_deref()
-            .and_then(|id| cookies::load(&self.inner.store, id).map(|c| (id.to_string(), c)))
-        {
-            Some((id, recs)) => {
-                Some(cookies::export_file(&self.inner.dir, &id, &recs).await?)
+        let source = self.source_of_url(page_url).cloned();
+        let source_id = source.as_ref().map(|s| s.id().to_string());
+        let cookie_recs =
+            source_id.as_deref().and_then(|id| cookies::load(&self.inner.store, id));
+        let cookies_file = match (&source_id, &cookie_recs) {
+            (Some(id), Some(recs)) => Some(cookies::export_file(&self.inner.dir, id, recs).await?),
+            _ => None,
+        };
+
+        // 进度条预览的雪碧图:**与 yt-dlp 解析并行**去问源要(见 SPRITE_FETCH_TIMEOUT),等解析
+        // 回来时多半已经在手。拿不到(源没实现 / 接口不顺 / 超时)= None = 前端只出时间气泡。
+        // 放歌没画面,不问。解析半路失败时这个任务被丢下也无妨:自带超时,几秒内自行收尾。
+        let sprite_task = match (&source, audio_only) {
+            (Some(src), false) => {
+                let src = src.clone();
+                let url = page_url.to_string();
+                let cookie = cookie_recs.as_deref().map(cookies::header_value);
+                Some(tokio::spawn(async move {
+                    match tokio::time::timeout(
+                        SPRITE_FETCH_TIMEOUT,
+                        src.sprites(&url, cookie.as_deref()),
+                    )
+                    .await
+                    {
+                        Ok(Ok(sheet)) => sheet,
+                        Ok(Err(e)) => {
+                            tracing::info!("雪碧图拿不到,进度条只出时间气泡: {e:#}");
+                            None
+                        }
+                        Err(_) => {
+                            tracing::info!("雪碧图请求超时,进度条只出时间气泡");
+                            None
+                        }
+                    }
+                }))
             }
-            None => None,
+            _ => None,
         };
 
         let task = self.inner.tasks.start("resolve", Text::new("task.resolve"));
@@ -942,6 +1010,17 @@ impl MediaRuntime {
         };
         task.done();
 
+        // 雪碧图到手 → 注册进 relay 的 /thumb/ 端点(与本地 ffmpeg 抽帧同一端点、同一前端契约);
+        // 没有 = None。有值 = 这片能出图,前端只认这一个信号(§3.5 不假装有图)。
+        let thumb_url = match sprite_task {
+            Some(handle) => handle
+                .await
+                .ok()
+                .flatten()
+                .map(|sheet| relay.register_sprites(Arc::new(sheet))),
+            None => None,
+        };
+
         let (loop_mode, shuffle) = self.mode_flags();
         // 网络流没有本地音轨概念(来源已定轨)→ 清掉本地现场,切音轨会如实退回
         *self.inner.current_local.lock().unwrap() = None;
@@ -964,9 +1043,9 @@ impl MediaRuntime {
             audio_tracks: Vec::new(),
             audio_track: 0,
             resume_at: None,
-            // 网络流手里只有远端 URL,没帧可抽 → 拖进度条只出时间气泡(B 站自家的雪碧图接口
-            // 是按源分化的另一档活,本期不接)。
-            thumb_url: None,
+            // 网络流没帧可抽,预览图来自源的雪碧图(B 站 videoshot,见 MediaSource::sprites);
+            // 源给不出 = None = 拖进度条只出时间气泡。
+            thumb_url,
         };
         self.seed_playing(&np.title, pos.map(|p| (p.index, p.total)));
         self.publish(MediaEvent::Play(np.clone()));

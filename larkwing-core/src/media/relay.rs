@@ -21,6 +21,7 @@ use sha2::Digest;
 use tokio::io::AsyncReadExt;
 
 use super::resolver::UpStream;
+use super::SpriteSheet;
 
 /// 视频转码用哪个 H.264 编码器。**探测出来的、每 entry 固定**(init 与各段必须同编码器,否则
 /// avcC 配置不一致、MSE 拼不上)。有硬件编码器就用 GPU(省 CPU,§硬件加速),没有则回落软件
@@ -194,8 +195,13 @@ enum Entry {
     /// 进度条 hover 预览缩略图:`/thumb/{token}?t=秒` 现抽现回一张 JPEG。**刻意与四条播放臂分开**
     /// 注册(不给 File/FileRemux/FileHls/FileAdaptive 各加一个字段):预览与播放是两件事,各自
     /// 一个 token 更好读、也让「这片有没有缩略图」只有一个信号(`NowPlaying.thumb_url` 有无)。
-    /// 只有本地文件配得上它 —— 网络流(B 站 DASH/混流)手里只有远端 URL,没帧可抽。
+    /// 本地文件专用 —— 网络流手里只有远端 URL,没帧可抽,它们的预览走 `Sprites`。
     Thumb { path: PathBuf, ffmpeg: PathBuf },
+    /// 网络源的进度条预览:平台**预生成的雪碧图**(B 站 `player/videoshot`,见 `MediaSource::sprites`)。
+    /// **复用同一个 `/thumb/{token}?t=` 端点、同一个前端契约**(回一张 JPEG):按 t 在 `index` 里定帧
+    /// → 下载所在那张大图(整图进有界缓存,一张图管几十格)→ 裁出那一格 → 缩到 THUMB_WIDTH → JPEG。
+    /// 裁好的格照旧进 `thumbs` 缓存(键 = (token, 帧号))。任何一步不顺一律 404,前端照旧降级。
+    Sprites { sheet: Arc<SpriteSheet> },
 }
 
 /// 一条字幕的来源(P4):要么是文件内嵌的第 n 条字幕轨,要么是旁边的外挂文件。
@@ -242,7 +248,19 @@ const THUMB_MAX_BYTES: usize = 512 * 1024;
 /// (超时即放弃,child 由 kill_on_drop 收尸)。
 const THUMB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 /// 缩略图宽度(像素,高度按比例):进度条上方的小图,192 在窄框里也够看清是哪一场戏。
-const THUMB_WIDTH: u32 = 192;
+/// 雪碧图路同一口径:原格比它宽才缩(HD 480 → 192),比它窄(SD 160)原样给、不放大。
+pub(crate) const THUMB_WIDTH: u32 = 192;
+
+/* ——— 雪碧图路(网络源预览)自己的两道闸(单源在此;**§4.11 待用户确认**)———
+ * 雪碧图一张大图装 100 格,贵的不是格而是**整图下载 + 解码**(HD 4800×2700 JPEG ≈ 400KB,
+ * 解码 ≈ 39MB 位图、百毫秒级);所以整图缓存 + 上面那套 thumbs 缓存 / 串行闸 / 超时一起用。 */
+/// 雪碧图整图缓存上限(张,全局 FIFO,与 thumbs 同理不按 token 分)。一部两小时电影约 10 张
+/// 大图;16 张够一部片来回拖,最坏(全 HD)≈ 16 × 400KB ≈ 6MB 编码字节(只存编码字节不存位图)。
+const SPRITE_IMG_CACHE_MAX: usize = 16;
+/// 单张雪碧图字节上限:HD 一张 ≈ 400KB,8MB 是「这不是雪碧图」的 backstop(边下边数,超了就弃)。
+const SPRITE_IMG_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// 裁出来那一格的 JPEG 质量(小图,80 已看不出差别;ffmpeg 路的 mjpeg 默认质量同量级)。
+const SPRITE_JPEG_QUALITY: u8 = 80;
 
 /// 把 hover 秒数落到 `THUMB_GRID` 格(向下取整),负数/非有限值一律归 0。
 /// 缓存键与 ffmpeg 的 `-ss` 都用它的结果 —— 前端也量化过,这里再落一次是为了
@@ -254,25 +272,39 @@ fn quantize_thumb_t(t: f64) -> u64 {
     ((t / THUMB_GRID).floor() as u64).saturating_mul(THUMB_GRID as u64)
 }
 
-/// 缩略图缓存:全局 FIFO(不做真 LRU —— 拖进度条是顺序扫过去的,FIFO 与 LRU 的命中率差异
-/// 在这个场景可以忽略,换来零依赖零复杂度)。
-#[derive(Default)]
-struct ThumbCache {
-    map: HashMap<(String, u64), Arc<Vec<u8>>>,
+/// 有界字节缓存:全局 FIFO(不做真 LRU —— 拖进度条是顺序扫过去的,FIFO 与 LRU 的命中率差异
+/// 在这个场景可以忽略,换来零依赖零复杂度)。两处实例:裁好的缩略图(键 (token, 格/帧))与
+/// 雪碧图整图(键 = 大图 URL),各自一个上限。
+struct FifoCache<K> {
+    cap: usize,
+    map: HashMap<K, Arc<Vec<u8>>>,
     /// 插入顺序,超上限从头淘汰。
-    order: std::collections::VecDeque<(String, u64)>,
+    order: std::collections::VecDeque<K>,
 }
 
-impl ThumbCache {
-    fn get(&self, key: &(String, u64)) -> Option<Arc<Vec<u8>>> {
+/// 裁好的缩略图缓存(本地 ffmpeg 抽的帧 / 雪碧图裁的格,同一份)。
+type ThumbCache = FifoCache<(String, u64)>;
+
+impl Default for ThumbCache {
+    fn default() -> Self {
+        FifoCache::new(THUMB_CACHE_MAX)
+    }
+}
+
+impl<K: std::hash::Hash + Eq + Clone> FifoCache<K> {
+    fn new(cap: usize) -> Self {
+        FifoCache { cap, map: HashMap::new(), order: std::collections::VecDeque::new() }
+    }
+
+    fn get(&self, key: &K) -> Option<Arc<Vec<u8>>> {
         self.map.get(key).cloned()
     }
 
-    fn put(&mut self, key: (String, u64), bytes: Arc<Vec<u8>>) {
+    fn put(&mut self, key: K, bytes: Arc<Vec<u8>>) {
         if self.map.insert(key.clone(), bytes).is_none() {
             self.order.push_back(key);
         }
-        while self.order.len() > THUMB_CACHE_MAX {
+        while self.order.len() > self.cap {
             if let Some(old) = self.order.pop_front() {
                 self.map.remove(&old);
             }
@@ -292,8 +324,11 @@ struct Inner {
     collect: Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>,
     /// hover 缩略图缓存(全局有界 FIFO,见 `ThumbCache`)。
     thumbs: Mutex<ThumbCache>,
+    /// 雪碧图整图缓存(编码字节,键 = 大图 URL;全局有界 FIFO,见 `SPRITE_IMG_CACHE_MAX`)。
+    sprites: Mutex<FifoCache<String>>,
     /// 缩略图串行闸:同时只抽一帧。拖一趟进度条会连着来好几格,并发起 ffmpeg 只是互相抢 CPU;
     /// 排队 + 前端只保留最新一次请求 = 最多积一个(拿到许可后还要再查一次缓存,别白抽)。
+    /// 雪碧图路同闸:并发的两格多半落同一张大图,串行后第二个直接命中整图缓存、不重复下载。
     thumb_gate: tokio::sync::Semaphore,
 }
 
@@ -319,6 +354,7 @@ impl Relay {
             hw_encoder: tokio::sync::OnceCell::new(),
             collect: Mutex::new(HashMap::new()),
             thumbs: Mutex::new(ThumbCache::default()),
+            sprites: Mutex::new(FifoCache::new(SPRITE_IMG_CACHE_MAX)),
             thumb_gate: tokio::sync::Semaphore::new(1),
         });
         let app = Router::new()
@@ -401,6 +437,12 @@ impl Relay {
     /// `Components::ready` 拿,不为预览图拉下载)—— 所以「有没有缩略图」就是 `thumb_url` 有没有值。
     pub fn register_thumbs(&self, path: PathBuf, ffmpeg: PathBuf) -> String {
         self.register(Entry::Thumb { path, ffmpeg }, "thumb")
+    }
+
+    /// 网络源雪碧图的预览基址(同样是 `…/thumb/{token}`,前端拼 `?t=秒`,与本地路一个契约)。
+    /// 大图不在这里下 —— 首次 hover 到某张图时才下、进 `sprites` 缓存;注册本身零 IO。
+    pub fn register_sprites(&self, sheet: Arc<SpriteSheet>) -> String {
+        self.register(Entry::Sprites { sheet }, "thumb")
     }
 
     /// 探/取该机器可用的视频编码器(硬件优先,整进程探一次缓存)。转码前调,拿来定 entry 的 `enc`。
@@ -1335,8 +1377,10 @@ fn build_thumb_cmd(ffmpeg: &Path, path: &Path, t: u64) -> tokio::process::Comman
     cmd
 }
 
-/// 进度条 hover 预览:`/thumb/{token}?t=秒`。量化 → 查缓存 → (串行闸)→ 抽一帧 → 收进缓存。
-/// 抽不出来一律 404,让前端一次性降级成"只有时间气泡"(§3.5:不给半张破图,也不装作有图)。
+/// 进度条 hover 预览:`/thumb/{token}?t=秒`。定格 → 查缓存 → (串行闸)→ 出图 → 收进缓存。
+/// 两种预览源走同一条流水线,只差「定格」与「出图」两步:本地文件 = 量化到 THUMB_GRID + ffmpeg
+/// 抽一帧;雪碧图 = 在采样表里定帧 + 下载大图裁一格。出不来一律 404,让前端一次性降级成
+/// "只有时间气泡"(§3.5:不给半张破图,也不装作有图)。
 async fn thumb(
     State(state): State<Arc<Inner>>,
     AxPath(token): AxPath<String>,
@@ -1347,8 +1391,15 @@ async fn thumb(
         return bad(StatusCode::BAD_REQUEST);
     };
     let Some(entry) = lookup(&state, &token) else { return bad(StatusCode::NOT_FOUND) };
-    let Entry::Thumb { path, ffmpeg } = entry.as_ref() else { return bad(StatusCode::NOT_FOUND) };
-    let at = quantize_thumb_t(t);
+    // 缓存键第二维:本地路 = 落格后的秒;雪碧图路 = 帧号(同帧永远同一张图)。
+    let at = match entry.as_ref() {
+        Entry::Thumb { .. } => quantize_thumb_t(t),
+        Entry::Sprites { sheet } => match sprite_frame(&sheet.index, t) {
+            Some(frame) => frame as u64,
+            None => return bad(StatusCode::NOT_FOUND), // 空采样表 = 这片没预览图
+        },
+        _ => return bad(StatusCode::NOT_FOUND), // 播放条目蹭不了这个端点
+    };
     let key = (token, at);
 
     if let Some(bytes) = state.thumbs.lock().expect("relay thumbs lock poisoned").get(&key) {
@@ -1362,21 +1413,153 @@ async fn thumb(
         return thumb_response(bytes);
     }
 
-    let cmd = build_thumb_cmd(ffmpeg, path, at);
-    let out = match tokio::time::timeout(THUMB_TIMEOUT, run_ffmpeg_collect(cmd, THUMB_MAX_BYTES))
-        .await
-    {
-        Ok(Some(bytes)) if !bytes.is_empty() => bytes,
-        // 抽不出(片尾之后的格 / 只有音轨 / 参数不合)与超时(弱机解不动)都走这:一律 404 降级
-        Ok(_) => return bad(StatusCode::NOT_FOUND),
-        Err(_) => {
-            tracing::warn!(path = %path.display(), at, "抽缩略图超时,放弃这一格");
-            return bad(StatusCode::NOT_FOUND);
-        }
+    let out = match entry.as_ref() {
+        Entry::Thumb { path, ffmpeg } => ffmpeg_thumb(ffmpeg, path, at).await,
+        Entry::Sprites { sheet } => sprite_thumb(&state, sheet, at as usize).await,
+        _ => None,
     };
+    // 抽不出(片尾之后的格 / 只有音轨 / 参数不合 / 大图下不来)与超时都走这:一律 404 降级
+    let Some(out) = out.filter(|b| !b.is_empty()) else { return bad(StatusCode::NOT_FOUND) };
     let bytes = Arc::new(out);
     state.thumbs.lock().expect("relay thumbs lock poisoned").put(key, bytes.clone());
     thumb_response(bytes)
+}
+
+/// 本地路出图:ffmpeg 抽 `at` 秒那一帧(见 `build_thumb_cmd`),`THUMB_TIMEOUT` 兜住弱机解不动。
+async fn ffmpeg_thumb(ffmpeg: &Path, path: &Path, at: u64) -> Option<Vec<u8>> {
+    let cmd = build_thumb_cmd(ffmpeg, path, at);
+    match tokio::time::timeout(THUMB_TIMEOUT, run_ffmpeg_collect(cmd, THUMB_MAX_BYTES)).await {
+        Ok(out) => out,
+        Err(_) => {
+            tracing::warn!(path = %path.display(), at, "抽缩略图超时,放弃这一格");
+            None
+        }
+    }
+}
+
+/// 雪碧图定帧:`index[k]` = 第 k 帧的采样秒(升序),取**采样时刻 ≤ t 的最后一帧**;t 在首帧之前
+/// (或负数 / 非有限)取第 0 帧,超过末帧取末帧(片尾 hover 也有图,不像本地路那样 404);
+/// 空表 → None(定不了格)。纯函数、可测。
+fn sprite_frame(index: &[f64], t: f64) -> Option<usize> {
+    if index.is_empty() {
+        return None;
+    }
+    let t = if t.is_finite() { t.max(0.0) } else { 0.0 };
+    // 升序表:`<= t` 的元素个数 - 1 = 最后一个 ≤ t 的下标;一个都不 ≤ → 0
+    let n = index.partition_point(|&x| x <= t);
+    Some(n.saturating_sub(1).min(index.len() - 1))
+}
+
+/// 帧号 → (第几张大图, 列, 行):大图按行优先装 `x_len × y_len` 格,帧号跨图连续。
+/// 帧号超出大图数(采样表比图多)→ None。纯函数、可测。
+fn sprite_cell(sheet: &SpriteSheet, frame: usize) -> Option<(usize, u32, u32)> {
+    let per = (sheet.x_len as usize).checked_mul(sheet.y_len as usize)?;
+    if per == 0 {
+        return None;
+    }
+    let img = frame / per;
+    if img >= sheet.images.len() {
+        return None;
+    }
+    let pos = (frame % per) as u32;
+    Some((img, pos % sheet.x_len, pos / sheet.x_len))
+}
+
+/// 雪碧图路出图:定位到大图与格 → 大图(缓存 / 下载)→ 裁格 + 缩放 + JPEG(CPU 活挪到阻塞线程,
+/// HD 大图解码是百毫秒级、别占 runtime 线程)。整段套 `THUMB_TIMEOUT`;任何一步不顺 → None。
+async fn sprite_thumb(state: &Inner, sheet: &Arc<SpriteSheet>, frame: usize) -> Option<Vec<u8>> {
+    let (img, col, row) = sprite_cell(sheet, frame)?;
+    let url = sheet.images.get(img)?.clone();
+    let work = async {
+        let bytes = fetch_sprite_image(state, sheet, &url).await?;
+        let sheet = sheet.clone();
+        tokio::task::spawn_blocking(move || crop_sprite_cell(&bytes, &sheet, col, row))
+            .await
+            .ok()
+            .flatten()
+    };
+    match tokio::time::timeout(THUMB_TIMEOUT, work).await {
+        Ok(out) => out,
+        Err(_) => {
+            tracing::warn!(url = %url, frame, "雪碧图取图超时,放弃这一格");
+            None
+        }
+    }
+}
+
+/// 取一张雪碧图大图的编码字节:先查整图缓存,没有则带防盗链头下载(走 net::Client,§4.6),
+/// 边读边封顶 `SPRITE_IMG_MAX_BYTES`(超了就弃,绝不把不明大小的东西拉进内存),成功即入缓存。
+async fn fetch_sprite_image(state: &Inner, sheet: &SpriteSheet, url: &str) -> Option<Arc<Vec<u8>>> {
+    if let Some(bytes) = state.sprites.lock().expect("relay sprites lock poisoned").get(&url.to_string()) {
+        return Some(bytes);
+    }
+    let mut resp = state
+        .net
+        .send(url, |c| {
+            let mut req = c.get(url);
+            for (k, v) in &sheet.headers {
+                req = req.header(k, v);
+            }
+            req
+        })
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        tracing::info!(url = %url, status = resp.status().as_u16(), "雪碧图大图取不到");
+        return None;
+    }
+    if resp.content_length().is_some_and(|n| n > SPRITE_IMG_MAX_BYTES as u64) {
+        return None;
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                if buf.len() + chunk.len() > SPRITE_IMG_MAX_BYTES {
+                    return None;
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(_) => return None,
+        }
+    }
+    if buf.is_empty() {
+        return None;
+    }
+    let bytes = Arc::new(buf);
+    state.sprites.lock().expect("relay sprites lock poisoned").put(url.to_string(), bytes.clone());
+    Some(bytes)
+}
+
+/// 从雪碧图大图字节里裁出第 (col, row) 格、超宽则缩到 THUMB_WIDTH(不放大)、编成 JPEG。
+/// 解码上限钉在**声明的整图尺寸**(x_len×tile_w / y_len×tile_h):大图比声明大 = 不是这张表说的
+/// 那张图,拒解(顺带免掉照着坏数据解一张巨图);格落在图外(末张大图不满一页却被点到)→ None。
+/// 纯 CPU、同步;调用方放阻塞线程。
+pub(crate) fn crop_sprite_cell(bytes: &[u8], sheet: &SpriteSheet, col: u32, row: u32) -> Option<Vec<u8>> {
+    let sheet_w = sheet.x_len.checked_mul(sheet.tile_w)?;
+    let sheet_h = sheet.y_len.checked_mul(sheet.tile_h)?;
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(sheet_w);
+    limits.max_image_height = Some(sheet_h);
+    reader.limits(limits);
+    let img = reader.decode().ok()?;
+    let x = col.checked_mul(sheet.tile_w)?;
+    let y = row.checked_mul(sheet.tile_h)?;
+    if x.checked_add(sheet.tile_w)? > img.width() || y.checked_add(sheet.tile_h)? > img.height() {
+        return None;
+    }
+    let mut cell = img.crop_imm(x, y, sheet.tile_w, sheet.tile_h);
+    if sheet.tile_w > THUMB_WIDTH {
+        let h = (sheet.tile_h as u64 * THUMB_WIDTH as u64 / sheet.tile_w as u64).max(1) as u32;
+        cell = cell.resize_exact(THUMB_WIDTH, h, image::imageops::FilterType::Triangle);
+    }
+    let rgb = image::DynamicImage::ImageRgb8(cell.to_rgb8());
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, SPRITE_JPEG_QUALITY);
+    rgb.write_with_encoder(enc).ok()?;
+    Some(buf.into_inner())
 }
 
 /// 缩略图响应:URL 已按格量化 + token 每次播放都换 → 可以放心让 WebView 自己缓存,
@@ -1553,6 +1736,7 @@ mod tests {
             hw_encoder: tokio::sync::OnceCell::new(),
             collect: Mutex::new(HashMap::new()),
             thumbs: Mutex::new(ThumbCache::default()),
+            sprites: Mutex::new(FifoCache::new(SPRITE_IMG_CACHE_MAX)),
             thumb_gate: tokio::sync::Semaphore::new(1),
         });
         let relay = Relay { inner };
@@ -1888,6 +2072,251 @@ mod tests {
         let key = ("tok".to_string(), THUMB_CACHE_MAX as u64 + 2);
         c.put(key.clone(), Arc::new(vec![9]));
         assert_eq!(c.order.len(), THUMB_CACHE_MAX);
+    }
+
+    /// 雪碧图整图缓存:同一套 FIFO、自己的上限(16 张),键是大图 URL。
+    #[test]
+    fn sprite_image_cache_evicts_oldest_beyond_cap() {
+        let mut c: FifoCache<String> = FifoCache::new(SPRITE_IMG_CACHE_MAX);
+        for i in 0..(SPRITE_IMG_CACHE_MAX + 3) {
+            c.put(format!("https://cdn/sheet-{i}.jpg"), Arc::new(vec![i as u8]));
+        }
+        assert_eq!(c.map.len(), SPRITE_IMG_CACHE_MAX, "总量封在上限");
+        assert!(c.get(&"https://cdn/sheet-0.jpg".to_string()).is_none(), "最早的被淘汰");
+        assert!(c.get(&format!("https://cdn/sheet-{}.jpg", SPRITE_IMG_CACHE_MAX + 2)).is_some());
+        c.put(format!("https://cdn/sheet-{}.jpg", SPRITE_IMG_CACHE_MAX + 2), Arc::new(vec![7]));
+        assert_eq!(c.order.len(), SPRITE_IMG_CACHE_MAX, "重复 put 不撑长队列");
+    }
+
+    /// 雪碧图定帧:采样表 `index[k]` = 第 k 帧的秒(bilibili 解析时已剥掉哨兵),取 ≤ t 的最后一帧。
+    #[test]
+    fn sprite_frame_picks_last_sample_at_or_before_t() {
+        let idx = [0.0, 5.0, 11.0, 17.0];
+        assert_eq!(sprite_frame(&idx, 0.0), Some(0));
+        assert_eq!(sprite_frame(&idx, 3.0), Some(0), "两格之间取前一格");
+        assert_eq!(sprite_frame(&idx, 5.0), Some(1), "正好落在采样点取它自己");
+        assert_eq!(sprite_frame(&idx, 12.9), Some(2));
+        assert_eq!(sprite_frame(&idx, 17.0), Some(3));
+        assert_eq!(sprite_frame(&idx, 9999.0), Some(3), "超末尾取最后一格(片尾 hover 也有图)");
+        assert_eq!(sprite_frame(&idx, -4.0), Some(0), "负数归 0");
+        assert_eq!(sprite_frame(&idx, f64::NAN), Some(0), "非有限归 0");
+        // 首帧采样不在 0(理论形状):t 在首帧之前也取第 0 帧
+        assert_eq!(sprite_frame(&[4.0, 9.0], 1.0), Some(0));
+        assert_eq!(sprite_frame(&[], 1.0), None, "空表定不了格");
+    }
+
+    /// 帧号 → (大图, 列, 行):按行优先、跨图连续;超出大图数 → None。
+    #[test]
+    fn sprite_cell_maps_frame_to_image_and_grid() {
+        let sheet = SpriteSheet {
+            x_len: 3,
+            y_len: 2,
+            tile_w: 16,
+            tile_h: 9,
+            images: vec!["a".into(), "b".into()],
+            index: Vec::new(),
+            headers: Vec::new(),
+        };
+        assert_eq!(sprite_cell(&sheet, 0), Some((0, 0, 0)));
+        assert_eq!(sprite_cell(&sheet, 2), Some((0, 2, 0)), "第一行末格");
+        assert_eq!(sprite_cell(&sheet, 4), Some((0, 1, 1)), "第二行中格");
+        assert_eq!(sprite_cell(&sheet, 6), Some((1, 0, 0)), "第 6 帧翻到第二张大图");
+        assert_eq!(sprite_cell(&sheet, 11), Some((1, 2, 1)));
+        assert_eq!(sprite_cell(&sheet, 12), None, "采样表比图多的尾巴 → 没图");
+        let degenerate = SpriteSheet { x_len: 0, ..sheet.clone() };
+        assert_eq!(sprite_cell(&degenerate, 0), None);
+    }
+
+    /// 造一张 2×2 格、每格 16×16 纯色的雪碧图 JPEG(16 对齐 = JPEG 宏块边界,颜色不串)。
+    fn solid_sprite_jpeg(colors: &[[u8; 3]], x_len: u32, tile: u32) -> Vec<u8> {
+        let y_len = (colors.len() as u32).div_ceil(x_len);
+        let img = image::RgbImage::from_fn(x_len * tile, y_len * tile, |x, y| {
+            let i = ((y / tile) * x_len + x / tile) as usize;
+            image::Rgb(colors[i])
+        });
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 95))
+            .unwrap();
+        buf.into_inner()
+    }
+
+    /// 回来的 JPEG 解码后取中心像素,断言是哪种纯色(JPEG 有量化误差,按通道主导判)。
+    fn dominant_channel(jpeg: &[u8]) -> (u32, u32, char) {
+        let img = image::load_from_memory(jpeg).unwrap().to_rgb8();
+        let p = img.get_pixel(img.width() / 2, img.height() / 2).0;
+        let ch = if p[0] > 180 && p[1] > 180 && p[2] < 90 {
+            'Y'
+        } else if p[0] > 180 && p[1] < 90 && p[2] < 90 {
+            'R'
+        } else if p[1] > 180 && p[0] < 90 && p[2] < 90 {
+            'G'
+        } else if p[2] > 180 && p[0] < 90 && p[1] < 90 {
+            'B'
+        } else {
+            '?'
+        };
+        (img.width(), img.height(), ch)
+    }
+
+    /// 雪碧图端到端:假 CDN 出两张大图 → 注册 → `/thumb/{token}?t=` 按秒定帧、跨图定位、裁出正确
+    /// 那一格(纯色验证)、大图只下一次(整图缓存)、同帧再来走裁格缓存、超宽格缩到 THUMB_WIDTH、
+    /// 大图 404 / 采样表空 / 防盗链头缺失 都如实 404。
+    #[tokio::test]
+    async fn sprite_endpoint_crops_right_cell_and_caches_sheet() {
+        use axum::routing::get as aget;
+        use std::sync::atomic::AtomicUsize;
+
+        const R: [u8; 3] = [255, 0, 0];
+        const G: [u8; 3] = [0, 255, 0];
+        const B: [u8; 3] = [0, 0, 255];
+        const Y: [u8; 3] = [255, 255, 0];
+        // 第一张:2×2 格 R G / B Y;第二张:2×2 格 Y B / G R;每格 16px。
+        let sheet1 = solid_sprite_jpeg(&[R, G, B, Y], 2, 16);
+        let sheet2 = solid_sprite_jpeg(&[Y, B, G, R], 2, 16);
+        // 超宽格(每格 256px,2×1)→ 该缩到 192 宽
+        let wide = solid_sprite_jpeg(&[R, G], 2, 256);
+        let hits = Arc::new(AtomicUsize::new(0));
+
+        // 「严格 CDN」:没带防盗链 Referer 就 403(同一个 handler 挂两个路径 —— 整图缓存按 URL 键,
+        // 验「头没带 → 拒」得用一个还没被缓存过的地址)。
+        let strict = {
+            let hits = hits.clone();
+            move |headers: HeaderMap| {
+                let hits = hits.clone();
+                let body = sheet1.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    if headers.get("referer").map(|v| v.as_bytes()) != Some(b"https://www.bilibili.com/") {
+                        return bad(StatusCode::FORBIDDEN);
+                    }
+                    Response::builder()
+                        .header("content-type", "image/jpeg")
+                        .body(Body::from(body))
+                        .unwrap()
+                }
+            }
+        };
+        let app = Router::new()
+            .route("/s1.jpg", aget(strict.clone()))
+            .route("/s1-uncached.jpg", aget(strict))
+            .route("/s2.jpg", aget(move || async move { Body::from(sheet2.clone()) }))
+            .route("/wide.jpg", aget(move || async move { Body::from(wide.clone()) }))
+            .route("/gone.jpg", aget(|| async { bad(StatusCode::NOT_FOUND) }));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let up_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let up = |p: &str| format!("http://127.0.0.1:{up_port}{p}");
+
+        let relay = Relay::start().await.unwrap();
+        let http = reqwest::Client::new();
+        let headers = vec![("Referer".to_string(), "https://www.bilibili.com/".to_string())];
+        // 8 帧,采样 0/10/…/70s:前 4 帧在 s1、后 4 帧在 s2
+        let sheet = SpriteSheet {
+            x_len: 2,
+            y_len: 2,
+            tile_w: 16,
+            tile_h: 16,
+            images: vec![up("/s1.jpg"), up("/s2.jpg")],
+            index: (0..8).map(|i| i as f64 * 10.0).collect(),
+            headers: headers.clone(),
+        };
+        let base = relay.register_sprites(Arc::new(sheet));
+        let fetch = |t: &str| {
+            let http = http.clone();
+            let url = format!("{base}?t={t}");
+            async move {
+                let r = http.get(url).send().await.unwrap();
+                (r.status().as_u16(), r.bytes().await.unwrap().to_vec())
+            }
+        };
+
+        let (code, jpeg) = fetch("0").await;
+        assert_eq!(code, 200);
+        assert!(jpeg.starts_with(&[0xFF, 0xD8, 0xFF]), "回的是 JPEG");
+        assert_eq!(dominant_channel(&jpeg), (16, 16, 'R'), "t=0 → 帧 0 → s1 左上 = 红,原格不放大");
+        assert_eq!(dominant_channel(&fetch("13").await.1).2, 'G', "t=13 → 帧 1(10s)→ s1 右上 = 绿");
+        assert_eq!(dominant_channel(&fetch("25").await.1).2, 'B', "帧 2 → s1 左下 = 蓝");
+        assert_eq!(dominant_channel(&fetch("39.9").await.1).2, 'Y', "帧 3 → s1 右下 = 黄");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "四格同一张大图,只下载一次");
+        assert_eq!(dominant_channel(&fetch("40").await.1).2, 'Y', "帧 4 翻到 s2 左上 = 黄");
+        assert_eq!(dominant_channel(&fetch("9999").await.1).2, 'R', "超末尾 → 末帧 7 → s2 右下 = 红");
+        // 同帧再来:裁格缓存命中,字节一致,大图仍只下过一次
+        let (again, jpeg2) = fetch("3").await;
+        assert_eq!((again, jpeg2), (200, jpeg));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // 超宽格缩到 THUMB_WIDTH(高按比例)
+        let wide_sheet = SpriteSheet {
+            x_len: 2,
+            y_len: 1,
+            tile_w: 256,
+            tile_h: 256,
+            images: vec![up("/wide.jpg")],
+            index: vec![0.0, 10.0],
+            headers: Vec::new(),
+        };
+        let wb = relay.register_sprites(Arc::new(wide_sheet));
+        let r = http.get(format!("{wb}?t=10")).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        let (w, h, ch) = dominant_channel(&r.bytes().await.unwrap());
+        assert_eq!((w, h, ch), (THUMB_WIDTH, THUMB_WIDTH, 'G'), "256 → 192,右格 = 绿");
+
+        // 坏路径全 404:大图取不到 / 采样表比图多且点到图外 / 空采样表 / 防盗链头没带(CDN 拒)
+        let gone = relay.register_sprites(Arc::new(SpriteSheet {
+            x_len: 2,
+            y_len: 2,
+            tile_w: 16,
+            tile_h: 16,
+            images: vec![up("/gone.jpg")],
+            index: vec![0.0, 10.0],
+            headers: Vec::new(),
+        }));
+        assert_eq!(http.get(format!("{gone}?t=0")).send().await.unwrap().status().as_u16(), 404);
+        let overflow = relay.register_sprites(Arc::new(SpriteSheet {
+            x_len: 2,
+            y_len: 2,
+            tile_w: 16,
+            tile_h: 16,
+            images: vec![up("/s2.jpg")],
+            index: (0..6).map(|i| i as f64 * 10.0).collect(), // 6 帧但只有 4 格
+            headers: headers.clone(),
+        }));
+        assert_eq!(http.get(format!("{overflow}?t=55")).send().await.unwrap().status().as_u16(), 404);
+        assert_eq!(http.get(format!("{overflow}?t=5")).send().await.unwrap().status().as_u16(), 200);
+        let empty = relay.register_sprites(Arc::new(SpriteSheet {
+            x_len: 2,
+            y_len: 2,
+            tile_w: 16,
+            tile_h: 16,
+            images: vec![up("/s1.jpg")],
+            index: Vec::new(),
+            headers: headers.clone(),
+        }));
+        assert_eq!(http.get(format!("{empty}?t=0")).send().await.unwrap().status().as_u16(), 404);
+        let no_ref = relay.register_sprites(Arc::new(SpriteSheet {
+            x_len: 2,
+            y_len: 2,
+            tile_w: 16,
+            tile_h: 16,
+            images: vec![up("/s1-uncached.jpg")],
+            index: vec![0.0],
+            headers: Vec::new(),
+        }));
+        assert_eq!(http.get(format!("{no_ref}?t=0")).send().await.unwrap().status().as_u16(), 404, "CDN 拒 → 404");
+        // 同一地址带上头就成:整图缓存不会把上面那次 403 记成"有图"
+        let with_ref = relay.register_sprites(Arc::new(SpriteSheet {
+            x_len: 2,
+            y_len: 2,
+            tile_w: 16,
+            tile_h: 16,
+            images: vec![up("/s1-uncached.jpg")],
+            index: vec![0.0],
+            headers,
+        }));
+        assert_eq!(http.get(format!("{with_ref}?t=0")).send().await.unwrap().status().as_u16(), 200);
+        // 参数错仍是 400(与本地路一致)
+        assert_eq!(http.get(format!("{base}?t=-1")).send().await.unwrap().status().as_u16(), 400);
     }
 
     /// 端点的坏路径:`?t=` 不对 = 400(调用方写错了);拿不到帧/token 不对 = 404(前端据此降级
