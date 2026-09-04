@@ -735,6 +735,14 @@ const petAct = computed<PetActivity | null>(
     ),
 )
 const petB = usePetBehavior(petAct, petTyping)
+// 听/说也算「有动静」:喊它的时候它不能还趴着打盹(复审实锤:唤醒反馈被睡意压住;主窗是唯一决策源,
+// 悬浮窗只收广播,所以在这里重置睡意才两窗一起醒)
+watch(
+  () => voice.state.phase !== 'idle' || voice.state.candidate,
+  (active) => {
+    if (active) petB.markInteraction()
+  },
+)
 const petBehavior = computed<PetBehavior>(
   () => (petDemo.behavior.value as PetBehavior | null) ?? petB.behavior.value,
 )

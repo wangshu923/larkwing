@@ -98,6 +98,13 @@ const orbState = computed(() => {
   if (wakeArmed.value) return 'armed' // 待机·免手唤醒在跑:头像一圈很淡的常亮环(竖着耳朵)
   return ''
 })
+// 打盹只压得过「空闲/待机环」:听/想/说的时候头像必须亮起来——喊它一声它还暗着趴那,唤醒反馈
+// 就没了(复审实锤)。orbState 与 behavior 都是广播/镜像来的,这里只做优先级合成。
+const orbClass = computed(() => {
+  const s = orbState.value
+  if (behavior.value === 'sleep' && (s === '' || s === 'armed')) return 'dozing'
+  return s
+})
 
 // 戏份角标(#10 A 层,与主窗桌宠共用 usePetActivity):orb 右下小圆片显示正在搬/查/放歌。
 // think 不出角标——orb 自己的辉光环已表达思考,别重复;主窗藏托盘时这是唯一的「在干活」线索。
@@ -296,7 +303,7 @@ onUnmounted(() => stopMoved())
         </div>
         <!-- @click.stop:头像只当拖动手柄,点一下(没拖动)合成的 click 不再冒泡到胶囊
              触发展开——「头像抓着挪、矮条点开」的职责分区在 mac 上一直漏这条(真机实锤) -->
-        <div class="orb" :class="behavior === 'sleep' ? 'dozing' : orbState" @mousedown="onOrbDown" @click.stop>
+        <div class="orb" :class="orbClass" @mousedown="onOrbDown" @click.stop>
           <img ref="orbImg" :src="avatar" :alt="petName" />
           <span
             v-for="s in orbStars"

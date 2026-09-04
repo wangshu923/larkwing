@@ -63,6 +63,9 @@ pub struct AutoBackupStatus {
     pub dir: Option<String>,
     pub last_ok_ms: Option<i64>,
     pub last_error: Option<String>,
+    /// 轮转保留份数 / 备份间隔(天):数字单源在 core,设置页文案只拼不写死(§4.11 双源之忌)。
+    pub keep: usize,
+    pub interval_days: u32,
 }
 
 impl AutoBackup {
@@ -97,20 +100,20 @@ impl AutoBackup {
 
         match &result {
             Ok(zip) => {
-                let _ = self.store.settings.set(None, LAST_OK_KEY, &now.to_string());
-                let _ = self.store.settings.set(None, LAST_ERR_KEY, "");
+                self.set_state(LAST_OK_KEY, &now.to_string());
+                self.set_state(LAST_ERR_KEY, "");
                 tracing::info!(zip = %zip.display(), "自动备份完成");
                 // 成功不打扰(设置页自会显示「上次备份」);事件仍发,前端刷新状态用。
                 self.bus.publish(AppEvent::Backup(BackupNote { ok: true, stale: false }));
             }
             Err(e) => {
-                let _ = self.store.settings.set(None, LAST_ERR_KEY, &format!("{e:#}"));
+                self.set_state(LAST_ERR_KEY, &format!("{e:#}"));
                 tracing::warn!(err = %e, dir = %dir, "自动备份失败(下轮再试)");
                 // 超期太久才提示,且频控 —— 单次失败(盘暂时没插)不烦人。
                 let stale = now - last_ok >= NAG_AFTER_MS;
                 let nagged_recently = now - self.setting_i64(LAST_NAG_KEY) < NAG_EVERY_MS;
                 if stale && !nagged_recently {
-                    let _ = self.store.settings.set(None, LAST_NAG_KEY, &now.to_string());
+                    self.set_state(LAST_NAG_KEY, &now.to_string());
                     self.bus.publish(AppEvent::Backup(BackupNote { ok: false, stale: true }));
                 }
             }
@@ -148,11 +151,21 @@ impl AutoBackup {
                 v => Some(v),
             },
             last_error: self.setting(LAST_ERR_KEY).filter(|s| !s.trim().is_empty()),
+            keep: BACKUP_KEEP,
+            interval_days: (INTERVAL_MS / 86_400_000) as u32,
         }
     }
 
     fn setting(&self, key: &str) -> Option<String> {
         self.store.settings.get(None, key).ok().flatten()
+    }
+
+    /// 写状态键。写不进(库锁/磁盘满)只能 warn,但**不能无声**:水位线没落盘 = 每 10 分钟
+    /// 再全量 VACUUM + zip 一次(复审实锤:原先 `let _ =` 吞掉)。
+    fn set_state(&self, key: &str, val: &str) {
+        if let Err(e) = self.store.settings.set(None, key, val) {
+            tracing::warn!(key, err = %e, "自动备份状态写不进 settings");
+        }
     }
 
     fn setting_i64(&self, key: &str) -> i64 {

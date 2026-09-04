@@ -70,10 +70,13 @@ export function usePetBehavior(
   )
 
   // —— 送信:会话有动静(提醒到点/后台汇报/渠道回合收尾)= 有话捎来 → 跑一趟。
+  //    旁听仲裁(overheard / overheard_dismissed)是零痕迹的内部事,不算「来消息」——高频唤醒名
+  //    被电视里的词误触时,它不该叼着信封满屏跑(复审实锤)。
+  const DELIVER_KINDS = new Set(['channel', 'reminder', 'report'])
   const delivering = ref(false)
   let deliverTimer = 0
   onAppEvent((ev) => {
-    if (ev.type !== 'conversation') return
+    if (ev.type !== 'conversation' || !DELIVER_KINDS.has(ev.data.kind)) return
     delivering.value = true
     clearTimeout(deliverTimer)
     deliverTimer = window.setTimeout(() => (delivering.value = false), DELIVER_MS)

@@ -166,11 +166,16 @@ mod win {
         r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
     const APPROVED_FOLDER: &str =
         r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder";
+    /// 32 位程序在 64 位系统上的 Run 键(注册表重定向视图)与它对应的启停标志键——任务管理器
+    /// 「启动应用」把这一栏也列出来,漏掉它就少一截清单(复审实锤)。
+    const RUN32: &str = r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run";
+    const APPROVED_RUN32: &str =
+        r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32";
 
     /// 一条启动项:名字 / 来源 / 命令 / 启停。
     pub(super) struct Item {
         pub name: String,
-        /// hkcu_run | hklm_run | user_folder | common_folder
+        /// hkcu_run | hklm_run | hklm_run32 | user_folder | common_folder
         pub source: &'static str,
         pub command: String,
         pub enabled: bool,
@@ -182,6 +187,7 @@ mod win {
         match s {
             "hkcu_run" => "注册表·当前用户",
             "hklm_run" => "注册表·所有用户",
+            "hklm_run32" => "注册表·所有用户(32 位)",
             "user_folder" => "启动文件夹",
             _ => "公共启动文件夹",
         }
@@ -196,14 +202,20 @@ mod win {
         }
     }
 
-    /// 枚举一个 Run 键(值名 = 项名,值 = 命令行)。
-    fn run_items(root: &RegKey, source: &'static str, togglable: bool) -> Vec<Item> {
-        let Ok(run) = root.open_subkey_with_flags(RUN, KEY_READ) else { return Vec::new() };
+    /// 枚举一个 Run 键(值名 = 项名,值 = 命令行);`approved` = 它对应的启停标志键。
+    fn run_items(
+        root: &RegKey,
+        run_key: &str,
+        approved: &str,
+        source: &'static str,
+        togglable: bool,
+    ) -> Vec<Item> {
+        let Ok(run) = root.open_subkey_with_flags(run_key, KEY_READ) else { return Vec::new() };
         let mut out = Vec::new();
         for entry in run.enum_values().flatten() {
             let (name, _) = entry;
             let command: String = run.get_value(&name).unwrap_or_default();
-            let enabled = approved_state(root, APPROVED_RUN, &name);
+            let enabled = approved_state(root, approved, &name);
             out.push(Item { name, source, command, enabled, togglable });
         }
         out
@@ -248,8 +260,9 @@ mod win {
     pub(super) fn collect() -> Vec<Item> {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-        let mut items = run_items(&hkcu, "hkcu_run", true);
-        items.extend(run_items(&hklm, "hklm_run", false));
+        let mut items = run_items(&hkcu, RUN, APPROVED_RUN, "hkcu_run", true);
+        items.extend(run_items(&hklm, RUN, APPROVED_RUN, "hklm_run", false));
+        items.extend(run_items(&hklm, RUN32, APPROVED_RUN32, "hklm_run32", false));
         items.extend(folder_items(true));
         items.extend(folder_items(false));
         items
@@ -283,13 +296,32 @@ mod win {
     /// startup_toggle 的执行:只动当前用户的两类;写 StartupApproved 标志位。
     pub(super) fn toggle(name: &str, enable: bool) -> Result<String> {
         let items = collect();
-        let hit = items.iter().find(|i| name_matches(&i.name, name));
-        let Some(it) = hit else {
-            let known: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
-            anyhow::bail!(
-                "没有叫「{name}」的启动项。现有的:{}(用 startup_list 里的原名)",
-                known.join("、")
-            );
+        let hits: Vec<&Item> = items.iter().filter(|i| name_matches(&i.name, name)).collect();
+        let it = match hits.as_slice() {
+            [] => {
+                let known: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
+                anyhow::bail!(
+                    "没有叫「{name}」的启动项。现有的:{}(用 startup_list 里的原名)",
+                    known.join("、")
+                );
+            }
+            [one] => *one,
+            many => {
+                // 同名多处(HKCU Run 的「钉钉」与启动文件夹的「钉钉.lnk」都认「钉钉」):
+                // 能改的只有一处就动它;否则如实报出各处,让用户用带扩展名的原名点名,别猜着关一个
+                let mut togglable = many.iter().filter(|i| i.togglable);
+                match (togglable.next(), togglable.next()) {
+                    (Some(one), None) => *one,
+                    _ => anyhow::bail!(
+                        "有 {} 个启动项都叫「{name}」:{}——说清是哪一个(用 startup_list 里带扩展名的原名)",
+                        many.len(),
+                        many.iter()
+                            .map(|i| format!("{}〔{}〕", i.name, source_label(i.source)))
+                            .collect::<Vec<_>>()
+                            .join("、")
+                    ),
+                }
+            }
         };
         if !it.togglable {
             anyhow::bail!(

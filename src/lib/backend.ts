@@ -1102,6 +1102,9 @@ export interface AutoBackupStatus {
   dir: string | null
   lastOkMs: number | null
   lastError: string | null
+  /** 轮转保留份数 / 间隔天数:core 常量过桥,前端文案只拼不写死。 */
+  keep: number
+  intervalDays: number
 }
 
 export const api = {

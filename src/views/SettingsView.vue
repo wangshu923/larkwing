@@ -620,7 +620,7 @@ async function backupNow() {
 }
 // 自动备份(autobackup.rs 水位线):选目标目录即开(每周一份、保留最近 10 份、机器轮转);
 // 清空 = 关。选完立即出第一份(auto_backup_now),别让用户等下个节拍才见着结果。
-const autoBackup = ref<import('../lib/backend').AutoBackupStatus>({ dir: null, lastOkMs: null, lastError: null })
+const autoBackup = ref<import('../lib/backend').AutoBackupStatus>({ dir: null, lastOkMs: null, lastError: null, keep: 0, intervalDays: 0 })
 const autoBackupBusy = ref(false)
 async function refreshAutoBackup() {
   if (!isTauri()) return
@@ -656,7 +656,8 @@ const autoBackupLine = computed(() => {
   if (!s.dir) return ''
   if (s.lastOkMs) {
     const d = new Date(s.lastOkMs)
-    return t('settings.system.autoBackupLast', { time: d.toLocaleString() })
+    // 份数 / 间隔来自 core 状态(单源常量过桥),文案里不写死数字(§4.11)
+    return t('settings.system.autoBackupLast', { time: d.toLocaleString(), days: s.intervalDays, keep: s.keep })
   }
   return s.lastError ? t('settings.system.autoBackupErr', { err: s.lastError }) : t('settings.system.autoBackupPending')
 })
@@ -1093,6 +1094,14 @@ function saveKey(p: ProviderView) {
 }
 function saveField(p: ProviderView, field: 'baseUrl' | 'model', ev: Event) {
   const v = (ev.target as HTMLInputElement).value.trim()
+  if (field === 'model' && pickDismissed === p.id) {
+    // 下拉开着时敲的字是筛选词,点到别处 = 放弃这次筛选(与 Esc 同义),回显已存模型——
+    // 否则「dee」这种半截筛选词会被 change 事件当模型存上、供应商静默坏掉(复审实锤)。
+    // 想手填自由文本:不开下拉直接改字,或回车确认。
+    pickDismissed = null
+    delete modelDraft[p.id]
+    return
+  }
   if (!v || v === p[field]) {
     if (field === 'model') delete modelDraft[p.id] // 空 / 没变 → 草稿退场,回显已存的值
     return
@@ -1147,8 +1156,15 @@ async function loadPick(p: ProviderView, force = false) {
     pickLoading.value = false
   }
 }
+// 点到下拉外面关掉的那张卡:紧随的 change 事件(pointerdown 之后同一轮里 blur 触发)按「撤销筛选」
+// 处理;下一个宏任务就清掉,免得残留到以后某次真正的手填改动上
+let pickDismissed: string | null = null
 function onPickDocDown(e: PointerEvent) {
-  if (!(e.target as Element | null)?.closest?.('.model-pick')) closePick()
+  if (!(e.target as Element | null)?.closest?.('.model-pick')) {
+    pickDismissed = pickOpen.value
+    setTimeout(() => (pickDismissed = null), 0)
+    closePick()
+  }
 }
 function closePick() {
   pickOpen.value = null

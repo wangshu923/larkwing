@@ -179,9 +179,13 @@ fn sniff_kind(p: &Path) -> anyhow::Result<FileKind> {
     if head[..n].starts_with(b"%PDF") {
         return Ok(FileKind::Pdf);
     }
-    let is_image = image::ImageReader::open(p)
+    // 图片:只按内容嗅探。⚠️ 不能用 `ImageReader::open(p)` —— 它带着扩展名提示,内容认不出时
+    // 会保留从后缀猜的格式(image 0.25 `with_guessed_format` 的文档化行为)→ 「课程表.png」
+    // 内容是垃圾也被判成图片、真送进打印队列(复审实锤)。从裸 reader 起步,猜不出 = 不是图。
+    let is_image = std::fs::File::open(p)
         .ok()
-        .and_then(|r| r.with_guessed_format().ok())
+        .map(std::io::BufReader::new)
+        .and_then(|f| image::ImageReader::new(f).with_guessed_format().ok())
         .and_then(|r| r.format())
         .is_some();
     anyhow::ensure!(
@@ -260,7 +264,10 @@ async fn print_files(
     let printer = match printer {
         Some(p) => {
             let known = win::printers();
-            if !known.is_empty() && !known.iter().any(|k| k.eq_ignore_ascii_case(p)) {
+            // UNC 形(\\server\printer)的网络打印机交给 CreateDCW 自己判——按用户装的连接
+            // 未必都在注册表清单里(复审实锤),名单只用来拦本机打印机的手误
+            let unc = p.starts_with("\\\\");
+            if !unc && !known.is_empty() && !known.iter().any(|k| k.eq_ignore_ascii_case(p)) {
                 anyhow::bail!("没有叫「{p}」的打印机;装了这些:{}", known.join("、"));
             }
             p.to_string()
@@ -380,13 +387,21 @@ mod win {
     /// 已装打印机清单:注册表 Print\Printers 的子键名(EnumPrinters 的底层数据源,
     /// 免 unsafe buffer 舞蹈)。
     pub(super) fn printers() -> Vec<String> {
+        let mut out = Vec::new();
+        // 本机打印机
         let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-        let Ok(k) = hklm
+        if let Ok(k) = hklm
             .open_subkey_with_flags(r"SYSTEM\CurrentControlSet\Control\Print\Printers", KEY_READ)
-        else {
-            return Vec::new();
-        };
-        k.enum_keys().flatten().collect()
+        {
+            out.extend(k.enum_keys().flatten());
+        }
+        // 按用户装的网络打印机连接:HKCU\Printers\Connections 的子键名把 `\` 编成 `,`
+        // (`,,server,share` = `\\server\share`),还原后才与用户嘴里的名字对得上(复审实锤)
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        if let Ok(k) = hkcu.open_subkey_with_flags(r"Printers\Connections", KEY_READ) {
+            out.extend(k.enum_keys().flatten().map(|n| n.replace(',', "\\")));
+        }
+        out
     }
 
     /// 系统默认打印机:HKCU Windows\Device 值,形如「HP LaserJet,winspool,Ne01:」取首段。
@@ -470,13 +485,17 @@ mod win {
     ) -> Result<()> {
         use windows::core::{HSTRING, PCWSTR};
         use windows::Win32::Graphics::Gdi::{DeleteDC, GetDeviceCaps, HDC, HORZRES, VERTRES};
-        use windows::Win32::Storage::Xps::{EndDoc, EndPage, StartDocW, StartPage, DOCINFOW};
+        use windows::Win32::Storage::Xps::{AbortDoc, EndDoc, EndPage, StartDocW, StartPage, DOCINFOW};
 
-        /// DC 守卫:任何一步失败,drop 时 DeleteDC(未 EndDoc 的文档被 spooler 丢弃 = 干净放弃)。
-        struct Dc(HDC);
+        /// DC 守卫:任何一步失败,drop 时先 AbortDoc(文档已 StartDoc 未 EndDoc 时显式让 spooler
+        /// 丢掉半截文档——只 DeleteDC 是否丢弃取决于驱动,复审待核项)再 DeleteDC。
+        struct Dc(HDC, std::cell::Cell<bool>);
         impl Drop for Dc {
             fn drop(&mut self) {
                 unsafe {
+                    if self.1.get() {
+                        let _ = AbortDoc(self.0);
+                    }
                     let _ = DeleteDC(self.0);
                 }
             }
@@ -493,7 +512,7 @@ mod win {
             )
         };
         anyhow::ensure!(!hdc.is_invalid(), "连不上打印机「{printer}」(名字对吗?在线吗?)");
-        let dc = Dc(hdc);
+        let dc = Dc(hdc, std::cell::Cell::new(false));
         let (pw, ph) =
             unsafe { (GetDeviceCaps(Some(dc.0), HORZRES), GetDeviceCaps(Some(dc.0), VERTRES)) };
         anyhow::ensure!(pw > 0 && ph > 0, "打印机「{printer}」没报出纸张尺寸");
@@ -508,6 +527,7 @@ mod win {
         };
         unsafe {
             anyhow::ensure!(StartDocW(dc.0, &di) > 0, "打印任务没能开始(队列拒绝了)");
+            dc.1.set(true); // 文档已开:中途任何失败 → drop 时 AbortDoc
             for _ in 0..copies {
                 for i in 0..page_count {
                     let img = render(i)?;
@@ -517,6 +537,7 @@ mod win {
                 }
             }
             anyhow::ensure!(EndDoc(dc.0) > 0, "打印任务收尾失败");
+            dc.1.set(false); // 正常收尾,别再 AbortDoc
         }
         Ok(())
     }
@@ -534,24 +555,33 @@ mod win {
 
         // 宽图 + 纵向纸 → 转 90° 横放(不动打印机方向设置,转位图更稳)
         let rotated;
-        let img = if img.width() > img.height() && pw < ph {
+        let mut img = if img.width() > img.height() && pw < ph {
             rotated = image::imageops::rotate90(img);
             &rotated
         } else {
             img
         };
+        // 等比 96% 落纸;比纸大的先缩到落纸尺寸再送 DIB(50MP 照片原样送 = 200MB × 份数进 spool,
+        // 且 iw*ih*4 按 i32 算会溢出,复审实锤);比纸小的交给 StretchDIBits 放大
+        let s = f64::min(pw as f64 / img.width() as f64, ph as f64 / img.height() as f64) * 0.96;
+        let resized;
+        if s < 1.0 {
+            let w = ((img.width() as f64 * s).round() as u32).max(1);
+            let h = ((img.height() as f64 * s).round() as u32).max(1);
+            resized = image::imageops::resize(img, w, h, image::imageops::FilterType::Triangle);
+            img = &resized;
+        }
         let (iw, ih) = (img.width() as i32, img.height() as i32);
 
         // RGBA → BGRA + 透明像素合白底(纸是白的;透明区 RGB 常是 0 → 不合成会打出黑块)
-        let mut buf = Vec::with_capacity((iw * ih * 4) as usize);
+        let mut buf = Vec::with_capacity(iw as usize * ih as usize * 4);
         for px in img.pixels() {
             let a = px[3] as u32;
             let f = |c: u8| ((c as u32 * a + 255 * (255 - a)) / 255) as u8;
             buf.extend([f(px[2]), f(px[1]), f(px[0]), 255]);
         }
 
-        let s = f64::min(pw as f64 / iw as f64, ph as f64 / ih as f64) * 0.96;
-        let (dw, dh) = ((iw as f64 * s) as i32, (ih as f64 * s) as i32);
+        let (dw, dh) = if s < 1.0 { (iw, ih) } else { ((iw as f64 * s) as i32, (ih as f64 * s) as i32) };
         let (dx, dy) = ((pw - dw) / 2, (ph - dh) / 2);
 
         let bmi = BITMAPINFO {
@@ -630,6 +660,11 @@ mod tests {
         let png = dir.join("图.png");
         image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255])).save(&png).unwrap();
         assert!(matches!(sniff_kind(&png).unwrap(), FileKind::Image));
+        // 假图:名字是 .png、内容是垃圾 → 不能凭后缀放行(复审实锤:原先 ImageReader::open
+        // 带着扩展名提示,内容认不出时保留后缀猜的格式,垃圾会被真送进打印队列)
+        let fake = dir.join("课程表.png");
+        std::fs::write(&fake, b"not an image at all").unwrap();
+        assert!(sniff_kind(&fake).is_err(), "垃圾内容不能凭 .png 后缀判成图片");
         // Office 文档(zip 魔数)→ 如实退回指路
         let docx = dir.join("作业.docx");
         std::fs::write(&docx, b"PK\x03\x04...").unwrap();
