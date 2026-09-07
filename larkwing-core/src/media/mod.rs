@@ -260,6 +260,23 @@ pub struct NowPlaying {
     pub thumb_url: Option<String>,
 }
 
+/// 剧集列表面板要的整份队列(按需取,不塞进每条 Play 事件 —— 合集上百集,标题一次拉够)。
+#[derive(Debug, Clone, Serialize)]
+pub struct PlaylistView {
+    pub index: usize,
+    pub shuffle: bool,
+    /// 剧名(拿不到 None,前端退回集数标题)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub entries: Vec<PlaylistEntryView>,
+}
+
+/// 列表里的一集:只给显示用的标题(url / id 不过桥 —— 点第几集由 core 按下标定位)。
+#[derive(Debug, Clone, Serialize)]
+pub struct PlaylistEntryView {
+    pub title: String,
+}
+
 /// 「正在播放」里的队列位置(过桥给前端 + 给工具叙述)。
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct PlaylistPos {
@@ -2088,6 +2105,21 @@ impl MediaRuntime {
         if idle {
             *self.inner.progress.lock().unwrap() = None;
         }
+    }
+
+    /// 当前队列的整份清单(剧集列表面板 / 曲目列表按需取;None = 没在放多集内容)。
+    pub fn playlist_view(&self) -> Option<PlaylistView> {
+        let guard = self.inner.playlist.lock().unwrap();
+        guard.as_ref().map(|pl| PlaylistView {
+            index: pl.index,
+            shuffle: pl.shuffle,
+            title: pl.series_title.clone(),
+            entries: pl
+                .entries
+                .iter()
+                .map(|e| PlaylistEntryView { title: e.title.clone() })
+                .collect(),
+        })
     }
 
     /// 循环/随机模式镜像(NowPlaying 每次捎带全量,前端以此对齐 el.loop/按钮态,零猜测)。

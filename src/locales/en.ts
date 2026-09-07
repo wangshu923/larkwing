@@ -304,6 +304,7 @@ export default {
       mute: 'Mute',
       speed: 'Slower / faster',
       episode: 'Previous / next episode',
+      list: 'Episode list',
       audioTrack: 'Switch audio track',
       subtitle: 'Switch subtitles',
       fullscreen: 'Fullscreen',
@@ -325,6 +326,9 @@ export default {
     prevEp: 'Previous',
     nextEp: 'Next',
     episodeOf: 'Ep {cur}/{total}',
+    episodeN: 'Episode {n}',
+    episodeList: 'Episodes',
+    trackList: 'Tracks',
     // Audio player bar uses track wording; loop/shuffle button titles state the current mode
     prevTrack: 'Previous track',
     nextTrack: 'Next track',

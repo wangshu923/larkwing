@@ -305,6 +305,7 @@ export default {
       mute: '静音',
       speed: '倍速慢一档 / 快一档',
       episode: '上一集 / 下一集',
+      list: '选集列表',
       audioTrack: '切换音轨',
       subtitle: '切换字幕',
       fullscreen: '全屏',
@@ -326,6 +327,9 @@ export default {
     prevEp: '上一集',
     nextEp: '下一集',
     episodeOf: '第 {cur}/{total} 集',
+    episodeN: '第 {n} 集',
+    episodeList: '选集',
+    trackList: '曲目',
     // 音频播放条(歌/故事)用「首」词族;循环/随机按钮 title 直述当前状态
     prevTrack: '上一首',
     nextTrack: '下一首',

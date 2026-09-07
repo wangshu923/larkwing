@@ -3,6 +3,7 @@
 // 按钮直连 VM,不绕 LLM。登录建议气泡也长在这排(有提示就出,与是否在放无关)。
 import { computed, nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import EpisodeList from './EpisodeList.vue'
 import { useLyrics } from '../composables/useLyrics'
 import { useMedia } from '../composables/useMedia'
 import { useScrubHover } from '../composables/useScrubHover'
@@ -83,6 +84,8 @@ const lyricsOn = computed(() => settings.get('ui.lyrics') !== '0')
 function toggleLyrics() {
   settings.set('ui.lyrics', lyricsOn.value ? '0' : '1')
 }
+/** 曲目列表(多首才有):播放条上方的下拉卡,点一行跳到那一首。 */
+const listOpen = ref(false)
 
 function onScrubInput(e: Event) {
   dragging.value = true
@@ -154,6 +157,23 @@ function onVolume(e: Event) {
         <path d="m7 15-3 3 3 3" />
       </svg>
     </button>
+    <button
+      v-if="playlist"
+      class="pbtn"
+      :class="{ on: listOpen }"
+      @click="listOpen = !listOpen"
+      :title="t('media.trackList')"
+    >
+      <svg viewBox="0 0 24 24">
+        <path d="M8 6h13" />
+        <path d="M8 12h13" />
+        <path d="M8 18h13" />
+        <path d="M3 6h.01" />
+        <path d="M3 12h.01" />
+        <path d="M3 18h.01" />
+      </svg>
+    </button>
+    <EpisodeList v-model:open="listOpen" variant="drop" />
     <button
       v-if="playlist"
       class="pbtn"
@@ -263,6 +283,7 @@ function onVolume(e: Event) {
 <style scoped>
 .player {
   /* 从 :root 继承科幻 token(原先自带一份 --p-* 副本,已删) */
+  position: relative; /* 曲目列表下拉卡的定位锚 */
   display: flex; align-items: center; gap: 10px;
   padding: 8px 12px; border-radius: 13px;
   background: var(--surface-deep); border: 1px solid var(--line);
@@ -288,6 +309,8 @@ function onVolume(e: Event) {
   box-shadow: 0 0 10px rgba(var(--accent-rgb), 0.35);
 }
 .pbtn.track { width: auto; min-width: 34px; padding: 0 8px; font-size: 11px; white-space: nowrap; }
+/* 曲目列表:从播放条上方展开(组件自身 right/width 定位,这里只定纵向锚) */
+.eplist.drop { bottom: calc(100% + 8px); left: 8px; right: auto; }
 .pbtn.stop { color: var(--attn); border-color: rgba(var(--attn-rgb), 0.35); }
 .pbtn.stop:hover { border-color: var(--attn); box-shadow: 0 0 12px rgba(var(--attn-rgb), 0.3); }
 

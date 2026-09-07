@@ -513,6 +513,14 @@ export interface NowPlaying {
   thumb_url?: string
 }
 
+/** 剧集列表面板要的整份队列(镜像 Rust media::PlaylistView;按需取,不塞进 Play 事件)。 */
+export interface PlaylistView {
+  index: number
+  shuffle: boolean
+  title?: string
+  entries: { title: string }[]
+}
+
 export type MediaEvent =
   | { type: 'play'; data: NowPlaying }
   | { type: 'control'; data: { action: string; value?: number } }
@@ -1195,6 +1203,10 @@ export const api = {
   mediaAutoNext: () => invoke<boolean>('media_auto_next'),
   /** 播放条循环/随机/音轨按钮 → core 校验落状态(与嘴控同一执行口);audio_track 带 value(1 起)。 */
   mediaMode: (action: string, value?: number) => invoke<void>('media_mode', { action, value }),
+  /** 剧集列表 / 曲目列表:按需取整份队列(标题 + 当前下标);null = 没在放多集内容。 */
+  mediaPlaylist: () => invoke<PlaylistView | null>('media_playlist'),
+  /** 列表里点第 N 集(1 起)= 嘴控「看第五集」同一 core 入口;越界抛错(前端 toast)。 */
+  mediaJump: (episode: number) => invoke<void>('media_jump', { episode }),
   /** 回报播放器当下状态给 core(只主窗调):状态/标题之外带基准音量(0–100)、进度/时长(秒)、
    *  倍速。core 据此在下个回合喂模型「此刻」背景 —— 修「歌放完了却以为还在播」,并让模型知道
    *  当前音量/进度(才能「调到 50」「快进 5 分钟」)。fire-and-forget。 */

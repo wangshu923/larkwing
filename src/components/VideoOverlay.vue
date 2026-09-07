@@ -7,6 +7,7 @@
 // 挪窗 = 悬浮窗双播陷阱同族 + 采集端 AEC 参考信号断链(§7.5)。
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import EpisodeList from './EpisodeList.vue'
 import { useContextMenu } from '../composables/useContextMenu'
 import { registerVideoEl, SEEK_STEP_LONG_S, SEEK_STEP_S, useMedia } from '../composables/useMedia'
 import { useScrubHover, useScrubThumb } from '../composables/useScrubHover'
@@ -241,6 +242,8 @@ function flashOsd(text: string) {
 }
 /** 快捷键速查浮层(H 键 / 「?」钮)。 */
 const helpOpen = ref(false)
+/** 剧集列表面板(L 键 / 标题栏「≡」钮;多集才有)。全屏 = 右侧侧栏,窗口态 = 标题栏下拉。 */
+const listOpen = ref(false)
 
 type KeyDef = {
   /** 显示用键名(帮助浮层 / tooltip)。 */
@@ -331,6 +334,13 @@ const KEYS: KeyDef[] = [
     },
   },
   {
+    keys: ['L'],
+    label: 'media.keys.list',
+    match: key('l'),
+    when: () => !!playlist.value,
+    run: () => (listOpen.value = !listOpen.value),
+  },
+  {
     keys: ['A'],
     label: 'media.keys.audioTrack',
     match: key('a'),
@@ -362,6 +372,7 @@ const KEYS: KeyDef[] = [
     match: (e) => e.key === 'Escape',
     run: () => {
       if (helpOpen.value) helpOpen.value = false
+      else if (listOpen.value) listOpen.value = false
       else if (state.fullscreen) void toggleFullscreen()
     },
   },
@@ -485,8 +496,19 @@ onUnmounted(() => {
       <span v-if="playlist" class="ep">{{
         t('media.episodeOf', { cur: playlist.index + 1, total: playlist.total })
       }}</span>
+      <!-- 选集:多集才有;全屏右侧侧栏 / 窗口态标题栏下拉(L) -->
+      <button
+        v-if="playlist"
+        class="vbtn"
+        :class="{ on: listOpen }"
+        @click="listOpen = !listOpen"
+        :title="kb(t('media.episodeList'), 'L')"
+      >
+        ≡
+      </button>
       <button class="vbtn" @click="stop" :title="t('media.closeVideo')">✕</button>
     </header>
+    <EpisodeList v-model:open="listOpen" :variant="state.fullscreen ? 'side' : 'drop'" />
     <video :key="videoKey" ref="video" class="screen" playsinline @dblclick="toggleFullscreen">
       <!-- 字幕:core 现转现回 WebVTT;默认全 disabled,按钮/嘴控切 mode(见 useMedia.setSubtitle) -->
       <track v-for="(s, i) in subtitles" :key="s.url" kind="subtitles" :src="s.url" :srclang="s.lang" :label="subtitleLabel(i)" />
@@ -762,6 +784,9 @@ onUnmounted(() => {
 .vbtn.rate { width: auto; padding: 0 9px; font: 11px/1 ui-monospace, "SF Mono", monospace; }
 .vbtn svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .vbtn.on { border-color: var(--accent); background: rgba(var(--accent-rgb), 0.22); }
+
+/* 选集下拉(窗口态):挂在标题栏下方;全屏侧栏由组件自己定位 */
+.eplist.drop { top: 46px; max-height: min(320px, calc(100% - 110px)); }
 
 /* 按键 OSD:画面中央的读数药丸(覆盖媒体豁免:恒亮浅字压黑底,不随皮肤) */
 .osd {

@@ -15,6 +15,7 @@ import {
   windowLabel,
   type MediaEvent,
   type NowPlaying,
+  type PlaylistView,
 } from '../lib/backend'
 import { i18n } from '../i18n'
 import { attachMedia, detachAudio } from './useAudioGraph'
@@ -703,6 +704,27 @@ function advance(delta: number) {
   void api.mediaAdvance(delta).catch(() => {})
 }
 
+/** 剧集列表:按需向 core 取整份队列(标题 + 当前下标)。浏览器预览没 core → 按 playlist 的
+ *  index/total 合成占位标题,只看布局。 */
+async function fetchPlaylist(): Promise<PlaylistView | null> {
+  const p = state.current?.playlist
+  if (!p) return null
+  if (isTauri()) return api.mediaPlaylist().catch(() => null)
+  return {
+    index: p.index,
+    shuffle: state.shuffle,
+    entries: Array.from({ length: p.total }, (_, i) => ({
+      title: i18n.global.t(state.current?.kind === 'audio' ? 'media.trackN' : 'media.episodeN', { n: i + 1 }),
+    })),
+  }
+}
+
+/** 列表里点第 N 集(1 起):与嘴控「看第五集」同一 core 入口;越界 toast,不 panic。 */
+function jumpTo(episode: number) {
+  if (!isTauri()) return
+  void api.mediaJump(episode).catch(() => useToast().error(i18n.global.t('toast.mediaFailed', { title: '' })))
+}
+
 /** seek:自适应流(shaka)/ 音频 / 直转单文件走**原生** currentTime(播放器管时间轴,精确 + 同步);
  *  只有本地转码的渐进混流(/m/、无 manifest)才换 src 重启(?t=)—— Stage 2 上 HLS 后这条也会消失。 */
 function seek(seconds: number) {
@@ -988,6 +1010,8 @@ export function useMedia() {
     openRateMenu,
     next: () => advance(1),
     prev: () => advance(-1),
+    fetchPlaylist,
+    jumpTo,
     cycleLoop,
     toggleShuffle,
     cycleAudioTrack,

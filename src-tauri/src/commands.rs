@@ -983,8 +983,8 @@ pub fn media_retry(
     let media = state.media.clone();
     let user_id = state.engine.store().users.ensure_default_user()?.id;
     tauri::async_runtime::spawn(async move {
-        // restart=false:重试沿用续播规则(本就是接着之前那次播放)
-        if let Err(e) = media.play(user_id, &page_url, audio_only, false).await {
+        // restart=false / 不点名集:重试沿用续播规则(本就是接着之前那次播放)
+        if let Err(e) = media.play(user_id, &page_url, audio_only, false, None).await {
             // 失败已由 play() 内部 task.fail_retryable 上报 HUD;这里只留日志
             tracing::debug!("重试播放失败(已上报 HUD): {e:#}");
         }
@@ -1031,6 +1031,22 @@ pub fn media_advance(state: State<'_, AppState>, delta: i32) -> Result<(), AppEr
         }
     });
     Ok(())
+}
+
+/// 剧集列表面板 / 曲目列表:按需取整份队列(标题 + 当前下标),不塞进每条 Play 事件。
+/// None = 没在放多集内容。
+#[tauri::command]
+pub fn media_playlist(state: State<'_, AppState>) -> Option<larkwing_core::media::PlaylistView> {
+    state.media.playlist_view()
+}
+
+/// 剧集列表里点第 N 集(1 起数):与嘴控「看第五集」同一个 core 入口(`jump_to_episode`),
+/// 按钮不绕 LLM(§7.1)。越界 / 没队列 = 错误返回给前端(它只 toast,不 panic)。
+#[tauri::command]
+pub async fn media_jump(state: State<'_, AppState>, episode: usize) -> Result<(), AppError> {
+    let user_id = state.engine.store().users.ensure_default_user()?.id;
+    let media = state.media.clone();
+    media.jump_to_episode(user_id, episode).await.map(|_| ()).map_err(AppError::internal)
 }
 
 /// 一集自然放完(前端 `ended`):core 按循环/随机决定要不要接管(顺序下一集 / 列表循环回卷 /

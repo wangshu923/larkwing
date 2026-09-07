@@ -435,6 +435,8 @@ pub fn run() {
       commands::media_advance,
       commands::media_auto_next,
       commands::media_mode,
+      commands::media_playlist,
+      commands::media_jump,
       commands::report_media_state,
       commands::set_media_codecs,
       commands::media_log,
