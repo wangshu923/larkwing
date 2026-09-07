@@ -9,6 +9,7 @@ pub mod capability;
 pub mod cookies;
 mod download;
 mod edit;
+pub mod fingerprint;
 mod lyrics;
 mod probe;
 mod relay;

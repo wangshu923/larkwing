@@ -46,6 +46,9 @@ pinyin = "0.11.0"
 #   真撞上只认 h1 的服务端,给那个调用点单独 `.http1_only()`,别把这个 feature 摘掉。
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks", "gzip", "multipart", "cookies", "http2"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+# 音频指纹(media/fingerprint.rs,剧集片头/片尾自动检测的地基):每帧 Hann 窗 → FFT → 16 个
+# 对数频带能量。纯 Rust,rust-version 1.61 与本 crate MSRV 1.77.2 兼容;num-complex 0.4 本就在树里。
+rustfft = "6.4"
 # web 工具的 HTML 解析(搜索结果页 + 正文抽取)
 scraper = "0.23"
 # 正文抽取的表格转 markdown(web.rs::table_to_markdown):认「这个 td 归哪张表」要用
