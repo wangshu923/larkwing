@@ -17,6 +17,8 @@ const {
   stop,
   seek,
   setVolume,
+  stepRate,
+  openRateMenu,
   next,
   prev,
   cycleLoop,
@@ -182,6 +184,16 @@ function onVolume(e: Event) {
       :title="lyricsOn ? t('media.lyricsHide') : t('media.lyricsShow')"
     >
       词
+    </button>
+    <!-- 倍速(有声书/故事 1.25x 常用):点开档位菜单,滚轮微调;与视频浮层同一张档位表 -->
+    <button
+      class="pbtn track"
+      :class="{ on: state.rate !== 1 }"
+      @click="openRateMenu"
+      @wheel.prevent="stepRate($event.deltaY < 0 ? 1 : -1)"
+      :title="t('media.speedPick', { rate: state.rate })"
+    >
+      {{ state.rate }}x
     </button>
     <div class="mid">
       <div class="title-row">

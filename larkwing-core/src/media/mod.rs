@@ -242,6 +242,8 @@ pub struct NowPlaying {
     pub loop_mode: String,
     /// 随机播放镜像(仅多集队列可能为 true)。
     pub shuffle: bool,
+    /// 倍速镜像(0.5–3):新点播复位 1、切集 / 自动续播沿用;前端每条 Play 直接落到播放元素。
+    pub rate: f64,
     /// 全部音轨(本地探测;≥2 条 UI 才出切换钮,〔此刻〕才列清单)。网络流恒空(来源定音轨)。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub audio_tracks: Vec<probe::AudioTrack>,
@@ -317,6 +319,10 @@ const PENDING_PLAY_TTL: Duration = Duration::from_secs(600);
 /// 「平台接口卡住」的坏情形 —— 起播最多被拖 3s 减去解析耗时。预览图是锦上添花,超时 = 没有
 /// 缩略图(`thumb_url` None),不是失败、不进任务条。
 const SPRITE_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
+/// 倍速允许范围(§4.11 用户拍板 2026-09-07)。下限 0.5:Chromium 的音频渲染器只在 0.5–4 倍之间
+/// 做变速保调,更慢直接静音 —— 原先放行的 0.25 档在 Windows 上是无声的;上限 3 = 前端档位表的顶
+/// (`useMedia.RATE_STEPS`,两处手工同步)。工具描述里的「0.5–3」照抄这里。
+const SPEED_RANGE: std::ops::RangeInclusive<f64> = 0.5..=3.0;
 
 /// 前端播放器的「此刻」状态快照。播放真相在前端 WebView(播放在那跑、放完只有它知道);
 /// core 起播时乐观 seed,前端在生命周期切换(playing/paused/ended/stop)+ 音量/倍速/seek 调整
@@ -444,6 +450,13 @@ struct Inner {
     loop_mode: Mutex<LoopMode>,
     /// 选中的音轨(0 起;新 `play()` 复位 0,切集粘住 —— 看英文轨的剧下一集还是英文)。
     audio_track: Mutex<usize>,
+    /// 选中音轨的语言码(切轨时从清单抄下;切集按**语言**对号、不按轨号 —— 两集轨序不同时
+    /// 「第 2 条」可能换了语言;没标语言的文件退回按轨号)。None = 没显式选过。
+    audio_track_lang: Mutex<Option<String>>,
+    /// 倍速(0.5–3;单源见 `SPEED_RANGE`)。**队列级粘住**:新 `play()` 请求复位 1(mpv 时代
+    /// 教训:放完电影再放歌还是 2 倍),切集 / 自动续播沿用 —— 1.5 倍看剧不该每集掉回 1.0。
+    /// 前端每条 Play 事件直接应用 `NowPlaying.rate`,零猜测(与 loop_mode 同款镜像)。
+    rate: Mutex<f64>,
     /// 当前本地播放现场(切音轨用;None = 没在放本地内容)。
     current_local: Mutex<Option<CurrentLocal>>,
     /// BT 下载引擎(懒建,同 relay):不用 BT 的用户零成本,且**不会平白发 DHT 包**。
@@ -477,6 +490,8 @@ impl MediaRuntime {
                 playlist: Mutex::new(None),
                 loop_mode: Mutex::new(LoopMode::Off),
                 audio_track: Mutex::new(0),
+                audio_track_lang: Mutex::new(None),
+                rate: Mutex::new(1.0),
                 current_local: Mutex::new(None),
                 torrent: tokio::sync::OnceCell::new(),
             }),
@@ -693,9 +708,12 @@ impl MediaRuntime {
         restart: bool,
     ) -> Result<PlayOutcome> {
         self.prefetch_ffmpeg(); // 后台预取(首次播放任何媒体即触发),不阻塞本次播放
-        // 新播放请求 = 新内容意图:循环/音轨都复位(同「倍速每次复位」口径;切集不经这里 —— 音轨跨集粘住)。
+        // 新播放请求 = 新内容意图:循环/音轨/倍速都复位;切集不经这里 —— 三者跨集粘住
+        // (2026-09-07 用户实锤「1.5 倍看剧下一集变 1.0」:复位口径是「新点播」,不是「新一集」)。
         *self.inner.loop_mode.lock().unwrap() = LoopMode::Off;
         *self.inner.audio_track.lock().unwrap() = 0;
+        *self.inner.audio_track_lang.lock().unwrap() = None;
+        *self.inner.rate.lock().unwrap() = 1.0;
         // 目录入参 = 音频文件夹:强制只出声;≥2 首由 build_queue 组队连播,恰 1 首退化成放
         // 那一首,一首没有如实退回(播放链吃不了目录,绝不喂它;§3.5 不静默)。
         let single_fallback;
@@ -1040,6 +1058,7 @@ impl MediaRuntime {
             playlist: pos,
             loop_mode,
             shuffle,
+            rate: self.rate(),
             audio_tracks: Vec::new(),
             audio_track: 0,
             resume_at: None,
@@ -1515,7 +1534,7 @@ impl MediaRuntime {
             (capability::Source::Bmff, Some(pr)) => {
                 duration_seconds = pr.duration_seconds;
                 tracks = pr.audio_tracks.clone();
-                sel_track = self.clamp_audio_track(tracks.len());
+                sel_track = self.pick_audio_track(&tracks);
                 // 逐轨判定:多音轨片只看**选中那条**要不要转(选中 AAC 轨 = 音频可 copy)。
                 let sel_audio_bad = tracks
                     .get(sel_track)
@@ -1590,7 +1609,7 @@ impl MediaRuntime {
                         let pr = self.probe_with_ffmpeg(&ffmpeg, &path).await;
                         duration_seconds = pr.duration_seconds;
                         tracks = pr.audio_tracks.clone();
-                        sel_track = self.clamp_audio_track(tracks.len());
+                        sel_track = self.pick_audio_track(&tracks);
                         let sel_audio_bad = tracks
                             .get(sel_track)
                             .map(|t| probe::audio_codec_needs_transcode(&t.codec))
@@ -1717,6 +1736,7 @@ impl MediaRuntime {
             playlist: pos,
             loop_mode,
             shuffle,
+            rate: self.rate(),
             audio_tracks: tracks,
             audio_track: sel_track,
             resume_at,
@@ -1760,7 +1780,14 @@ impl MediaRuntime {
             }
             "speed" => {
                 let v = value.context("speed 需要 value(倍速)")?;
-                anyhow::ensure!((0.25..=3.0).contains(&v), "倍速范围 0.25–3,收到 {v}");
+                anyhow::ensure!(
+                    SPEED_RANGE.contains(&v),
+                    "倍速范围 {}–{},收到 {v}",
+                    SPEED_RANGE.start(),
+                    SPEED_RANGE.end()
+                );
+                // 先落 core 状态(切集 / 自动续播的 NowPlaying 据此捎带),再随 Control 事件让前端对齐。
+                *self.inner.rate.lock().unwrap() = v;
             }
             "seek" => {
                 let v = value.context("seek 需要 value(秒)")?;
@@ -1784,13 +1811,24 @@ impl MediaRuntime {
         Ok(())
     }
 
-    /// 读选中音轨并钳到有效范围(切集后新一集音轨数可能变少;越界回 0 并回写,状态别悬空)。
-    fn clamp_audio_track(&self, total: usize) -> usize {
-        let mut guard = self.inner.audio_track.lock().unwrap();
-        if *guard >= total.max(1) {
-            *guard = 0;
+    /// 新一集 / 新文件的音轨选择,结果回写(状态别悬空):显式切过轨就按**语言**对号 ——
+    /// 选中轨号在这个文件里若不再是那个语言,找第一条同语言的;没标语言的文件退回按轨号;
+    /// 越界(新一集音轨数变少)回 0。没显式选过 = 纯钳位(老行为)。
+    fn pick_audio_track(&self, tracks: &[probe::AudioTrack]) -> usize {
+        let total = tracks.len();
+        let mut idx = self.inner.audio_track.lock().unwrap();
+        if let Some(lang) = self.inner.audio_track_lang.lock().unwrap().as_deref() {
+            let same = |t: &probe::AudioTrack| t.lang.as_deref() == Some(lang);
+            if !tracks.get(*idx).is_some_and(same) {
+                if let Some(j) = tracks.iter().position(same) {
+                    *idx = j;
+                }
+            }
         }
-        *guard
+        if *idx >= total.max(1) {
+            *idx = 0;
+        }
+        *idx
     }
 
     /// 播放器「此刻」位置(秒):最近回报值 + 播放中按倍速外推(与 playback_summary 同口径)。
@@ -1832,7 +1870,10 @@ impl MediaRuntime {
         if idx == prev {
             return Ok(format!("已经在第 {n} 条音轨({})了", track_desc(&cur.tracks[idx], n)));
         }
+        let prev_lang = self.inner.audio_track_lang.lock().unwrap().clone();
         *self.inner.audio_track.lock().unwrap() = idx;
+        // 记下语言码:切集时按语言对号(两集轨序不同也不串)。
+        *self.inner.audio_track_lang.lock().unwrap() = cur.tracks[idx].lang.clone();
         // 统一走「重建 + 原位续播」(mac 直传也一样):真机实锤 WKWebView **播放中**改
         // audioTracks.enabled 不重新路由音频(静音且切回也不恢复);loadedmetadata 时的收敛
         // 有效 → 重载后由起播收敛把新轨启起来,本地文件重载亚秒级,与 Windows 同一条路。
@@ -1845,12 +1886,18 @@ impl MediaRuntime {
         if let Err(e) = self.play_local(&cur.page_url, cur.audio_only, pos, true, resume).await {
             // 重建失败:选择回滚(老管线还在播旧轨,状态别悬空指向没生效的轨)
             *self.inner.audio_track.lock().unwrap() = prev;
+            *self.inner.audio_track_lang.lock().unwrap() = prev_lang;
             return Err(e);
         }
         Ok(format!(
             "已切到第 {n} 条音轨({}),从刚才的位置接着放",
             track_desc(&cur.tracks[idx], n)
         ))
+    }
+
+    /// 当前倍速(NowPlaying 镜像用;新点播复位 1,切集沿用)。
+    fn rate(&self) -> f64 {
+        *self.inner.rate.lock().unwrap()
     }
 
     /// 循环/随机模式镜像(NowPlaying 每次捎带全量,前端以此对齐 el.loop/按钮态,零猜测)。
@@ -2255,6 +2302,8 @@ mod tests {
         assert!(rt.control("blast_off", None).is_err(), "未知动作被拒");
         assert!(rt.control("speed", None).is_err(), "speed 缺 value 被拒");
         assert!(rt.control("speed", Some(9.0)).is_err(), "倍速超界被拒");
+        assert!(rt.control("speed", Some(0.25)).is_err(), "0.25 在 Chromium 上无声,下限 0.5");
+        assert_eq!(rt.rate(), 1.5, "倍速先落 core 状态(切集的 NowPlaying 据此捎带)");
         assert!(rt.control("seek", Some(-3.0)).is_err(), "负秒数被拒");
         assert!(rt.control("volume", None).is_err(), "volume 缺 value 被拒");
         assert!(rt.control("volume", Some(120.0)).is_err(), "音量超 0–100 被拒");
@@ -2265,6 +2314,46 @@ mod tests {
             }
             other => panic!("应是 Control,实际 {other:?}"),
         }
+    }
+
+    /// 倍速是队列级粘住:切集不经 `play()` 所以沿用;**新点播**(`play()`)一进门就复位 1 ——
+    /// 这里拿一个空文件夹当点播入参(会如实退回,但复位发生在退回之前)。
+    #[tokio::test]
+    async fn speed_resets_on_new_play_request() {
+        let (rt, _rx) = runtime("speed-reset");
+        rt.control("speed", Some(2.0)).unwrap();
+        assert_eq!(rt.rate(), 2.0);
+        let empty = std::env::temp_dir().join(format!("lw-speed-reset-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(rt.play(1, &empty.to_string_lossy(), false, false).await.is_err());
+        assert_eq!(rt.rate(), 1.0, "新点播复位倍速");
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    /// 切集选音轨:显式切过轨按语言对号(轨序变了也不串),没同语言按轨号,越界回 0,
+    /// 没显式选过纯钳位。
+    #[test]
+    fn pick_audio_track_follows_language_then_index() {
+        let (rt, _rx) = runtime("pick-track");
+        let tr = |lang: Option<&str>| probe::AudioTrack {
+            codec: "aac".into(),
+            lang: lang.map(Into::into),
+            title: None,
+            channels: Some(2),
+        };
+        let set = |idx: usize, lang: Option<&str>| {
+            *rt.inner.audio_track.lock().unwrap() = idx;
+            *rt.inner.audio_track_lang.lock().unwrap() = lang.map(Into::into);
+        };
+        set(1, Some("eng"));
+        assert_eq!(rt.pick_audio_track(&[tr(Some("eng")), tr(Some("chi"))]), 0, "轨序反了按语言");
+        set(1, Some("eng"));
+        assert_eq!(rt.pick_audio_track(&[tr(Some("chi")), tr(Some("jpn"))]), 1, "没同语言按轨号");
+        set(1, Some("eng"));
+        assert_eq!(rt.pick_audio_track(&[tr(Some("chi"))]), 0, "越界回 0");
+        set(3, None);
+        assert_eq!(rt.pick_audio_track(&[tr(None), tr(None)]), 0, "没显式选过纯钳位");
+        assert_eq!(*rt.inner.audio_track.lock().unwrap(), 0, "结果回写");
     }
 
     #[test]

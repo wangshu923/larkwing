@@ -16,8 +16,8 @@ impl MediaControl {
                 name: "media_control",
                 description: "控制正在播放的内容:pause 暂停 / resume 继续 / stop 停止 / \
                               louder 大点声 / softer 小点声(各约一档)/ volume 音量调到指定值\
-                              (value=0–100,「调到一半」=50、「静音」=0)/ speed 倍速(value=0.25–3,\
-                              如 1.5)/ seek 定位播放(value=秒,「跳到一分半」=90、\
+                              (value=0–100,「调到一半」=50、「静音」=0)/ speed 倍速(value=0.5–3,\
+                              如 1.5;切集连播时倍速保持,新点播才回 1)/ seek 定位播放(value=秒,「跳到一分半」=90、\
                               「快进到十分钟」=600)/ next 下一集(下一首)/ prev 上一集(上一首)/ \
                               episode 跳到第几集(value=集数或第几首,「看第五集」=5;多集/多首列表可用)/ \
                               loop_one 单曲循环(「就循环这一首」)/ loop_all 列表循环(「循环放/一直放」,\
@@ -39,7 +39,7 @@ impl MediaControl {
                         },
                         "value": {
                             "type": "number",
-                            "description": "volume=音量(0–100);speed=倍速(0.25–3);seek=定位到第几秒;episode=第几集(从 1 数);其它动作不传"
+                            "description": "volume=音量(0–100);speed=倍速(0.5–3);seek=定位到第几秒;episode=第几集(从 1 数);其它动作不传"
                         }
                     },
                     "required": ["action"]

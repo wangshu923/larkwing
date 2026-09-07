@@ -291,6 +291,7 @@ export default {
     stop: 'Stop',
     volume: 'Volume',
     speed: 'Speed',
+    speedPick: 'Speed {rate}x (click to pick, scroll to nudge)',
     fullscreen: 'Fullscreen',
     closeVideo: 'Close',
     prevEp: 'Previous',

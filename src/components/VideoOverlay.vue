@@ -7,14 +7,29 @@
 // 挪窗 = 悬浮窗双播陷阱同族 + 采集端 AEC 参考信号断链(§7.5)。
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { useContextMenu } from '../composables/useContextMenu'
 import { registerVideoEl, useMedia } from '../composables/useMedia'
 import { useScrubHover, useScrubThumb } from '../composables/useScrubHover'
 import { win } from '../lib/backend'
 import { fmtClock } from '../lib/fmt'
 
 const { t } = useI18n()
-const { state, toggle, stop, seek, setVolume, setRate, next, prev, cycleAudioTrack, audioTrackLabel, cycleSubtitle, subtitleLabel } =
-  useMedia()
+const {
+  state,
+  toggle,
+  stop,
+  seek,
+  setVolume,
+  stepRate,
+  openRateMenu,
+  next,
+  prev,
+  cycleAudioTrack,
+  audioTrackLabel,
+  cycleSubtitle,
+  subtitleLabel,
+} = useMedia()
+const menu = useContextMenu()
 
 /** 多集剧集才出集数指示 + 上/下一集按钮(单集/电影为 null,不出现)。 */
 const playlist = computed(() => state.current?.playlist ?? null)
@@ -44,13 +59,6 @@ const routeInfo = computed(() => {
   const camel = r.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase()) // hls_copy → hlsCopy
   return { label: t(`media.route.${camel}`), hint: t(`media.route.${camel}Hint`), tone: ROUTE_TONE[r] ?? 'accent' }
 })
-
-/** 倍速循环挡位(点一下进一档,家庭场景不需要精调)。 */
-const RATES = [1, 1.25, 1.5, 2, 0.75]
-function cycleRate() {
-  const i = RATES.indexOf(state.rate)
-  setRate(RATES[(i + 1) % RATES.length] ?? 1)
-}
 
 function onVolume(e: Event) {
   setVolume(Number((e.target as HTMLInputElement).value) / 100)
@@ -221,6 +229,8 @@ async function toggleFullscreen() {
 const SEEK_STEP = 20 // 秒
 const VOL_STEP = 0.1
 function onKey(e: KeyboardEvent) {
+  // 倍速菜单(全局右键菜单宿主)开着:Esc / 键盘交给它,别顺手把全屏也退了
+  if (menu.state.open) return
   // Esc 退全屏:tao 原生全屏在 Windows 不可靠响应 Esc,自己接管。
   if (e.key === 'Escape' && state.fullscreen) {
     e.preventDefault()
@@ -440,7 +450,14 @@ onUnmounted(() => {
       >
         CC
       </button>
-      <button v-if="!compact" class="vbtn rate" @click="cycleRate" :title="t('media.speed')">
+      <!-- 倍速:点开档位菜单(全局右键菜单宿主,当前档打勾);悬停滚轮一档一档调 -->
+      <button
+        v-if="!compact"
+        class="vbtn rate"
+        @click="openRateMenu"
+        @wheel.prevent="stepRate($event.deltaY < 0 ? 1 : -1)"
+        :title="t('media.speedPick', { rate: state.rate })"
+      >
         {{ state.rate }}x
       </button>
       <input

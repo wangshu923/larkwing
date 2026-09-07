@@ -19,6 +19,7 @@ import {
 import { i18n } from '../i18n'
 import { attachMedia, detachAudio } from './useAudioGraph'
 import { isAdaptiveUrl, playAdaptive, type AdaptiveController } from './localAdaptive'
+import { useContextMenu } from './useContextMenu'
 import { useToast } from './useToast'
 
 export type PlayStatus = 'idle' | 'loading' | 'playing' | 'paused'
@@ -31,7 +32,8 @@ const state = reactive({
   duration: 0,
   /** 音量 0–1:跨播放粘住(用户调好的音量别每次重置)。 */
   volume: 1,
-  /** 倍速:每次新播放复位 1(mpv 时代的教训——倍速粘住,放完电影再放歌还是 2 倍)。 */
+  /** 倍速镜像(core 是真相源:新点播复位 1 —— mpv 时代的教训,放完电影再放歌还是 2 倍;
+   *  切集 / 自动续播沿用 —— 1.5 倍看剧不该每集掉回 1.0)。每条 Play 事件全量捎带,这里零猜测。 */
   rate: 1,
   /** 循环模式(core 是真相源,这里是镜像:Play 事件全量捎带 + Control 事件增量对齐)。
    *  one=单曲(落 el.loop 原生无缝循环);all=列表(core auto_next 回卷;没队列时也落 el.loop)。 */
@@ -46,8 +48,21 @@ const state = reactive({
   loginHint: null as string | null,
 })
 
+/** 倍速档位表(§4.11 用户拍板 2026-09-07:1.5–2.5 之间加密)。范围两端与 core `SPEED_RANGE` 手工同步;
+ *  下限 0.5 = Chromium 音频渲染器变速保调的下界(更慢直接静音)。快捷键 / 滚轮按这张表一档一档走。 */
+export const RATE_STEPS = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5, 3] as const
+const RATE_MIN = RATE_STEPS[0]
+const RATE_MAX = RATE_STEPS[RATE_STEPS.length - 1]
+
 let audio: HTMLAudioElement | null = null
 let videoEl: HTMLVideoElement | null = null
+
+/** 把当前倍速落到播放元素。顺手显式打开 preservesPitch(变速不变调):Chromium/WebKit 默认就开,
+ *  写一次当保险 —— 这就是各家播放器宣传的「倍速声音优化」,浏览器白送。 */
+function applyRateToEl(el: HTMLMediaElement) {
+  el.preservesPitch = true
+  el.playbackRate = state.rate
+}
 /** 混流视频 seek = 换 src 重启,这里记基准秒数,显示时间 = base + currentTime。 */
 let videoBase = 0
 // 唤醒避让(duck):语音交互期间把播放压低,让 7274 的话被听见。`state.volume` 是**基准**
@@ -203,7 +218,7 @@ async function loadVideoInto(el: HTMLVideoElement) {
   const cur = state.current
   if (!cur || cur.kind !== 'video') return
   clearPendingResume() // 换元素/换路:旧的起播定位监听先摘,别让它在新一次加载时跳到旧位置
-  el.playbackRate = 1
+  applyRateToEl(el) // 换 src 会把 playbackRate 重置回 1(规范行为),切集后要重新落
   el.volume = liveVolume()
   // 起播定位(切音轨重建管线的「接着放」):消费一次即清,防浮层重挂载重复回跳
   const resume = cur.resume_at && cur.resume_at > 0 ? cur.resume_at : 0
@@ -378,16 +393,32 @@ export function registerVideoEl(el: HTMLVideoElement | null) {
   })
   // 多音轨收敛:直传的多音轨片只留选中那条(治 WKWebView 全轨混播;≥2 轨才动作)
   el.addEventListener('loadedmetadata', () => applyAudioTrackToEl(el))
+  // 字幕:<track> 默认全 disabled,切集粘住的那条要等元数据到了再打开(此前没人在这一步重放)
+  el.addEventListener('loadedmetadata', () => {
+    if (state.subtitle >= 1) setSubtitle(state.subtitle)
+  })
   el.volume = liveVolume()
-  el.playbackRate = state.rate
+  applyRateToEl(el)
   syncLoopToEl()
   if (state.current?.kind === 'video') {
     void loadVideoInto(el) // 后挂场景:接力起播(自适应走 shaka,否则原生 src)
   }
 }
 
+/** 同队列切集时字幕跟着走:上一条与这条都是剧集(带 playlist)且字幕开着 → 按**语言**找同一条,
+ *  找不到同语言按序号,再不行关。新点播(任一方不是剧集)一律复位「关」。纯显示层,不碰管线。 */
+function carrySubtitle(prev: NowPlaying | null, np: NowPlaying): number {
+  if (!prev?.playlist || !np.playlist || state.subtitle < 1) return 0
+  const was = prev.subtitles?.[state.subtitle - 1]
+  const list = np.subtitles ?? []
+  if (!was || !list.length) return 0
+  const byLang = was.lang ? list.findIndex((s) => s.lang === was.lang) : -1
+  if (byLang >= 0) return byLang + 1
+  return state.subtitle <= list.length ? state.subtitle : 0
+}
+
 function play(np: NowPlaying) {
-  state.subtitle = 0 // 字幕每次新播放复位「关」(与倍速同口径;用户/模型再开)
+  state.subtitle = carrySubtitle(state.current, np)
   // 悬浮窗(独立 WebView)只显示"正在放",不实际出声 —— 否则与主窗双播(robot 双播坑的多窗变体)
   if (windowLabel() === 'float') {
     state.current = np
@@ -409,8 +440,8 @@ function play(np: NowPlaying) {
   state.status = 'loading'
   state.position = 0
   state.duration = np.duration_seconds ?? 0
-  state.rate = 1 // 倍速不跨播放粘住;音量粘住
-  // 循环/随机镜像:core 每次 Play 全量捎带(新播放的复位、切集/自动续播的延续,这里零猜测)。
+  // 倍速 / 循环 / 随机镜像:core 每次 Play 全量捎带(新点播的复位、切集/自动续播的延续,这里零猜测);音量基准粘住。
+  state.rate = np.rate ?? 1
   state.loopMode = np.loop_mode ?? 'off'
   state.shuffle = np.shuffle ?? false
   syncLoopToEl()
@@ -420,7 +451,7 @@ function play(np: NowPlaying) {
   syncToPeers() // 广播"在放这个"给悬浮窗镜像
   if (np.kind === 'audio') {
     const a = ensureAudio()
-    a.playbackRate = 1
+    applyRateToEl(a)
     const resume = np.resume_at && np.resume_at > 0 ? np.resume_at : 0
     if (np.resume_at != null && state.current) state.current.resume_at = undefined
     a.src = np.stream_url
@@ -485,12 +516,45 @@ function setDucked(on: boolean) {
   else fadeToLive(DUCK_RESTORE_FADE_MS)
 }
 
-/** 倍速 0.25–3:作用到当前元素;新播放复位 1。调完回报 core(进度外推按倍速算)。 */
-function setRate(v: number) {
-  state.rate = Math.min(3, Math.max(0.25, v))
+/** 倍速落地(本地):镜像 + 播放元素 + 回报 core(进度外推按倍速算)。嘴控 Control 事件走这里。 */
+function applyRate(v: number) {
+  state.rate = Math.round(Math.min(RATE_MAX, Math.max(RATE_MIN, v)) * 100) / 100
   const el = activeEl()
-  if (el) el.playbackRate = state.rate
+  if (el) applyRateToEl(el)
   reportToCore()
+}
+
+/** 用户从 UI 改倍速(档位菜单 / 滚轮 / 快捷键):本地即时生效,再经壳层命令落 core 状态 ——
+ *  core 是真相源,切集 / 自动续播的 NowPlaying 据此捎带倍速(与循环/随机按钮同一条路)。 */
+function setRate(v: number) {
+  applyRate(v)
+  if (isTauri()) void api.mediaMode('speed', state.rate).catch(() => {})
+}
+
+/** 倍速档位菜单:复用全局右键菜单宿主(皮肤化、点外 / Esc 自关),当前档打勾。
+ *  视频浮层与音频条的倍速按钮都开它 —— 十档轮转按钮撑不住,菜单一眼选中。 */
+function openRateMenu(e: MouseEvent) {
+  const { openMenu } = useContextMenu()
+  openMenu(
+    e,
+    RATE_STEPS.map((r) => ({
+      label: `${Math.abs(r - state.rate) < 0.001 ? '✓ ' : '  '}${r}x`,
+      action: () => setRate(r),
+    })),
+  )
+}
+
+/** 沿档位表走一档(+1 快 / −1 慢):当前值不在表上时取最近的一档再挪。快捷键 / 滚轮共用。 */
+function stepRate(dir: 1 | -1) {
+  let i = RATE_STEPS.findIndex((r) => Math.abs(r - state.rate) < 0.001)
+  if (i < 0) {
+    i = RATE_STEPS.reduce(
+      (best, r, idx) => (Math.abs(r - state.rate) < Math.abs(RATE_STEPS[best] - state.rate) ? idx : best),
+      0,
+    )
+  }
+  const next = RATE_STEPS[Math.min(RATE_STEPS.length - 1, Math.max(0, i + dir))]
+  if (next !== state.rate) setRate(next)
 }
 
 /** 回报 core 当下播放快照(「此刻」背景的数据源):状态/标题之外带**基准音量、进度、时长、
@@ -648,7 +712,7 @@ function applyControl(action: string, value?: number) {
   else if (action === 'louder') setVolume(state.volume + 0.2)
   else if (action === 'softer') setVolume(state.volume - 0.2)
   else if (action === 'volume' && value != null) setVolume(value / 100) // 绝对音量(core 已校验 0–100)
-  else if (action === 'speed' && value != null) setRate(value)
+  else if (action === 'speed' && value != null) applyRate(value) // core 已落状态,这里只对齐镜像 + 元素
   else if (action === 'seek' && value != null) seek(value)
   else if (action === 'loop_one' || action === 'loop_all' || action === 'loop_off') {
     // 循环/随机:core 已先落状态(嘴控/按钮同一口),这里对齐镜像 + 播放元素
@@ -831,6 +895,8 @@ export function useMedia() {
     setVolume,
     setDucked,
     setRate,
+    stepRate,
+    openRateMenu,
     next: () => advance(1),
     prev: () => advance(-1),
     cycleLoop,

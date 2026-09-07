@@ -292,6 +292,7 @@ export default {
     stop: '停止',
     volume: '音量',
     speed: '倍速',
+    speedPick: '倍速 {rate}x(点击选档,滚轮微调)',
     fullscreen: '全屏',
     closeVideo: '关闭',
     prevEp: '上一集',

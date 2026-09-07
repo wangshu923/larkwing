@@ -495,6 +495,8 @@ export interface NowPlaying {
   loop_mode?: 'off' | 'one' | 'all'
   /** 随机播放镜像(多集队列才可能 true)。 */
   shuffle?: boolean
+  /** 倍速镜像(0.5–3):新点播复位 1、切集/自动续播沿用。可选:浏览器预览假数据可不带(按 1 处理)。 */
+  rate?: number
   /** 全部音轨(本地探测;≥2 条才出切换钮)。缺省/空 = 单音轨或网络流。 */
   audio_tracks?: AudioTrackInfo[]
   /** 可显示的字幕(P4;空/缺 = 这片没有)。url 指向 relay 的 WebVTT 端点,挂成 `<track>`。
