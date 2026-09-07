@@ -985,7 +985,8 @@ impl Engine {
         // 静默时段 / 呈现节流的门在前端(useFloatIdle,本地时钟)。
         let mut cares = Vec::new();
         if self.store.settings.get(None, "care.enabled")?.as_deref() != Some("0") {
-            if let Some(p) = self.store.media_progress.list_recent(user.id, 1)?.into_iter().next() {
+            // 续播进度按家记(2026-09-07):候选取全家最近在看的那部,标题 = 剧名
+            if let Some(p) = self.store.media_progress.list_recent(1)?.into_iter().next() {
                 cares.push(CareCandidate { kind: "resume".into(), title: p.title, updated_at: p.updated_at });
             }
             if let Some(td) = self.store.todos.oldest_open(user.id)? {
@@ -1677,7 +1678,7 @@ impl Engine {
         self.store.todos.delete_for_user(id)?; // 待办
         self.store.confirms.delete_for_user(id)?; // 确认足迹
         self.store.fsops.delete_for_user(id)?; // 文件操作记录
-        self.store.media_progress.delete_for_user(id)?; // 续播进度
+        // 续播进度按家记(2026-09-07 起不再归人),删家人不动它
         self.store.usage.delete_for_user(id)?; // 用量流水
         self.store.users.delete(id)?;
         Ok(())
@@ -3376,11 +3377,10 @@ mod tests {
         let ghost = eng.create_user("旧家人").unwrap().id;
         assert!(ghost > owner, "新家人 id 更大(复用的就是它)");
 
-        // 在这五张无 CASCADE 的表里各塞一条归 ghost 的数据
+        // 在这四张无 CASCADE 的归人表里各塞一条归 ghost 的数据(续播进度 2026-09-07 起按家记,不在此列)
         s.todos.add(ghost, "旧待办").unwrap();
         s.confirms.record(ghost, 1, "web", "example.com", "erase", "delete", "deny", "channel").unwrap();
         s.fsops.record(ghost, "move", "[]", 1).unwrap();
-        s.media_progress.set(ghost, "series:x", "ep1", "1.mp4", 0.0).unwrap();
         s.usage
             .add_round(&crate::store::UsageRound {
                 user_id: ghost,
@@ -3402,16 +3402,15 @@ mod tests {
                 !s.todos.list_open(ghost, 100).unwrap().is_empty(),
                 s.confirms.list_recent(100).unwrap().iter().any(|r| r.user_id == ghost),
                 !s.fsops.list_for(ghost, 100).unwrap().is_empty(),
-                s.media_progress.get(ghost, "series:x").unwrap().is_some(),
                 s.usage.count_for_user(ghost).unwrap() > 0,
             )
         };
-        assert_eq!(present(s), (true, true, true, true, true), "塞数据后五张表都该有 ghost 的行");
+        assert_eq!(present(s), (true, true, true, true), "塞数据后四张表都该有 ghost 的行");
 
         eng.delete_user(ghost).unwrap();
 
-        // 删干净:五张表里归 ghost 的一条不剩
-        assert_eq!(present(s), (false, false, false, false, false), "删家人后五张表都该清空");
+        // 删干净:四张表里归 ghost 的一条不剩
+        assert_eq!(present(s), (false, false, false, false), "删家人后四张表都该清空");
 
         // 复用 id:新家人拿到同一个 id,而且是干净的
         let reborn = eng.create_user("新家人").unwrap().id;

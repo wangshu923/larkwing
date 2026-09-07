@@ -107,7 +107,7 @@ pub trait MediaSource: Send + Sync {
         &self,
         _page_url: &str,
         _cookie_header: Option<&str>,
-    ) -> Result<Option<(String, Vec<EpisodeRef>)>> {
+    ) -> Result<Option<Series>> {
         Ok(None)
     }
 
@@ -282,6 +282,16 @@ pub struct EpisodeRef {
     pub title: String,
 }
 
+/// 发现出来的一部剧集(B 站合集/分P/番剧、本地剧集文件夹、本地音频整夹共用):
+/// `key` = 续播记忆 key(绝不含绝对路径,§6.2);`title` = 剧名(关怀条「继续看《X》」/ 家庭日记用,
+/// 拿不到 None —— 不拿集名冒充);`entries` = 有序集列表(≥2 才成系列)。
+#[derive(Debug, Clone)]
+pub struct Series {
+    pub key: String,
+    pub title: Option<String>,
+    pub entries: Vec<EpisodeRef>,
+}
+
 /// 登录窗口的三件套(壳层 media_login command 消费)。
 #[derive(Debug, Clone, Serialize)]
 pub struct LoginSpec {
@@ -323,6 +333,15 @@ const SPRITE_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 /// 做变速保调,更慢直接静音 —— 原先放行的 0.25 档在 Windows 上是无声的;上限 3 = 前端档位表的顶
 /// (`useMedia.RATE_STEPS`,两处手工同步)。工具描述里的「0.5–3」照抄这里。
 const SPEED_RANGE: std::ops::RangeInclusive<f64> = 0.5..=3.0;
+/// 集内进度落盘节拍(用户拍板「30s 之类」,2026-09-07):前端 15s 一次心跳,core 每 30s 真写一次盘;
+/// 暂停 / 停止 / 切集不受节拍限制,立刻落。断电最多丢半分钟。
+const PROGRESS_PERSIST_EVERY: Duration = Duration::from_secs(30);
+/// 续播读侧三道闸(单源;§4.11 过程默认,用户嫌不对回来改):
+/// 看了不到 30 秒 = 还没开始看,下次从头;离结尾不到 90 秒 = 看完了(片尾字幕区),下次从下一集开头;
+/// 总长不到 10 分钟的内容(歌 / 短片)不记集内位置 —— 重听从头是常识,记了反而怪。
+const RESUME_HEAD_S: f64 = 30.0;
+const RESUME_TAIL_S: f64 = 90.0;
+const RESUME_MIN_DURATION_S: f64 = 600.0;
 
 /// 前端播放器的「此刻」状态快照。播放真相在前端 WebView(播放在那跑、放完只有它知道);
 /// core 起播时乐观 seed,前端在生命周期切换(playing/paused/ended/stop)+ 音量/倍速/seek 调整
@@ -404,6 +423,8 @@ struct Playlist {
     /// 续播记忆的 key(B 站 season id/bvid;本地视频 `local:FNV(目录+骨架)`、
     /// 本地音频 `local:FNV(目录+audio)` —— 音频整夹一个队列,从哪首进都是同一个 key)。
     series_key: String,
+    /// 剧名(进度表 series_title / 关怀条用;拿不到 None)。
+    series_title: Option<String>,
     entries: Vec<EpisodeRef>,
     /// 当前集下标。
     index: usize,
@@ -414,6 +435,15 @@ struct Playlist {
     shuffle: bool,
     /// 随机播放履历(这一轮已放过的队列下标,当前一首恒在末位;shuffle_on 时重置为 [当前])。
     played: Vec<usize>,
+}
+
+/// 当前播放内容在续播表里的身份(起播成功时记下;前端心跳据此落集内位置;停播即清)。
+/// `title` 用来核对心跳 —— 切集 / 换片瞬间迟到的旧心跳带着旧标题,不许写进新一集的行。
+#[derive(Debug, Clone)]
+struct ProgressTarget {
+    key: String,
+    episode_id: String,
+    title: String,
 }
 
 /// 当前本地播放的现场(切音轨重建管线用;app 级瞬态,§6.4 派生可丢:丢了 = 切不了轨,不出错)。
@@ -459,6 +489,9 @@ struct Inner {
     rate: Mutex<f64>,
     /// 当前本地播放现场(切音轨用;None = 没在放本地内容)。
     current_local: Mutex<Option<CurrentLocal>>,
+    /// 当前内容的续播身份 + 上次落盘时刻(节拍见 PROGRESS_PERSIST_EVERY)。None = 不记进度。
+    progress: Mutex<Option<ProgressTarget>>,
+    progress_at: Mutex<Option<std::time::Instant>>,
     /// BT 下载引擎(懒建,同 relay):不用 BT 的用户零成本,且**不会平白发 DHT 包**。
     torrent: tokio::sync::OnceCell<torrent::TorrentEngine>,
 }
@@ -493,6 +526,8 @@ impl MediaRuntime {
                 audio_track_lang: Mutex::new(None),
                 rate: Mutex::new(1.0),
                 current_local: Mutex::new(None),
+                progress: Mutex::new(None),
+                progress_at: Mutex::new(None),
                 torrent: tokio::sync::OnceCell::new(),
             }),
         }
@@ -595,7 +630,7 @@ impl MediaRuntime {
                 let this = self.clone();
                 handle.spawn(async move {
                     // 重放走完整 play(会重建队列):带新 cookie 重新发现合集/分P,resume 规则照常生效。
-                    if let Err(e) = this.play(p.user_id, &p.page_url, p.audio_only, false).await {
+                    if let Err(e) = this.play(p.user_id, &p.page_url, p.audio_only, false, None).await {
                         tracing::warn!("登录后自动重放失败: {e:#}");
                     }
                 });
@@ -697,8 +732,9 @@ impl MediaRuntime {
     }
 
     /// 播放(用户发起):先**发现剧集队列**(B 站合集/分P → view API;本地 → 同文件夹扫描),
-    /// 套用**续播规则**定起播集,再把那一集交给 `play_entry` 现取现播。`restart=true`(用户说
-    /// 「从头/重新看」)= 忽略续播存档、从第一集起。单个内容(电影/单曲)队列为空,退化成原行为。
+    /// 套用**续播规则**定起播集(见 `build_queue`),再把那一集交给 `play_entry` 现取现播。
+    /// `restart=true`(用户说「从头/重新看」)= 忽略续播存档、从第一集起;`episode=Some(N)`(用户点名
+    /// 「看第五集」)= 放第 N 集。单个内容(电影/单曲):队列为空,电影按文件身份续播集内位置。
     /// 错误向上抛(工具层转成喂模型的观察)。
     pub async fn play(
         &self,
@@ -706,6 +742,7 @@ impl MediaRuntime {
         page_url: &str,
         audio_only: bool,
         restart: bool,
+        episode: Option<usize>,
     ) -> Result<PlayOutcome> {
         self.prefetch_ffmpeg(); // 后台预取(首次播放任何媒体即触发),不阻塞本次播放
         // 新播放请求 = 新内容意图:循环/音轨/倍速都复位;切集不经这里 —— 三者跨集粘住
@@ -731,20 +768,29 @@ impl MediaRuntime {
         } else {
             (page_url, audio_only)
         };
-        let (pos, target) = self.build_queue(user_id, page_url, audio_only, restart).await;
-        self.play_entry(user_id, &target, audio_only, pos).await
+        let (pos, target, resume_at) =
+            self.build_queue(page_url, audio_only, restart, episode).await?;
+        self.play_entry(user_id, &target, audio_only, pos, resume_at).await
     }
 
-    /// 发现并装配剧集队列,返回 `(起播集的队列位置, 该集可播地址)`。
-    /// **续播规则**:仅当请求落在「自然起点」(requested_index==0)且非 restart 时,才用存档跳到上次那集
-    /// (`resumed=true`);用户点名某集(index>0)→ 就放那集、不跳。单集/发现失败 → 清队列、(None, 原 url)。
+    /// 发现并装配剧集队列,返回 `(起播集的队列位置, 该集可播地址, 集内续播位)`。
+    ///
+    /// **续播规则(2026-09-07 改)**:传进来的路径 / 链接**只用来认剧,不再从「传的是第几集」推断意图**
+    /// —— 模型习惯拿上次用过的某一集路径当整部剧的把手,老规则把它当「点名要看那集」,进度都不查
+    /// (真机「昨晚看到 4 集今天回到 2 集」的病灶)。现在:
+    ///   · `episode=Some(N)`(用户点名)→ 第 N 集从头,不查进度;越界如实退回;
+    ///   · `restart` → 第一集从头;
+    ///   · 否则有进度就接上:停在第 i 集 → 第 i 集 + 集内位置(够长才续,`resume_position`);
+    ///     第 i 集已看完 → 第 i+1 集从头;末集看完 = 整部从头(resumed=false);
+    ///   · 没进度(第一次看)→ 传的那个文件所在的集,匹配不上 → 第一集。
+    /// 单集 / 发现失败 → 清队列;电影按文件身份查集内位置。决策落一行 info 日志(排查续播问题靠它)。
     async fn build_queue(
         &self,
-        user_id: i64,
         page_url: &str,
         audio_only: bool,
         restart: bool,
-    ) -> (Option<PlaylistPos>, String) {
+        episode: Option<usize>,
+    ) -> Result<(Option<PlaylistPos>, String, Option<f64>)> {
         let discovered = if is_local_path(page_url) {
             local_episodes(std::path::Path::new(page_url))
         } else if let Some(source) = self.source_of_url(page_url) {
@@ -761,38 +807,79 @@ impl MediaRuntime {
             None
         };
 
-        // 不成系列(单集 / 发现失败 / <2 集)→ 清队列,退化成单集播放。
-        let Some((key, entries)) = discovered.filter(|(_, e)| e.len() >= 2) else {
+        // 不成系列(单集 / 发现失败 / <2 集)→ 清队列,退化成单集播放;电影按文件身份续播集内位置。
+        let Some(Series { key, title: series_title, entries }) =
+            discovered.filter(|s| s.entries.len() >= 2)
+        else {
             *self.inner.playlist.lock().unwrap() = None;
-            return (None, page_url.to_string());
+            anyhow::ensure!(episode.is_none(), "这不是多集内容,没有「第几集」可选");
+            let resume_at = if restart || audio_only {
+                None
+            } else {
+                let key = single_key(page_url);
+                let prog = self.inner.store.media_progress.get(&key).ok().flatten();
+                let at = prog.as_ref().and_then(resume_position);
+                tracing::info!(
+                    key = %key,
+                    stored = ?prog.as_ref().map(|p| (p.position_seconds, p.duration_seconds, p.finished)),
+                    resume_at = ?at,
+                    "续播决策(单部)"
+                );
+                at
+            };
+            return Ok((None, page_url.to_string(), resume_at));
         };
 
-        // requested = 用户实际点的那集在队列里的位置(本地按绝对路径、B 站按 page_url 精确匹配;
-        // 分P 的 P1 用裸 bvid url 对齐)。找不到 → 0(自然起点)。
-        let requested = entries.iter().position(|e| e.url == page_url).unwrap_or(0);
-        let mut index = requested;
-        let mut resumed = false;
-        if !restart && requested == 0 {
-            if let Some(prog) = self.inner.store.media_progress.get(user_id, &key).ok().flatten() {
-                if let Some(i) = entries.iter().position(|e| e.id == prog.episode_id) {
-                    index = i;
-                    resumed = i != 0; // 跳到非首集才算「接着上次」
+        let total = entries.len();
+        // requested = 传进来的那个文件 / 链接落在队列的第几集(本地按绝对路径、B 站按 page_url 精确匹配;
+        // 分P 的 P1 用裸 bvid url 对齐)—— 只在**没有进度**时当起点用。
+        let requested = entries.iter().position(|e| e.url == page_url);
+        let prog = self.inner.store.media_progress.get(&key).ok().flatten();
+        let stored = match &prog {
+            Some(p) => entries.iter().position(|e| e.id == p.episode_id).map(|i| (i, p)),
+            None => None,
+        };
+        let (index, resumed, resume_at) = match (episode, restart, stored) {
+            (Some(n), _, _) => {
+                anyhow::ensure!((1..=total).contains(&n), "这部一共 {total} 集,没有第 {n} 集");
+                (n - 1, false, None)
+            }
+            (None, true, _) => (0, false, None),
+            (None, false, Some((i, p))) if p.finished => {
+                // 上次那集看完了:接下一集;末集看完 = 整部看完,从头(不算「接着上次」)
+                if i + 1 < total {
+                    (i + 1, true, None)
+                } else {
+                    (0, false, None)
                 }
             }
-        }
-        let total = entries.len();
+            (None, false, Some((i, p))) => {
+                let at = resume_position(p);
+                (i, i != 0 || at.is_some(), at)
+            }
+            (None, false, None) => (requested.unwrap_or(0), false, None),
+        };
+        tracing::info!(
+            key = %key,
+            requested = ?requested,
+            stored = ?prog.as_ref().map(|p| (p.episode_id.as_str(), p.position_seconds, p.finished)),
+            episode,
+            restart,
+            chosen = index,
+            resume_at = ?resume_at,
+            "续播决策"
+        );
         let target = entries[index].url.clone();
-        // 落进度(起播即记)。失败不挡播放 —— 续播是锦上添花。
-        let _ = self.inner.store.media_progress.set(user_id, &key, &entries[index].id, &entries[index].title, 0.0);
         *self.inner.playlist.lock().unwrap() = Some(Playlist {
             series_key: key,
+            series_title,
             entries,
             index,
             audio_only,
             shuffle: false,
             played: Vec::new(),
         });
-        (Some(PlaylistPos { index, total, resumed }), target)
+        Ok((Some(PlaylistPos { index, total, resumed }), target, resume_at))
     }
 
     /// 上/下一集(嘴控「下一集」、播放器按钮、`ended` 自动续播都汇到这):在**现有队列**里挪
@@ -855,15 +942,14 @@ impl MediaRuntime {
             };
             pl.index = new;
             let e = &pl.entries[pl.index];
-            // 切集即落进度(下次续播接得上)。
-            let _ = self.inner.store.media_progress.set(user_id, &pl.series_key, &e.id, &e.title, 0.0);
+            // 进度由 play_entry 起播成功时落(切集失败 = 进度停在原来那集,如实)。
             (
                 e.url.clone(),
                 pl.audio_only,
                 PlaylistPos { index: pl.index, total, resumed: false },
             )
         };
-        self.play_entry(user_id, &target_url, audio_only, Some(pos)).await
+        self.play_entry(user_id, &target_url, audio_only, Some(pos), None).await
     }
 
     /// 一集自然放完(前端 `ended` 的唯一 core 入口):按循环/随机决定接下来放什么。
@@ -893,17 +979,34 @@ impl MediaRuntime {
     }
 
     /// 放**一集**(队列已定;不碰队列):本地直走文件端点,网络走 yt-dlp 解析 → 注册转发。
-    /// `pos` = 这一集在队列里的位置(None = 单集),会写进 `NowPlaying.playlist`。`play`/`advance` 共用。
+    /// `pos` = 这一集在队列里的位置(None = 单集),会写进 `NowPlaying.playlist`;`resume_at` = 集内续播位
+    /// (前端加载完 seek 过去)。`play`/`advance` 共用。起播成功即登记续播身份 + 落「现在放到哪一集」。
     async fn play_entry(
         &self,
         user_id: i64,
         page_url: &str,
         audio_only: bool,
         pos: Option<PlaylistPos>,
+        resume_at: Option<f64>,
+    ) -> Result<PlayOutcome> {
+        let outcome = self.play_entry_inner(user_id, page_url, audio_only, pos, resume_at).await?;
+        if let PlayOutcome::Playing(np) = &outcome {
+            self.track_progress(np, page_url, resume_at, user_id);
+        }
+        Ok(outcome)
+    }
+
+    async fn play_entry_inner(
+        &self,
+        user_id: i64,
+        page_url: &str,
+        audio_only: bool,
+        pos: Option<PlaylistPos>,
+        resume_at: Option<f64>,
     ) -> Result<PlayOutcome> {
         if is_local_path(page_url) {
             return self
-                .play_local(page_url, audio_only, pos, true, None)
+                .play_local(page_url, audio_only, pos, true, resume_at)
                 .await
                 .map(PlayOutcome::Playing);
         }
@@ -1061,7 +1164,7 @@ impl MediaRuntime {
             rate: self.rate(),
             audio_tracks: Vec::new(),
             audio_track: 0,
-            resume_at: None,
+            resume_at,
             // 网络流没帧可抽,预览图来自源的雪碧图(B 站 videoshot,见 MediaSource::sprites);
             // 源给不出 = None = 拖进度条只出时间气泡。
             thumb_url,
@@ -1900,6 +2003,92 @@ impl MediaRuntime {
         *self.inner.rate.lock().unwrap()
     }
 
+    /// 起播成功:登记续播身份(前端心跳据此落集内位置)+ 落「现在放到这一集 / 这部」。
+    /// 剧集按队列身份;单部**视频**按文件 / 链接身份(电影看一半明天接着看);单曲不记
+    /// (歌重听从头是常识)。失败不挡播放 —— 续播是锦上添花,只 warn。
+    fn track_progress(&self, np: &NowPlaying, page_url: &str, resume_at: Option<f64>, user_id: i64) {
+        let audio = matches!(np.kind, MediaKind::Audio);
+        let target = match &np.playlist {
+            Some(p) => {
+                let guard = self.inner.playlist.lock().unwrap();
+                guard.as_ref().and_then(|pl| pl.entries.get(p.index)).map(|e| {
+                    let series_title = guard.as_ref().and_then(|pl| pl.series_title.clone());
+                    (pl_key(&guard), e.id.clone(), e.title.clone(), series_title.unwrap_or_default())
+                })
+            }
+            None if audio => None,
+            None => Some((
+                single_key(page_url),
+                single_episode_id(page_url),
+                np.title.clone(),
+                np.title.clone(),
+            )),
+        };
+        let Some((key, episode_id, title, series_title)) = target else {
+            *self.inner.progress.lock().unwrap() = None;
+            return;
+        };
+        if let Err(e) = self.inner.store.media_progress.set_episode(
+            &key,
+            &episode_id,
+            &title,
+            &series_title,
+            resume_at.unwrap_or(0.0),
+            Some(user_id),
+        ) {
+            tracing::warn!("续播进度落不了盘(不影响播放): {e:#}");
+        }
+        *self.inner.progress.lock().unwrap() =
+            Some(ProgressTarget { key, episode_id, title: np.title.clone() });
+        *self.inner.progress_at.lock().unwrap() = Some(std::time::Instant::now());
+    }
+
+    /// 前端心跳 / 暂停 / 停止 → 集内位置落盘(节拍 PROGRESS_PERSIST_EVERY;暂停 / 停止立刻)。
+    /// 只认标题对得上的回报(切集瞬间迟到的旧心跳不许写进新一集);短内容不记;
+    /// 停播后清身份。`finished` = 播到片尾区,下次从下一集开头起。
+    fn persist_progress(&self, r: &PlaybackReport) {
+        let Some(target) = self.inner.progress.lock().unwrap().clone() else { return };
+        let idle = r.status == "idle";
+        if !idle && r.title.as_deref() != Some(target.title.as_str()) {
+            return; // 别的内容的回报(切集 / 换片竞态),不是这一行的
+        }
+        let Some(pos) = r.position.filter(|p| p.is_finite() && *p >= 0.0) else {
+            if idle {
+                *self.inner.progress.lock().unwrap() = None;
+            }
+            return;
+        };
+        let dur = r.duration.filter(|d| d.is_finite() && *d > 0.0).unwrap_or(0.0);
+        let immediate = idle || r.status == "paused";
+        if !immediate {
+            let mut at = self.inner.progress_at.lock().unwrap();
+            if at.is_some_and(|t| t.elapsed() < PROGRESS_PERSIST_EVERY) {
+                return;
+            }
+            *at = Some(std::time::Instant::now());
+        }
+        // 短内容(歌 / 短片)不记集内位置:重听从头是常识,记了反而怪
+        if dur > 0.0 && dur < RESUME_MIN_DURATION_S {
+            if idle {
+                *self.inner.progress.lock().unwrap() = None;
+            }
+            return;
+        }
+        let finished = dur > 0.0 && pos >= dur - RESUME_TAIL_S;
+        if let Err(e) = self.inner.store.media_progress.set_position(
+            &target.key,
+            &target.episode_id,
+            pos,
+            dur,
+            finished,
+        ) {
+            tracing::warn!("集内进度落不了盘: {e:#}");
+        }
+        if idle {
+            *self.inner.progress.lock().unwrap() = None;
+        }
+    }
+
     /// 循环/随机模式镜像(NowPlaying 每次捎带全量,前端以此对齐 el.loop/按钮态,零猜测)。
     fn mode_flags(&self) -> (String, bool) {
         let loop_mode = self.inner.loop_mode.lock().unwrap().as_str().to_string();
@@ -1927,23 +2116,27 @@ impl MediaRuntime {
     /// 集数位置(pos)由 core 起播/切集时 seed,前端回报不带 → 这里**保留**已有 pos;
     /// 音量也粘住(idle 不清,与前端「跨播放粘住」一致);其余 idle 清空。
     pub fn set_playback(&self, r: PlaybackReport) {
-        let mut guard = self.inner.playback.lock().unwrap();
-        let volume_pct =
-            r.volume.map(|v| v.clamp(0.0, 100.0).round() as u8).or(guard.volume_pct);
-        *guard = match r.status.as_str() {
-            "idle" => Playback { volume_pct, ..Playback::default() },
-            // paused 只认显式;playing / loading / 其它 → 正在播
-            s => Playback {
-                title: r.title,
-                paused: s == "paused",
-                pos: guard.pos,
-                volume_pct,
-                position_secs: r.position,
-                duration_secs: r.duration.filter(|d| *d > 0.0),
-                rate: r.rate,
-                at: Some(std::time::Instant::now()),
-            },
-        };
+        {
+            let mut guard = self.inner.playback.lock().unwrap();
+            let volume_pct =
+                r.volume.map(|v| v.clamp(0.0, 100.0).round() as u8).or(guard.volume_pct);
+            *guard = match r.status.as_str() {
+                "idle" => Playback { volume_pct, ..Playback::default() },
+                // paused 只认显式;playing / loading / 其它 → 正在播
+                s => Playback {
+                    title: r.title.clone(),
+                    paused: s == "paused",
+                    pos: guard.pos,
+                    volume_pct,
+                    position_secs: r.position,
+                    duration_secs: r.duration.filter(|d| *d > 0.0),
+                    rate: r.rate,
+                    at: Some(std::time::Instant::now()),
+                },
+            };
+        }
+        // 同一条心跳顺手落集内进度(续播「第几秒」的唯一数据源;节拍与闸在 persist_progress)
+        self.persist_progress(&r);
     }
 
     /// 「此刻」播放器状态的一行背景:回合装配追加到末条 user 喂模型,让它任何时候都拿得到
@@ -2066,7 +2259,7 @@ pub fn is_local_path(s: &str) -> bool {
 /// 数字骨架分组防误判:把文件名里的数字段抹成 `#` 当骨架 —— `小猪佩奇E01/E02` 同骨架 `小猪佩奇E#`
 /// = 一季;`肖申克的救赎 / 阿甘正传` 骨架各异 = 各自单独不续播。`series_key` = `local:FNV(小写父目录+骨架)`
 /// **单向哈希,绝不落绝对路径**(§6.2);整棵目录搬走仍对得上(同相对结构 → 同 key)。
-fn local_episodes(current: &std::path::Path) -> Option<(String, Vec<EpisodeRef>)> {
+fn local_episodes(current: &std::path::Path) -> Option<Series> {
     // 目录入参(音频文件夹,`play()` 已归一):整夹音频即队列,起点 = 排序后第一首
     //(build_queue 按 url 匹配不到目录 → requested=0 = 自然起点,续播规则照常适用)。
     if current.is_dir() {
@@ -2104,7 +2297,57 @@ fn local_episodes(current: &std::path::Path) -> Option<(String, Vec<EpisodeRef>)
     }
     group.sort_by(|a, b| natural_cmp(a, b));
     let key_material = format!("{}\u{1f}{}", parent.to_string_lossy().to_lowercase(), cur_skel);
-    Some((format!("local:{}", fnv1a_hex(&key_material)), folder_entries(parent, &group)))
+    Some(Series {
+        key: format!("local:{}", fnv1a_hex(&key_material)),
+        title: folder_title(parent),
+        entries: folder_entries(parent, &group),
+    })
+}
+
+/// 本地剧集的剧名 = 所在文件夹名(家里的剧集夹通常就叫剧名;盘根 / 拿不到 → None)。
+fn folder_title(dir: &std::path::Path) -> Option<String> {
+    dir.file_name().map(|s| s.to_string_lossy().into_owned()).filter(|s| !s.is_empty())
+}
+
+/// 单部内容(电影 / 单个网页视频)的续播 key:本地按小写全路径哈希(**不落绝对路径**,§6.2)、
+/// 网络按页面地址哈希。与剧集 key 前缀不同,不串。
+fn single_key(page_url: &str) -> String {
+    if is_local_path(page_url) {
+        format!("local:file:{}", fnv1a_hex(&page_url.to_lowercase()))
+    } else {
+        format!("web:{}", fnv1a_hex(page_url))
+    }
+}
+
+/// 单部内容在进度表里的「集身份」:本地 = 文件名(相对名,不带目录),网络 = 页面地址。
+fn single_episode_id(page_url: &str) -> String {
+    if is_local_path(page_url) {
+        std::path::Path::new(page_url)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| page_url.to_string())
+    } else {
+        page_url.to_string()
+    }
+}
+
+/// 当前队列的 series_key(track_progress 用;锁由调用方持有)。
+fn pl_key(guard: &std::sync::MutexGuard<'_, Option<Playlist>>) -> String {
+    guard.as_ref().map(|pl| pl.series_key.clone()).unwrap_or_default()
+}
+
+/// 续播读侧:这条进度值得「接着放」吗?看完 / 看了不到 30 秒 / 离结尾不到 90 秒 / 内容太短 → None。
+fn resume_position(p: &crate::store::Progress) -> Option<f64> {
+    if p.finished || p.position_seconds < RESUME_HEAD_S {
+        return None;
+    }
+    if p.duration_seconds > 0.0
+        && (p.duration_seconds < RESUME_MIN_DURATION_S
+            || p.position_seconds >= p.duration_seconds - RESUME_TAIL_S)
+    {
+        return None;
+    }
+    Some(p.position_seconds)
 }
 
 /// 目录判定:本地路径且真是目录(非本地/不存在都算否;fs 探一次,亚毫秒)。
@@ -2177,13 +2420,17 @@ fn audio_folder_files(dir: &std::path::Path) -> Vec<String> {
 /// 音频整夹队列:<2 首不成队列(单曲不出集数 UI)。series_key 只认「哪个文件夹」
 /// (目录 + audio 桶标记)——从任一首进、或直接给文件夹,都是同一个 key → 续播记录共享。
 /// (原音频骨架 key 的老续播记录〔有声书章节类〕一次性失联,之后照常;拍板可接受。)
-fn audio_folder_queue(dir: &std::path::Path) -> Option<(String, Vec<EpisodeRef>)> {
+fn audio_folder_queue(dir: &std::path::Path) -> Option<Series> {
     let group = audio_folder_files(dir);
     if group.len() < 2 {
         return None;
     }
     let key_material = format!("{}\u{1f}audio", dir.to_string_lossy().to_lowercase());
-    Some((format!("local:{}", fnv1a_hex(&key_material)), folder_entries(dir, &group)))
+    Some(Series {
+        key: format!("local:{}", fnv1a_hex(&key_material)),
+        title: folder_title(dir),
+        entries: folder_entries(dir, &group),
+    })
 }
 
 /// 文件名列表 → 队列条目(id = 相对文件名〔续播记忆存它,绝不落绝对路径 §6.2〕,url = 绝对路径)。
@@ -2325,7 +2572,7 @@ mod tests {
         assert_eq!(rt.rate(), 2.0);
         let empty = std::env::temp_dir().join(format!("lw-speed-reset-{}", std::process::id()));
         std::fs::create_dir_all(&empty).unwrap();
-        assert!(rt.play(1, &empty.to_string_lossy(), false, false).await.is_err());
+        assert!(rt.play(1, &empty.to_string_lossy(), false, false, None).await.is_err());
         assert_eq!(rt.rate(), 1.0, "新点播复位倍速");
         let _ = std::fs::remove_dir_all(&empty);
     }
@@ -2407,7 +2654,7 @@ mod tests {
         touch(&dir, "小猪佩奇 第1集.srt"); // 非媒体,过滤
         touch(&dir, "无关电影.mp4"); // 骨架不同,排除
 
-        let (key, eps) = local_episodes(&e2).expect("应识别为剧集");
+        let Series { key, entries: eps, .. } = local_episodes(&e2).expect("应识别为剧集");
         assert!(key.starts_with("local:"));
         assert_eq!(eps.len(), 3, "三集,排除字幕与无关电影");
         // 自然排序:1 < 2 < 10
@@ -2451,13 +2698,13 @@ mod tests {
         touch(&dir, "说明.txt"); // 非媒体,过滤
         touch(&dir, "短片.mp4"); // 视频不混进音频桶
 
-        let (key_a, eps) = local_episodes(&a).expect("整夹音频应组队");
+        let Series { key: key_a, entries: eps, .. } = local_episodes(&a).expect("整夹音频应组队");
         assert_eq!(eps.len(), 2, "只收音频");
         assert!(eps.iter().all(|e| e.id.ends_with(".mp3") || e.id.ends_with(".flac")));
         assert!(!eps[0].id.contains('/') && !eps[0].id.contains('\\'), "id 是相对名");
         // 从另一首进、或直接给文件夹:同一个 key + 同一份队列(续播记录共享)
-        let (key_b, _) = local_episodes(&b).unwrap();
-        let (key_dir, eps_dir) = local_episodes(&dir).unwrap();
+        let key_b = local_episodes(&b).unwrap().key;
+        let Series { key: key_dir, entries: eps_dir, .. } = local_episodes(&dir).unwrap();
         assert_eq!(key_a, key_b);
         assert_eq!(key_a, key_dir);
         assert_eq!(eps.len(), eps_dir.len());
@@ -2474,6 +2721,7 @@ mod tests {
     fn mk_shuffle_playlist(n: usize) -> Playlist {
         Playlist {
             series_key: "local:test".into(),
+            series_title: None,
             entries: (0..n)
                 .map(|i| EpisodeRef {
                     id: format!("{i}.mp3"),
@@ -2573,14 +2821,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         touch(&dir, "唯一.mp4");
         let err =
-            rt.play(1, &dir.to_string_lossy(), false, false).await.unwrap_err().to_string();
+            rt.play(1, &dir.to_string_lossy(), false, false, None).await.unwrap_err().to_string();
         assert!(err.contains("没有能播放的音频"), "空音频文件夹如实退回: {err}");
         // 恰一首:退化成放那一首(单曲,无队列,仍强制只出声)
         let solo = std::env::temp_dir().join(format!("lw-audio-one-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&solo);
         std::fs::create_dir_all(&solo).unwrap();
         touch(&solo, "独一首.mp3");
-        match rt.play(1, &solo.to_string_lossy(), false, false).await.unwrap() {
+        match rt.play(1, &solo.to_string_lossy(), false, false, None).await.unwrap() {
             PlayOutcome::Playing(np) => {
                 assert!(matches!(np.kind, MediaKind::Audio), "目录入参强制只出声");
                 assert!(np.playlist.is_none(), "单曲不出队列");
@@ -2605,7 +2853,7 @@ mod tests {
         };
 
         // 目录入参:整夹组队、强制只出声、从第一首起;循环镜像随 Play 捎带
-        let np = plist(rt.play(1, &dir.to_string_lossy(), false, false).await.unwrap());
+        let np = plist(rt.play(1, &dir.to_string_lossy(), false, false, None).await.unwrap());
         assert!(matches!(np.kind, MediaKind::Audio));
         let pos = np.playlist.expect("整夹应组队");
         assert_eq!((pos.index, pos.total), (0, 3));
@@ -2643,7 +2891,7 @@ mod tests {
         assert!(rt.auto_next(1).await.unwrap().is_none(), "随机放完一轮且不循环 → 收尾");
 
         // 新播放请求复位循环(音量粘住、循环不粘)
-        let np = plist(rt.play(1, &dir.to_string_lossy(), false, true).await.unwrap());
+        let np = plist(rt.play(1, &dir.to_string_lossy(), false, true, None).await.unwrap());
         assert_eq!(np.loop_mode, "off", "新 play() 复位循环");
     }
 
@@ -2655,7 +2903,7 @@ mod tests {
         let f = dir.join("儿歌串烧.mp3");
         std::fs::write(&f, b"FAKE-MP3-BYTES").unwrap();
 
-        let np = match rt.play(1, &f.to_string_lossy(), true, false).await.unwrap() {
+        let np = match rt.play(1, &f.to_string_lossy(), true, false, None).await.unwrap() {
             PlayOutcome::Playing(np) => np,
             other => panic!("本地文件应为 Playing,实际 {other:?}"),
         };
@@ -2669,7 +2917,7 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap(), AppEvent::Media(MediaEvent::Play(_))));
 
         // 不存在的文件 = 错误观察
-        assert!(rt.play(1, "/no/such/file.mp4", false, false).await.is_err());
+        assert!(rt.play(1, "/no/such/file.mp4", false, false, None).await.is_err());
     }
 
     /// 分流按内容不按扩展名的端到端守卫(2026-08-07 黑屏回归):`.mp4` 里装 MPEG-TS —— 编码
@@ -2699,7 +2947,7 @@ mod tests {
         assert!(ok, "生成 mpegts 夹具失败");
         assert_eq!(probe::sniff_container(&fake), probe::Container::Foreign("mpegts"));
 
-        let np = match rt.play(1, &fake.to_string_lossy(), false, false).await.unwrap() {
+        let np = match rt.play(1, &fake.to_string_lossy(), false, false, None).await.unwrap() {
             PlayOutcome::Playing(np) => np,
             other => panic!("应为 Playing,实际 {other:?}"),
         };
@@ -2770,7 +3018,7 @@ mod tests {
             .success();
         assert!(ok, "生成 {container} 夹具失败");
 
-        let np = match rt.play(1, &src.to_string_lossy(), false, false).await.unwrap() {
+        let np = match rt.play(1, &src.to_string_lossy(), false, false, None).await.unwrap() {
             PlayOutcome::Playing(np) => np,
             other => panic!("应为 Playing,实际 {other:?}"),
         };
@@ -2862,7 +3110,7 @@ mod tests {
             .success();
         assert!(ok, "生成双音轨夹具失败");
 
-        let np = match rt.play(1, &src.to_string_lossy(), false, false).await.unwrap() {
+        let np = match rt.play(1, &src.to_string_lossy(), false, false, None).await.unwrap() {
             PlayOutcome::Playing(np) => np,
             other => panic!("应为 Playing,实际 {other:?}"),
         };
@@ -2923,7 +3171,7 @@ mod tests {
             .success();
         assert!(ok, "生成带内嵌字幕的夹具失败");
 
-        let np = match rt.play(1, &src.to_string_lossy(), false, false).await.unwrap() {
+        let np = match rt.play(1, &src.to_string_lossy(), false, false, None).await.unwrap() {
             PlayOutcome::Playing(np) => np,
             other => panic!("应为 Playing,实际 {other:?}"),
         };
@@ -2961,7 +3209,7 @@ mod tests {
         };
 
         // 起播第1集 → 三集队列,位置 0/3,非续播
-        let pos = plist(rt.play(1, &e1, false, false).await.unwrap());
+        let pos = plist(rt.play(1, &e1, false, false, None).await.unwrap());
         assert_eq!((pos.index, pos.total, pos.resumed), (0, 3, false));
 
         // 自动/手动续播:下一集 → 1,再下一集 → 2
@@ -2973,15 +3221,20 @@ mod tests {
         assert_eq!(plist(rt.advance(1, -1).await.unwrap()).index, 1);
 
         // 进度此刻停在第2集 → 重放(点首集/没点集)续播跳回第2集
-        let pos = plist(rt.play(1, &e1, false, false).await.unwrap());
+        let pos = plist(rt.play(1, &e1, false, false, None).await.unwrap());
         assert_eq!((pos.index, pos.resumed), (1, true), "应接着上次第2集");
 
         // restart=true → 回第1集、不续播
-        let pos = plist(rt.play(1, &e1, false, true).await.unwrap());
+        let pos = plist(rt.play(1, &e1, false, true, None).await.unwrap());
         assert_eq!((pos.index, pos.resumed), (0, false));
 
-        // 点名放第3集(index>0)→ 就放那集,不被续播带走
-        assert_eq!(plist(rt.play(1, &e3, false, false).await.unwrap()).index, 2);
+        // 2026-09-07 改:传第3集的**路径**不再算点名(路径只用来认剧)—— 有进度就接进度(此刻第1集)。
+        // 老规则把它当「点名要看那集」,模型拿上次的路径当剧的把手时进度就被绕过(真机回到第 2 集)。
+        assert_eq!(plist(rt.play(1, &e3, false, false, None).await.unwrap()).index, 0, "路径不是点名");
+        // 点名 = episode 参数:看第3集 → index 2;越界如实报
+        assert_eq!(plist(rt.play(1, &e3, false, false, Some(3)).await.unwrap()).index, 2);
+        let err = rt.play(1, &e1, false, false, Some(9)).await.unwrap_err().to_string();
+        assert!(err.contains("一共 3 集"), "越界报错要说清共几集: {err}");
 
         // 第 N 集绝对定位(嘴控「看第一集」= 1 起数):跳到第1集 → index 0
         let pos = plist(rt.jump_to_episode(1, 1).await.unwrap());
@@ -2992,13 +3245,79 @@ mod tests {
         assert!(err.contains("一共 3 集"), "越界报错要说清共几集: {err}");
         assert!(rt.jump_to_episode(1, 0).await.is_err(), "第 0 集(1 起数)被拒");
         // 跳集也落续播进度:重放(自然起点)接到刚跳的第1集 → resumed=false(本就是首集)
-        let pos = plist(rt.play(1, &e1, false, false).await.unwrap());
+        let pos = plist(rt.play(1, &e1, false, false, None).await.unwrap());
         assert_eq!((pos.index, pos.resumed), (0, false), "进度已被 jump 更新到第1集");
 
         // 没有队列时 advance / jump 都报错(没在放剧集)
         let (rt2, _rx2) = runtime("noqueue");
         assert!(rt2.advance(1, 1).await.is_err());
         assert!(rt2.jump_to_episode(1, 2).await.is_err());
+    }
+
+    /// 集内续播(2026-09-07):前端心跳 / 暂停落「第几秒」,再放接着那一秒;播到片尾区 = 看完 →
+    /// 下次从下一集开头;末集看完 = 整部从头;别的内容的迟到心跳写不进;电影按文件身份同样续。
+    #[tokio::test]
+    async fn position_resume_finished_and_movie_progress() {
+        let (rt, _rx) = runtime("posresume");
+        let dir = std::env::temp_dir().join(format!("lw-pos-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |n: &str| {
+            let f = dir.join(n);
+            std::fs::write(&f, b"x").unwrap();
+            f.to_string_lossy().to_string()
+        };
+        let e1 = mk("剧 第1集.mp4");
+        let _e2 = mk("剧 第2集.mp4");
+        let _e3 = mk("剧 第3集.mp4");
+        let np_of = |o: PlayOutcome| match o {
+            PlayOutcome::Playing(np) => np,
+            other => panic!("应为 Playing,实际 {other:?}"),
+        };
+        let report = |title: &str, status: &str, pos: f64, dur: f64| PlaybackReport {
+            status: status.into(),
+            title: Some(title.into()),
+            position: Some(pos),
+            duration: Some(dur),
+            ..PlaybackReport::default()
+        };
+
+        let np = np_of(rt.play(1, &e1, false, false, None).await.unwrap());
+        assert_eq!(np.playlist.unwrap().index, 0);
+        // 暂停在 700s(总长 1400)→ 立刻落盘;再放 = 第1集 700s 接着放
+        rt.set_playback(report(&np.title, "paused", 700.0, 1400.0));
+        let np = np_of(rt.play(1, &e1, false, false, None).await.unwrap());
+        let p = np.playlist.unwrap();
+        assert_eq!((p.index, p.resumed, np.resume_at), (0, true, Some(700.0)));
+        // 别的内容的心跳(换片 / 切集竞态)写不进这一行
+        rt.set_playback(report("别的片", "playing", 900.0, 1400.0));
+        assert_eq!(
+            rt.inner.store.media_progress.get(&pl_key(&rt.inner.playlist.lock().unwrap())).unwrap().unwrap().position_seconds,
+            700.0
+        );
+        // 播到片尾区(1350/1400)= 看完 → 再放 = 第2集从头
+        rt.set_playback(report(&np.title, "paused", 1350.0, 1400.0));
+        let np = np_of(rt.play(1, &e1, false, false, None).await.unwrap());
+        let p = np.playlist.unwrap();
+        assert_eq!((p.index, p.resumed, np.resume_at), (1, true, None), "上集看完接下一集");
+        // 看了不到 30 秒不算(下次仍从头);短内容(歌)不记
+        rt.set_playback(report(&np.title, "paused", 12.0, 1400.0));
+        assert_eq!(np_of(rt.play(1, &e1, false, false, None).await.unwrap()).resume_at, None);
+        // 末集看完 → 整部从头,不算「接着上次」
+        let np = np_of(rt.play(1, &e1, false, false, Some(3)).await.unwrap());
+        rt.set_playback(report(&np.title, "idle", 1390.0, 1400.0));
+        let np = np_of(rt.play(1, &e1, false, false, None).await.unwrap());
+        let p = np.playlist.unwrap();
+        assert_eq!((p.index, p.resumed, np.resume_at), (0, false, None), "整部看完从头");
+
+        // 单部电影:按文件身份续;restart 忽略;放歌(audio_only)不记
+        let movie = mk("某电影.mp4");
+        let np = np_of(rt.play(1, &movie, false, false, None).await.unwrap());
+        assert!(np.playlist.is_none());
+        rt.set_playback(report(&np.title, "paused", 2500.0, 6000.0));
+        assert_eq!(np_of(rt.play(1, &movie, false, false, None).await.unwrap()).resume_at, Some(2500.0));
+        assert_eq!(np_of(rt.play(1, &movie, false, true, None).await.unwrap()).resume_at, None, "从头看");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -562,15 +562,19 @@ function stepRate(dir: 1 | -1) {
  *  只主窗(真播放位)报;fire-and-forget,非 Tauri(浏览器预览)跳过。
  *  进度在 core 侧按回报时刻 + 倍速外推,所以这里不必高频报 —— 状态切换/音量/倍速/seek 各报
  *  一次 + 播放中低频心跳(兜缓冲卡顿的外推漂移)即可。 */
-function reportToCore() {
+function reportToCore(last?: { position: number; duration: number }) {
   if (isFloat || !isTauri()) return
+  // last = 停播那一刻的位置/时长(stop() 已把 state 清零,单独带过来):core 据此落最后的集内进度
+  //(播到片尾停 = 看完,下次从下一集开头;半路关掉 = 下次接着这里)。
+  const position = last?.position ?? state.position
+  const duration = last?.duration ?? state.duration
   void api
     .reportMediaState({
       status: state.status,
       title: state.current?.title ?? null,
       volume: Math.round(state.volume * 100),
-      position: state.position,
-      duration: state.duration > 0 ? state.duration : null,
+      position,
+      duration: duration > 0 ? duration : null,
       rate: state.rate,
     })
     .catch(() => {})
@@ -580,10 +584,10 @@ function reportToCore() {
  *  让模型下个回合拿到「此刻」真相(修「歌放完了却以为还在播」)。绝对态快照 → 幂等;
  *  只主窗发,悬浮窗自身调用是 no-op(它是镜像、不当真相源)。所有播放态切换都经此(play/暂停/
  *  ended/stop 的监听都调它),所以回报 core 一处接上即全覆盖。 */
-function syncToPeers() {
+function syncToPeers(last?: { position: number; duration: number }) {
   if (isFloat) return
   emitNowPlaying(state.current, state.status)
-  reportToCore()
+  reportToCore(last)
 }
 
 function stopElements() {
@@ -616,6 +620,7 @@ function stop() {
     if (videoWasHidden) win.hideToTray()
   }
   videoWasHidden = false
+  const last = { position: state.position, duration: state.duration } // 最后的集内进度随 idle 回报落盘
   state.current = null
   state.status = 'idle'
   state.position = 0
@@ -624,7 +629,7 @@ function stop() {
   state.loopMode = 'off' // 停了就归位(core 侧下次 play() 也会复位);随机随队列生灭
   state.shuffle = false
   syncLoopToEl()
-  syncToPeers() // 广播"停了"给悬浮窗(修:UI 点停止 / 自然播完时它仍显在放)
+  syncToPeers(last) // 广播"停了"给悬浮窗(修:UI 点停止 / 自然播完时它仍显在放)
 }
 
 /** 一集放完:「接下来放什么」归 core(auto_next:顺序下一集 / 列表循环回卷 / 随机挑;

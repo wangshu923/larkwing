@@ -6,7 +6,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
-use super::{EpisodeRef, MediaHit, MediaSource, SearchError, SpriteSheet};
+use super::{EpisodeRef, MediaHit, MediaSource, SearchError, Series, SpriteSheet};
 
 const SEARCH_URL: &str = "https://api.bilibili.com/x/web-interface/search/type";
 /// 视频详情(分P `pages` + 合集 `ugc_season`):非 WBI 端点,UA+Referer 即可,多集发现走它。
@@ -90,7 +90,7 @@ impl Bilibili {
         &self,
         pgc: &PgcRef,
         cookie_header: Option<&str>,
-    ) -> Result<Option<(String, Vec<EpisodeRef>)>> {
+    ) -> Result<Option<Series>> {
         Ok(self.pgc_season(pgc, cookie_header).await?.as_ref().and_then(parse_season))
     }
 
@@ -207,7 +207,7 @@ impl MediaSource for Bilibili {
         &self,
         page_url: &str,
         cookie_header: Option<&str>,
-    ) -> Result<Option<(String, Vec<EpisodeRef>)>> {
+    ) -> Result<Option<Series>> {
         // 番剧优先判:它的 URL 里没有 BV 号,落到下面的 extract_bvid 只会一路 None。
         if let Some(pgc) = extract_pgc(page_url) {
             return self.pgc_episodes(&pgc, cookie_header).await;
@@ -424,7 +424,7 @@ fn extract_pgc(url: &str) -> Option<PgcRef> {
 /// 解析 `pgc/view/web/season` 的 `result`(注意番剧走 `result`、UGC 走 `data`)。纯函数、可测。
 /// 只收 `episodes`(正片);`section`(PV / 特别篇 / 预告)刻意不并进队列——「自动播下一集」
 /// 要的是正片顺序,混进花絮会把连播打乱。<2 集 → None(不成系列,同 `parse_view`)。
-fn parse_season(result: &serde_json::Value) -> Option<(String, Vec<EpisodeRef>)> {
+fn parse_season(result: &serde_json::Value) -> Option<Series> {
     let mut eps = Vec::new();
     for (i, ep) in result["episodes"].as_array()?.iter().enumerate() {
         // ep 号既是集身份也是可播地址的唯一来源,缺了就拼不出地址 → 跳过(同 ugc_season 滤 bvid)。
@@ -445,7 +445,12 @@ fn parse_season(result: &serde_json::Value) -> Option<(String, Vec<EpisodeRef>)>
         .map(|i| format!("bili:pgc:{i}"))
         // 缺 season_id 也别丢掉队列:拿首集 ep 号当季身份(首集不会变)。
         .unwrap_or_else(|| format!("bili:pgc:{}", eps[0].id));
-    Some((key, eps))
+    Some(Series { key, title: nonempty(result["season_title"].as_str()), entries: eps })
+}
+
+/// 有内容的字符串才算名字(空串 = 没有,别拿空串冒充剧名)。
+fn nonempty(s: Option<&str>) -> Option<String> {
+    s.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
 }
 
 /// 集名:番剧的 `title` 是集号("1" / "OVA" / "特别篇"),`long_title` 才是副标题。
@@ -470,7 +475,7 @@ fn episode_title(ep: &serde_json::Value, i: usize) -> String {
 /// 解析 view API 的 `data`:**合集优先**(ugc_season,整季多个 BV),其次**分P**(单 BV 多 P)。
 /// 单集(无合集 + ≤1 P)→ None。纯函数、可测。集身份 `id`:合集用 bvid、分P 用 `pN`;
 /// 分P 的 P1 用**裸 bvid url**(对齐 build_queue 的 url 匹配),P2+ 带 `?p=N`。
-fn parse_view(data: &serde_json::Value, bvid: &str) -> Option<(String, Vec<EpisodeRef>)> {
+fn parse_view(data: &serde_json::Value, bvid: &str) -> Option<Series> {
     // 合集(ugc_season):跨 sections 拍平 episodes,每集一个独立 BV。
     if let Some(season) = data.get("ugc_season").filter(|v| v.is_object()) {
         let mut eps = Vec::new();
@@ -499,7 +504,7 @@ fn parse_view(data: &serde_json::Value, bvid: &str) -> Option<(String, Vec<Episo
                 .as_i64()
                 .map(|i| format!("bili:season:{i}"))
                 .unwrap_or_else(|| format!("bili:bv:{bvid}"));
-            return Some((key, eps));
+            return Some(Series { key, title: nonempty(season["title"].as_str()), entries: eps });
         }
     }
     // 分P(单 BV 多 P)。
@@ -522,7 +527,12 @@ fn parse_view(data: &serde_json::Value, bvid: &str) -> Option<(String, Vec<Episo
                 EpisodeRef { id: format!("p{page}"), url, title }
             })
             .collect();
-        return Some((format!("bili:bv:{bvid}"), eps));
+        // 分P 的「剧名」= 这个视频自己的标题
+        return Some(Series {
+            key: format!("bili:bv:{bvid}"),
+            title: nonempty(data["title"].as_str()),
+            entries: eps,
+        });
     }
     None
 }
@@ -678,7 +688,7 @@ mod tests {
                 ]
             }
         });
-        let (key, eps) = parse_view(&data, "BV1aa").unwrap();
+        let Series { key, entries: eps, .. } = parse_view(&data, "BV1aa").unwrap();
         assert_eq!(key, "bili:season:778899");
         assert_eq!(eps.len(), 3);
         assert_eq!(eps[0].id, "BV1aa");
@@ -696,7 +706,7 @@ mod tests {
                 {"cid":3,"page":3,"part":""} // 空 → "P3"
             ]
         });
-        let (key, eps) = parse_view(&data, "BV1zz").unwrap();
+        let Series { key, entries: eps, .. } = parse_view(&data, "BV1zz").unwrap();
         assert_eq!(key, "bili:bv:BV1zz");
         assert_eq!(eps.len(), 3);
         // P1 用裸 url(对齐 build_queue 的 url 匹配),P2+ 带 ?p=
@@ -752,7 +762,7 @@ mod tests {
                 {"id": 742485, "ep_id": 742485, "title": "3", "long_title": ""}
             ]
         });
-        let (key, eps) = parse_season(&result).unwrap();
+        let Series { key, entries: eps, .. } = parse_season(&result).unwrap();
         assert_eq!(key, "bili:pgc:44871", "季 key 用 pgc 前缀,绝不与 ugc_season 的 bili:season: 撞车");
         assert_eq!(eps.len(), 3);
         // 集身份 = ep 号;url 必须用 bangumi/play/ep 形 —— 番剧集自带的 bvid 在 UGC view
@@ -766,7 +776,7 @@ mod tests {
 
     #[test]
     fn parse_season_keeps_non_numeric_episode_labels() {
-        let (_, eps) = parse_season(&serde_json::json!({
+        let Series { entries: eps, .. } = parse_season(&serde_json::json!({
             "season_id": 3,
             "episodes": [
                 {"ep_id": 1, "title": "OVA", "long_title": "特别篇"},
@@ -787,14 +797,14 @@ mod tests {
         .is_none());
         assert!(parse_season(&serde_json::json!({ "season_id": 1 })).is_none());
         // 拼不出可播地址的条目跳过(缺 ep 号)
-        let (_, eps) = parse_season(&serde_json::json!({
+        let Series { entries: eps, .. } = parse_season(&serde_json::json!({
             "season_id": 2,
             "episodes": [{"ep_id": 11, "title": "1"}, {"title": "坏条目"}, {"ep_id": 13, "title": "3"}]
         }))
         .unwrap();
         assert_eq!(eps.len(), 2, "缺 ep 号的条目跳过,不生成放不了的地址");
         // 缺 season_id 也别丢掉队列 —— 拿首集 ep 号当季身份(首集不会变)
-        let (key, _) = parse_season(&serde_json::json!({
+        let Series { key, .. } = parse_season(&serde_json::json!({
             "episodes": [{"ep_id": 5, "title": "1"}, {"ep_id": 6, "title": "2"}]
         }))
         .unwrap();
@@ -963,7 +973,7 @@ mod tests {
         let bili = Bilibili::new();
         // 安全警长啦咘啦哆(旧名「拉布拉多警长」)第 1 集,52 集的季。
         let ep_url = "https://www.bilibili.com/bangumi/play/ep742483";
-        let (key, eps) = bili
+        let Series { key, entries: eps, .. } = bili
             .episodes(ep_url, None)
             .await
             .expect("请求不该报错")
@@ -977,7 +987,7 @@ mod tests {
         // 用户贴进来的那一集必须能在队列里精确匹配上 —— 否则 build_queue 认不出「点的是第几集」。
         assert!(eps.iter().any(|e| e.url == ep_url), "首集 url 应与用户贴的形态逐字一致");
         // ss 形(整季链接)走同一个端点、应得同一个季。
-        let (key2, eps2) = bili
+        let Series { key: key2, entries: eps2, .. } = bili
             .episodes("https://www.bilibili.com/bangumi/play/ss44871", None)
             .await
             .expect("请求不该报错")

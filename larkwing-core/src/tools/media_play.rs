@@ -20,9 +20,11 @@ impl MediaPlay {
                               含 NAS 路径)。放歌/听故事/白噪音用 audio_only=true(只出声音);\
                               看视频/动画片用 false。**连播**:B 站合集/分P、本地剧集文件夹放一集\
                               自动接着下一集;本地音频放一首自动接着同文件夹的下一首,给音频\
-                              **文件夹路径**则把整夹当列表从头连着放——都记住上次放到哪,用户没指定\
-                              第几集/首时默认接着上次;说「从头/重新看/从第一集」时传 restart=true。\
-                              循环/随机用 media_control。开始播放后简短告诉用户放的是什么就好。",
+                              **文件夹路径**则把整夹当列表从头连着放。**续播**:剧集和电影都记着上次\
+                              看到哪一集、第几秒,默认接着上次 —— url 只用来认出是哪部剧,传剧里任何一集的\
+                              路径都行,不必自己猜上次看到哪;用户点名「看第五集」传 episode=5;说\
+                              「从头/重新看/从第一集」传 restart=true。循环/随机用 media_control。\
+                              开始播放后简短告诉用户放的是什么(结果里有「接着上次…」就照实转述)。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -37,6 +39,10 @@ impl MediaPlay {
                         "restart": {
                             "type": "boolean",
                             "description": "true=忽略上次进度、从第一集重新放(用户说「从头/重新看」时用);默认 false=接着上次"
+                        },
+                        "episode": {
+                            "type": "integer",
+                            "description": "用户点名要看第几集/第几首(从 1 数)时传;不传 = 接着上次的进度"
                         }
                     },
                     "required": ["url"]
@@ -80,15 +86,26 @@ impl Tool for MediaPlay {
         // 放歌弹全屏视频框)。走共享 arg_bool 兜底(§4.4 Quirks)。
         let audio_only = super::arg_bool(&args, "audio_only", false);
         let restart = super::arg_bool(&args, "restart", false);
+        // 点名第几集(字符串数字也认,§4.4 quirk);不传 / 0 = 没点名,接着上次
+        let episode = match super::arg_u64(&args, "episode", 0) {
+            0 => None,
+            n => Some(n as usize),
+        };
 
-        match ctx.media.play(ctx.user_id, url, audio_only, restart).await? {
+        match ctx.media.play(ctx.user_id, url, audio_only, restart, episode).await? {
             crate::media::PlayOutcome::Playing(np) => {
-                // 多集:带上「第N/共M集(音频=首)」+ 续播时点明"接着上次"(让模型如实转述)。
+                // 多集:带上「第N/共M集(音频=首)」+ 续播时点明"接着上次"(让模型如实转述);
+                // 集内续播位(resume_at)有值就报「从 mm:ss」,电影看一半接着看也走这句。
                 let unit =
                     if matches!(np.kind, crate::media::MediaKind::Audio) { "首" } else { "集" };
+                let at = np
+                    .resume_at
+                    .filter(|s| *s > 0.0)
+                    .map(|s| format!(" {}:{:02} 处", (s as i64) / 60, (s as i64) % 60))
+                    .unwrap_or_default();
                 let mut out = match &np.playlist {
                     Some(p) if p.resumed => format!(
-                        "接着上次,从《{}》第{}{unit}继续播放(共{}{unit})",
+                        "接着上次,从《{}》第{}{unit}{at}继续播放(共{}{unit})",
                         np.title,
                         p.index + 1,
                         p.total
@@ -99,6 +116,7 @@ impl Tool for MediaPlay {
                         p.index + 1,
                         p.total
                     ),
+                    None if !at.is_empty() => format!("接着上次,从《{}》{at}继续播放", np.title),
                     None => format!("已开始播放《{}》", np.title),
                 };
                 if let Some(author) = &np.author {

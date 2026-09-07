@@ -126,18 +126,16 @@ fn collect_materials(store: &Store, from_ms: i64, end_ms: i64) -> Result<Vec<Day
         days.entry(date).or_default().push(format!("{who}: {text}"));
         *cnt += 1;
     }
-    // 看/听过的(全家的续播动静都算这个家的日子)
-    for uid in names.keys() {
-        for p in store.media_progress.list_recent(*uid, 20)? {
-            if p.updated_at < from_ms || p.updated_at >= end_ms {
-                continue;
-            }
-            if let Some(date) = local_date(p.updated_at).map(|d| d.to_string()) {
-                let line = format!("(看/听了《{}》)", p.title);
-                let bucket = days.entry(date).or_default();
-                if !bucket.contains(&line) {
-                    bucket.push(line);
-                }
+    // 看/听过的(续播进度本就按家记 —— 全家的动静都算这个家的日子;标题 = 剧名)
+    for p in store.media_progress.list_recent(20)? {
+        if p.updated_at < from_ms || p.updated_at >= end_ms {
+            continue;
+        }
+        if let Some(date) = local_date(p.updated_at).map(|d| d.to_string()) {
+            let line = format!("(看/听了《{}》)", p.title);
+            let bucket = days.entry(date).or_default();
+            if !bucket.contains(&line) {
+                bucket.push(line);
             }
         }
     }

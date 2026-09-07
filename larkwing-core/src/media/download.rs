@@ -152,7 +152,9 @@ impl MediaRuntime {
                 None
             }
         };
-        let Some((_key, mut entries)) = discovered.filter(|(_, e)| e.len() >= 2) else {
+        let Some(mut entries) =
+            discovered.filter(|s| s.entries.len() >= 2).map(|s| s.entries)
+        else {
             return self.download_audio(page_url, dir, &meta).await;
         };
         // 范围切片(1 起含两端;越界如实报「一共 X 首」= media_control episode 同口径)
