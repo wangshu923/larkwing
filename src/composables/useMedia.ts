@@ -685,16 +685,23 @@ function stop() {
  *  单曲循环由 el.loop 原生循环,ended 压根不触发。只在主窗触发(悬浮窗不实际播放、不会冒 ended)。 */
 function onEnded() {
   if (state.current?.playlist && isTauri()) {
-    state.status = 'loading' // 续播解析的空档显 spinner(别看着像卡死)
-    api
-      .mediaAutoNext()
-      .then((took) => {
-        if (!took) stop() // 放完了(末集且不循环 / 随机放完一轮):正常收尾
-      })
-      .catch(() => stop()) // 切集失败兜底停
+    autoNext()
     return
   }
   stop() // 单集(el.loop 没开才会走到 ended)/ 浏览器预览:正常收尾
+}
+
+/** 「接下来放什么」交 core(顺序下一集 / 列表循环回卷 / 随机挑):自然播完与片尾倒计时到点共用。
+ *  没有下一首 → 正常收尾。 */
+function autoNext() {
+  if (!isTauri()) return
+  state.status = 'loading' // 续播解析的空档显 spinner(别看着像卡死)
+  api
+    .mediaAutoNext()
+    .then((took) => {
+      if (!took) stop() // 放完了(末集且不循环 / 随机放完一轮):正常收尾
+    })
+    .catch(() => stop()) // 切集失败兜底停
 }
 
 /** 上/下一集(+1/-1):播放器按钮 + 嘴控都最终汇到 core 的 advance(全局队列);任意窗口可调
@@ -717,6 +724,14 @@ async function fetchPlaylist(): Promise<PlaylistView | null> {
       title: i18n.global.t(state.current?.kind === 'audio' ? 'media.trackN' : 'media.episodeN', { n: i + 1 }),
     })),
   }
+}
+
+/** 片头 / 片尾手标(播放器菜单 / S 键):与嘴控「片头到这里」同一 core 入口(`media_mode` → `control`),
+ *  core 落库、重算、广播 skip 事件回来替换 `state.current.skip`。`secs` 缺省 = core 取此刻播放位。 */
+type SkipMark = 'intro_start' | 'intro_end' | 'outro_start' | 'skip_clear'
+function markSkip(action: SkipMark, secs?: number) {
+  if (!isTauri()) return
+  void api.mediaMode(action, secs).catch(() => useToast().error(i18n.global.t('toast.mediaFailed', { title: '' })))
 }
 
 /** 列表里点第 N 集(1 起):与嘴控「看第五集」同一 core 入口;越界 toast,不 panic。 */
@@ -866,6 +881,10 @@ function onMedia(ev: MediaEvent) {
       // 嘴控(core 已校验);只主窗执行 —— 悬浮窗处理会再转发回主窗,徒增重复
       if (!isFloat) applyControl(ev.data.action, ev.data.value)
       break
+    case 'skip':
+      // 本集片头 / 片尾信息变了(用户标记 / 清除、指纹检测跑完):替换当前条目的 skip,VideoOverlay 据此跳
+      if (state.current) state.current.skip = ev.data.skip ?? undefined
+      break
     case 'auth_required':
     case 'login_hint':
       state.loginHint = ev.data.source
@@ -960,6 +979,8 @@ function wire() {
       // hover 缩略图预览:真机是 relay 的 /thumb/{token}(现抽现回),预览借一张仓库里的图
       // 顶着看气泡布局(dev 路径,只活在 ?demo 分支里;`?t=` 查询对静态文件无害)。
       thumb_url: '/src/assets/logo-tile.png',
+      // 片头片尾预览:片头 0:05–1:30(自然播进去会跳)、片尾从 4:50 起(倒计时切下一集)
+      skip: { intro: { start: 5, end: 90 }, outro_start: 290, source: 'detected' },
     }
     state.status = 'playing'
     state.duration = 320
@@ -1012,6 +1033,8 @@ export function useMedia() {
     prev: () => advance(-1),
     fetchPlaylist,
     jumpTo,
+    markSkip,
+    autoNext,
     cycleLoop,
     toggleShuffle,
     cycleAudioTrack,

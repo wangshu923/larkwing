@@ -1082,7 +1082,7 @@ pub async fn media_mode(
         let media = state.media.clone();
         media.set_audio_track(n).await.map(|_| ()).map_err(AppError::internal)
     } else {
-        state.media.control(&action, value).map_err(AppError::internal)
+        state.media.control(&action, value).map(|_| ()).map_err(AppError::internal)
     }
 }
 

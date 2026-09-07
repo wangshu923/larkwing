@@ -24,22 +24,27 @@ impl MediaControl {
                               整个列表放完从头再来)/ loop_off 取消循环 / shuffle_on 随机播放\
                               (「随便放/打乱放」)/ shuffle_off 恢复顺序播放 / audio_track 切音轨\
                               (value=第几条,从 1 数;〔此刻〕背景列着可选音轨和语言,用户说\
-                              「换英文原声/换国语」就挑对应语言那条的轨号;单音轨内容没得切,会如实说)。\
+                              「换英文原声/换国语」就挑对应语言那条的轨号;单音轨内容没得切,会如实说)/ \
+                              **片头片尾**(只对多集剧集):skip_intro 跳过本集片头 / intro_start、intro_end、\
+                              outro_start 标记「片头从这里开始 / 片头到这里为止 / 片尾从这里开始」(value=秒;\
+                              用户说「到这里」就不传 value = 取此刻播放位;标记从当前这一集起生效,以后自动跳)/ \
+                              skip_clear 清掉这部剧的手动标记。\
                               当前音量/播放进度/倍速/第几集/循环随机/音轨在〔此刻〕背景注记里,\
                               相对要求(「再大一点点」「快进五分钟」)按它算出绝对值后用 volume/seek。\
                               用户说「暂停/接着放/别放了/大点声/音量调到 30/1.5 倍速/跳到第 90 秒/\
-                              下一首/看第五集/单曲循环/随机放/换英文原声」时用。没有在放东西就别调。",
+                              下一首/看第五集/单曲循环/随机放/换英文原声/跳过片头/片头到这里」时用。没有在放东西就别调。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
                             "enum": ["pause", "resume", "stop", "louder", "softer", "volume", "speed", "seek", "next", "prev", "episode",
-                                     "loop_one", "loop_all", "loop_off", "shuffle_on", "shuffle_off", "audio_track"]
+                                     "loop_one", "loop_all", "loop_off", "shuffle_on", "shuffle_off", "audio_track", "subtitle",
+                                     "skip_intro", "intro_start", "intro_end", "outro_start", "skip_clear"]
                         },
                         "value": {
                             "type": "number",
-                            "description": "volume=音量(0–100);speed=倍速(0.5–3);seek=定位到第几秒;episode=第几集(从 1 数);其它动作不传"
+                            "description": "volume=音量(0–100);speed=倍速(0.5–3);seek=定位到第几秒;episode=第几集(从 1 数);subtitle=第几条字幕(0=关);intro_start/intro_end/outro_start=秒(用户说「到这里」就不传,取此刻);其它动作不传"
                         }
                     },
                     "required": ["action"]
@@ -107,10 +112,8 @@ impl Tool for MediaControl {
                     )),
                 }
             }
-            _ => {
-                ctx.media.control(action, value)?;
-                Ok("ok".into())
-            }
+            // 其余(含片头片尾标记 / 跳过):core 校验落状态,回它组的观察文本("ok" 或一句说明)
+            _ => ctx.media.control(action, value),
         }
     }
 }

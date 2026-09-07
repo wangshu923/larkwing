@@ -10,10 +10,12 @@ pub mod cookies;
 mod download;
 mod edit;
 pub mod fingerprint;
+mod introdetect;
 mod lyrics;
 mod probe;
 mod relay;
 mod resolver;
+pub mod skip;
 pub mod timeline;
 mod torrent;
 mod usage;
@@ -122,6 +124,17 @@ pub trait MediaSource: Send + Sync {
         _cookie_header: Option<&str>,
     ) -> Result<Option<SpriteSheet>> {
         Ok(None)
+    }
+
+    /// 平台标注的片头 / 片尾段(B 站番剧 playurl 的 clip_info_list,人工逐集标注、约六成集有)。
+    /// **尽力件**:没有 / 拿不到一律 `Ok(vec![])`;调用方另套超时、与解析并行,不拖起播。
+    /// 默认无 —— 未实现的源没有平台标注(靠章节 / 指纹 / 手标)。
+    async fn skip_clips(
+        &self,
+        _page_url: &str,
+        _cookie_header: Option<&str>,
+    ) -> Result<Vec<skip::AutoSeg>> {
+        Ok(Vec::new())
     }
 }
 
@@ -258,6 +271,11 @@ pub struct NowPlaying {
     /// 前端只认这一个信号,不做别的判断(§3.5 不假装有图)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumb_url: Option<String>,
+    /// 本集的片头 / 片尾(手标 / B 站标注 / 章节 / 指纹检测汇成,见 `skip::resolve`)。None = 不跳。
+    /// 前端:自然播进片头段 → 跳到段尾(OSD 可回看);自然越过片尾起点且有下一集 → 3 秒倒计时切集。
+    /// 标记 / 检测结果变了由 `MediaEvent::Skip` 增量替换。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip: Option<skip::SkipInfo>,
 }
 
 /// 剧集列表面板要的整份队列(按需取,不塞进每条 Play 事件 —— 合集上百集,标题一次拉够)。
@@ -464,6 +482,15 @@ struct ProgressTarget {
     title: String,
 }
 
+/// 本集片头 / 片尾的解析现场:`auto` = 起播时拿到的自动段(B 站标注 / 章节),`duration` = 本集总长,
+/// `current` = 最近一次解析结果(嘴控「跳过片头」读它)。手标 / 检测落库后用原料重算(`refresh_skip`)。
+#[derive(Debug, Clone)]
+struct SkipCtx {
+    auto: Vec<skip::AutoSeg>,
+    duration: Option<f64>,
+    current: Option<skip::SkipInfo>,
+}
+
 /// 当前本地播放的现场(切音轨重建管线用;app 级瞬态,§6.4 派生可丢:丢了 = 切不了轨,不出错)。
 #[derive(Debug, Clone)]
 struct CurrentLocal {
@@ -510,6 +537,10 @@ struct Inner {
     /// 当前内容的续播身份 + 上次落盘时刻(节拍见 PROGRESS_PERSIST_EVERY)。None = 不记进度。
     progress: Mutex<Option<ProgressTarget>>,
     progress_at: Mutex<Option<std::time::Instant>>,
+    /// 当前这一集的片头 / 片尾解析原料 + 结果(用户标记 / 检测跑完后据此重算再广播)。None = 单部内容。
+    skip_ctx: Mutex<Option<SkipCtx>>,
+    /// 指纹检测任务在跑(一次只跑一个;新一集开播时上一个还没完就先不起,下次开播再来)。
+    detect_busy: AtomicBool,
     /// BT 下载引擎(懒建,同 relay):不用 BT 的用户零成本,且**不会平白发 DHT 包**。
     torrent: tokio::sync::OnceCell<torrent::TorrentEngine>,
 }
@@ -546,6 +577,8 @@ impl MediaRuntime {
                 current_local: Mutex::new(None),
                 progress: Mutex::new(None),
                 progress_at: Mutex::new(None),
+                skip_ctx: Mutex::new(None),
+                detect_busy: AtomicBool::new(false),
                 torrent: tokio::sync::OnceCell::new(),
             }),
         }
@@ -1069,6 +1102,29 @@ impl MediaRuntime {
             _ => None,
         };
 
+        // 平台标注的片头 / 片尾(B 站番剧 clip_info_list):同雪碧图,与解析并行、同一超时;拿不到 = 空 =
+        // 靠章节 / 指纹 / 手标(B 站约六成集有标注,空是常态,不 warn)。放歌不问。
+        let clip_task = match (&source, audio_only) {
+            (Some(src), false) => {
+                let src = src.clone();
+                let url = page_url.to_string();
+                let cookie = cookie_recs.as_deref().map(cookies::header_value);
+                Some(tokio::spawn(async move {
+                    match tokio::time::timeout(SPRITE_FETCH_TIMEOUT, src.skip_clips(&url, cookie.as_deref()))
+                        .await
+                    {
+                        Ok(Ok(v)) => v,
+                        Ok(Err(e)) => {
+                            tracing::info!("片头片尾标注拿不到,靠手标 / 章节: {e:#}");
+                            Vec::new()
+                        }
+                        Err(_) => Vec::new(),
+                    }
+                }))
+            }
+            _ => None,
+        };
+
         let task = self.inner.tasks.start("resolve", Text::new("task.resolve"));
         task.step("step.resolve", serde_json::Value::Null);
         let resolved =
@@ -1160,6 +1216,13 @@ impl MediaRuntime {
             None => None,
         };
 
+        let clips = match clip_task {
+            Some(handle) => handle.await.unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let skip_info =
+            if audio_only { None } else { self.compute_skip(clips, resolved.duration_seconds) };
+
         let (loop_mode, shuffle) = self.mode_flags();
         // 网络流没有本地音轨概念(来源已定轨)→ 清掉本地现场,切音轨会如实退回
         *self.inner.current_local.lock().unwrap() = None;
@@ -1186,6 +1249,7 @@ impl MediaRuntime {
             // 网络流没帧可抽,预览图来自源的雪碧图(B 站 videoshot,见 MediaSource::sprites);
             // 源给不出 = None = 拖进度条只出时间气泡。
             thumb_url,
+            skip: skip_info,
         };
         self.seed_playing(&np.title, pos.map(|p| (p.index, p.total)));
         self.publish(MediaEvent::Play(np.clone()));
@@ -1624,6 +1688,7 @@ impl MediaRuntime {
         let mut manifest_url: Option<String> = None;
         let mut route: Option<PlaybackRoute> = None;
         let mut subtitle_refs: Vec<SubtitleRef> = Vec::new(); // P4:字幕清单(自适应路才有) // Some = 显式(自适应路 URL 反推不出 copy/转码)
+        let mut chapters: Vec<probe::Chapter> = Vec::new(); // 章节(ffmpeg 探测路才有;OP/ED 章节 → 自动跳)
         let mut tracks: Vec<probe::AudioTrack> = Vec::new(); // 音轨清单(BMFF/容器探测才有)
         let mut sel_track = 0usize; // 选中音轨(越界已钳回 0)
         // 分流看**文件内容**、不看扩展名(2026-08-07 实锤:`.mp4` 里装的是 mpegts,
@@ -1730,6 +1795,7 @@ impl MediaRuntime {
                         let pr = self.probe_with_ffmpeg(&ffmpeg, &path).await;
                         duration_seconds = pr.duration_seconds;
                         tracks = pr.audio_tracks.clone();
+                        chapters = pr.chapters.clone();
                         sel_track = self.pick_audio_track(&tracks);
                         let sel_audio_bad = tracks
                             .get(sel_track)
@@ -1840,6 +1906,12 @@ impl MediaRuntime {
             audio_only,
             tracks: tracks.clone(),
         });
+        // 片头 / 片尾:章节里名为 OP/ED 的段 + 库里的手标 / 检测结果汇成本集怎么跳(放歌不跳)
+        let skip_info = if audio_only {
+            None
+        } else {
+            self.compute_skip(skip::chapters_to_auto(&chapters), duration_seconds)
+        };
         let np = NowPlaying {
             subtitles: subtitle_refs.clone(),
             // 放歌带旁挂歌词;切集/连播每次重进这里 → 换曲自动换词
@@ -1862,9 +1934,14 @@ impl MediaRuntime {
             audio_track: sel_track,
             resume_at,
             thumb_url,
+            skip: skip_info,
         };
         self.seed_playing(&np.title, pos.map(|p| (p.index, p.total)));
         self.publish(MediaEvent::Play(np.clone()));
+        // 本地视频剧集:后台起指纹检测(本集还没测过才跑;ffmpeg 不在手 / 上一个还在跑就先不起)
+        if !audio_only && pos.is_some() {
+            self.maybe_spawn_detect();
+        }
         Ok(np)
     }
 
@@ -1872,9 +1949,28 @@ impl MediaRuntime {
     /// 经壳层命令也汇到这(同一校验/执行口)。speed/seek 带 value,其余不带;
     /// 词表和校验收口在这,前端只执行不判断。循环/随机先落 core 状态(auto_next/「此刻」背景
     /// 读它),再随 Control 事件让前端对齐 el.loop/按钮态。
-    pub fn control(&self, action: &str, value: Option<f64>) -> Result<()> {
+    pub fn control(&self, action: &str, value: Option<f64>) -> Result<String> {
         match action {
             "pause" | "resume" | "stop" | "louder" | "softer" => {}
+            // 片头 / 片尾手标(嘴控「片头到这里」/ 播放器菜单):落库 + 重算 + 广播 Skip,不发 Control
+            "intro_start" | "intro_end" | "outro_start" => return self.mark_skip(action, value),
+            "skip_clear" => return self.clear_skip_marks(),
+            // 「跳过片头」= 定位到本集片头段尾(没有信息如实说;标一个就有)
+            "skip_intro" => {
+                let intro = self
+                    .inner
+                    .skip_ctx
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|c| c.current.as_ref())
+                    .and_then(|s| s.intro);
+                let Some(seg) = intro else {
+                    anyhow::bail!("这一集还没有片头信息,可以放到片头结束时说「片头到这里」标一个");
+                };
+                self.publish(MediaEvent::Control { action: "seek".into(), value: Some(seg.end) });
+                return Ok(format!("已跳过片头,从 {} 接着放", fmt_clock(seg.end)));
+            }
             "loop_one" | "loop_all" | "loop_off" => {
                 *self.inner.loop_mode.lock().unwrap() = match action {
                     "loop_one" => LoopMode::One,
@@ -1925,11 +2021,157 @@ impl MediaRuntime {
             }
             other => anyhow::bail!(
                 "未知动作 {other},可用: pause/resume/stop/louder/softer/volume/speed/seek/\
-                 loop_one/loop_all/loop_off/shuffle_on/shuffle_off/audio_track/subtitle"
+                 loop_one/loop_all/loop_off/shuffle_on/shuffle_off/audio_track/subtitle/\
+                 intro_start/intro_end/outro_start/skip_intro/skip_clear"
             ),
         }
         self.publish(MediaEvent::Control { action: action.into(), value });
-        Ok(())
+        Ok("ok".into())
+    }
+
+    /// 算本集怎么跳(起播 / 标记后 / 检测完重算):队列在手才有意义(单部电影不跳)。原料存进
+    /// `skip_ctx` 供重算;结果既是 `NowPlaying.skip` 也是 `MediaEvent::Skip` 的载荷。
+    fn compute_skip(&self, auto: Vec<skip::AutoSeg>, duration: Option<f64>) -> Option<skip::SkipInfo> {
+        let (key, order, current) = {
+            let guard = self.inner.playlist.lock().unwrap();
+            let Some(pl) = guard.as_ref() else {
+                *self.inner.skip_ctx.lock().unwrap() = None;
+                return None;
+            };
+            (
+                pl.series_key.clone(),
+                pl.entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+                pl.entries[pl.index].id.clone(),
+            )
+        };
+        let rows = self.inner.store.media_skip.list(&key).unwrap_or_default();
+        let manual: Vec<skip::ManualRule> =
+            rows.iter().filter(|r| r.source == "manual").map(skip::ManualRule::from_row).collect();
+        let mut segs = skip::detected_segs(&rows, &current);
+        segs.extend(auto.iter().cloned());
+        let order_refs: Vec<&str> = order.iter().map(String::as_str).collect();
+        let info = skip::resolve(&order_refs, &current, duration, &manual, &segs);
+        *self.inner.skip_ctx.lock().unwrap() =
+            Some(SkipCtx { auto, duration, current: info.clone() });
+        info
+    }
+
+    /// 标记 / 检测结果变了:用存着的原料重算并广播(前端替换 `NowPlaying.skip`)。
+    fn refresh_skip(&self) -> Option<skip::SkipInfo> {
+        let (auto, duration) = match self.inner.skip_ctx.lock().unwrap().as_ref() {
+            Some(c) => (c.auto.clone(), c.duration),
+            None => return None,
+        };
+        // 时长以前端回报的为准(起播时探不出的 /m/ 混流路,播起来后前端知道)
+        let duration = duration.or(self.inner.playback.lock().unwrap().duration_secs);
+        let info = self.compute_skip(auto, duration);
+        self.publish(MediaEvent::Skip { skip: info.clone() });
+        info
+    }
+
+    /// 手标片头 / 片尾(嘴控「片头到这里」/ 播放器菜单):锚在当前这一集、**从这集起**生效;只改被标的
+    /// 那一项,其余继承本集在用的手标规则(第 26 集换片头不丢第 1 集标的片尾;继承的片尾按距结尾
+    /// 换算到本集)。`value` 缺省 = 播放器此刻位置。
+    fn mark_skip(&self, action: &str, value: Option<f64>) -> Result<String> {
+        let (key, order, current, index) = {
+            let guard = self.inner.playlist.lock().unwrap();
+            let Some(pl) = guard.as_ref() else {
+                anyhow::bail!("现在没有在放剧集,片头片尾标记只对多集内容有意义");
+            };
+            (
+                pl.series_key.clone(),
+                pl.entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+                pl.entries[pl.index].id.clone(),
+                pl.index,
+            )
+        };
+        let at = match value {
+            Some(v) => v,
+            None => self.current_position().context("不知道现在放到哪了,说个秒数吧")?,
+        };
+        anyhow::ensure!(at.is_finite() && at >= 0.0, "秒数不对: {at}");
+        let duration = self
+            .inner
+            .playback
+            .lock()
+            .unwrap()
+            .duration_secs
+            .or_else(|| self.inner.skip_ctx.lock().unwrap().as_ref().and_then(|c| c.duration));
+        let rows = self.inner.store.media_skip.list(&key)?;
+        let manual: Vec<skip::ManualRule> =
+            rows.iter().filter(|r| r.source == "manual").map(skip::ManualRule::from_row).collect();
+        let order_refs: Vec<&str> = order.iter().map(String::as_str).collect();
+        let mut rule = skip::effective_manual(&order_refs, &current, &manual).cloned().unwrap_or_default();
+        if rule.episode_id != current {
+            // 从更早的锚点继承过来:片尾是「那集的绝对秒」,按距结尾换算成本集的
+            if let (Some(o), Some(rd), Some(d)) = (rule.outro_start, rule.duration, duration) {
+                if rd > 0.0 && d > 0.0 {
+                    rule.outro_start = Some((d - (rd - o)).max(0.0));
+                }
+            }
+            rule.episode_id = current.clone();
+            rule.duration = duration.or(rule.duration);
+        }
+        match action {
+            "intro_start" => rule.intro_start = Some(at),
+            "intro_end" => {
+                rule.intro_end = Some(at);
+                if rule.intro_start.is_some_and(|s| s >= at) {
+                    rule.intro_start = None; // 起点在终点之后没意义,退回从 0 算
+                }
+            }
+            _ => {
+                rule.outro_start = Some(at);
+                rule.duration = duration.or(rule.duration);
+            }
+        }
+        if rule.duration.is_none() {
+            rule.duration = duration;
+        }
+        self.inner.store.media_skip.upsert(&crate::store::SkipRow {
+            series_key: key,
+            episode_id: current,
+            source: "manual".into(),
+            intro_start: rule.intro_start,
+            intro_end: rule.intro_end,
+            outro_start: rule.outro_start,
+            outro_end: None,
+            duration: rule.duration,
+            updated_at: 0,
+        })?;
+        let info = self.refresh_skip();
+        let mut out = format!("已记下,从第 {} 集起:", index + 1);
+        match info {
+            Some(s) => {
+                if let Some(seg) = s.intro {
+                    out.push_str(&format!("片头 {}–{}", fmt_clock(seg.start), fmt_clock(seg.end)));
+                }
+                if let Some(o) = s.outro_start {
+                    if s.intro.is_some() {
+                        out.push_str(",");
+                    }
+                    out.push_str(&format!("片尾从 {} 开始", fmt_clock(o)));
+                }
+                out.push_str(";以后这部剧自动跳。");
+            }
+            None => out.push_str("标记已保存,但片头段还不完整(只标了起点或落在片长外),标上终点才会跳。"),
+        }
+        Ok(out)
+    }
+
+    /// 清掉这部剧的全部手标(检测 / 平台标注留着)。
+    fn clear_skip_marks(&self) -> Result<String> {
+        let key = self
+            .inner
+            .playlist
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|pl| pl.series_key.clone())
+            .context("现在没有在放剧集,没有可清除的标记")?;
+        let n = self.inner.store.media_skip.clear_manual(&key)?;
+        self.refresh_skip();
+        Ok(if n > 0 { "已清除这部剧的手动片头片尾标记".into() } else { "这部剧没有手动标记".into() })
     }
 
     /// 新一集 / 新文件的音轨选择,结果回写(状态别悬空):显式切过轨就按**语言**对号 ——

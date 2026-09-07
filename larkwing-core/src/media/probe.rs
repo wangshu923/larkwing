@@ -174,6 +174,17 @@ pub struct LocalProbe {
     /// 让模型从文件名判断后带参重试。只在 `ffmpeg -i` 路径有值(BMFF 轻量探测不解析 ilst)。
     pub tag_title: Option<String>,
     pub tag_artist: Option<String>,
+    /// 章节(`ffmpeg -i` 打出的 `Chapter #0:N: start X, end Y` + 紧跟的 `title`;字幕组 / 蓝光压制
+    /// 常带 OP / Part A / ED / Preview 这样的章节)。空 = 没有 / 解析不出;只在 ffmpeg 探测路径有值。
+    pub chapters: Vec<Chapter>,
+}
+
+/// 一个章节(秒;`title` 可能为空串 —— 没名字的章节边界不当片头片尾用,见 `skip::chapters_to_auto`)。
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+pub struct Chapter {
+    pub start: f64,
+    pub end: f64,
+    pub title: String,
 }
 
 fn ext_lower(path: &Path) -> Option<String> {
@@ -330,13 +341,31 @@ fn parse_ffmpeg_stderr_with(stderr: &str, mac_native: bool) -> LocalProbe {
     // 首个 Stream 行之前 = 容器全局 Metadata 块(title/artist 是歌名/歌手标签);
     // 之后的 title 归各流(上面 title_pending 那套),两边互不串味。
     let mut seen_stream = false;
+    // 章节:`Chapter #0:2: start 1300.000000, end 1390.000000` 后面跟 `Metadata:` / `title : ED`;
+    // 新的 Chapter / Stream 行一出现就收口(title 只认紧跟的那条)。
+    let mut chapter_title_pending = false;
     for raw in stderr.lines() {
         let line = raw.trim();
         if p.duration_seconds.is_none() {
             p.duration_seconds = parse_duration_line(line);
         }
+        if let Some(ch) = parse_chapter_line(line) {
+            p.chapters.push(ch);
+            chapter_title_pending = true;
+            continue;
+        }
+        if chapter_title_pending && line.starts_with("title") {
+            if let Some((_, v)) = line.split_once(':') {
+                if let Some(last) = p.chapters.last_mut() {
+                    last.title = v.trim().to_string();
+                }
+            }
+            chapter_title_pending = false;
+            continue;
+        }
         if line.starts_with("Stream #") {
             title_pending = false;
+            chapter_title_pending = false;
             seen_stream = true;
         }
         if !seen_stream {
@@ -416,6 +445,21 @@ fn parse_ffmpeg_stderr_with(stderr: &str, mac_native: bool) -> LocalProbe {
         }
     }
     p
+}
+
+/// `Chapter #0:2: start 1300.000000, end 1390.000000` → Chapter(标题由后续 title 行补)。
+/// 形状对不上(不是章节行 / 数字坏了 / end ≤ start)→ None。
+fn parse_chapter_line(line: &str) -> Option<Chapter> {
+    let rest = line.strip_prefix("Chapter #")?;
+    let (_, body) = rest.split_once(':')?; // "0:2: start …" → 去掉 "0"
+    let (_, body) = body.split_once(':')?; // 去掉章节序号
+    let body = body.trim();
+    let after_start = body.strip_prefix("start ")?;
+    let (start_s, end_part) = after_start.split_once(',')?;
+    let end_s = end_part.trim().strip_prefix("end ")?;
+    let start: f64 = start_s.trim().parse().ok()?;
+    let end: f64 = end_s.trim().parse().ok()?;
+    (end > start && start >= 0.0).then(|| Chapter { start, end, title: String::new() })
 }
 
 /// 一条单文件 fMP4(B 站 DASH 的 video.m4s / audio.m4s)里两个关键字节范围,供合成 DASH MPD
@@ -686,6 +730,8 @@ fn probe_local_with(path: &Path, mac_native: bool) -> Option<LocalProbe> {
         audio_tracks: audio_tracks_of_moov(&moov),
         // BMFF 的字幕轨(tx3g)少见,轻量探测不解;真有字幕的片走 ffmpeg 路那条(mkv 为主)。
         subtitles: Vec::new(),
+        // 章节(chpl / 章节轨)也只在 ffmpeg 路解析:mp4 带章节的少见,不为它读 udta
+        chapters: Vec::new(),
         // 歌名/歌手标签只在 `ffmpeg -i` 路解析(ilst 不在轻量探测范围,播放路用不上)
         tag_title: None,
         tag_artist: None,
@@ -1857,6 +1903,41 @@ Input #0, flac, from 'song.flac':
         let bare = "Input #0, mp3, from 'x.mp3':\n  Duration: 00:03:00.00\n    Stream #0:0: Audio: mp3";
         let p2 = parse_ffmpeg_stderr_with(bare, false);
         assert!(p2.tag_title.is_none() && p2.tag_artist.is_none());
+    }
+
+    #[test]
+    fn ffmpeg_stderr_reads_chapters_with_titles() {
+        // 字幕组 mkv 常见形:章节块在 Stream 行之前,每章紧跟 Metadata/title;没名字的章节标题为空串
+        let stderr = "\
+Input #0, matroska,webm, from 'ep01.mkv':
+  Metadata:
+    title           : 某剧 第1集
+  Duration: 00:23:40.00, start: 0.000000, bitrate: 3000 kb/s
+  Chapters:
+    Chapter #0:0: start 0.000000, end 90.000000
+      Metadata:
+        title           : OP
+    Chapter #0:1: start 90.000000, end 1300.000000
+      Metadata:
+        title           : Part A
+    Chapter #0:2: start 1300.000000, end 1390.000000
+      Metadata:
+        title           : ED
+    Chapter #0:3: start 1390.000000, end 1420.000000
+    Stream #0:0: Video: h264 (High), yuv420p, 1920x1080
+    Stream #0:1(jpn): Audio: aac (LC), 48000 Hz, stereo, fltp
+    Metadata:
+      title           : 日语";
+        let p = parse_ffmpeg_stderr_with(stderr, false);
+        assert_eq!(p.chapters.len(), 4);
+        assert_eq!(p.chapters[0], Chapter { start: 0.0, end: 90.0, title: "OP".into() });
+        assert_eq!(p.chapters[2].title, "ED");
+        assert_eq!(p.chapters[3].title, "", "没名字的章节标题为空");
+        assert_eq!(p.tag_title.as_deref(), Some("某剧 第1集"), "全局标签不受章节块影响");
+        assert_eq!(p.audio_tracks[0].title.as_deref(), Some("日语"), "音轨 title 不被章节 title 抢走");
+        // 形状坏的行不认
+        assert!(parse_chapter_line("Chapter #0:0: start abc, end 90").is_none());
+        assert!(parse_chapter_line("Chapter #0:0: start 90.0, end 10.0").is_none(), "end ≤ start 不认");
     }
 
     #[test]

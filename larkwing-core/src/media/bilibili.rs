@@ -22,6 +22,11 @@ const VIDEOSHOT_URL: &str = "https://api.bilibili.com/x/player/videoshot";
 /// 分P 清单(每 P 的 cid):比 VIEW_URL 轻、且 view 被 412 风控时它仍 200(2026-09-04 实测),
 /// 「第 N P 的 cid」只从这里拿。
 const PAGELIST_URL: &str = "https://api.bilibili.com/x/player/pagelist";
+/// 番剧播放地址 v1:`result.clip_info_list[]` 带人工标注的 OP/ED 段(`start`/`end` 整数**秒**,
+/// `clipType` = CLIP_TYPE_OP / CLIP_TYPE_ED;2026-09-07 实测 20 季 60 集 58% 有,会员集匿名也给)。
+/// 免 WBI、免登录;UGC 稿件没有这套数据(`x/player/v2` 的 view_points 只是章节 / 赛事点)。
+/// **随机 -10403「地区不可观看」不是真限制**(约 6%,重试即过),接法见 `skip_clips`。
+const PGC_PLAYURL_URL: &str = "https://api.bilibili.com/pgc/player/web/playurl";
 /// 裸 UA 常被 412,挂一个像真浏览器的(robot 同款手法,版本号更新)。
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                   (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
@@ -241,6 +246,29 @@ impl MediaSource for Bilibili {
         Ok(parse_view(&payload["data"], &bvid))
     }
 
+    /// 番剧 OP/ED 段(只有 `bangumi/play/ep` 形有;ss 形 / UGC → 空)。`-10403` 或缺字段重试一次
+    /// (实测是随机误判,不是地区限制),仍不行按「本集没标注」退化 —— 空是常态,不 warn。
+    async fn skip_clips(
+        &self,
+        page_url: &str,
+        cookie_header: Option<&str>,
+    ) -> Result<Vec<super::skip::AutoSeg>> {
+        let Some(PgcRef::Ep(ep_id)) = extract_pgc(page_url) else { return Ok(Vec::new()) };
+        let query = [("ep_id", ep_id.as_str()), ("qn", "16"), ("fnval", "16"), ("fourk", "1")];
+        for attempt in 0..2 {
+            let Some(payload) = self.fetch_json(PGC_PLAYURL_URL, &query, cookie_header).await? else {
+                return Ok(Vec::new());
+            };
+            if payload["code"].as_i64().unwrap_or(-1) == 0 && payload["result"].is_object() {
+                return Ok(parse_clip_info(&payload["result"]));
+            }
+            if attempt == 0 {
+                tracing::debug!(ep = %ep_id, code = ?payload["code"], "playurl 首发不顺,重试一次");
+            }
+        }
+        Ok(Vec::new())
+    }
+
     /// 进度条预览雪碧图(`player/videoshot`)。三种页面形态各自定位到「哪一 P」:
     ///   · 番剧 ep 形 → season 端点找这一集的 bvid + cid(番剧集自带 bvid,videoshot 认;ss 形
     ///     到不了这里 —— build_queue 早把它换成首集的 ep 形,真到了就 None 别硬凑);
@@ -446,6 +474,30 @@ fn parse_season(result: &serde_json::Value) -> Option<Series> {
         // 缺 season_id 也别丢掉队列:拿首集 ep 号当季身份(首集不会变)。
         .unwrap_or_else(|| format!("bili:pgc:{}", eps[0].id));
     Some(Series { key, title: nonempty(result["season_title"].as_str()), entries: eps })
+}
+
+/// `pgc/player/web/playurl` 的 `result` → OP/ED 段。`clip_info_list` 元素
+/// `{clipType:"CLIP_TYPE_OP"|"CLIP_TYPE_ED", start:秒, end:秒, toastText, materialNo}`;
+/// 未知 clipType 忽略(将来若加广告 / 预告类型别 panic);`toastText` 是 B 站 UI 文案,不消费(§6.6)。
+/// 纯函数、可测。
+fn parse_clip_info(result: &serde_json::Value) -> Vec<super::skip::AutoSeg> {
+    use super::skip::{AutoSeg, AutoSource, SegKind};
+    let empty = Vec::new();
+    result["clip_info_list"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .filter_map(|c| {
+            let kind = match c["clipType"].as_str()? {
+                "CLIP_TYPE_OP" => SegKind::Intro,
+                "CLIP_TYPE_ED" => SegKind::Outro,
+                _ => return None,
+            };
+            let start = c["start"].as_f64()?;
+            let end = c["end"].as_f64()?;
+            (end > start && start >= 0.0).then_some(AutoSeg { kind, start, end, source: AutoSource::Bili })
+        })
+        .collect()
 }
 
 /// 有内容的字符串才算名字(空串 = 没有,别拿空串冒充剧名)。
@@ -749,6 +801,27 @@ mod tests {
     }
 
     /// 夹具形状照真实 `pgc/view/web/season` 返回(季 44871「安全警长啦咘啦哆」,52 集)。
+    #[test]
+    fn parse_clip_info_reads_op_ed_and_ignores_unknown() {
+        use super::super::skip::{AutoSource, SegKind};
+        // 真实样例形(冰菓 ep84776,2026-09-07 实测):单位秒、冷开场 OP 不从 0 起
+        let result = serde_json::json!({
+            "timelength": 1630418,
+            "clip_info_list": [
+                {"materialNo":0,"start":261,"end":352,"toastText":"即将跳过片头","clipType":"CLIP_TYPE_OP"},
+                {"materialNo":0,"start":1531,"end":1623,"toastText":"即将跳过片尾","clipType":"CLIP_TYPE_ED"},
+                {"materialNo":0,"start":10,"end":20,"toastText":"?","clipType":"CLIP_TYPE_AD"},
+                {"materialNo":0,"start":50,"end":40,"toastText":"?","clipType":"CLIP_TYPE_OP"}
+            ]
+        });
+        let segs = parse_clip_info(&result);
+        assert_eq!(segs.len(), 2, "未知类型 / end≤start 的丢掉");
+        assert_eq!((segs[0].kind, segs[0].start, segs[0].end, segs[0].source), (SegKind::Intro, 261.0, 352.0, AutoSource::Bili));
+        assert_eq!((segs[1].kind, segs[1].start), (SegKind::Outro, 1531.0));
+        assert!(parse_clip_info(&serde_json::json!({"clip_info_list": []})).is_empty(), "没标注 = 空是常态");
+        assert!(parse_clip_info(&serde_json::json!({})).is_empty());
+    }
+
     #[test]
     fn parse_season_builds_queue_from_pgc_episodes() {
         let result = serde_json::json!({

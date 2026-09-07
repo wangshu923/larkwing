@@ -511,6 +511,17 @@ export interface NowPlaying {
   /** 进度条 hover 预览缩略图的基址(自己拼 `?t=秒`)。**有值 = 这片能出图**;
    *  缺 = 只出时间气泡(网络流没帧可抽 / 放歌没画面 / ffmpeg 还没到手)。 */
   thumb_url?: string
+  /** 本集的片头 / 片尾(手标 / B 站标注 / 章节 / 指纹检测汇成;core `skip::resolve`)。缺 = 不跳。
+   *  标记 / 检测结果变了由 media 事件 `skip` 增量替换。 */
+  skip?: SkipInfo
+}
+
+/** 本集怎么跳(镜像 Rust media::skip::SkipInfo):`intro` = 片头段(自然播进去 → 跳到 end);
+ *  `outro_start` = 片尾起点(自然越过 + 有下一集 → 3 秒倒计时切集);`source` = 主要来源。 */
+export interface SkipInfo {
+  intro?: { start: number; end: number }
+  outro_start?: number
+  source: 'manual' | 'bili' | 'chapter' | 'detected' | string
 }
 
 /** 剧集列表面板要的整份队列(镜像 Rust media::PlaylistView;按需取,不塞进 Play 事件)。 */
@@ -524,6 +535,7 @@ export interface PlaylistView {
 export type MediaEvent =
   | { type: 'play'; data: NowPlaying }
   | { type: 'control'; data: { action: string; value?: number } }
+  | { type: 'skip'; data: { skip?: SkipInfo } }
   | { type: 'auth_required'; data: { source: string } }
   | { type: 'login_hint'; data: { source: string } }
   | { type: 'logged_in'; data: { source: string } }

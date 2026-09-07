@@ -8,7 +8,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import EpisodeList from './EpisodeList.vue'
-import { useContextMenu } from '../composables/useContextMenu'
+import { useContextMenu, type MenuItem } from '../composables/useContextMenu'
 import { registerVideoEl, SEEK_STEP_LONG_S, SEEK_STEP_S, useMedia } from '../composables/useMedia'
 import { useScrubHover, useScrubThumb } from '../composables/useScrubHover'
 import { win } from '../lib/backend'
@@ -31,6 +31,8 @@ const {
   audioTrackLabel,
   cycleSubtitle,
   subtitleLabel,
+  markSkip,
+  autoNext,
 } = useMedia()
 const menu = useContextMenu()
 
@@ -245,6 +247,143 @@ const helpOpen = ref(false)
 /** 剧集列表面板(L 键 / 标题栏「≡」钮;多集才有)。全屏 = 右侧侧栏,窗口态 = 标题栏下拉。 */
 const listOpen = ref(false)
 
+/* —— 片头 / 片尾(core 汇成的 NowPlaying.skip:手标 > B 站标注 > 章节 > 指纹检测)——
+ * 片头:自然播进 [start, end) → 跳到 end,右下 OSD「已跳过片头 · 回看」5 秒可点回去;用户自己拖进片头
+ *   = 想看,不跳(本集不再自动跳)。
+ * 片尾:自然越过起点且有下一集 → 3 秒倒计时切集(用户拍板 2026-09-07),可取消;拖进片尾区 = 想看字幕,不切。
+ * 「自然播放 vs 拖动」靠相邻两次 timeupdate 的跨度判(> SEEK_JUMP_S = 拖了)。换集全部复位。 */
+const skipInfo = computed(() => state.current?.skip ?? null)
+const SEEK_JUMP_S = 2.5
+const COUNTDOWN_S = 3
+const skipOsd = ref<{ text: string; undoTo: number } | null>(null)
+let skipOsdTimer = 0
+const countdown = ref<number | null>(null)
+let countdownTimer = 0
+let lastPos = 0
+let introHandled = false
+let outroHandled = false
+/** 有没有「下一集」可切:顺序未到末集,或列表循环 / 随机开着(core auto_next 会回卷 / 挑)。 */
+const hasNext = computed(() => {
+  const p = playlist.value
+  return !!p && (p.index + 1 < p.total || state.loopMode === 'all' || state.shuffle)
+})
+function showSkipOsd(text: string, undoTo: number) {
+  skipOsd.value = { text, undoTo }
+  clearTimeout(skipOsdTimer)
+  skipOsdTimer = window.setTimeout(() => (skipOsd.value = null), 5000)
+}
+function undoSkip() {
+  const u = skipOsd.value
+  if (!u) return
+  skipOsd.value = null
+  seek(u.undoTo)
+}
+function startCountdown() {
+  countdown.value = COUNTDOWN_S
+  clearInterval(countdownTimer)
+  countdownTimer = window.setInterval(() => {
+    if (countdown.value == null) return
+    countdown.value -= 1
+    if (countdown.value <= 0) {
+      cancelCountdown()
+      autoNext() // 与自然播完同一条路:core 按顺序 / 循环 / 随机定下一集
+    }
+  }, 1000)
+}
+function cancelCountdown() {
+  clearInterval(countdownTimer)
+  countdown.value = null
+}
+/** 跳过片头(S 键 / 嘴控走 core 的 seek):记为已处理,OSD 给回看口。 */
+function skipIntroNow() {
+  const s = skipInfo.value
+  if (!s?.intro) return false
+  introHandled = true
+  seek(s.intro.end)
+  showSkipOsd(t('media.skip.skipped'), s.intro.start)
+  return true
+}
+watch(
+  () => state.current?.stream_url,
+  () => {
+    introHandled = false
+    outroHandled = false
+    lastPos = 0
+    cancelCountdown()
+    skipOsd.value = null
+  },
+)
+watch(
+  () => state.position,
+  (p) => {
+    const jumped = Math.abs(p - lastPos) > SEEK_JUMP_S
+    lastPos = p
+    const s = skipInfo.value
+    if (!s || state.status !== 'playing' || dragging.value) return
+    if (s.intro && !introHandled && p >= s.intro.start && p < s.intro.end - 0.5) {
+      introHandled = true
+      if (!jumped) skipIntroNow() // 拖进片头 = 想看,只记不跳
+    }
+    if (s.outro_start != null && !outroHandled && countdown.value == null && p >= s.outro_start) {
+      outroHandled = true
+      if (!jumped && hasNext.value) startCountdown()
+    }
+  },
+)
+onUnmounted(() => {
+  cancelCountdown()
+  clearTimeout(skipOsdTimer)
+})
+
+/** 片头片尾标记菜单(进度条右键 = 光标处的时间;剪刀钮 / S 键 = 当前播放位):三项标记 + 本集在用的
+ *  信息一行 + 有手标才出「清除」。落库 / 重算在 core,与嘴控「片头到这里」同一入口。 */
+function skipMenuItems(at: number): MenuItem[] {
+  const s = skipInfo.value
+  const items: MenuItem[] = []
+  if (s) {
+    const parts: string[] = []
+    if (s.intro) parts.push(t('media.skip.intro', { a: fmtClock(s.intro.start), b: fmtClock(s.intro.end) }))
+    if (s.outro_start != null) parts.push(t('media.skip.outro', { t: fmtClock(s.outro_start) }))
+    items.push({ label: t('media.skip.now', { info: parts.join(' · ') }), disabled: true }, { separator: true })
+  }
+  const mark = (a: 'intro_start' | 'intro_end' | 'outro_start') => () => {
+    markSkip(a, at)
+    flashOsd(t('media.skip.marked'))
+  }
+  items.push(
+    { label: t('media.skip.introStart', { t: fmtClock(at) }), action: mark('intro_start') },
+    { label: t('media.skip.introEnd', { t: fmtClock(at) }), action: mark('intro_end') },
+    { label: t('media.skip.outroStart', { t: fmtClock(at) }), action: mark('outro_start') },
+  )
+  if (s?.source === 'manual') {
+    items.push(
+      { separator: true },
+      {
+        label: t('media.skip.clear'),
+        danger: true,
+        action: () => {
+          markSkip('skip_clear')
+          flashOsd(t('media.skip.cleared'))
+        },
+      },
+    )
+  }
+  return items
+}
+function onScrubMenu(e: MouseEvent) {
+  if (!playlist.value) return // 单部电影没有片头片尾可标(core 也会退回),别弹空菜单
+  menu.openMenu(e, skipMenuItems(hoverTime.value ?? state.position))
+}
+function openSkipMenu(e: MouseEvent) {
+  menu.openMenu(e, skipMenuItems(state.position))
+}
+/** 键盘打开标记菜单:没有鼠标位置,合成一个落在面板中央的事件(openMenu 只读 clientX/Y)。 */
+function openSkipMenuAtCenter() {
+  const r = panelEl.value?.getBoundingClientRect()
+  if (!r) return
+  openSkipMenu(new MouseEvent('contextmenu', { clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 }))
+}
+
 type KeyDef = {
   /** 显示用键名(帮助浮层 / tooltip)。 */
   keys: string[]
@@ -339,6 +478,18 @@ const KEYS: KeyDef[] = [
     match: key('l'),
     when: () => !!playlist.value,
     run: () => (listOpen.value = !listOpen.value),
+  },
+  {
+    keys: ['S'],
+    label: 'media.keys.skip',
+    match: key('s'),
+    when: () => !!playlist.value,
+    run: () => {
+      // 有片头且还没过 → 跳过;否则打开标记菜单(第一次按 S 就学会怎么标)
+      const s = skipInfo.value
+      if (s?.intro && state.position < s.intro.end - 0.5) skipIntroNow()
+      else openSkipMenuAtCenter()
+    },
   },
   {
     keys: ['A'],
@@ -518,6 +669,14 @@ onUnmounted(() => {
     <Transition name="osd">
       <div v-if="osd" class="osd" aria-live="polite">{{ osd }}</div>
     </Transition>
+    <!-- 跳过片头的回看口(5 秒);片尾倒计时切集(可取消)。都挂右下、控制条之上 -->
+    <button v-if="skipOsd" class="skip-osd" @click.stop="undoSkip">
+      {{ skipOsd.text }} · {{ t('media.skip.undo') }}
+    </button>
+    <div v-if="countdown != null" class="countdown" @pointerdown.stop>
+      <span>{{ t('media.skip.nextIn', { s: countdown }) }}</span>
+      <button class="vbtn small" @click.stop="cancelCountdown">{{ t('media.skip.cancel') }}</button>
+    </div>
     <!-- 快捷键速查(H):从同一张键位表生成;点外 / Esc / H 关 -->
     <div v-if="helpOpen" class="help" @click="helpOpen = false" @pointerdown.stop>
       <div class="help-card" @click.stop>
@@ -563,6 +722,7 @@ onUnmounted(() => {
         @pointermove="onMove"
         @pointerleave="onLeave"
         @pointercancel="onLeave"
+        @contextmenu="onScrubMenu"
       >
         <div
           v-if="hoverPct !== null"
@@ -608,6 +768,22 @@ onUnmounted(() => {
         :title="kb(subtitleText, 'C')"
       >
         CC
+      </button>
+      <!-- 片头片尾标记(多集才有):点开菜单,时间取当前播放位;进度条右键 = 光标处的时间 -->
+      <button
+        v-if="playlist && !compact"
+        class="vbtn"
+        :class="{ on: !!skipInfo }"
+        @click="openSkipMenu"
+        :title="kb(t('media.skip.menu'), 'S')"
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="6" cy="6" r="3" />
+          <circle cx="6" cy="18" r="3" />
+          <path d="M20 4 8.1 15.9" />
+          <path d="M14.5 14.5 20 20" />
+          <path d="M8.1 8.1 12 12" />
+        </svg>
       </button>
       <!-- 倍速:点开档位菜单(全局右键菜单宿主,当前档打勾);悬停滚轮一档一档调 -->
       <button
@@ -787,6 +963,19 @@ onUnmounted(() => {
 
 /* 选集下拉(窗口态):挂在标题栏下方;全屏侧栏由组件自己定位 */
 .eplist.drop { top: 46px; max-height: min(320px, calc(100% - 110px)); }
+
+/* 跳过片头回看口 / 片尾倒计时:右下角、控制条之上(覆盖媒体豁免:恒亮浅字压黑底) */
+.skip-osd, .countdown {
+  position: absolute; right: 16px; bottom: 64px; z-index: 3;
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 14px; border-radius: 999px;
+  background: rgba(0, 0, 0, 0.72); color: #eaf2fb; font-size: 12.5px;
+  border: 1px solid rgba(var(--accent-rgb), 0.35);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+.skip-osd { cursor: pointer; }
+.skip-osd:hover { border-color: var(--accent); }
+.vbtn.small { width: auto; height: 24px; padding: 0 10px; font-size: 11.5px; }
 
 /* 按键 OSD:画面中央的读数药丸(覆盖媒体豁免:恒亮浅字压黑底,不随皮肤) */
 .osd {

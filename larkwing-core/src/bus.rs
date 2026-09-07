@@ -77,6 +77,8 @@ pub struct TaskView {
 }
 
 /// 播放器车道。Play/Control 是 core → UI 的指令;UI 本地按钮直接操作播放元素,不绕这里。
+/// (`Play` 载荷大、其余变体小:事件每次播放才发一条、不进热路径,不值得为 clippy 装箱。)
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum MediaEvent {
@@ -90,6 +92,12 @@ pub enum MediaEvent {
         action: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         value: Option<f64>,
+    },
+    /// 当前这一集的片头 / 片尾信息变了(用户标记 / 清除、指纹检测跑完):前端替换 `NowPlaying.skip`。
+    /// None = 这一集没有可用信息(不跳)。增量变体,老前端忽略。
+    Skip {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        skip: Option<crate::media::skip::SkipInfo>,
     },
     /// 登录态缺失/失效:UI 出"扫码登录"入口;话术由模型按人格组织(中性事件喂回模型)。
     AuthRequired { source: String },

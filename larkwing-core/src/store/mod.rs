@@ -12,6 +12,7 @@ pub mod diary;
 pub mod fsops;
 pub mod jobs;
 pub mod media_progress;
+pub mod media_skip;
 pub mod memory;
 pub mod settings;
 pub mod skills;
@@ -37,6 +38,7 @@ pub(crate) fn like_escape(s: &str) -> String {
 pub use fsops::{FsOpRepo, FsOpRow};
 pub use jobs::{Job, JobRepo};
 pub use media_progress::{MediaProgressRepo, Progress};
+pub use media_skip::{MediaSkipRepo, SkipRow};
 pub use memory::{MaintenanceLog, Memory, MemoryRepo};
 pub use settings::SettingsRepo;
 pub use skills::{Skill, SkillIndex, SkillRepo, SkillWithStats};
@@ -60,6 +62,7 @@ pub struct Store {
     pub fsops: FsOpRepo,
     pub voiceprints: VoiceprintRepo,
     pub media_progress: MediaProgressRepo,
+    pub media_skip: MediaSkipRepo,
     pub todos: TodoRepo,
     pub diary: DiaryRepo,
     pub confirms: ConfirmRepo,
@@ -81,6 +84,7 @@ fn all_migrations() -> Vec<db::Migration> {
         fsops::MIGRATIONS,
         voiceprints::MIGRATIONS,
         media_progress::MIGRATIONS,
+        media_skip::MIGRATIONS,
         todos::MIGRATIONS,
         diary::MIGRATIONS,
         confirms::MIGRATIONS,
@@ -112,6 +116,7 @@ impl Store {
             fsops: FsOpRepo::new(db.clone()),
             voiceprints: VoiceprintRepo::new(db.clone()),
             media_progress: MediaProgressRepo::new(db.clone()),
+            media_skip: MediaSkipRepo::new(db.clone()),
             todos: TodoRepo::new(db.clone()),
             diary: DiaryRepo::new(db.clone()),
             confirms: ConfirmRepo::new(db.clone()),
