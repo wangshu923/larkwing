@@ -32,6 +32,8 @@ const state = reactive({
   duration: 0,
   /** 音量 0–1:跨播放粘住(用户调好的音量别每次重置)。 */
   volume: 1,
+  /** 静音旗标(M 键 / 喇叭钮):独立于基准音量 —— 取消静音回到原音量;任何调音量动作自动取消静音。 */
+  muted: false,
   /** 倍速镜像(core 是真相源:新点播复位 1 —— mpv 时代的教训,放完电影再放歌还是 2 倍;
    *  切集 / 自动续播沿用 —— 1.5 倍看剧不该每集掉回 1.0)。每条 Play 事件全量捎带,这里零猜测。 */
   rate: 1,
@@ -70,10 +72,15 @@ let videoBase = 0
 // 恢复时新基准生效 —— 修「50%→喊→压低→大点声→恢复又被无脑还原成 50%、改动丢失」的 bug。
 const DUCK_RATIO = 0.2
 let ducked = false
-/** 实时元素音量 = 基准(state.volume)按是否避让折算。 */
+/** 实时元素音量 = 基准(state.volume)按是否避让折算;静音恒 0(基准不动,取消静音即回)。 */
 function liveVolume(): number {
+  if (state.muted) return 0
   return ducked ? state.volume * DUCK_RATIO : state.volume
 }
+
+/** 快捷键 / 实体媒体键的快退快进步长(秒;§4.11 用户拍板 2026-09-07:←→ 15 秒、Shift 60 秒)。 */
+export const SEEK_STEP_S = 15
+export const SEEK_STEP_LONG_S = 60
 /** 把当前实时音量刷到两个元素(切音频/视频不丢)。即时设置 = 抢占进行中的渐变。 */
 function applyVolume() {
   cancelFade()
@@ -433,6 +440,7 @@ function play(np: NowPlaying) {
   // (原误用 `&& state.fullscreen` 当判据 → 用户退全屏成窗口播放后,下一集 continuation=false →
   //  强行 bringToFront+全屏,每个集边界都拽一次,是 bug。)只有「从无到有」起播视频才叫窗到前 + 全屏。
   const continuation = state.current?.kind === 'video' && np.kind === 'video'
+  updateMediaMetadata(np)
   stopElements()
   adaptiveFellBackFor = null // 新播放:清兜底记忆(muxed 回落走 /hls/ 不再进自适应,不会循环)
   failToastedFor = null // 同上:兜底重放也从这过,那一次再失败就该说话了
@@ -501,8 +509,46 @@ function toggle() {
  *  调完回报 core:模型的「此刻」背景里音量要跟手(才答得出「现在多大声」)。 */
 function setVolume(v: number) {
   state.volume = Math.min(1, Math.max(0, v))
+  state.muted = false // 动了音量 = 想听见,静音自动取消
   applyVolume()
   reportToCore()
+}
+
+/** 静音切换(M 键 / 喇叭钮):基准音量原地不动,取消即回。 */
+function toggleMute() {
+  state.muted = !state.muted
+  applyVolume()
+  reportToCore()
+}
+
+/** 相对定位(快捷键 / 实体媒体键):原生路立即跳;**混流路(/m/,seek = 换 src 重启 ffmpeg)连按合并
+ *  成一次** —— 读数先跟手,静默 250ms 后才真跳一次,否则按五下方向键 = 起五次 ffmpeg。 */
+const SEEK_COALESCE_MS = 250
+let seekAcc = 0
+let seekBase: number | null = null
+let seekTimer = 0
+function clampPos(p: number): number {
+  const cap = state.duration > 0 ? state.duration : Number.POSITIVE_INFINITY
+  return Math.min(cap, Math.max(0, p))
+}
+function seekBy(delta: number) {
+  const cur = state.current
+  if (!cur) return
+  const restartRoute = cur.kind === 'video' && !cur.manifest_url && cur.stream_url.includes('/m/')
+  if (!restartRoute) {
+    seek(clampPos(state.position + delta))
+    return
+  }
+  if (seekBase == null) seekBase = state.position
+  seekAcc += delta
+  state.position = clampPos(seekBase + seekAcc)
+  clearTimeout(seekTimer)
+  seekTimer = window.setTimeout(() => {
+    const target = clampPos((seekBase ?? 0) + seekAcc)
+    seekBase = null
+    seekAcc = 0
+    seek(target)
+  }, SEEK_COALESCE_MS)
 }
 
 /** 唤醒避让开关(useVoice 调):on=语音交互期压低,off=恢复。改的是折算系数,基准不动 →
@@ -572,7 +618,7 @@ function reportToCore(last?: { position: number; duration: number }) {
     .reportMediaState({
       status: state.status,
       title: state.current?.title ?? null,
-      volume: Math.round(state.volume * 100),
+      volume: Math.round((state.muted ? 0 : state.volume) * 100), // 静音报 0:模型说「大点声」会带出声
       position,
       duration: duration > 0 ? duration : null,
       rate: state.rate,
@@ -621,6 +667,7 @@ function stop() {
   }
   videoWasHidden = false
   const last = { position: state.position, duration: state.duration } // 最后的集内进度随 idle 回报落盘
+  updateMediaMetadata(null)
   state.current = null
   state.status = 'idle'
   state.position = 0
@@ -807,9 +854,44 @@ function onMedia(ev: MediaEvent) {
   }
 }
 
+/** 实体媒体键 / 系统媒体浮层(Windows 键盘的播放暂停、上下曲键,SMTC):Media Session API,Chromium
+ *  支持、WebView2 表现待真机。只主窗接(真播放位);动作全部汇到与按钮同一执行口。不支持的动作
+ *  抛异常 → 单个吞掉,别让一个动作不支持拖垮整套。 */
+function setupMediaSession() {
+  if (isFloat || typeof navigator === 'undefined' || !('mediaSession' in navigator)) return
+  const ms = navigator.mediaSession
+  const on = (action: MediaSessionAction, fn: () => void) => {
+    try {
+      ms.setActionHandler(action, fn)
+    } catch {
+      /* 这个动作此平台不支持 */
+    }
+  }
+  on('play', resume)
+  on('pause', pause)
+  on('stop', stop)
+  on('previoustrack', () => advance(-1))
+  on('nexttrack', () => advance(1))
+  on('seekbackward', () => seekBy(-SEEK_STEP_S))
+  on('seekforward', () => seekBy(SEEK_STEP_S))
+}
+
+/** 系统媒体浮层显示的标题 / 作者(切集自动换);不支持就算了。 */
+function updateMediaMetadata(np: NowPlaying | null) {
+  if (isFloat || typeof navigator === 'undefined' || !('mediaSession' in navigator)) return
+  try {
+    navigator.mediaSession.metadata = np
+      ? new MediaMetadata({ title: np.title, artist: np.author ?? '' })
+      : null
+  } catch {
+    /* MediaMetadata 不可用 */
+  }
+}
+
 function wire() {
   if (wired) return
   wired = true
+  setupMediaSession()
   if (isTauri()) {
     onAppEvent((ev) => {
       if (ev.type === 'media') onMedia(ev.data)
@@ -898,6 +980,8 @@ export function useMedia() {
     stop,
     seek,
     setVolume,
+    toggleMute,
+    seekBy,
     setDucked,
     setRate,
     stepRate,

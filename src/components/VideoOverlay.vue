@@ -8,7 +8,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useContextMenu } from '../composables/useContextMenu'
-import { registerVideoEl, useMedia } from '../composables/useMedia'
+import { registerVideoEl, SEEK_STEP_LONG_S, SEEK_STEP_S, useMedia } from '../composables/useMedia'
 import { useScrubHover, useScrubThumb } from '../composables/useScrubHover'
 import { win } from '../lib/backend'
 import { fmtClock } from '../lib/fmt'
@@ -19,7 +19,9 @@ const {
   toggle,
   stop,
   seek,
+  seekBy,
   setVolume,
+  toggleMute,
   stepRate,
   openRateMenu,
   next,
@@ -224,61 +226,180 @@ async function toggleFullscreen() {
   await win.setFullscreen(next)
 }
 
-/** 看片快捷键:空格=播放/暂停、↑↓=音量、←→=快进退 20s、Esc=退全屏。
- * 在输入框打字时不抢键;空格/方向键会 preventDefault(否则页面滚动/翻页)。 */
-const SEEK_STEP = 20 // 秒
+/* —— 看片快捷键(§4.11 用户拍板 2026-09-07 键位表)——
+ * 一张表当数据:按键分发、帮助浮层(H)、按钮 tooltip 都从它生成,加键 = 加一行。
+ * 全部动作汇到与按钮 / 嘴控同一执行口(useMedia),不长第二套语义。
+ * 只在视频浮层在前、且焦点不在输入框时接管;音频条不接单键(它与打字共存)。 */
 const VOL_STEP = 0.1
+/** OSD:每次按键在画面中央闪一下读数(「1.75x」「+15s」「音量 60%」),0.9s 自隐。 */
+const osd = ref<string | null>(null)
+let osdTimer = 0
+function flashOsd(text: string) {
+  osd.value = text
+  clearTimeout(osdTimer)
+  osdTimer = window.setTimeout(() => (osd.value = null), 900)
+}
+/** 快捷键速查浮层(H 键 / 「?」钮)。 */
+const helpOpen = ref(false)
+
+type KeyDef = {
+  /** 显示用键名(帮助浮层 / tooltip)。 */
+  keys: string[]
+  /** 帮助浮层里的说明(i18n key)。 */
+  label: string
+  /** 命中判定:返回 true = 这条接管本次按键。 */
+  match: (e: KeyboardEvent) => boolean
+  run: (e: KeyboardEvent) => void
+  /** 只在有对应能力时显示 / 生效(多集才有上下集,双语片才有音轨…)。 */
+  when?: () => boolean
+}
+const key = (k: string, code?: string) => (e: KeyboardEvent) =>
+  !e.shiftKey && (e.key === k || e.key === k.toUpperCase() || (code !== undefined && e.code === code))
+const shift = (k: string) => (e: KeyboardEvent) => e.shiftKey && e.key === k
+const ctrl = (k: string) => (e: KeyboardEvent) => (e.ctrlKey || e.metaKey) && e.key === k
+const volPct = (v: number) => Math.round(v * 100)
+const KEYS: KeyDef[] = [
+  {
+    keys: ['Space', 'K'],
+    label: 'media.keys.playPause',
+    match: (e) => key('k')(e) || e.key === ' ' || e.key === 'Spacebar',
+    run: () => {
+      toggle()
+      flashOsd(state.status === 'playing' ? t('media.osd.pause') : t('media.osd.play'))
+    },
+  },
+  {
+    keys: ['←', '→'],
+    label: 'media.keys.seek',
+    match: (e) => !e.shiftKey && !e.ctrlKey && !e.metaKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight'),
+    run: (e) => {
+      const d = e.key === 'ArrowLeft' ? -SEEK_STEP_S : SEEK_STEP_S
+      seekBy(d)
+      flashOsd(t('media.osd.seek', { s: `${d > 0 ? '+' : '−'}${Math.abs(d)}` }))
+    },
+  },
+  {
+    keys: ['Shift+←', 'Shift+→'],
+    label: 'media.keys.seekLong',
+    match: (e) => shift('ArrowLeft')(e) || shift('ArrowRight')(e),
+    run: (e) => {
+      const d = e.key === 'ArrowLeft' ? -SEEK_STEP_LONG_S : SEEK_STEP_LONG_S
+      seekBy(d)
+      flashOsd(t('media.osd.seek', { s: `${d > 0 ? '+' : '−'}${Math.abs(d)}` }))
+    },
+  },
+  {
+    keys: ['↑', '↓'],
+    label: 'media.keys.volume',
+    match: (e) => e.key === 'ArrowUp' || e.key === 'ArrowDown',
+    run: (e) => {
+      setVolume(state.volume + (e.key === 'ArrowUp' ? VOL_STEP : -VOL_STEP))
+      flashOsd(t('media.osd.volume', { pct: volPct(state.volume) }))
+    },
+  },
+  {
+    keys: ['M'],
+    label: 'media.keys.mute',
+    match: key('m'),
+    run: () => {
+      toggleMute()
+      flashOsd(state.muted ? t('media.osd.muted') : t('media.osd.volume', { pct: volPct(state.volume) }))
+    },
+  },
+  {
+    keys: ['Ctrl+←', 'Ctrl+→'],
+    label: 'media.keys.speed',
+    match: (e) => ctrl('ArrowLeft')(e) || ctrl('ArrowRight')(e),
+    run: (e) => {
+      stepRate(e.key === 'ArrowRight' ? 1 : -1)
+      flashOsd(`${state.rate}x`)
+    },
+  },
+  {
+    keys: ['PageUp', 'PageDown'],
+    label: 'media.keys.episode',
+    match: (e) => e.key === 'PageUp' || e.key === 'PageDown',
+    when: () => !!playlist.value,
+    run: (e) => {
+      if (e.key === 'PageDown') {
+        next()
+        flashOsd(t('media.osd.nextEp'))
+      } else {
+        prev()
+        flashOsd(t('media.osd.prevEp'))
+      }
+    },
+  },
+  {
+    keys: ['A'],
+    label: 'media.keys.audioTrack',
+    match: key('a'),
+    when: () => audioTrackCount.value >= 2,
+    run: () => {
+      cycleAudioTrack()
+      flashOsd(t('media.audioTrack', { label: audioTrackLabel(state.current?.audio_track ?? 0) }))
+    },
+  },
+  {
+    keys: ['C'],
+    label: 'media.keys.subtitle',
+    match: key('c'),
+    when: () => subtitles.value.length >= 1,
+    run: () => {
+      cycleSubtitle()
+      flashOsd(subtitleText.value)
+    },
+  },
+  {
+    keys: ['F'],
+    label: 'media.keys.fullscreen',
+    match: key('f'),
+    run: () => void toggleFullscreen(),
+  },
+  {
+    keys: ['Esc'],
+    label: 'media.keys.esc',
+    match: (e) => e.key === 'Escape',
+    run: () => {
+      if (helpOpen.value) helpOpen.value = false
+      else if (state.fullscreen) void toggleFullscreen()
+    },
+  },
+  {
+    keys: ['H'],
+    label: 'media.keys.help',
+    match: key('h'),
+    run: () => (helpOpen.value = !helpOpen.value),
+  },
+]
+/** 帮助浮层的行:只列当前有意义的(没多集不列上下集)。 */
+const keyHelp = computed(() => KEYS.filter((k) => !k.when || k.when()).map((k) => ({ keys: k.keys, label: t(k.label) })))
+/** 按钮 tooltip 里附带的键名提示,如「下一集 (PageDown)」。 */
+const kb = (label: string, k: string) => `${label} (${k})`
+
 function onKey(e: KeyboardEvent) {
   // 倍速菜单(全局右键菜单宿主)开着:Esc / 键盘交给它,别顺手把全屏也退了
   if (menu.state.open) return
-  // Esc 退全屏:tao 原生全屏在 Windows 不可靠响应 Esc,自己接管。
-  if (e.key === 'Escape' && state.fullscreen) {
-    e.preventDefault()
-    e.stopPropagation()
-    void toggleFullscreen()
-    return
-  }
   // 正在真文本输入(输入框/可编辑区打字)→ 让位,别抢键。浮层自己的滑杆(range)不算:
   // 拖完进度条/音量条焦点留在滑杆上,快捷键要照常生效(行为恒定,不随焦点漂)。
-  const t = e.target as HTMLElement | null
+  const tg = e.target as HTMLElement | null
   if (
-    t &&
-    (t.isContentEditable ||
-      (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) && (t as HTMLInputElement).type !== 'range'))
+    tg &&
+    (tg.isContentEditable ||
+      (/^(INPUT|TEXTAREA|SELECT)$/.test(tg.tagName) && (tg as HTMLInputElement).type !== 'range'))
   )
     return
-  // 带修饰键的组合留给系统/其它快捷键
-  if (e.ctrlKey || e.metaKey || e.altKey) return
+  // Alt 组合留给系统;Ctrl/Cmd 只放行表里点名的(Ctrl+←→ 倍速),其余同样让位
+  if (e.altKey) return
   // 没有在播放的内容就不接管(避免在别的视图误吞键)
   if (!state.current) return
-  switch (e.key) {
-    case ' ':
-    case 'Spacebar': // 老 Edge/IE 的空格键名
-      e.preventDefault()
-      toggle()
-      break
-    case 'ArrowUp':
-      e.preventDefault()
-      setVolume(state.volume + VOL_STEP)
-      break
-    case 'ArrowDown':
-      e.preventDefault()
-      setVolume(state.volume - VOL_STEP)
-      break
-    case 'ArrowLeft':
-      e.preventDefault()
-      seek(Math.max(0, state.position - SEEK_STEP))
-      break
-    case 'ArrowRight': {
-      e.preventDefault()
-      const cap = state.duration > 0 ? state.duration : state.position + SEEK_STEP
-      seek(Math.min(cap, state.position + SEEK_STEP))
-      break
-    }
-    default:
-      return
-  }
-  showControls() // 调整后让控制条/OSD 浮现一下(全屏态)
+  const hit = KEYS.find((k) => (!k.when || k.when()) && k.match(e))
+  if (!hit) return
+  // Esc 退全屏:tao 原生全屏在 Windows 不可靠响应 Esc,自己接管;空格/方向键防页面滚动
+  e.preventDefault()
+  e.stopPropagation()
+  hit.run(e)
+  showControls() // 调整后让控制条浮现一下(全屏态)
 }
 
 // 控制条覆盖在画面上,播放中 2.8s 无操作自动隐藏(鼠标一动即现)。两种模式同一套:
@@ -371,17 +492,33 @@ onUnmounted(() => {
       <track v-for="(s, i) in subtitles" :key="s.url" kind="subtitles" :src="s.url" :srclang="s.lang" :label="subtitleLabel(i)" />
     </video>
     <div v-if="state.status === 'loading'" class="spinner" aria-hidden="true"></div>
+    <!-- 按键 OSD:画面中央闪一下读数(倍速 / 音量 / ±秒),0.9s 自隐 -->
+    <Transition name="osd">
+      <div v-if="osd" class="osd" aria-live="polite">{{ osd }}</div>
+    </Transition>
+    <!-- 快捷键速查(H):从同一张键位表生成;点外 / Esc / H 关 -->
+    <div v-if="helpOpen" class="help" @click="helpOpen = false" @pointerdown.stop>
+      <div class="help-card" @click.stop>
+        <h3>{{ t('media.keys.title') }}</h3>
+        <ul>
+          <li v-for="row in keyHelp" :key="row.label">
+            <span class="kbs"><kbd v-for="k in row.keys" :key="k">{{ k }}</kbd></span>
+            <span class="lbl">{{ row.label }}</span>
+          </li>
+        </ul>
+      </div>
+    </div>
     <footer class="bar bottom">
       <button
         v-if="playlist"
         class="vbtn"
         @click="prev"
         :disabled="playlist.index <= 0"
-        :title="t('media.prevEp')"
+        :title="kb(t('media.prevEp'), 'PageUp')"
       >
         ⏮
       </button>
-      <button class="vbtn" @click="toggle">
+      <button class="vbtn" @click="toggle" :title="kb(state.status === 'playing' ? t('media.pause') : t('media.play'), 'Space')">
         {{ state.status === 'playing' ? '⏸' : '▶' }}
       </button>
       <button
@@ -389,7 +526,7 @@ onUnmounted(() => {
         class="vbtn"
         @click="next"
         :disabled="playlist.index >= playlist.total - 1"
-        :title="t('media.nextEp')"
+        :title="kb(t('media.nextEp'), 'PageDown')"
       >
         ⏭
       </button>
@@ -436,7 +573,7 @@ onUnmounted(() => {
         v-if="audioTrackCount >= 2 && !compact"
         class="vbtn rate"
         @click="cycleAudioTrack"
-        :title="t('media.audioTrack', { label: audioLabel })"
+        :title="kb(t('media.audioTrack', { label: audioLabel }), 'A')"
       >
         {{ audioLabel }}
       </button>
@@ -446,7 +583,7 @@ onUnmounted(() => {
         class="vbtn rate"
         :class="{ on: state.subtitle >= 1 }"
         @click="cycleSubtitle"
-        :title="subtitleText"
+        :title="kb(subtitleText, 'C')"
       >
         CC
       </button>
@@ -460,18 +597,39 @@ onUnmounted(() => {
       >
         {{ state.rate }}x
       </button>
+      <!-- 静音:基准音量不动,取消即回(M);内联 SVG 而非 🔇 emoji —— emoji 恒彩色无视 CSS color -->
+      <button
+        v-if="!compact"
+        class="vbtn"
+        :class="{ on: state.muted }"
+        @click="toggleMute"
+        :title="kb(state.muted ? t('media.unmute') : t('media.mute'), 'M')"
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M4 9v6h4l5 4V5L8 9H4z" />
+          <template v-if="state.muted">
+            <path d="m17 9 4 6" />
+            <path d="m21 9-4 6" />
+          </template>
+          <template v-else>
+            <path d="M16.5 8.5a5 5 0 0 1 0 7" />
+            <path d="M19 6a8.5 8.5 0 0 1 0 12" />
+          </template>
+        </svg>
+      </button>
       <input
         v-if="!compact"
         class="vol-slider"
         type="range"
         min="0"
         max="100"
-        :value="Math.round(state.volume * 100)"
+        :value="state.muted ? 0 : Math.round(state.volume * 100)"
         @input="onVolume"
         :title="t('media.volume')"
-        :style="{ '--pct': state.volume * 100 + '%' }"
+        :style="{ '--pct': (state.muted ? 0 : state.volume * 100) + '%' }"
       />
-      <button class="vbtn" @click="toggleFullscreen" :title="t('media.fullscreen')">⛶</button>
+      <button v-if="!compact" class="vbtn" @click="helpOpen = !helpOpen" :title="kb(t('media.keys.title'), 'H')">?</button>
+      <button class="vbtn" @click="toggleFullscreen" :title="kb(t('media.fullscreen'), 'F')">⛶</button>
     </footer>
     <div v-if="!state.fullscreen" class="grip" @pointerdown="onGripDown" aria-hidden="true"></div>
   </div>
@@ -602,6 +760,43 @@ onUnmounted(() => {
 }
 
 .vbtn.rate { width: auto; padding: 0 9px; font: 11px/1 ui-monospace, "SF Mono", monospace; }
+.vbtn svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.vbtn.on { border-color: var(--accent); background: rgba(var(--accent-rgb), 0.22); }
+
+/* 按键 OSD:画面中央的读数药丸(覆盖媒体豁免:恒亮浅字压黑底,不随皮肤) */
+.osd {
+  position: absolute; top: 50%; left: 50%; z-index: 3;
+  transform: translate(-50%, -50%);
+  padding: 8px 18px; border-radius: 999px;
+  background: rgba(0, 0, 0, 0.62); color: #eaf2fb;
+  font: 15px/1 ui-monospace, "SF Mono", monospace; letter-spacing: 0.5px;
+  pointer-events: none; white-space: nowrap;
+}
+.osd-enter-active, .osd-leave-active { transition: opacity 0.18s ease, transform 0.18s ease; }
+.osd-enter-from, .osd-leave-to { opacity: 0; transform: translate(-50%, -50%) scale(0.92); }
+
+/* 快捷键速查:盖在画面上的半透黑幕 + 卡片(键帽 / 说明两列) */
+.help {
+  position: absolute; inset: 0; z-index: 5;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+}
+.help-card {
+  min-width: 260px; max-width: min(92%, 420px); max-height: 92%; overflow: auto;
+  padding: 14px 18px 16px; border-radius: 14px;
+  background: rgba(0, 0, 0, 0.82); color: #eaf2fb;
+  border: 1px solid rgba(var(--accent-rgb), 0.3);
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55);
+}
+.help-card h3 { margin: 0 0 10px; font-size: 13px; letter-spacing: 0.6px; color: var(--accent); }
+.help-card ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.help-card li { display: flex; align-items: center; gap: 12px; font-size: 12.5px; }
+.help-card .kbs { flex: none; min-width: 118px; display: flex; gap: 4px; flex-wrap: wrap; }
+.help-card kbd {
+  padding: 2px 7px; border-radius: 6px; font: 11px/1.5 ui-monospace, "SF Mono", monospace;
+  background: rgba(255, 255, 255, 0.1); border: 1px solid rgba(255, 255, 255, 0.22); color: #fff;
+}
+.help-card .lbl { color: rgba(234, 242, 251, 0.85); }
 .vol-slider {
   -webkit-appearance: none; appearance: none; width: 70px; height: 3px; border-radius: 2px; flex: none;
   background: linear-gradient(90deg, var(--accent) var(--pct), rgba(var(--accent-rgb), 0.14) var(--pct));
