@@ -32,15 +32,28 @@ export function parseLrc(raw: string): LrcLine[] {
   return out.sort((a, b) => a.t - b.t)
 }
 
-/** 当前句 = 最后一条 t ≤ 位置(+0.2s 提前量:口型对不齐时宁早勿晚)。还没到第一句 = 空。 */
-export function lineAt(lines: LrcLine[], position: number): string {
+/** 当前句的下标 = 最后一条 t ≤ 位置(+0.2s 提前量:口型对不齐时宁早勿晚)。还没到第一句 = -1。 */
+export function indexAt(lines: LrcLine[], position: number): number {
   const pos = position + 0.2
-  let cur = ''
-  for (const l of lines) {
-    if (l.t <= pos) cur = l.text
+  let cur = -1
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].t <= pos) cur = i
     else break
   }
   return cur
+}
+
+/** 当前句文本(还没到第一句 = 空)。 */
+export function lineAt(lines: LrcLine[], position: number): string {
+  const i = indexAt(lines, position)
+  return i >= 0 ? lines[i].text : ''
+}
+
+/** 「正在播放」大卡的三行:上一句 / 当前句 / 下一句(没有的留空)。 */
+export interface LyricContext {
+  prev: string
+  cur: string
+  next: string
 }
 
 export function useLyrics(lyricsRaw: Ref<string | undefined>, position: Ref<number>) {
@@ -48,5 +61,16 @@ export function useLyrics(lyricsRaw: Ref<string | undefined>, position: Ref<numb
   /** 有带时间轴的词才算「有歌词」(按钮与显示都看它)。 */
   const available = computed(() => lines.value.length > 0)
   const current = computed(() => (available.value ? lineAt(lines.value, position.value) : ''))
-  return { available, current }
+  /** 三行上下文(大卡用):当前句居中,前后各一句。还没到第一句时 next = 第一句,让人知道快开唱了。 */
+  const around = computed<LyricContext>(() => {
+    const ls = lines.value
+    if (!ls.length) return { prev: '', cur: '', next: '' }
+    const i = indexAt(ls, position.value)
+    return {
+      prev: i >= 1 ? ls[i - 1].text : '',
+      cur: i >= 0 ? ls[i].text : '',
+      next: ls[i + 1]?.text ?? '',
+    }
+  })
+  return { available, current, around }
 }

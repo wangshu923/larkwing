@@ -434,7 +434,10 @@ async fn fetch_audio_file(
     };
     if let Some(ff) = ffmpeg {
         let dest = files::dedupe_path(&dir.join(format!("{name}.{ext}")));
-        match remux_audio(
+        // 封面:源页面的封面图嵌进产物(m4a 进 covr、flac 进 PICTURE),手机播放器 / 音乐 app 就有图。
+        // 锦上添花:下不到 / 转不了 = 不嵌;带封面整理失败再退回不带封面整理一次,绝不因封面丢下载。
+        let cover = if cover_embeddable(ext) { fetch_cover_temp(net, resolved, dir).await } else { None };
+        let mut attempt = remux_audio(
             ff,
             &part,
             &dest,
@@ -442,9 +445,27 @@ async fn fetch_audio_file(
             &display_title,
             meta.artist.as_deref(),
             &comment,
+            cover.as_deref(),
         )
-        .await
-        {
+        .await;
+        if let (Err(e), Some(_)) = (&attempt, &cover) {
+            tracing::warn!(title = %display_title, "带封面整理失败,改为不嵌封面再试一次: {e:#}");
+            attempt = remux_audio(
+                ff,
+                &part,
+                &dest,
+                ext,
+                &display_title,
+                meta.artist.as_deref(),
+                &comment,
+                None,
+            )
+            .await;
+        }
+        if let Some(c) = &cover {
+            let _ = std::fs::remove_file(c);
+        }
+        match attempt {
             Ok(out_bytes) => {
                 let _ = std::fs::remove_file(&part);
                 return Ok(DownloadedAudio {
@@ -541,8 +562,115 @@ async fn stream_to_part(
     Ok(total)
 }
 
-/// ffmpeg `-c copy` 整理:抽音轨(`-vn` 兜合并流)、换标准容器、写歌名/歌手/来源标签。
+/// 封面能嵌进哪些容器:m4a(covr 原子)、flac(PICTURE 块)。ogg / opus 的 ffmpeg 复用器不收
+/// attached_pic 流,这两种跳过(不嵌不算失败)。
+fn cover_embeddable(ext: &str) -> bool {
+    matches!(ext, "m4a" | "flac")
+}
+
+/// 下载封面图的字节上限(B 站封面几十到几百 KB;8MB 是「这不是封面」的 backstop,与 relay 同数)。
+const COVER_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// 嵌进文件的封面最长边:原图不裁不改比例(用户拍板 2026-09-07),只封顶超大图;B 站封面本就 ≤1920。
+const COVER_EMBED_MAX_EDGE: u32 = 2000;
+const COVER_EMBED_JPEG_QUALITY: u8 = 90;
+
+/// 把源页面的封面下成一张临时 JPEG(嵌进下载产物用):走 net::Client 带防盗链头(与流同站,
+/// 同一套 Referer/UA),webp/png 一律转 JPEG(covr / PICTURE 两边都吃 JPEG;B 站封面常带 .webp 变体)。
+/// 任何一步不顺 = None(封面是锦上添花,不挡下载)。临时件由调用方整理完删掉。
+async fn fetch_cover_temp(
+    net: &crate::net::Client,
+    resolved: &Resolved,
+    dir: &Path,
+) -> Option<PathBuf> {
+    let url = resolved.thumbnail.as_deref()?;
+    let headers = sub_headers(resolved);
+    let mut resp = net
+        .send(url, |c| {
+            let mut req = c.get(url);
+            for (k, v) in headers {
+                req = req.header(k, v);
+            }
+            req
+        })
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        tracing::info!(url = %url, status = resp.status().as_u16(), "封面图取不到,产物不嵌封面");
+        return None;
+    }
+    if resp.content_length().is_some_and(|n| n > COVER_MAX_BYTES as u64) {
+        return None;
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        if buf.len() + chunk.len() > COVER_MAX_BYTES {
+            return None;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    let jpeg = tokio::task::spawn_blocking(move || {
+        super::relay::cover_jpeg(&buf, COVER_EMBED_MAX_EDGE, COVER_EMBED_JPEG_QUALITY)
+    })
+    .await
+    .ok()
+    .flatten()?;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = dir.join(format!(
+        ".lw-cover-{}-{}.jpg",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&tmp, jpeg).ok()?;
+    Some(tmp)
+}
+
+/// remux 的 ffmpeg 参数(纯函数、可测):`-c copy` 抽音轨、写标签;`cover` 给了就把它当第二路输入
+/// 挂成 attached_pic(m4a → covr、flac → PICTURE),没给则 `-vn` 兜合并流里的视频轨。
+fn remux_args(
+    src: &Path,
+    tmp: &Path,
+    ext: &str,
+    title: &str,
+    artist: Option<&str>,
+    comment: &str,
+    cover: Option<&Path>,
+) -> Vec<std::ffi::OsString> {
+    use std::ffi::OsString;
+    fn s(v: &str) -> OsString {
+        OsString::from(v)
+    }
+    let mut a: Vec<OsString> = vec![s("-hide_banner"), s("-y"), s("-i"), src.into()];
+    match cover {
+        Some(c) => {
+            a.push(s("-i"));
+            a.push(c.into());
+            a.extend(
+                ["-map", "0:a", "-map", "1:v", "-c:a", "copy", "-c:v", "copy", "-disposition:v:0", "attached_pic"]
+                    .into_iter()
+                    .map(s),
+            );
+        }
+        None => a.extend(["-vn", "-c:a", "copy"].into_iter().map(s)),
+    }
+    if ext == "m4a" {
+        a.push(s("-movflags"));
+        a.push(s("+faststart")); // moov 提前,顺序读的播放器/网盘预览友好
+    }
+    a.push(s("-metadata"));
+    a.push(s(&format!("title={title}")));
+    if let Some(ar) = artist {
+        a.push(s("-metadata"));
+        a.push(s(&format!("artist={ar}")));
+    }
+    a.push(s("-metadata"));
+    a.push(s(&format!("comment={comment}")));
+    a.push(tmp.into());
+    a
+}
+
+/// ffmpeg `-c copy` 整理:抽音轨(`-vn` 兜合并流)、换标准容器、写歌名/歌手/来源标签、嵌封面(给了的话)。
 /// 不转码 —— 纯 I/O,秒级。输出先落同目录临时名(ffmpeg 按扩展名认格式)再改名。
+#[allow(clippy::too_many_arguments)]
 async fn remux_audio(
     ffmpeg: &Path,
     src: &Path,
@@ -551,6 +679,7 @@ async fn remux_audio(
     title: &str,
     artist: Option<&str>,
     comment: &str,
+    cover: Option<&Path>,
 ) -> Result<u64> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let tmp = dest.with_file_name(format!(
@@ -559,16 +688,7 @@ async fn remux_audio(
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     let mut cmd = tokio::process::Command::new(ffmpeg);
-    cmd.arg("-hide_banner").arg("-y").arg("-i").arg(src).arg("-vn").arg("-c:a").arg("copy");
-    if ext == "m4a" {
-        cmd.arg("-movflags").arg("+faststart"); // moov 提前,顺序读的播放器/网盘预览友好
-    }
-    cmd.arg("-metadata").arg(format!("title={title}"));
-    if let Some(a) = artist {
-        cmd.arg("-metadata").arg(format!("artist={a}"));
-    }
-    cmd.arg("-metadata").arg(format!("comment={comment}"));
-    cmd.arg(&tmp);
+    cmd.args(remux_args(src, &tmp, ext, title, artist, comment, cover));
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -601,6 +721,35 @@ mod tests {
             vcodec: vcodec.map(str::to_string),
             ..UpStream::default()
         }
+    }
+
+    #[test]
+    fn remux_args_embed_cover_only_when_given() {
+        let src = Path::new("/tmp/in.part");
+        let tmp = Path::new("/tmp/.lw-remux.m4a");
+        let cover = Path::new("/tmp/.lw-cover.jpg");
+        let with = remux_args(src, tmp, "m4a", "歌名", Some("歌手"), "来源: x", Some(cover));
+        let s: Vec<String> = with.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        // 第二路输入 = 封面,挂成 attached_pic;音频只 copy 不转码;m4a 仍 faststart
+        assert!(s.windows(2).any(|w| w[0] == "-i" && w[1] == cover.to_string_lossy()));
+        assert!(s.windows(2).any(|w| w[0] == "-disposition:v:0" && w[1] == "attached_pic"));
+        assert!(s.windows(2).any(|w| w[0] == "-map" && w[1] == "1:v"));
+        assert!(s.windows(2).any(|w| w[0] == "-c:a" && w[1] == "copy"));
+        assert!(s.windows(2).any(|w| w[0] == "-movflags" && w[1] == "+faststart"));
+        assert!(!s.iter().any(|a| a == "-vn"), "带封面时不能 -vn(会把封面也丢掉)");
+        assert!(s.iter().any(|a| a == "artist=歌手"));
+        assert_eq!(s.last().map(String::as_str), Some(tmp.to_string_lossy().as_ref()));
+
+        let without = remux_args(src, tmp, "flac", "歌名", None, "来源: x", None);
+        let s: Vec<String> = without.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(s.iter().any(|a| a == "-vn"), "不带封面 = 原样 -vn 兜合并流");
+        assert!(!s.iter().any(|a| a == "attached_pic"));
+        assert!(!s.iter().any(|a| a.starts_with("artist=")), "没给歌手不写 artist");
+        assert!(!s.iter().any(|a| a == "-movflags"), "flac 不带 faststart");
+
+        // 封面只嵌 m4a / flac;ogg/opus 的复用器不收 attached_pic
+        assert!(cover_embeddable("m4a") && cover_embeddable("flac"));
+        assert!(!cover_embeddable("opus") && !cover_embeddable("ogg"));
     }
 
     #[test]
@@ -653,6 +802,7 @@ mod tests {
             title: "《测试曲目》某某录音棚大声听".into(),
             uploader: Some("某搬运号".into()),
             duration_seconds: Some(3.0),
+            thumbnail: None,
             streams: vec![UpStream {
                 url: format!("http://127.0.0.1:{port}/a"),
                 headers: vec![("Referer".into(), "https://example-source.test/".into())],

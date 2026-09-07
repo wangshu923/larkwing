@@ -57,6 +57,8 @@ pub struct Resolved {
     pub title: String,
     pub uploader: Option<String>,
     pub duration_seconds: Option<f64>,
+    /// 源页面的封面图(yt-dlp `thumbnail`;B 站 = 视频封面)。放歌时当专辑封面显示、下载时嵌进文件。
+    pub thumbnail: Option<String>,
     /// 1 路 = 直转;2 路(视频+音频分离,B 站 DASH 常态)= 走 ffmpeg 混流。
     pub streams: Vec<UpStream>,
     pub subtitles: Vec<SubtitleRef>,
@@ -175,6 +177,11 @@ pub(super) fn parse_resolved(json: &serde_json::Value) -> Result<Resolved> {
     let title = json["title"].as_str().unwrap_or("未知标题").to_string();
     let uploader = json["uploader"].as_str().map(str::to_string);
     let duration_seconds = json["duration"].as_f64();
+    // 只认 http(s) 的封面地址(yt-dlp 偶有 data:/相对形;不是能下的就当没有)
+    let thumbnail = json["thumbnail"]
+        .as_str()
+        .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
+        .map(str::to_string);
 
     let mut streams = Vec::new();
     if let Some(formats) = json["requested_formats"].as_array() {
@@ -200,7 +207,7 @@ pub(super) fn parse_resolved(json: &serde_json::Value) -> Result<Resolved> {
     };
     tracing::info!(title = %title, streams = streams.len(), fmts = ?fmts, "媒体解析完成");
     let subtitles = parse_subtitles(json);
-    Ok(Resolved { title, uploader, duration_seconds, streams, subtitles })
+    Ok(Resolved { title, uploader, duration_seconds, thumbnail, streams, subtitles })
 }
 
 /// 字幕清单:每语言取一条(优先 `ext=json` 变体 = B 站原生字幕形,带 from/to 时间轴);
@@ -267,12 +274,14 @@ mod tests {
             "title": "恭喜发财",
             "uploader": "某UP",
             "duration": 225.0,
+            "thumbnail": "https://img.example/cover.jpg",
             "url": "https://cdn.example/audio.m4a",
             "http_headers": { "Referer": "https://www.bilibili.com/", "User-Agent": "UA" }
         });
         let r = parse_resolved(&json).unwrap();
         assert_eq!(r.title, "恭喜发财");
         assert_eq!(r.duration_seconds, Some(225.0));
+        assert_eq!(r.thumbnail.as_deref(), Some("https://img.example/cover.jpg"));
         assert_eq!(r.streams.len(), 1);
         assert_eq!(r.streams[0].url, "https://cdn.example/audio.m4a");
         assert!(r.streams[0].headers.iter().any(|(k, v)| k == "Referer" && v.contains("bilibili")));
@@ -291,6 +300,7 @@ mod tests {
         let r = parse_resolved(&json).unwrap();
         assert_eq!(r.streams.len(), 2, "音视频分离 = 两路,走混流");
         assert_eq!(r.uploader, None);
+        assert_eq!(r.thumbnail, None, "没给封面就是没有");
     }
 
     #[test]

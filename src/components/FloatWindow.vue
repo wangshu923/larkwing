@@ -23,6 +23,12 @@ import catIdle from '../assets/cat-idle.png'
 const { t, te } = useI18n()
 const settings = useSettings()
 const { state, running, nowPlaying, mediaPlaying, mediaToggle, mediaStop, listening, level, wakeArmed, dismissNotice, openMain } = useFloat()
+/** 封面图加载失败 → 回落 ♪;换曲复位再试。 */
+const coverBroken = ref(false)
+watch(
+  () => nowPlaying.value?.cover_url,
+  () => (coverBroken.value = false),
+)
 const mood = useAgentMood()
 const idle = useFloatIdle()
 // 确认卡(§7.8):悬浮窗也收 bus 卡——主窗藏托盘时这里是唯一可点的确认入口(展开面板直接
@@ -341,7 +347,16 @@ onUnmounted(() => stopMoved())
             <span class="wave"><i v-for="(h, i) in waveBars" :key="i" :style="{ height: h + 'px' }" /></span>
           </div>
           <div v-if="nowPlaying" class="status">
-            <i>♪</i><span class="ellip">{{ nowPlaying.title }}</span>
+            <!-- 封面(有图显 20px 小图,没图 / 加载失败回落 ♪);主窗 NowPlaying 镜像过来,零额外接线 -->
+            <img
+              v-if="nowPlaying.cover_url && !coverBroken"
+              class="cov"
+              :src="nowPlaying.cover_url"
+              alt=""
+              decoding="async"
+              @error="coverBroken = true"
+            />
+            <i v-else>♪</i><span class="ellip">{{ nowPlaying.title }}</span>
             <!-- 迷你播控:点击转发主窗(useMedia 按 isFloat 分流;悬浮窗自身不出声) -->
             <button class="mctl" :title="mediaPlaying ? t('float.pause') : t('float.resume')" @click.stop="mediaToggle()">{{ mediaPlaying ? '⏸' : '▶' }}</button>
             <button class="mctl" :title="t('float.stop')" @click.stop="mediaStop()">⏹</button>
@@ -656,6 +671,7 @@ onUnmounted(() => stopMoved())
   padding: 2px 4px;
 }
 .status i { font-style: normal; flex: 0 0 auto; }
+.status .cov { flex: 0 0 auto; width: 20px; height: 20px; border-radius: 5px; object-fit: cover; display: block; }
 .status .ellip { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .status em {
   font-style: normal;

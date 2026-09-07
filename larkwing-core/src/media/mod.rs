@@ -251,11 +251,18 @@ pub struct NowPlaying {
     /// None = 单个内容(电影/单曲),不出现集数 UI。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub playlist: Option<PlaylistPos>,
-    /// 循环模式镜像:"off" / "one"(单曲)/ "all"(列表)。core 是唯一真相,每次 Play 事件
-    /// 全量捎带 → 新播放的复位、切集时的延续,前端零猜测;"one" 由前端 `el.loop` 原生无缝循环。
-    pub loop_mode: String,
-    /// 随机播放镜像(仅多集队列可能为 true)。
-    pub shuffle: bool,
+    /// 播放模式镜像:once(放完就停)/ loop_all(列表循环)/ loop_one(单曲循环)/ shuffle(随机)。
+    /// core 是唯一真相,每次 Play 事件全量捎带 → 新播放的复位、切集时的延续,前端零猜测;
+    /// loop_one 由前端 `el.loop` 原生无缝循环。中途改模式由 `MediaEvent::Mode` 增量对齐。
+    pub play_mode: String,
+    /// 封面地址(relay `/cover/{token}`,现取现回一张 ≤512px 的 JPEG)。**有值 = 有图可取**,
+    /// None = 前端显 ♪ 占位(§3.5 不假装有图)。来源:本地音频文件内嵌图 > 同目录侧车图
+    /// (cover / folder / front / album.*)> 网络源封面(B 站视频封面,视频也带 —— 当 poster 与系统媒体浮层图)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cover_url: Option<String>,
+    /// 专辑名(本地音频的全局标签;网络流 / 视频恒无)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub album: Option<String>,
     /// 倍速镜像(0.5–3):新点播复位 1、切集 / 自动续播沿用;前端每条 Play 直接落到播放元素。
     pub rate: f64,
     /// 全部音轨(本地探测;≥2 条 UI 才出切换钮,〔此刻〕才列清单)。网络流恒空(来源定音轨)。
@@ -282,7 +289,6 @@ pub struct NowPlaying {
 #[derive(Debug, Clone, Serialize)]
 pub struct PlaylistView {
     pub index: usize,
-    pub shuffle: bool,
     /// 剧名(拿不到 None,前端退回集数标题)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -430,24 +436,54 @@ enum EpisodeTarget {
     Nth(usize),
 }
 
-/// 循环模式(嘴控 loop_one/loop_all/loop_off;app 级,新 `play()` 请求复位 Off ——
-/// 同「倍速每次复位、音量粘住」的粘性口径,切集/自动续播不复位)。
-/// One 由前端 `el.loop` 原生无缝循环(ended 压根不触发);All 在 `auto_next` 里回卷队列
-/// (没有队列时前端同样落到 `el.loop`,等价单曲循环)。
+/// 播放模式(2026-09-07 用户拍板「一个模式钮三档」:列表循环 / 单曲循环 / 随机,取代原
+/// 「循环三态 × 随机开关」两个正交状态)。app 级,**新 `play()` 请求复位**(同「倍速每次复位、
+/// 音量粘住」的粘性口径,切集 / 自动续播不复位),默认见 `default_for`:
+///   · 放歌且成队列 → `LoopAll`(音乐播放器口径:歌单默认循环着放);
+///   · 单曲 / 视频剧集 → `Once`(放完就停;一季剧看完不该半夜自己从第一集重来)。
+/// `Once` 是内部态:音频队列的模式钮只在后三档轮转,单曲上只有 `Once ↔ LoopOne` 两档,
+/// 视频没有模式钮(嘴控仍可开循环 / 随机)。`LoopOne` 由前端 `el.loop` 原生无缝循环(ended
+/// 压根不触发);`LoopAll` / `Shuffle` 在 `auto_next` 里回卷 / 挑歌,随机恒循环不停。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LoopMode {
-    Off,
-    One,
-    All,
+enum PlayMode {
+    Once,
+    LoopAll,
+    LoopOne,
+    Shuffle,
 }
 
-impl LoopMode {
-    /// 过桥字符串(NowPlaying 镜像;前端按它对齐 el.loop 与按钮态)。
+impl PlayMode {
+    /// 过桥字符串(`NowPlaying.play_mode` / `MediaEvent::Mode`;前端按它对齐 el.loop 与按钮态)。
     fn as_str(self) -> &'static str {
         match self {
-            LoopMode::Off => "off",
-            LoopMode::One => "one",
-            LoopMode::All => "all",
+            PlayMode::Once => "once",
+            PlayMode::LoopAll => "loop_all",
+            PlayMode::LoopOne => "loop_one",
+            PlayMode::Shuffle => "shuffle",
+        }
+    }
+
+    /// 新点播的默认模式:放歌成队列 = 列表循环,其余(单曲 / 视频)= 放完就停。
+    fn default_for(audio_only: bool, has_queue: bool) -> PlayMode {
+        if audio_only && has_queue {
+            PlayMode::LoopAll
+        } else {
+            PlayMode::Once
+        }
+    }
+
+    /// 手动上 / 下一首到头时要不要回卷:三档都是「列表是环」,只有放完就停的 Once 到头报错。
+    fn wraps(self) -> bool {
+        self != PlayMode::Once
+    }
+
+    /// 〔此刻〕背景里的模式一句(默认的放完就停不啰嗦)。
+    fn ambient(self) -> &'static str {
+        match self {
+            PlayMode::Once => "",
+            PlayMode::LoopAll => ",列表循环中",
+            PlayMode::LoopOne => ",单曲循环中",
+            PlayMode::Shuffle => ",随机播放中",
         }
     }
 }
@@ -466,11 +502,51 @@ struct Playlist {
     index: usize,
     /// 整队列继承首集的音/画意图(放歌 vs 看视频),切集不变。
     audio_only: bool,
-    /// 随机播放开关(嘴控 shuffle_on/off;随队列生灭)。开着时「下一首/自动续播」从这轮
-    /// 没放过的里随机挑,「上一首」沿播放履历回退。
-    shuffle: bool,
-    /// 随机播放履历(这一轮已放过的队列下标,当前一首恒在末位;shuffle_on 时重置为 [当前])。
+    /// 随机播放履历(这一轮已放过的队列下标,当前一首恒在末位;进随机模式时重置为 [当前])。
+    /// 随机开没开看 `Inner.mode == Shuffle`,履历随队列生灭。
     played: Vec<usize>,
+}
+
+/// 放歌时顺手探出来的标签与封面(见 `audio_extras`);拿不到就是默认空,不挡播放。
+#[derive(Debug, Default)]
+struct AudioExtras {
+    author: Option<String>,
+    album: Option<String>,
+    cover_url: Option<String>,
+    duration: Option<f64>,
+}
+
+/// 同目录侧车封面的文件名(不含扩展名;§4.11 用户拍板 2026-09-07):Windows 媒体播放器写 `Folder.jpg`,
+/// foobar2000 / MusicBee 默认 `cover.*` / `front.*`,再加 `album.*`;大小写不敏感,按此顺序取第一个。
+const COVER_SIDECAR_NAMES: [&str; 4] = ["cover", "folder", "front", "album"];
+/// 侧车封面认的图片扩展名(webp 要 image crate 解得动,已开 feature)。
+const COVER_SIDECAR_EXTS: [&str; 4] = ["jpg", "jpeg", "png", "webp"];
+
+/// 在音频文件所在目录找一张侧车封面:名字在 `COVER_SIDECAR_NAMES`、扩展名在 `COVER_SIDECAR_EXTS`
+/// (都不分大小写)。同目录多张按名字顺序、再按扩展名顺序取第一张;目录读不了 = None。纯函数、可测。
+fn find_sidecar_cover(audio: &std::path::Path) -> Option<PathBuf> {
+    let dir = audio.parent()?;
+    let mut best: Option<(usize, usize, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let stem = path.file_stem().and_then(|s| s.to_str()).map(str::to_ascii_lowercase);
+        let ext = path.extension().and_then(|s| s.to_str()).map(str::to_ascii_lowercase);
+        let (Some(stem), Some(ext)) = (stem, ext) else { continue };
+        let Some(ni) = COVER_SIDECAR_NAMES.iter().position(|n| *n == stem) else { continue };
+        let Some(ei) = COVER_SIDECAR_EXTS.iter().position(|e| *e == ext) else { continue };
+        // 显式 match 而非 `is_none_or`(Rust 1.82 才稳定,本项目 MSRV 1.77.2)
+        let better = match &best {
+            None => true,
+            Some((bn, be, _)) => (ni, ei) < (*bn, *be),
+        };
+        if better {
+            best = Some((ni, ei, path));
+        }
+    }
+    best.map(|(_, _, p)| p)
 }
 
 /// 当前播放内容在续播表里的身份(起播成功时记下;前端心跳据此落集内位置;停播即清)。
@@ -521,8 +597,8 @@ struct Inner {
     playback: Mutex<Playback>,
     /// 当前剧集队列(多集续播;None = 没在放剧集/单集内容)。
     playlist: Mutex<Option<Playlist>>,
-    /// 循环模式(见 LoopMode;新 `play()` 请求复位 Off)。
-    loop_mode: Mutex<LoopMode>,
+    /// 播放模式(见 PlayMode;新 `play()` 请求按内容复位:歌单列表循环、其余放完就停)。
+    mode: Mutex<PlayMode>,
     /// 选中的音轨(0 起;新 `play()` 复位 0,切集粘住 —— 看英文轨的剧下一集还是英文)。
     audio_track: Mutex<usize>,
     /// 选中音轨的语言码(切轨时从清单抄下;切集按**语言**对号、不按轨号 —— 两集轨序不同时
@@ -570,7 +646,7 @@ impl MediaRuntime {
                 pending_play: Mutex::new(HashMap::new()),
                 playback: Mutex::new(Playback::default()),
                 playlist: Mutex::new(None),
-                loop_mode: Mutex::new(LoopMode::Off),
+                mode: Mutex::new(PlayMode::Once),
                 audio_track: Mutex::new(0),
                 audio_track_lang: Mutex::new(None),
                 rate: Mutex::new(1.0),
@@ -796,9 +872,10 @@ impl MediaRuntime {
         episode: Option<usize>,
     ) -> Result<PlayOutcome> {
         self.prefetch_ffmpeg(); // 后台预取(首次播放任何媒体即触发),不阻塞本次播放
-        // 新播放请求 = 新内容意图:循环/音轨/倍速都复位;切集不经这里 —— 三者跨集粘住
+        // 新播放请求 = 新内容意图:播放模式/音轨/倍速都复位;切集不经这里 —— 三者跨集粘住
         // (2026-09-07 用户实锤「1.5 倍看剧下一集变 1.0」:复位口径是「新点播」,不是「新一集」)。
-        *self.inner.loop_mode.lock().unwrap() = LoopMode::Off;
+        // 模式先归零,队列建好后再按内容定默认(歌单 = 列表循环,见 PlayMode::default_for)。
+        *self.inner.mode.lock().unwrap() = PlayMode::Once;
         *self.inner.audio_track.lock().unwrap() = 0;
         *self.inner.audio_track_lang.lock().unwrap() = None;
         *self.inner.rate.lock().unwrap() = 1.0;
@@ -821,6 +898,7 @@ impl MediaRuntime {
         };
         let (pos, target, resume_at) =
             self.build_queue(page_url, audio_only, restart, episode).await?;
+        *self.inner.mode.lock().unwrap() = PlayMode::default_for(audio_only, pos.is_some());
         self.play_entry(user_id, &target, audio_only, pos, resume_at).await
     }
 
@@ -927,7 +1005,6 @@ impl MediaRuntime {
             entries,
             index,
             audio_only,
-            shuffle: false,
             played: Vec::new(),
         });
         Ok((Some(PlaylistPos { index, total, resumed }), target, resume_at))
@@ -949,7 +1026,7 @@ impl MediaRuntime {
     /// 切集共用体(相对挪 / 第 N 集绝对定位):算目标 index → 越界报错 → 切集即落续播进度 →
     /// 那一集现取现播(不重建队列、流地址永不过期)。
     async fn switch_episode(&self, user_id: i64, target: EpisodeTarget) -> Result<PlayOutcome> {
-        let loop_all = *self.inner.loop_mode.lock().unwrap() == LoopMode::All;
+        let mode = *self.inner.mode.lock().unwrap();
         let (target_url, audio_only, pos) = {
             let mut guard = self.inner.playlist.lock().unwrap();
             let pl = guard
@@ -959,7 +1036,7 @@ impl MediaRuntime {
             let new = match target {
                 // 随机播放中的「下一首」= 这轮没放过的里随机挑(用户点名要,放完一轮也接着挑,
                 // 恒有下一首);「上一首」= 沿履历回退(现场心智 = 回到刚才那首)。
-                EpisodeTarget::Delta(d) if pl.shuffle => {
+                EpisodeTarget::Delta(d) if mode == PlayMode::Shuffle => {
                     if d > 0 {
                         shuffle_advance(pl, true, shuffle_seed()).expect("wrap=true 恒有下一首")
                     } else {
@@ -969,8 +1046,8 @@ impl MediaRuntime {
                 }
                 EpisodeTarget::Delta(d) => {
                     let n = pl.index as i32 + d;
-                    if loop_all {
-                        // 列表循环开着:到头/到顶都回卷(开着循环点「下一首」不该被「已是最后」拦下)
+                    if mode.wraps() {
+                        // 列表循环 / 单曲循环:列表是环,到头/到顶都回卷(开着循环点「下一首」不该被「已是最后」拦下)
                         n.rem_euclid(total as i32) as usize
                     } else {
                         anyhow::ensure!(n >= 0, "已经是第一集了");
@@ -985,7 +1062,7 @@ impl MediaRuntime {
                     );
                     let idx = n - 1;
                     // 点名跳集也记进随机履历(「上一首」能回来;auto_next 已推过的恰在末位,不重复)。
-                    if pl.shuffle && pl.played.last() != Some(&idx) {
+                    if mode == PlayMode::Shuffle && pl.played.last() != Some(&idx) {
                         pl.played.push(idx);
                     }
                     idx
@@ -1003,24 +1080,22 @@ impl MediaRuntime {
         self.play_entry(user_id, &target_url, audio_only, Some(pos), None).await
     }
 
-    /// 一集自然放完(前端 `ended` 的唯一 core 入口):按循环/随机决定接下来放什么。
+    /// 一集自然放完(前端 `ended` 的唯一 core 入口):按播放模式决定接下来放什么。
     /// Some = core 已接管(切下一首现取现播,Play 事件接力);None = 没有下一首,前端正常收尾。
-    /// 只服务自动续播路;用户嘴控 next/prev 仍走 `advance`(到头报错的反馈是对的)。
-    /// (单曲循环由前端 `el.loop` 原生循环,ended 压根不触发,不经这里。)
+    /// 只服务自动续播路;用户嘴控 next/prev 仍走 `advance`(放完就停时到头报错的反馈是对的)。
+    /// (单曲循环由前端 `el.loop` 原生循环,ended 压根不触发;真走到这〔视频片尾倒计时〕= 重放本集。)
     pub async fn auto_next(&self, user_id: i64) -> Result<Option<PlayOutcome>> {
-        let loop_all = *self.inner.loop_mode.lock().unwrap() == LoopMode::All;
+        let mode = *self.inner.mode.lock().unwrap();
         let target = {
             let mut guard = self.inner.playlist.lock().unwrap();
             let Some(pl) = guard.as_mut() else { return Ok(None) }; // 单集:交回前端收尾
-            if pl.shuffle {
-                // 随机:这轮没放过的里挑;都放过 → 列表循环重开一轮,否则收尾。
-                shuffle_advance(pl, loop_all, shuffle_seed())
-            } else if pl.index + 1 < pl.entries.len() {
-                Some(pl.index + 1)
-            } else if loop_all {
-                Some(0) // 列表循环:末集放完回卷到第一集
-            } else {
-                None
+            match mode {
+                // 随机:这轮没放过的里挑;都放过 → 重开一轮(随机恒循环不停)。
+                PlayMode::Shuffle => shuffle_advance(pl, true, shuffle_seed()),
+                PlayMode::LoopOne => Some(pl.index),
+                _ if pl.index + 1 < pl.entries.len() => Some(pl.index + 1),
+                PlayMode::LoopAll => Some(0), // 列表循环:末集放完回卷到第一集
+                PlayMode::Once => None,
             }
         };
         match target {
@@ -1223,9 +1298,14 @@ impl MediaRuntime {
         let skip_info =
             if audio_only { None } else { self.compute_skip(clips, resolved.duration_seconds) };
 
-        let (loop_mode, shuffle) = self.mode_flags();
         // 网络流没有本地音轨概念(来源已定轨)→ 清掉本地现场,切音轨会如实退回
         *self.inner.current_local.lock().unwrap() = None;
+        // 封面 = 源页面的封面图(B 站视频封面;放歌时就是那条视频的封面):经 relay 代取(带防盗链头,
+        // 雪碧图同款),前端拿 `/cover/{token}`。没有 = None。
+        let cover_url = resolved.thumbnail.clone().map(|url| {
+            let headers = resolved.streams.first().map(|s| s.headers.clone()).unwrap_or_default();
+            relay.register_cover(relay::CoverSrc::Remote { url, headers })
+        });
         let np = NowPlaying {
             // 网络流的字幕另有来源(resolver 已解出平台字幕,配歌词在用),播放路本期不接。
             subtitles: Vec::new(),
@@ -1233,6 +1313,8 @@ impl MediaRuntime {
             kind: if audio_only { MediaKind::Audio } else { MediaKind::Video },
             title: resolved.title,
             author: resolved.uploader,
+            album: None,
+            cover_url,
             duration_seconds: resolved.duration_seconds,
             route: derive_route(&stream_url, manifest_url.as_deref()),
             stream_url,
@@ -1240,8 +1322,7 @@ impl MediaRuntime {
             page_url: page_url.into(),
             source: source_id.clone().unwrap_or_else(|| "web".into()),
             playlist: pos,
-            loop_mode,
-            shuffle,
+            play_mode: self.play_mode_str(),
             rate: self.rate(),
             audio_tracks: Vec::new(),
             audio_track: 0,
@@ -1552,6 +1633,34 @@ impl MediaRuntime {
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect())
+    }
+
+    /// 放歌的「锦上添花」件:歌手 / 专辑标签 + 封面来源。**只用已到手的 ffmpeg**(`Components::ready`,
+    /// 不为它下载 —— 播放本身早已后台预取,新装机器至多第一首没有),没有 ffmpeg 就只找侧车图。
+    /// 封面优先级:文件内嵌图(mp3 APIC / flac PICTURE / m4a covr,`ffmpeg -i` 的 attached pic 流)>
+    /// 同目录侧车图(`find_sidecar_cover`);都没有 = None,前端显 ♪ 占位(§3.5 不假装有图)。
+    /// 任何一步不顺都不挡播放。
+    async fn audio_extras(&self, relay: &relay::Relay, path: &std::path::Path) -> AudioExtras {
+        let mut out = AudioExtras::default();
+        if let Some(ff) = self.inner.components.ready(Component::Ffmpeg) {
+            let pr = self.probe_with_ffmpeg(&ff, path).await;
+            out.author = pr.tag_artist;
+            out.album = pr.tag_album;
+            out.duration = pr.duration_seconds;
+            if pr.attached_pic {
+                out.cover_url = Some(relay.register_cover(relay::CoverSrc::Embedded {
+                    path: path.to_path_buf(),
+                    ffmpeg: ff,
+                }));
+                return out;
+            }
+        }
+        let p = path.to_path_buf();
+        let side = tokio::task::spawn_blocking(move || find_sidecar_cover(&p)).await.ok().flatten();
+        if let Some(side) = side {
+            out.cover_url = Some(relay.register_cover(relay::CoverSrc::Sidecar(side)));
+        }
+        out
     }
 
     /// 用已就绪的 ffmpeg 探测非 BMFF 容器(mkv/avi…):跑 `ffmpeg -i` 读 stderr 拿编码/时长。
@@ -1882,7 +1991,12 @@ impl MediaRuntime {
             }
         };
 
-        let (loop_mode, shuffle) = self.mode_flags();
+        // 放歌的锦上添花:歌手 / 专辑标签 + 封面(内嵌图 > 侧车图);只用已到手的 ffmpeg,拿不到不挡播放。
+        let extras =
+            if audio_only { self.audio_extras(relay, &path).await } else { AudioExtras::default() };
+        if duration_seconds.is_none() {
+            duration_seconds = extras.duration; // 直传路原本不探时长,标签探测顺手带回来(前端元数据到了会再校准)
+        }
         // 进度条 hover 预览:放歌没画面不出图;视频**只在 ffmpeg 已经在手时**注册 —— 用
         // `Components::ready`(绝不下载):预览图这种锦上添花的事不值得为它拉一次组件下载,
         // 而播放本身早已在后台预取 ffmpeg(`prefetch_ffmpeg`),所以新装机器至多是第一次看片
@@ -1918,7 +2032,9 @@ impl MediaRuntime {
             lyrics: if audio_only { lyrics::sidecar_lyrics(&path) } else { None },
             kind: if audio_only { MediaKind::Audio } else { MediaKind::Video },
             title,
-            author: None,
+            author: extras.author,
+            album: extras.album,
+            cover_url: extras.cover_url,
             duration_seconds,
             // 自适应路显式给 route(URL 是 /la/,反推不出 copy/转码);其余路由由 URL 反推。
             route,
@@ -1927,8 +2043,7 @@ impl MediaRuntime {
             page_url: path_str.into(),
             source: "local".into(),
             playlist: pos,
-            loop_mode,
-            shuffle,
+            play_mode: self.play_mode_str(),
             rate: self.rate(),
             audio_tracks: tracks,
             audio_track: sel_track,
@@ -1971,25 +2086,33 @@ impl MediaRuntime {
                 self.publish(MediaEvent::Control { action: "seek".into(), value: Some(seg.end) });
                 return Ok(format!("已跳过片头,从 {} 接着放", fmt_clock(seg.end)));
             }
-            "loop_one" | "loop_all" | "loop_off" => {
-                *self.inner.loop_mode.lock().unwrap() = match action {
-                    "loop_one" => LoopMode::One,
-                    "loop_all" => LoopMode::All,
-                    _ => LoopMode::Off,
-                };
-            }
-            "shuffle_on" | "shuffle_off" => {
-                let on = action == "shuffle_on";
+            // 播放模式:五个动作名保留当嘴控词汇(模型按用户口语对号),落到一个 PlayMode 并**归一**:
+            // 单曲上「循环放」= 循环这一首;「取消循环 / 别随机了」= 回该内容的默认(歌单 = 列表循环,
+            // 单曲 / 视频 = 放完就停)。结果态经 `MediaEvent::Mode` 发给前端(不发 Control,前端不猜)。
+            "loop_one" | "loop_all" | "loop_off" | "shuffle_on" | "shuffle_off" => {
                 let mut guard = self.inner.playlist.lock().unwrap();
-                match guard.as_mut() {
-                    Some(pl) => {
-                        pl.shuffle = on;
+                let (has_queue, audio_only) =
+                    guard.as_ref().map(|pl| (true, pl.audio_only)).unwrap_or((false, false));
+                let next = match action {
+                    "loop_one" => PlayMode::LoopOne,
+                    "loop_all" if has_queue => PlayMode::LoopAll,
+                    "loop_all" => PlayMode::LoopOne,
+                    "shuffle_on" => {
+                        // 单曲/没在放列表:开随机没意义,如实退回(§3.5);关随机幂等、不吵。
+                        anyhow::ensure!(has_queue, "现在没有在放多首的列表,没法随机播放");
+                        PlayMode::Shuffle
+                    }
+                    _ => PlayMode::default_for(audio_only, has_queue),
+                };
+                if next == PlayMode::Shuffle {
+                    if let Some(pl) = guard.as_mut() {
                         pl.played = vec![pl.index]; // 新一轮履历从当前这首起算
                     }
-                    // 单曲/没在放列表:开随机没意义,如实退回(§3.5);关随机幂等、不吵。
-                    None if on => anyhow::bail!("现在没有在放多首的列表,没法随机播放"),
-                    None => {}
                 }
+                drop(guard);
+                *self.inner.mode.lock().unwrap() = next;
+                self.publish(MediaEvent::Mode { mode: next.as_str().into() });
+                return Ok("ok".into());
             }
             "volume" => {
                 let v = value.context("volume 需要 value(0–100)")?;
@@ -2354,7 +2477,6 @@ impl MediaRuntime {
         let guard = self.inner.playlist.lock().unwrap();
         guard.as_ref().map(|pl| PlaylistView {
             index: pl.index,
-            shuffle: pl.shuffle,
             title: pl.series_title.clone(),
             entries: pl
                 .entries
@@ -2364,11 +2486,9 @@ impl MediaRuntime {
         })
     }
 
-    /// 循环/随机模式镜像(NowPlaying 每次捎带全量,前端以此对齐 el.loop/按钮态,零猜测)。
-    fn mode_flags(&self) -> (String, bool) {
-        let loop_mode = self.inner.loop_mode.lock().unwrap().as_str().to_string();
-        let shuffle = self.inner.playlist.lock().unwrap().as_ref().is_some_and(|p| p.shuffle);
-        (loop_mode, shuffle)
+    /// 播放模式镜像(NowPlaying 每次捎带全量,前端以此对齐 el.loop/按钮态,零猜测)。
+    fn play_mode_str(&self) -> String {
+        self.inner.mode.lock().unwrap().as_str().to_string()
     }
 
     /// 起播时乐观 seed「正在放」(前端随后经 report 校准;这步只是让模型立刻就知道在放什么)。
@@ -2461,20 +2581,8 @@ impl MediaRuntime {
                 })
                 .unwrap_or_default()
         };
-        // 循环/随机标记:模型据此答「现在是循环吗」、对「别循环了/换随机」给对动作。
-        let mode = {
-            let lm = *self.inner.loop_mode.lock().unwrap();
-            let sh = self.inner.playlist.lock().unwrap().as_ref().is_some_and(|p| p.shuffle);
-            format!(
-                "{}{}",
-                match lm {
-                    LoopMode::One => ",单曲循环中",
-                    LoopMode::All => ",列表循环中",
-                    LoopMode::Off => "",
-                },
-                if sh { ",随机播放中" } else { "" }
-            )
-        };
+        // 播放模式:模型据此答「现在是循环吗」、对「别循环了/换随机」给对动作。
+        let mode = self.inner.mode.lock().unwrap().ambient();
         Some(match (pb.title, pb.paused) {
             (None, _) => "播放器现在空闲,没有在播放任何内容".to_string(),
             (Some(t), false) => format!("播放器正在播放《{t}》{ep}{progress}{vol}{rate}{mode}{audio}"),
@@ -3006,7 +3114,6 @@ mod tests {
                 .collect(),
             index: 0,
             audio_only: true,
-            shuffle: true,
             played: vec![0],
         }
     }
@@ -3050,10 +3157,55 @@ mod tests {
             ..Default::default()
         });
         assert!(rt.playback_summary().unwrap().contains("单曲循环中"));
+        // 单曲上「循环放」归一成单曲循环(没有列表可循环)
         rt.control("loop_all", None).unwrap();
-        assert!(rt.playback_summary().unwrap().contains("列表循环中"));
+        assert_eq!(*rt.inner.mode.lock().unwrap(), PlayMode::LoopOne);
+        assert!(rt.playback_summary().unwrap().contains("单曲循环中"));
         rt.control("loop_off", None).unwrap();
         assert!(!rt.playback_summary().unwrap().contains("循环中"));
+
+        // 歌单:默认列表循环;「取消循环」回的是默认(列表循环),随机可开、关随机也回默认
+        *rt.inner.playlist.lock().unwrap() = Some(mk_shuffle_playlist(3));
+        *rt.inner.mode.lock().unwrap() = PlayMode::default_for(true, true);
+        assert!(rt.playback_summary().unwrap().contains("列表循环中"));
+        rt.control("shuffle_on", None).unwrap();
+        assert!(rt.playback_summary().unwrap().contains("随机播放中"));
+        assert_eq!(rt.inner.playlist.lock().unwrap().as_ref().unwrap().played, vec![0], "履历从当前起算");
+        rt.control("shuffle_off", None).unwrap();
+        assert_eq!(*rt.inner.mode.lock().unwrap(), PlayMode::LoopAll);
+        rt.control("loop_one", None).unwrap();
+        rt.control("loop_off", None).unwrap();
+        assert_eq!(*rt.inner.mode.lock().unwrap(), PlayMode::LoopAll, "loop_off 回歌单默认");
+        // 视频剧集的默认是放完就停
+        assert_eq!(PlayMode::default_for(false, true), PlayMode::Once);
+        assert_eq!(PlayMode::default_for(true, false), PlayMode::Once);
+    }
+
+    #[tokio::test]
+    async fn auto_next_follows_play_mode() {
+        let (rt, _rx) = runtime("auto-next-mode");
+        // 三首歌单,当前在末首:放完就停 → None;列表循环 → 回卷 0;随机 → 重开一轮挑一首
+        let mut pl = mk_shuffle_playlist(3);
+        pl.index = 2;
+        pl.played = vec![0, 1, 2];
+        *rt.inner.playlist.lock().unwrap() = Some(pl);
+        let pick = |rt: &MediaRuntime, mode: PlayMode| {
+            *rt.inner.mode.lock().unwrap() = mode;
+            let mut guard = rt.inner.playlist.lock().unwrap();
+            let pl = guard.as_mut().unwrap();
+            match mode {
+                PlayMode::Shuffle => shuffle_advance(pl, true, 5),
+                PlayMode::LoopOne => Some(pl.index),
+                _ if pl.index + 1 < pl.entries.len() => Some(pl.index + 1),
+                PlayMode::LoopAll => Some(0),
+                PlayMode::Once => None,
+            }
+        };
+        assert_eq!(pick(&rt, PlayMode::Once), None);
+        assert_eq!(pick(&rt, PlayMode::LoopAll), Some(0));
+        assert_eq!(pick(&rt, PlayMode::LoopOne), Some(2));
+        let s = pick(&rt, PlayMode::Shuffle).expect("随机恒有下一首");
+        assert_ne!(s, 2, "重开一轮不紧挨着重复当前那首");
     }
 
     #[tokio::test]
@@ -3127,47 +3279,85 @@ mod tests {
             other => panic!("应为 Playing,实际 {other:?}"),
         };
 
-        // 目录入参:整夹组队、强制只出声、从第一首起;循环镜像随 Play 捎带
+        // 目录入参:整夹组队、强制只出声、从第一首起;歌单默认列表循环,模式镜像随 Play 捎带
         let np = plist(rt.play(1, &dir.to_string_lossy(), false, false, None).await.unwrap());
         assert!(matches!(np.kind, MediaKind::Audio));
         let pos = np.playlist.expect("整夹应组队");
         assert_eq!((pos.index, pos.total), (0, 3));
-        assert_eq!(np.loop_mode, "off");
-        assert!(!np.shuffle);
+        assert_eq!(np.play_mode, "loop_all", "歌单默认列表循环");
 
-        // 顺序自动续播:0→1→2;末首放完且不循环 → 交回前端收尾
+        // 顺序自动续播:0→1→2;列表循环 → 末首放完回卷到第一首
         let np = plist(rt.auto_next(1).await.unwrap().expect("有下一首"));
         assert_eq!(np.playlist.unwrap().index, 1);
         assert_eq!(plist(rt.auto_next(1).await.unwrap().unwrap()).playlist.unwrap().index, 2);
-        assert!(rt.auto_next(1).await.unwrap().is_none(), "末首且不循环 → 收尾");
-
-        // 列表循环:auto_next 回卷到第一首;嘴控到顶/到头也回卷不报错
-        rt.control("loop_all", None).unwrap();
         let np = plist(rt.auto_next(1).await.unwrap().expect("列表循环回卷"));
         assert_eq!(np.playlist.unwrap().index, 0);
-        assert_eq!(np.loop_mode, "all", "镜像随 Play 捎带");
         let np = plist(rt.advance(1, -1).await.unwrap());
-        assert_eq!(np.playlist.unwrap().index, 2, "循环开着,到顶回卷");
+        assert_eq!(np.playlist.unwrap().index, 2, "列表是环,到顶回卷不报错");
 
-        // 随机:开启后 auto_next 挑「这轮没放过的」,一轮内不重复
+        // 放完就停(视频剧集的默认;歌单只能内部置,嘴控没有这一档):末首放完 → 交回前端收尾,到头报错
+        *rt.inner.mode.lock().unwrap() = PlayMode::Once;
+        assert!(rt.auto_next(1).await.unwrap().is_none(), "末首且放完就停 → 收尾");
+        assert!(rt.advance(1, 1).await.is_err(), "放完就停:已是最后一首");
+
+        // 单曲循环:auto_next 重放本首(正常由前端 el.loop 兜,真走到这也不跳集);到头照样回卷
+        rt.control("loop_one", None).unwrap();
+        let np = plist(rt.auto_next(1).await.unwrap().expect("重放本首"));
+        assert_eq!(np.playlist.unwrap().index, 2);
+        assert_eq!(np.play_mode, "loop_one");
+        let np = plist(rt.advance(1, 1).await.unwrap());
+        assert_eq!(np.playlist.unwrap().index, 0, "单曲循环下手动下一首照样回卷");
+
+        // 随机:auto_next 挑「这轮没放过的」,一轮内不重复;放完一轮重开(随机恒循环不停)
         rt.control("shuffle_on", None).unwrap();
-        let mut seen = vec![2usize]; // 当前第 3 首(index 2),新一轮履历从它起算
+        let mut seen = vec![0usize]; // 当前第 1 首(index 0),新一轮履历从它起算
         for _ in 0..2 {
             let np = plist(rt.auto_next(1).await.unwrap().expect("随机还有没放过的"));
             let i = np.playlist.unwrap().index;
             assert!(!seen.contains(&i), "随机一轮内不重复,已放 {seen:?} 又放 {i}");
-            assert!(np.shuffle, "随机镜像随 Play 捎带");
+            assert_eq!(np.play_mode, "shuffle", "随机镜像随 Play 捎带");
             seen.push(i);
         }
-        // 一轮放完:列表循环开着 → 重开一轮接着放;关掉循环把余下放完 → 收尾
-        assert!(rt.auto_next(1).await.unwrap().is_some(), "循环+随机:放完一轮重开");
-        rt.control("loop_off", None).unwrap();
-        assert!(rt.auto_next(1).await.unwrap().is_some(), "这轮还剩一首");
-        assert!(rt.auto_next(1).await.unwrap().is_none(), "随机放完一轮且不循环 → 收尾");
+        assert!(rt.auto_next(1).await.unwrap().is_some(), "随机放完一轮重开一轮");
+        // 「别随机了」= 回歌单默认(列表循环),接着顺序放
+        rt.control("shuffle_off", None).unwrap();
+        assert_eq!(*rt.inner.mode.lock().unwrap(), PlayMode::LoopAll);
+        assert!(rt.auto_next(1).await.unwrap().is_some());
 
-        // 新播放请求复位循环(音量粘住、循环不粘)
+        // 新播放请求复位模式(音量粘住、模式不粘):歌单回到默认列表循环
+        rt.control("loop_one", None).unwrap();
         let np = plist(rt.play(1, &dir.to_string_lossy(), false, true, None).await.unwrap());
-        assert_eq!(np.loop_mode, "off", "新 play() 复位循环");
+        assert_eq!(np.play_mode, "loop_all", "新 play() 复位到歌单默认");
+    }
+
+    #[test]
+    fn sidecar_cover_prefers_cover_over_folder_case_insensitive() {
+        let dir = std::env::temp_dir().join(format!("lw-sidecar-cover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let song = touch(&dir, "歌.flac");
+        assert!(find_sidecar_cover(&song).is_none(), "没有侧车图");
+        touch(&dir, "Folder.JPG");
+        assert_eq!(
+            find_sidecar_cover(&song).unwrap().file_name().unwrap().to_str().unwrap(),
+            "Folder.JPG",
+            "大小写不敏感"
+        );
+        touch(&dir, "cover.png");
+        assert_eq!(
+            find_sidecar_cover(&song).unwrap().file_name().unwrap().to_str().unwrap(),
+            "cover.png",
+            "名字顺序 cover > folder"
+        );
+        touch(&dir, "cover.jpg");
+        assert_eq!(
+            find_sidecar_cover(&song).unwrap().file_name().unwrap().to_str().unwrap(),
+            "cover.jpg",
+            "同名按扩展名顺序 jpg > png"
+        );
+        touch(&dir, "back.jpg"); // 不在清单里的名字不算
+        assert_eq!(find_sidecar_cover(&song).unwrap().file_name().unwrap(), "cover.jpg");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

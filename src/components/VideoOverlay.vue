@@ -8,8 +8,10 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import EpisodeList from './EpisodeList.vue'
+import KeyHelpCard from './KeyHelpCard.vue'
 import { useContextMenu, type MenuItem } from '../composables/useContextMenu'
-import { registerVideoEl, SEEK_STEP_LONG_S, SEEK_STEP_S, useMedia } from '../composables/useMedia'
+import { registerVideoEl, useMedia } from '../composables/useMedia'
+import { useMediaKeys, VOL_STEP } from '../composables/useMediaKeys'
 import { useScrubHover, useScrubThumb } from '../composables/useScrubHover'
 import { win } from '../lib/backend'
 import { fmtClock } from '../lib/fmt'
@@ -229,11 +231,9 @@ async function toggleFullscreen() {
   await win.setFullscreen(next)
 }
 
-/* —— 看片快捷键(§4.11 用户拍板 2026-09-07 键位表)——
- * 一张表当数据:按键分发、帮助浮层(H)、按钮 tooltip 都从它生成,加键 = 加一行。
- * 全部动作汇到与按钮 / 嘴控同一执行口(useMedia),不长第二套语义。
- * 只在视频浮层在前、且焦点不在输入框时接管;音频条不接单键(它与打字共存)。 */
-const VOL_STEP = 0.1
+/* —— 看片快捷键(§4.11 用户拍板 2026-09-07 键位表;键位表本体在 useMediaKeys,与音频播放条共用)——
+ * 按键分发、帮助浮层(H)、按钮 tooltip 都从同一张表生成;全部动作汇到与按钮 / 嘴控同一执行口(useMedia)。
+ * 只在视频浮层在前、且焦点不在输入框时接管。 */
 /** OSD:每次按键在画面中央闪一下读数(「1.75x」「+15s」「音量 60%」),0.9s 自隐。 */
 const osd = ref<string | null>(null)
 let osdTimer = 0
@@ -262,10 +262,11 @@ let countdownTimer = 0
 let lastPos = 0
 let introHandled = false
 let outroHandled = false
-/** 有没有「下一集」可切:顺序未到末集,或列表循环 / 随机开着(core auto_next 会回卷 / 挑)。 */
+/** 有没有「下一集」可切:顺序未到末集,或模式不是「放完就停」(列表循环 / 单曲 / 随机 → core auto_next 会回卷 / 重放 / 挑)。 */
+const wraps = computed(() => state.playMode !== 'once')
 const hasNext = computed(() => {
   const p = playlist.value
-  return !!p && (p.index + 1 < p.total || state.loopMode === 'all' || state.shuffle)
+  return !!p && (p.index + 1 < p.total || wraps.value)
 })
 function showSkipOsd(text: string, undoTo: number) {
   skipOsd.value = { text, undoTo }
@@ -384,184 +385,49 @@ function openSkipMenuAtCenter() {
   openSkipMenu(new MouseEvent('contextmenu', { clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 }))
 }
 
-type KeyDef = {
-  /** 显示用键名(帮助浮层 / tooltip)。 */
-  keys: string[]
-  /** 帮助浮层里的说明(i18n key)。 */
-  label: string
-  /** 命中判定:返回 true = 这条接管本次按键。 */
-  match: (e: KeyboardEvent) => boolean
-  run: (e: KeyboardEvent) => void
-  /** 只在有对应能力时显示 / 生效(多集才有上下集,双语片才有音轨…)。 */
-  when?: () => boolean
-}
-const key = (k: string, code?: string) => (e: KeyboardEvent) =>
-  !e.shiftKey && (e.key === k || e.key === k.toUpperCase() || (code !== undefined && e.code === code))
-const shift = (k: string) => (e: KeyboardEvent) => e.shiftKey && e.key === k
-const ctrl = (k: string) => (e: KeyboardEvent) => (e.ctrlKey || e.metaKey) && e.key === k
-const volPct = (v: number) => Math.round(v * 100)
-const KEYS: KeyDef[] = [
-  {
-    keys: ['Space', 'K'],
-    label: 'media.keys.playPause',
-    match: (e) => key('k')(e) || e.key === ' ' || e.key === 'Spacebar',
-    run: () => {
-      toggle()
-      flashOsd(state.status === 'playing' ? t('media.osd.pause') : t('media.osd.play'))
-    },
+const keys = useMediaKeys({
+  surface: 'video',
+  // 倍速菜单(全局右键菜单宿主)开着:Esc / 键盘交给它,别顺手把全屏也退了;没在放视频就不接管
+  blocked: () => menu.state.open || !show.value,
+  osd: flashOsd,
+  status: () => state.status,
+  playPause: toggle,
+  seekBy,
+  volumePct: () => Math.round(state.volume * 100),
+  volumeStep: (dir) => setVolume(state.volume + dir * VOL_STEP),
+  muted: () => state.muted,
+  toggleMute,
+  rate: () => state.rate,
+  stepRate,
+  hasPlaylist: () => !!playlist.value,
+  next,
+  prev,
+  toggleList: () => (listOpen.value = !listOpen.value),
+  skip: () => {
+    // 有片头且还没过 → 跳过;否则打开标记菜单(第一次按 S 就学会怎么标)
+    const s = skipInfo.value
+    if (s?.intro && state.position < s.intro.end - 0.5) skipIntroNow()
+    else openSkipMenuAtCenter()
   },
-  {
-    keys: ['←', '→'],
-    label: 'media.keys.seek',
-    match: (e) => !e.shiftKey && !e.ctrlKey && !e.metaKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight'),
-    run: (e) => {
-      const d = e.key === 'ArrowLeft' ? -SEEK_STEP_S : SEEK_STEP_S
-      seekBy(d)
-      flashOsd(t('media.osd.seek', { s: `${d > 0 ? '+' : '−'}${Math.abs(d)}` }))
-    },
+  audioTrackCount: () => audioTrackCount.value,
+  cycleAudioTrack,
+  audioTrackLabel: () => audioTrackLabel(state.current?.audio_track ?? 0),
+  captionCount: () => subtitles.value.length,
+  cycleCaption: cycleSubtitle,
+  captionLabel: () => subtitleText.value,
+  toggleFullscreen: () => void toggleFullscreen(),
+  // Esc 退全屏:tao 原生全屏在 Windows 不可靠响应 Esc,自己接管
+  escape: () => {
+    if (helpOpen.value) helpOpen.value = false
+    else if (listOpen.value) listOpen.value = false
+    else if (state.fullscreen) void toggleFullscreen()
   },
-  {
-    keys: ['Shift+←', 'Shift+→'],
-    label: 'media.keys.seekLong',
-    match: (e) => shift('ArrowLeft')(e) || shift('ArrowRight')(e),
-    run: (e) => {
-      const d = e.key === 'ArrowLeft' ? -SEEK_STEP_LONG_S : SEEK_STEP_LONG_S
-      seekBy(d)
-      flashOsd(t('media.osd.seek', { s: `${d > 0 ? '+' : '−'}${Math.abs(d)}` }))
-    },
-  },
-  {
-    keys: ['↑', '↓'],
-    label: 'media.keys.volume',
-    match: (e) => e.key === 'ArrowUp' || e.key === 'ArrowDown',
-    run: (e) => {
-      setVolume(state.volume + (e.key === 'ArrowUp' ? VOL_STEP : -VOL_STEP))
-      flashOsd(t('media.osd.volume', { pct: volPct(state.volume) }))
-    },
-  },
-  {
-    keys: ['M'],
-    label: 'media.keys.mute',
-    match: key('m'),
-    run: () => {
-      toggleMute()
-      flashOsd(state.muted ? t('media.osd.muted') : t('media.osd.volume', { pct: volPct(state.volume) }))
-    },
-  },
-  {
-    keys: ['Ctrl+←', 'Ctrl+→'],
-    label: 'media.keys.speed',
-    match: (e) => ctrl('ArrowLeft')(e) || ctrl('ArrowRight')(e),
-    run: (e) => {
-      stepRate(e.key === 'ArrowRight' ? 1 : -1)
-      flashOsd(`${state.rate}x`)
-    },
-  },
-  {
-    keys: ['PageUp', 'PageDown'],
-    label: 'media.keys.episode',
-    match: (e) => e.key === 'PageUp' || e.key === 'PageDown',
-    when: () => !!playlist.value,
-    run: (e) => {
-      if (e.key === 'PageDown') {
-        next()
-        flashOsd(t('media.osd.nextEp'))
-      } else {
-        prev()
-        flashOsd(t('media.osd.prevEp'))
-      }
-    },
-  },
-  {
-    keys: ['L'],
-    label: 'media.keys.list',
-    match: key('l'),
-    when: () => !!playlist.value,
-    run: () => (listOpen.value = !listOpen.value),
-  },
-  {
-    keys: ['S'],
-    label: 'media.keys.skip',
-    match: key('s'),
-    when: () => !!playlist.value,
-    run: () => {
-      // 有片头且还没过 → 跳过;否则打开标记菜单(第一次按 S 就学会怎么标)
-      const s = skipInfo.value
-      if (s?.intro && state.position < s.intro.end - 0.5) skipIntroNow()
-      else openSkipMenuAtCenter()
-    },
-  },
-  {
-    keys: ['A'],
-    label: 'media.keys.audioTrack',
-    match: key('a'),
-    when: () => audioTrackCount.value >= 2,
-    run: () => {
-      cycleAudioTrack()
-      flashOsd(t('media.audioTrack', { label: audioTrackLabel(state.current?.audio_track ?? 0) }))
-    },
-  },
-  {
-    keys: ['C'],
-    label: 'media.keys.subtitle',
-    match: key('c'),
-    when: () => subtitles.value.length >= 1,
-    run: () => {
-      cycleSubtitle()
-      flashOsd(subtitleText.value)
-    },
-  },
-  {
-    keys: ['F'],
-    label: 'media.keys.fullscreen',
-    match: key('f'),
-    run: () => void toggleFullscreen(),
-  },
-  {
-    keys: ['Esc'],
-    label: 'media.keys.esc',
-    match: (e) => e.key === 'Escape',
-    run: () => {
-      if (helpOpen.value) helpOpen.value = false
-      else if (listOpen.value) listOpen.value = false
-      else if (state.fullscreen) void toggleFullscreen()
-    },
-  },
-  {
-    keys: ['H'],
-    label: 'media.keys.help',
-    match: key('h'),
-    run: () => (helpOpen.value = !helpOpen.value),
-  },
-]
-/** 帮助浮层的行:只列当前有意义的(没多集不列上下集)。 */
-const keyHelp = computed(() => KEYS.filter((k) => !k.when || k.when()).map((k) => ({ keys: k.keys, label: t(k.label) })))
-/** 按钮 tooltip 里附带的键名提示,如「下一集 (PageDown)」。 */
-const kb = (label: string, k: string) => `${label} (${k})`
+  toggleHelp: () => (helpOpen.value = !helpOpen.value),
+})
+const kb = keys.kb
 
 function onKey(e: KeyboardEvent) {
-  // 倍速菜单(全局右键菜单宿主)开着:Esc / 键盘交给它,别顺手把全屏也退了
-  if (menu.state.open) return
-  // 正在真文本输入(输入框/可编辑区打字)→ 让位,别抢键。浮层自己的滑杆(range)不算:
-  // 拖完进度条/音量条焦点留在滑杆上,快捷键要照常生效(行为恒定,不随焦点漂)。
-  const tg = e.target as HTMLElement | null
-  if (
-    tg &&
-    (tg.isContentEditable ||
-      (/^(INPUT|TEXTAREA|SELECT)$/.test(tg.tagName) && (tg as HTMLInputElement).type !== 'range'))
-  )
-    return
-  // Alt 组合留给系统;Ctrl/Cmd 只放行表里点名的(Ctrl+←→ 倍速),其余同样让位
-  if (e.altKey) return
-  // 没有在播放的内容就不接管(避免在别的视图误吞键)
-  if (!state.current) return
-  const hit = KEYS.find((k) => (!k.when || k.when()) && k.match(e))
-  if (!hit) return
-  // Esc 退全屏:tao 原生全屏在 Windows 不可靠响应 Esc,自己接管;空格/方向键防页面滚动
-  e.preventDefault()
-  e.stopPropagation()
-  hit.run(e)
-  showControls() // 调整后让控制条浮现一下(全屏态)
+  if (keys.onKey(e)) showControls() // 调整后让控制条浮现一下(全屏态)
 }
 
 // 控制条覆盖在画面上,播放中 2.8s 无操作自动隐藏(鼠标一动即现)。两种模式同一套:
@@ -660,7 +526,8 @@ onUnmounted(() => {
       <button class="vbtn" @click="stop" :title="t('media.closeVideo')">✕</button>
     </header>
     <EpisodeList v-model:open="listOpen" :variant="state.fullscreen ? 'side' : 'drop'" />
-    <video :key="videoKey" ref="video" class="screen" playsinline @dblclick="toggleFullscreen">
+    <!-- poster:网络源的封面(B 站视频封面)在加载黑屏期先顶着;本地片没有,不设 -->
+    <video :key="videoKey" ref="video" class="screen" playsinline :poster="state.current?.cover_url" @dblclick="toggleFullscreen">
       <!-- 字幕:core 现转现回 WebVTT;默认全 disabled,按钮/嘴控切 mode(见 useMedia.setSubtitle) -->
       <track v-for="(s, i) in subtitles" :key="s.url" kind="subtitles" :src="s.url" :srclang="s.lang" :label="subtitleLabel(i)" />
     </video>
@@ -679,22 +546,14 @@ onUnmounted(() => {
     </div>
     <!-- 快捷键速查(H):从同一张键位表生成;点外 / Esc / H 关 -->
     <div v-if="helpOpen" class="help" @click="helpOpen = false" @pointerdown.stop>
-      <div class="help-card" @click.stop>
-        <h3>{{ t('media.keys.title') }}</h3>
-        <ul>
-          <li v-for="row in keyHelp" :key="row.label">
-            <span class="kbs"><kbd v-for="k in row.keys" :key="k">{{ k }}</kbd></span>
-            <span class="lbl">{{ row.label }}</span>
-          </li>
-        </ul>
-      </div>
+      <KeyHelpCard :rows="keys.help.value" variant="overlay" />
     </div>
     <footer class="bar bottom">
       <button
         v-if="playlist"
         class="vbtn"
         @click="prev"
-        :disabled="playlist.index <= 0"
+        :disabled="!wraps && playlist.index <= 0"
         :title="kb(t('media.prevEp'), 'PageUp')"
       >
         ⏮
@@ -706,7 +565,7 @@ onUnmounted(() => {
         v-if="playlist"
         class="vbtn"
         @click="next"
-        :disabled="playlist.index >= playlist.total - 1"
+        :disabled="!wraps && playlist.index >= playlist.total - 1"
         :title="kb(t('media.nextEp'), 'PageDown')"
       >
         ⏭
@@ -989,28 +848,12 @@ onUnmounted(() => {
 .osd-enter-active, .osd-leave-active { transition: opacity 0.18s ease, transform 0.18s ease; }
 .osd-enter-from, .osd-leave-to { opacity: 0; transform: translate(-50%, -50%) scale(0.92); }
 
-/* 快捷键速查:盖在画面上的半透黑幕 + 卡片(键帽 / 说明两列) */
+/* 快捷键速查:盖在画面上的半透黑幕 + 卡片(KeyHelpCard overlay 观感,键帽 / 说明两列) */
 .help {
   position: absolute; inset: 0; z-index: 5;
   display: flex; align-items: center; justify-content: center;
   background: rgba(0, 0, 0, 0.45);
 }
-.help-card {
-  min-width: 260px; max-width: min(92%, 420px); max-height: 92%; overflow: auto;
-  padding: 14px 18px 16px; border-radius: 14px;
-  background: rgba(0, 0, 0, 0.82); color: #eaf2fb;
-  border: 1px solid rgba(var(--accent-rgb), 0.3);
-  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55);
-}
-.help-card h3 { margin: 0 0 10px; font-size: 13px; letter-spacing: 0.6px; color: var(--accent); }
-.help-card ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
-.help-card li { display: flex; align-items: center; gap: 12px; font-size: 12.5px; }
-.help-card .kbs { flex: none; min-width: 118px; display: flex; gap: 4px; flex-wrap: wrap; }
-.help-card kbd {
-  padding: 2px 7px; border-radius: 6px; font: 11px/1.5 ui-monospace, "SF Mono", monospace;
-  background: rgba(255, 255, 255, 0.1); border: 1px solid rgba(255, 255, 255, 0.22); color: #fff;
-}
-.help-card .lbl { color: rgba(234, 242, 251, 0.85); }
 .vol-slider {
   -webkit-appearance: none; appearance: none; width: 70px; height: 3px; border-radius: 2px; flex: none;
   background: linear-gradient(90deg, var(--accent) var(--pct), rgba(var(--accent-rgb), 0.14) var(--pct));

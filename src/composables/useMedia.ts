@@ -15,6 +15,7 @@ import {
   windowLabel,
   type MediaEvent,
   type NowPlaying,
+  type PlayMode,
   type PlaylistView,
 } from '../lib/backend'
 import { i18n } from '../i18n'
@@ -24,6 +25,7 @@ import { useContextMenu } from './useContextMenu'
 import { useToast } from './useToast'
 
 export type PlayStatus = 'idle' | 'loading' | 'playing' | 'paused'
+export type { PlayMode }
 
 const state = reactive({
   current: null as NowPlaying | null,
@@ -38,11 +40,10 @@ const state = reactive({
   /** 倍速镜像(core 是真相源:新点播复位 1 —— mpv 时代的教训,放完电影再放歌还是 2 倍;
    *  切集 / 自动续播沿用 —— 1.5 倍看剧不该每集掉回 1.0)。每条 Play 事件全量捎带,这里零猜测。 */
   rate: 1,
-  /** 循环模式(core 是真相源,这里是镜像:Play 事件全量捎带 + Control 事件增量对齐)。
-   *  one=单曲(落 el.loop 原生无缝循环);all=列表(core auto_next 回卷;没队列时也落 el.loop)。 */
-  loopMode: 'off' as 'off' | 'one' | 'all',
-  /** 随机播放镜像(多集队列才可能 true;挑歌在 core)。 */
-  shuffle: false,
+  /** 播放模式(core 是真相源,这里是镜像:Play 事件全量捎带 + `mode` 事件增量对齐;core 已归一,前端不猜)。
+   *  once=放完就停 / loop_all=列表循环(歌单默认;core auto_next 回卷)/ loop_one=单曲循环(落 el.loop
+   *  原生无缝)/ shuffle=随机(挑歌在 core)。 */
+  playMode: 'once' as PlayMode,
   /** 当前字幕:0 = 关(默认),1 起 = NowPlaying.subtitles 的第几条。纯显示层,新播放复位。 */
   subtitle: 0,
   /** 视频全屏中(HUD 缩成迷你胶囊的信号)。 */
@@ -165,12 +166,10 @@ function applyAudioTrackToEl(el: HTMLMediaElement) {
   for (let i = 0; i < list.length; i++) list[i].enabled = i === want
 }
 
-/** 循环落到播放元素:单曲循环用原生 el.loop(无缝、ended 压根不触发);
- *  「列表循环 + 没队列」只有一首,同样落 el.loop(等价单曲)。列表循环有队列时不设
- *  loop —— ended 正常触发,由 core auto_next 回卷。 */
+/** 循环落到播放元素:单曲循环用原生 el.loop(无缝、ended 压根不触发)。其余模式不设 loop ——
+ *  ended 正常触发,由 core auto_next 按列表循环 / 随机 / 放完就停决定下一首。 */
 function syncLoopToEl() {
-  const native =
-    state.loopMode === 'one' || (state.loopMode === 'all' && !state.current?.playlist)
+  const native = state.playMode === 'loop_one'
   if (audio) audio.loop = native
   if (videoEl) videoEl.loop = native
 }
@@ -449,10 +448,9 @@ function play(np: NowPlaying) {
   state.status = 'loading'
   state.position = 0
   state.duration = np.duration_seconds ?? 0
-  // 倍速 / 循环 / 随机镜像:core 每次 Play 全量捎带(新点播的复位、切集/自动续播的延续,这里零猜测);音量基准粘住。
+  // 倍速 / 播放模式镜像:core 每次 Play 全量捎带(新点播的复位、切集/自动续播的延续,这里零猜测);音量基准粘住。
   state.rate = np.rate ?? 1
-  state.loopMode = np.loop_mode ?? 'off'
-  state.shuffle = np.shuffle ?? false
+  state.playMode = np.play_mode ?? 'once'
   syncLoopToEl()
   videoBase = 0
   clearPendingResume() // 换播放:上一次没等到元数据的起播定位先摘掉(自适应那条路不走 applyResume,只能在这收口)
@@ -674,8 +672,7 @@ function stop() {
   state.position = 0
   state.duration = 0
   state.fullscreen = false
-  state.loopMode = 'off' // 停了就归位(core 侧下次 play() 也会复位);随机随队列生灭
-  state.shuffle = false
+  state.playMode = 'once' // 停了就归位(core 侧下次 play() 也会按内容复位)
   syncLoopToEl()
   syncToPeers(last) // 广播"停了"给悬浮窗(修:UI 点停止 / 自然播完时它仍显在放)
 }
@@ -719,7 +716,6 @@ async function fetchPlaylist(): Promise<PlaylistView | null> {
   if (isTauri()) return api.mediaPlaylist().catch(() => null)
   return {
     index: p.index,
-    shuffle: state.shuffle,
     entries: Array.from({ length: p.total }, (_, i) => ({
       title: i18n.global.t(state.current?.kind === 'audio' ? 'media.trackN' : 'media.episodeN', { n: i + 1 }),
     })),
@@ -766,20 +762,32 @@ function seek(seconds: number) {
   reportToCore() // 跳转后位置基准变了,立刻校准 core 的「此刻」进度
 }
 
-/** 播放条循环按钮:关 → 列表循环 → 单曲循环 → 关。经壳层命令走 core(校验/落状态/广播),
- *  与嘴控同一执行口;浏览器预览无 core,本地生效纯看视觉。 */
-function cycleLoop() {
-  const next =
-    state.loopMode === 'off' ? 'loop_all' : state.loopMode === 'all' ? 'loop_one' : 'loop_off'
-  if (isTauri()) void api.mediaMode(next).catch(() => {})
-  else applyControl(next)
+/** 想要某个模式 → 发给 core 的嘴控动作名(五个动作名是 core 的词汇;once 只有「回默认」一条路)。 */
+const MODE_ACTION: Record<PlayMode, string> = {
+  once: 'loop_off',
+  loop_all: 'loop_all',
+  loop_one: 'loop_one',
+  shuffle: 'shuffle_on',
 }
 
-/** 播放条随机按钮(多集队列才显示)。 */
-function toggleShuffle() {
-  const next = state.shuffle ? 'shuffle_off' : 'shuffle_on'
-  if (isTauri()) void api.mediaMode(next).catch(() => {})
-  else applyControl(next)
+/** 模式落地(本地):镜像 + 播放元素的 loop。core 的 `mode` 事件与浏览器预览都走这里。 */
+function applyMode(m: PlayMode) {
+  state.playMode = m
+  syncLoopToEl()
+}
+
+/** 播放模式钮 / R 键:一个钮三档轮转(2026-09-07 用户拍板)—— 歌单:列表循环 → 单曲循环 → 随机 → 列表循环;
+ *  单曲(没队列):放完就停 ↔ 单曲循环(列表循环 / 随机对一首歌没意义)。经壳层命令走 core(归一 / 落状态 /
+ *  广播 `mode` 事件回来对齐),与嘴控同一执行口;浏览器预览无 core,本地生效纯看视觉。返回轮到的模式。 */
+function cycleMode(): PlayMode {
+  const order: PlayMode[] = state.current?.playlist
+    ? ['loop_all', 'loop_one', 'shuffle']
+    : ['once', 'loop_one']
+  const i = order.indexOf(state.playMode)
+  const nextMode = order[(i + 1) % order.length]
+  if (isTauri()) void api.mediaMode(MODE_ACTION[nextMode]).catch(() => {})
+  else applyMode(nextMode)
+  return nextMode
 }
 
 function dismissLoginHint() {
@@ -803,13 +811,7 @@ function applyControl(action: string, value?: number) {
   else if (action === 'volume' && value != null) setVolume(value / 100) // 绝对音量(core 已校验 0–100)
   else if (action === 'speed' && value != null) applyRate(value) // core 已落状态,这里只对齐镜像 + 元素
   else if (action === 'seek' && value != null) seek(value)
-  else if (action === 'loop_one' || action === 'loop_all' || action === 'loop_off') {
-    // 循环/随机:core 已先落状态(嘴控/按钮同一口),这里对齐镜像 + 播放元素
-    state.loopMode = action === 'loop_one' ? 'one' : action === 'loop_all' ? 'all' : 'off'
-    syncLoopToEl()
-  } else if (action === 'shuffle_on' || action === 'shuffle_off') {
-    state.shuffle = action === 'shuffle_on'
-  } else if (action === 'audio_track' && value != null) {
+  else if (action === 'audio_track' && value != null) {
     // mac 直传切音轨:core 已落状态并发来事件,这里就地启停(无缝);管线路不经这(core 重发 Play)
     if (state.current) state.current.audio_track = Math.max(0, Math.round(value) - 1)
     const el = activeEl()
@@ -881,6 +883,10 @@ function onMedia(ev: MediaEvent) {
       // 嘴控(core 已校验);只主窗执行 —— 悬浮窗处理会再转发回主窗,徒增重复
       if (!isFloat) applyControl(ev.data.action, ev.data.value)
       break
+    case 'mode':
+      // 播放模式变了(嘴控 / 模式钮,core 已归一落状态):两窗都对齐镜像(悬浮窗只显示,el.loop 在主窗)
+      applyMode(ev.data.mode)
+      break
     case 'skip':
       // 本集片头 / 片尾信息变了(用户标记 / 清除、指纹检测跑完):替换当前条目的 skip,VideoOverlay 据此跳
       if (state.current) state.current.skip = ev.data.skip ?? undefined
@@ -917,12 +923,18 @@ function setupMediaSession() {
   on('seekforward', () => seekBy(SEEK_STEP_S))
 }
 
-/** 系统媒体浮层显示的标题 / 作者(切集自动换);不支持就算了。 */
+/** 系统媒体浮层显示的标题 / 作者 / 专辑 / 封面(切集自动换);不支持就算了。 */
 function updateMediaMetadata(np: NowPlaying | null) {
   if (isFloat || typeof navigator === 'undefined' || !('mediaSession' in navigator)) return
   try {
     navigator.mediaSession.metadata = np
-      ? new MediaMetadata({ title: np.title, artist: np.author ?? '' })
+      ? new MediaMetadata({
+          title: np.title,
+          artist: np.author ?? '',
+          album: np.album ?? '',
+          // 封面 = relay 归一的 ≤512px JPEG(Windows 系统媒体浮层 / 锁屏拿它当图)
+          artwork: np.cover_url ? [{ src: np.cover_url, sizes: '512x512', type: 'image/jpeg' }] : [],
+        })
       : null
   } catch {
     /* MediaMetadata 不可用 */
@@ -991,12 +1003,16 @@ function wire() {
       kind: 'audio',
       title: '西游记 第7回 收服白龙马',
       author: '单田芳 评书',
+      album: '西游记 全本',
       duration_seconds: 225,
       stream_url: '',
       page_url: '#',
       source: 'bilibili',
-      // 多集音频(评书/儿歌合集):播放条出集数 + 上/下一集
+      // 多集音频(评书/儿歌合集):播放条出集数 + 上/下一集;歌单默认列表循环
       playlist: { index: 6, total: 30, resumed: false },
+      play_mode: 'loop_all',
+      // 封面预览:真机是 relay 的 /cover/{token},预览借一张仓库里的图(dev 路径,只活在 ?demo 分支里)
+      cover_url: '/src/assets/logo-tile.png',
       audio_tracks: [
         { codec: 'mp4a', lang: 'chi', title: '普通话' },
         { codec: 'mp4a', lang: 'yue' },
@@ -1011,6 +1027,8 @@ function wire() {
     state.position = 67
     state.loginHint = 'bilibili'
   }
+  // 预览没走 play():模式镜像手动对齐假数据(真机由 Play 事件捎带)
+  state.playMode = state.current?.play_mode ?? 'once'
 }
 
 export function useMedia() {
@@ -1035,8 +1053,7 @@ export function useMedia() {
     jumpTo,
     markSkip,
     autoNext,
-    cycleLoop,
-    toggleShuffle,
+    cycleMode,
     cycleAudioTrack,
     audioTrackLabel,
     cycleSubtitle,

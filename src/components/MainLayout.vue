@@ -761,8 +761,18 @@ function openPetMenu(e: MouseEvent) {
   ])
 }
 
-onMounted(() => window.addEventListener('keydown', onVoiceKey))
-onUnmounted(() => window.removeEventListener('keydown', onVoiceKey))
+/** 播放条 Esc「把键盘还给输入框」(PlayerBar 发 lw:focus-input;它够不着这里的 inputEl)。 */
+function onFocusInput() {
+  inputEl.value?.focus()
+}
+onMounted(() => {
+  window.addEventListener('keydown', onVoiceKey)
+  window.addEventListener('lw:focus-input', onFocusInput)
+})
+onUnmounted(() => {
+  window.removeEventListener('keydown', onVoiceKey)
+  window.removeEventListener('lw:focus-input', onFocusInput)
+})
 let lastLen = 0
 watch(messages, () => nextTick(() => {
   const s = streamEl.value

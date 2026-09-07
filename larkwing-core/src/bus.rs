@@ -84,15 +84,19 @@ pub struct TaskView {
 pub enum MediaEvent {
     /// 解析完成,前端把 stream_url 挂上 <audio>/<video>。
     Play(crate::media::NowPlaying),
-    /// 模型侧的播放控制(用户用嘴说"暂停/大点声/倍速/跳到第几秒/单曲循环/随机放"):
-    /// pause | resume | stop | louder | softer | volume | speed | seek |
-    /// loop_one | loop_all | loop_off | shuffle_on | shuffle_off;volume/speed/seek 带 value。
-    /// 循环/随机已先落 core 状态,事件只为前端对齐 el.loop/按钮态。
+    /// 模型侧的播放控制(用户用嘴说"暂停/大点声/倍速/跳到第几秒"):
+    /// pause | resume | stop | louder | softer | volume | speed | seek | audio_track | subtitle;
+    /// volume/speed/seek 带 value。(播放模式不走这里:见 `Mode`。)
     Control {
         action: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         value: Option<f64>,
     },
+    /// 播放模式变了(嘴控 loop_*/shuffle_* 或播放条模式钮,core 已落状态并**归一**过——
+    /// 单曲上「循环放」= 单曲循环、「取消循环」= 回默认):前端只认这里给的结果态,
+    /// 不再从动作名反推。取值 = `NowPlaying.play_mode` 同一套:once | loop_all | loop_one | shuffle。
+    /// 增量变体,老前端忽略。
+    Mode { mode: String },
     /// 当前这一集的片头 / 片尾信息变了(用户标记 / 清除、指纹检测跑完):前端替换 `NowPlaying.skip`。
     /// None = 这一集没有可用信息(不跳)。增量变体,老前端忽略。
     Skip {

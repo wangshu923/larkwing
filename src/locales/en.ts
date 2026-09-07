@@ -294,7 +294,7 @@ export default {
     speedPick: 'Speed {rate}x (click to pick, scroll to nudge)',
     mute: 'Mute',
     unmute: 'Unmute',
-    // Player shortcuts (the key table lives in VideoOverlay; help overlay / tooltips are generated from it)
+    // Player shortcuts (the key table lives in useMediaKeys, shared by the video overlay and the audio bar; help overlay / tooltips are generated from it)
     keys: {
       title: 'Shortcuts',
       playPause: 'Play / pause',
@@ -304,12 +304,17 @@ export default {
       mute: 'Mute',
       speed: 'Slower / faster',
       episode: 'Previous / next episode',
+      track: 'Previous / next track',
+      mode: 'Cycle play mode',
       list: 'Episode list',
+      trackList: 'Track list',
       skip: 'Skip intro / mark intro & outro',
       audioTrack: 'Switch audio track',
       subtitle: 'Switch subtitles',
+      lyrics: 'Show / hide lyrics',
       fullscreen: 'Fullscreen',
       esc: 'Exit fullscreen / close',
+      escBar: 'Close panel / back to the input box',
       help: 'This list',
     },
     // Key-press OSD readouts
@@ -321,7 +326,23 @@ export default {
       seek: '{s} s',
       nextEp: 'Next episode',
       prevEp: 'Previous episode',
+      nextTrack: 'Next track',
+      prevTrack: 'Previous track',
+      lyricsOn: 'Lyrics: on',
+      lyricsOff: 'Lyrics: off',
     },
+    // Play mode (one button, three settings: playlist Repeat all → Repeat one → Shuffle; single track Play once ↔ Repeat one)
+    mode: {
+      once: 'Play once',
+      loopAll: 'Repeat all',
+      loopOne: 'Repeat one',
+      shuffle: 'Shuffle',
+    },
+    modePick: 'Play mode: {mode} (click to switch)',
+    // Cover art / "Now playing" card
+    nowPlaying: 'Now playing',
+    coverOpen: 'See what’s playing',
+    coverClose: 'Close',
     // Intro / outro: mark menu (right-click the bar / scissors / S), skip undo, outro countdown
     skip: {
       menu: 'Intro & outro',
@@ -347,15 +368,10 @@ export default {
     episodeN: 'Episode {n}',
     episodeList: 'Episodes',
     trackList: 'Tracks',
-    // Audio player bar uses track wording; loop/shuffle button titles state the current mode
+    // Audio player bar uses track wording
     prevTrack: 'Previous track',
     nextTrack: 'Next track',
     trackOf: 'Track {cur}/{total}',
-    loopOff: 'Repeat: off',
-    loopAll: 'Repeating all',
-    loopOne: 'Repeating one',
-    shuffleOn: 'Shuffle: on',
-    shuffleOff: 'Shuffle: off',
     // Audio track switching (dual-language rips): button shows the current track's friendly name
     audioTrack: 'Audio track: {label} (click to switch)',
     lyricsShow: 'Show lyrics',

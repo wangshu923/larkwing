@@ -174,6 +174,11 @@ pub struct LocalProbe {
     /// 让模型从文件名判断后带参重试。只在 `ffmpeg -i` 路径有值(BMFF 轻量探测不解析 ilst)。
     pub tag_title: Option<String>,
     pub tag_artist: Option<String>,
+    /// 专辑名(同上一组全局标签;播放条「歌手 · 专辑」用)。
+    pub tag_album: Option<String>,
+    /// 文件里带内嵌封面(`ffmpeg -i` 把 mp3 APIC / flac PICTURE / m4a covr 列成一条标着
+    /// `(attached pic)` 的 Video 流)。只在 `ffmpeg -i` 路径有值;封面端点据此决定抽不抽。
+    pub attached_pic: bool,
     /// 章节(`ffmpeg -i` 打出的 `Chapter #0:N: start X, end Y` + 紧跟的 `title`;字幕组 / 蓝光压制
     /// 常带 OP / Part A / ED / Preview 这样的章节)。空 = 没有 / 解析不出;只在 ffmpeg 探测路径有值。
     pub chapters: Vec<Chapter>,
@@ -376,12 +381,20 @@ fn parse_ffmpeg_stderr_with(stderr: &str, mac_native: bool) -> LocalProbe {
                         p.tag_title = Some(v.to_string());
                     } else if k.eq_ignore_ascii_case("artist") && p.tag_artist.is_none() {
                         p.tag_artist = Some(v.to_string());
+                    } else if k.eq_ignore_ascii_case("album") && p.tag_album.is_none() {
+                        p.tag_album = Some(v.to_string());
                     }
                 }
             }
         }
         // "Stream #0:0(eng): Video: hevc (Main 10), yuv420p10le, 1920x1080 …"
+        // 音频文件的内嵌封面也长成一条 Video 流:"Stream #0:1: Video: mjpeg (Baseline), … (attached pic)"
+        // —— 只记「有封面」,不参与视频兼容判定(mjpeg/png 本就不在不兼容表里)。
         if let Some(rest) = line.split("Video: ").nth(1) {
+            if line.contains("(attached pic)") {
+                p.attached_pic = true;
+                continue;
+            }
             let codec = rest.split([' ', ',', '(']).next().unwrap_or("");
             if FFNAME_BAD_VIDEO.contains(&codec) && !mac_native_ffname(codec, mac_native) {
                 p.video_incompatible = true;
@@ -735,6 +748,8 @@ fn probe_local_with(path: &Path, mac_native: bool) -> Option<LocalProbe> {
         // 歌名/歌手标签只在 `ffmpeg -i` 路解析(ilst 不在轻量探测范围,播放路用不上)
         tag_title: None,
         tag_artist: None,
+        tag_album: None,
+        attached_pic: false,
     })
 }
 
@@ -1894,6 +1909,8 @@ Input #0, flac, from 'song.flac':
         let p = parse_ffmpeg_stderr_with(stderr, false);
         assert_eq!(p.tag_title.as_deref(), Some("示例曲目"));
         assert_eq!(p.tag_artist.as_deref(), Some("某演唱者"));
+        assert_eq!(p.tag_album.as_deref(), Some("某专辑"));
+        assert!(!p.attached_pic, "没有封面流");
         assert_eq!(
             p.audio_tracks[0].title.as_deref(),
             Some("音轨内部题名"),
@@ -1902,7 +1919,29 @@ Input #0, flac, from 'song.flac':
         // 没有全局标签的文件 → None(让模型从文件名判断)
         let bare = "Input #0, mp3, from 'x.mp3':\n  Duration: 00:03:00.00\n    Stream #0:0: Audio: mp3";
         let p2 = parse_ffmpeg_stderr_with(bare, false);
-        assert!(p2.tag_title.is_none() && p2.tag_artist.is_none());
+        assert!(p2.tag_title.is_none() && p2.tag_artist.is_none() && p2.tag_album.is_none());
+    }
+
+    #[test]
+    fn ffmpeg_stderr_marks_embedded_cover_as_attached_pic() {
+        // mp3 带 APIC 的典型形:封面是一条标着 (attached pic) 的 mjpeg Video 流 —— 记「有封面」,
+        // 不当视频轨、不影响兼容判定;音轨照常只有一条。
+        let stderr = "\
+Input #0, mp3, from 'song.mp3':
+  Metadata:
+    title           : 示例曲目
+    artist          : 某演唱者
+    album           : 某专辑
+  Duration: 00:03:00.00, start: 0.025057, bitrate: 320 kb/s
+  Stream #0:0: Audio: mp3 (mp3float), 44100 Hz, stereo, fltp, 320 kb/s
+  Stream #0:1: Video: mjpeg (Baseline), yuvj420p(pc, bt470bg/unknown/unknown), 500x500 [SAR 1:1 DAR 1:1], 90k tbr, 90k tbn (attached pic)
+    Metadata:
+      comment         : Cover (front)";
+        let p = parse_ffmpeg_stderr_with(stderr, false);
+        assert!(p.attached_pic);
+        assert!(!p.video_incompatible);
+        assert_eq!(p.audio_tracks.len(), 1);
+        assert_eq!(p.tag_album.as_deref(), Some("某专辑"));
     }
 
     #[test]

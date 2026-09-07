@@ -202,6 +202,21 @@ enum Entry {
     /// → 下载所在那张大图(整图进有界缓存,一张图管几十格)→ 裁出那一格 → 缩到 THUMB_WIDTH → JPEG。
     /// 裁好的格照旧进 `thumbs` 缓存(键 = (token, 帧号))。任何一步不顺一律 404,前端照旧降级。
     Sprites { sheet: Arc<SpriteSheet> },
+    /// 封面(专辑图 / 视频封面):`/cover/{token}` 现取现回一张 ≤ `COVER_MAX_EDGE` 的 JPEG。与播放条目
+    /// 分开注册(缩略图同款理由):「有没有封面」就是 `NowPlaying.cover_url` 有没有值。三种来源见 `CoverSrc`;
+    /// 取不出一律 404,前端回落 ♪ 占位。
+    Cover(CoverSrc),
+}
+
+/// 封面从哪来(三条路同一个端点、同一个前端契约)。
+#[derive(Debug, Clone)]
+pub enum CoverSrc {
+    /// 音频文件内嵌图(mp3 APIC / flac PICTURE / m4a covr…):ffmpeg 把 attached_pic 流 `-c copy` 原字节抽出来。
+    Embedded { path: PathBuf, ffmpeg: PathBuf },
+    /// 同目录侧车图(cover / folder / front / album.*)。
+    Sidecar(PathBuf),
+    /// 远端图片(网络源封面,B 站视频封面):带防盗链头下载(雪碧图同款)。
+    Remote { url: String, headers: Vec<(String, String)> },
 }
 
 /// 一条字幕的来源(P4):要么是文件内嵌的第 n 条字幕轨,要么是旁边的外挂文件。
@@ -261,6 +276,18 @@ const SPRITE_IMG_CACHE_MAX: usize = 16;
 const SPRITE_IMG_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// 裁出来那一格的 JPEG 质量(小图,80 已看不出差别;ffmpeg 路的 mjpeg 默认质量同量级)。
 const SPRITE_JPEG_QUALITY: u8 = 80;
+
+/* ——— 封面(专辑图 / 视频封面)的几个数(§4.11 用户拍板 2026-09-07:512 / q85 / 缓存 16;原图上限沿雪碧图)——— */
+/// 封面最长边(像素):播放条缩略 40px、「正在播放」大卡约 200px,512 留足 2× 屏,一张 ≈ 30–60KB。
+pub(crate) const COVER_MAX_EDGE: u32 = 512;
+/// 封面 JPEG 质量。
+const COVER_JPEG_QUALITY: u8 = 85;
+/// 封面缓存上限(张,全局 FIFO;键 = 来源身份〔文件路径 / 图 URL〕,同一首再放命中缓存不重抽)。
+const COVER_CACHE_MAX: usize = 16;
+/// 原图字节上限(内嵌 PNG 封面几 MB 常见;8MB 是「这不是封面」的 backstop,与雪碧图同数)。
+const COVER_SRC_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// 原图边长上限(解码器限额;封面不该是几亿像素的图,超过不解)。
+const COVER_SRC_MAX_EDGE: u32 = 8192;
 
 /// 把 hover 秒数落到 `THUMB_GRID` 格(向下取整),负数/非有限值一律归 0。
 /// 缓存键与 ffmpeg 的 `-ss` 都用它的结果 —— 前端也量化过,这里再落一次是为了
@@ -326,6 +353,8 @@ struct Inner {
     thumbs: Mutex<ThumbCache>,
     /// 雪碧图整图缓存(编码字节,键 = 大图 URL;全局有界 FIFO,见 `SPRITE_IMG_CACHE_MAX`)。
     sprites: Mutex<FifoCache<String>>,
+    /// 封面缓存(归一后的 JPEG,键 = 来源身份;全局有界 FIFO,见 `COVER_CACHE_MAX`)。
+    covers: Mutex<FifoCache<String>>,
     /// 缩略图串行闸:同时只抽一帧。拖一趟进度条会连着来好几格,并发起 ffmpeg 只是互相抢 CPU;
     /// 排队 + 前端只保留最新一次请求 = 最多积一个(拿到许可后还要再查一次缓存,别白抽)。
     /// 雪碧图路同闸:并发的两格多半落同一张大图,串行后第二个直接命中整图缓存、不重复下载。
@@ -355,6 +384,7 @@ impl Relay {
             collect: Mutex::new(HashMap::new()),
             thumbs: Mutex::new(ThumbCache::default()),
             sprites: Mutex::new(FifoCache::new(SPRITE_IMG_CACHE_MAX)),
+            covers: Mutex::new(FifoCache::new(COVER_CACHE_MAX)),
             thumb_gate: tokio::sync::Semaphore::new(1),
         });
         let app = Router::new()
@@ -369,6 +399,8 @@ impl Relay {
             .route("/la/{token}/{seg}", get(local_adaptive).options(dash_preflight))
             // 进度条 hover 预览缩略图:`?t=秒` 现抽现回一张 JPEG(前端 <img>,不查 CORS → 不用放行)。
             .route("/thumb/{token}", get(thumb))
+            // 封面(专辑图 / 视频封面):现取现回一张 ≤512px 的 JPEG(同样 <img> 用,不查 CORS)。
+            .route("/cover/{token}", get(cover))
             // webrender 回传(壳层隐藏窗注入脚本 → 任意外源页面 fetch 过来 → 需 CORS;
             // 脚本用 text/plain 发 = 简单请求免预检,OPTIONS 只是兜底)。
             .route("/collect/{token}", axum::routing::post(collect).options(collect_preflight))
@@ -443,6 +475,12 @@ impl Relay {
     /// 大图不在这里下 —— 首次 hover 到某张图时才下、进 `sprites` 缓存;注册本身零 IO。
     pub fn register_sprites(&self, sheet: Arc<SpriteSheet>) -> String {
         self.register(Entry::Sprites { sheet }, "thumb")
+    }
+
+    /// 封面地址(`…/cover/{token}`):注册零 IO,首次请求才抽 / 读 / 下,归一成 ≤512px JPEG 进缓存。
+    /// 有没有封面由调用方决定(内嵌图探到了 / 侧车图在 / 源给了封面 URL 才注册),这里不猜。
+    pub fn register_cover(&self, src: CoverSrc) -> String {
+        self.register(Entry::Cover(src), "cover")
     }
 
     /// 探/取该机器可用的视频编码器(硬件优先,整进程探一次缓存)。转码前调,拿来定 entry 的 `enc`。
@@ -1487,17 +1525,30 @@ async fn sprite_thumb(state: &Inner, sheet: &Arc<SpriteSheet>, frame: usize) -> 
     }
 }
 
-/// 取一张雪碧图大图的编码字节:先查整图缓存,没有则带防盗链头下载(走 net::Client,§4.6),
-/// 边读边封顶 `SPRITE_IMG_MAX_BYTES`(超了就弃,绝不把不明大小的东西拉进内存),成功即入缓存。
+/// 取一张雪碧图大图的编码字节:先查整图缓存,没有则带防盗链头下载(`fetch_image_bytes`),成功即入缓存。
 async fn fetch_sprite_image(state: &Inner, sheet: &SpriteSheet, url: &str) -> Option<Arc<Vec<u8>>> {
     if let Some(bytes) = state.sprites.lock().expect("relay sprites lock poisoned").get(&url.to_string()) {
         return Some(bytes);
     }
+    let buf = fetch_image_bytes(state, url, &sheet.headers, SPRITE_IMG_MAX_BYTES).await?;
+    let bytes = Arc::new(buf);
+    state.sprites.lock().expect("relay sprites lock poisoned").put(url.to_string(), bytes.clone());
+    Some(bytes)
+}
+
+/// 带防盗链头下载一张图的字节(走 net::Client,§4.6),边读边封顶 `cap`(超了就弃,绝不把不明大小的
+/// 东西拉进内存)。雪碧图大图与远端封面共用;非 2xx / 空体 / 断流一律 None。
+async fn fetch_image_bytes(
+    state: &Inner,
+    url: &str,
+    headers: &[(String, String)],
+    cap: usize,
+) -> Option<Vec<u8>> {
     let mut resp = state
         .net
         .send(url, |c| {
             let mut req = c.get(url);
-            for (k, v) in &sheet.headers {
+            for (k, v) in headers {
                 req = req.header(k, v);
             }
             req
@@ -1505,17 +1556,17 @@ async fn fetch_sprite_image(state: &Inner, sheet: &SpriteSheet, url: &str) -> Op
         .await
         .ok()?;
     if !resp.status().is_success() {
-        tracing::info!(url = %url, status = resp.status().as_u16(), "雪碧图大图取不到");
+        tracing::info!(url = %url, status = resp.status().as_u16(), "图片取不到");
         return None;
     }
-    if resp.content_length().is_some_and(|n| n > SPRITE_IMG_MAX_BYTES as u64) {
+    if resp.content_length().is_some_and(|n| n > cap as u64) {
         return None;
     }
     let mut buf: Vec<u8> = Vec::new();
     loop {
         match resp.chunk().await {
             Ok(Some(chunk)) => {
-                if buf.len() + chunk.len() > SPRITE_IMG_MAX_BYTES {
+                if buf.len() + chunk.len() > cap {
                     return None;
                 }
                 buf.extend_from_slice(&chunk);
@@ -1527,9 +1578,126 @@ async fn fetch_sprite_image(state: &Inner, sheet: &SpriteSheet, url: &str) -> Op
     if buf.is_empty() {
         return None;
     }
-    let bytes = Arc::new(buf);
-    state.sprites.lock().expect("relay sprites lock poisoned").put(url.to_string(), bytes.clone());
-    Some(bytes)
+    Some(buf)
+}
+
+/// 封面:`/cover/{token}`。查缓存 →(与缩略图同一把串行闸,别并发起 ffmpeg)→ 按来源取原图 →
+/// 归一成 ≤ COVER_MAX_EDGE 的 JPEG → 收进缓存。取不出一律 404,前端回落 ♪ 占位(§3.5 不给破图)。
+async fn cover(State(state): State<Arc<Inner>>, AxPath(token): AxPath<String>) -> Response {
+    let Some(entry) = lookup(&state, &token) else { return bad(StatusCode::NOT_FOUND) };
+    let Entry::Cover(src) = entry.as_ref() else { return bad(StatusCode::NOT_FOUND) };
+    let key = cover_key(src);
+    if let Some(bytes) = state.covers.lock().expect("relay covers lock poisoned").get(&key) {
+        return thumb_response(bytes);
+    }
+    let Ok(_permit) = state.thumb_gate.acquire().await else {
+        return bad(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    if let Some(bytes) = state.covers.lock().expect("relay covers lock poisoned").get(&key) {
+        return thumb_response(bytes);
+    }
+    let raw: Option<Vec<u8>> = match src {
+        CoverSrc::Embedded { path, ffmpeg } => {
+            let cmd = build_cover_cmd(ffmpeg, path);
+            match tokio::time::timeout(THUMB_TIMEOUT, run_ffmpeg_collect(cmd, COVER_SRC_MAX_BYTES)).await {
+                Ok(out) => out,
+                Err(_) => {
+                    tracing::warn!(path = %path.display(), "抽内嵌封面超时,放弃");
+                    None
+                }
+            }
+        }
+        CoverSrc::Sidecar(path) => {
+            let p = path.clone();
+            tokio::task::spawn_blocking(move || read_capped(&p, COVER_SRC_MAX_BYTES)).await.ok().flatten()
+        }
+        CoverSrc::Remote { url, headers } => {
+            fetch_image_bytes(&state, url, headers, COVER_SRC_MAX_BYTES).await
+        }
+    };
+    let out = match raw {
+        Some(bytes) => tokio::task::spawn_blocking(move || {
+            cover_jpeg(&bytes, COVER_MAX_EDGE, COVER_JPEG_QUALITY)
+        })
+        .await
+        .ok()
+        .flatten(),
+        None => None,
+    };
+    let Some(out) = out.filter(|b| !b.is_empty()) else { return bad(StatusCode::NOT_FOUND) };
+    let bytes = Arc::new(out);
+    state.covers.lock().expect("relay covers lock poisoned").put(key, bytes.clone());
+    thumb_response(bytes)
+}
+
+/// 封面缓存键 = 来源身份:同一个文件 / 同一张远端图,换一次播放(新 token)照样命中。
+fn cover_key(src: &CoverSrc) -> String {
+    match src {
+        CoverSrc::Embedded { path, .. } => format!("embedded:{}", path.display()),
+        CoverSrc::Sidecar(path) => format!("sidecar:{}", path.display()),
+        CoverSrc::Remote { url, .. } => format!("remote:{url}"),
+    }
+}
+
+/// 读一个小文件到内存,超过 `cap` 的不读(侧车图理应几百 KB;巨图不是封面)。
+fn read_capped(path: &Path, cap: usize) -> Option<Vec<u8>> {
+    let len = std::fs::metadata(path).ok()?.len();
+    if len == 0 || len > cap as u64 {
+        return None;
+    }
+    std::fs::read(path).ok()
+}
+
+/// 抽音频文件的内嵌封面:attached_pic 是一条单帧 Video 流(mjpeg / png),`-c copy` 原字节吐到 stdout。
+/// **这里用小写 `0:v:0`**(与缩略图的大写 `V` 相反):大写 V 会把封面轨排除掉,而这次要的正是它。
+/// 文件没封面流 → ffmpeg 报错无输出 → 调用方按 404 处理。
+fn build_cover_cmd(ffmpeg: &Path, path: &Path) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(ffmpeg);
+    cmd.arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-nostdin")
+        .arg("-i")
+        .arg(path)
+        .arg("-map")
+        .arg("0:v:0")
+        .arg("-an")
+        .arg("-sn")
+        .arg("-dn")
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-c:v")
+        .arg("copy")
+        .arg("-f")
+        .arg("image2pipe")
+        .arg("pipe:1");
+    cmd
+}
+
+/// 任意图(jpg / png / webp / bmp)→ JPEG:最长边超 `max_edge` 才等比缩小(不放大、不裁),透明合到黑底
+/// (to_rgb8;封面几乎没有透明,不为它多一路 PNG)。解码限额 `COVER_SRC_MAX_EDGE`。纯 CPU、同步、
+/// 可测;调用方放阻塞线程。relay 的封面端点(512)与下载嵌封面(2000)共用。
+pub(crate) fn cover_jpeg(bytes: &[u8], max_edge: u32, quality: u8) -> Option<Vec<u8>> {
+    let mut reader =
+        image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(COVER_SRC_MAX_EDGE);
+    limits.max_image_height = Some(COVER_SRC_MAX_EDGE);
+    reader.limits(limits);
+    let img = reader.decode().ok()?;
+    if img.width() == 0 || img.height() == 0 {
+        return None;
+    }
+    let img = if img.width().max(img.height()) > max_edge {
+        img.thumbnail(max_edge, max_edge)
+    } else {
+        img
+    };
+    let rgb = image::DynamicImage::ImageRgb8(img.to_rgb8());
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
+    rgb.write_with_encoder(enc).ok()?;
+    Some(buf.into_inner())
 }
 
 /// 从雪碧图大图字节里裁出第 (col, row) 格、超宽则缩到 THUMB_WIDTH(不放大)、编成 JPEG。
@@ -1737,6 +1905,7 @@ mod tests {
             collect: Mutex::new(HashMap::new()),
             thumbs: Mutex::new(ThumbCache::default()),
             sprites: Mutex::new(FifoCache::new(SPRITE_IMG_CACHE_MAX)),
+            covers: Mutex::new(FifoCache::new(COVER_CACHE_MAX)),
             thumb_gate: tokio::sync::Semaphore::new(1),
         });
         let relay = Relay { inner };
@@ -2057,6 +2226,87 @@ mod tests {
         assert_eq!(a.last().unwrap(), "pipe:1");
         // 第 0 秒不带 -ss(省掉一次无意义的 seek)
         assert!(!args_at(0).iter().any(|s| s == "-ss"));
+    }
+
+    #[test]
+    fn cover_cmd_takes_attached_pic_stream_as_is() {
+        let c = build_cover_cmd(Path::new("ffmpeg"), Path::new("/tmp/song.flac"));
+        let a: Vec<String> = c.as_std().get_args().map(|s| s.to_string_lossy().into_owned()).collect();
+        // 小写 v:封面轨就是 attached pic,这次要的正是它(缩略图那边用大写 V 排除它)
+        assert!(a.windows(2).any(|w| w[0] == "-map" && w[1] == "0:v:0"), "{a:?}");
+        assert!(a.windows(2).any(|w| w[0] == "-c:v" && w[1] == "copy"), "原字节不重编:{a:?}");
+        assert!(a.windows(2).any(|w| w[0] == "-frames:v" && w[1] == "1"));
+        assert!(a.windows(2).any(|w| w[0] == "-f" && w[1] == "image2pipe"));
+        assert!(!a.iter().any(|s| s == "-ss"), "封面不按时间抽");
+        assert_eq!(a.last().unwrap(), "pipe:1");
+    }
+
+    /// 造一张 PNG(纯色即可)的编码字节。
+    fn png_bytes(w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(w, h, image::Rgba([200, 40, 40, 255]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img).write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        buf.into_inner()
+    }
+
+    #[test]
+    fn cover_jpeg_fits_long_edge_and_never_upscales() {
+        // 大图缩到最长边 512、比例不变;小图原尺寸;坏字节 None;输出是 JPEG(FF D8 开头)
+        let big = cover_jpeg(&png_bytes(1200, 800), COVER_MAX_EDGE, COVER_JPEG_QUALITY).unwrap();
+        assert!(big.starts_with(&[0xFF, 0xD8]));
+        let dims = image::load_from_memory(&big).unwrap();
+        assert_eq!((dims.width(), dims.height()), (512, 341));
+        let small = cover_jpeg(&png_bytes(300, 300), COVER_MAX_EDGE, COVER_JPEG_QUALITY).unwrap();
+        let dims = image::load_from_memory(&small).unwrap();
+        assert_eq!((dims.width(), dims.height()), (300, 300), "不放大");
+        assert!(cover_jpeg(b"not an image", COVER_MAX_EDGE, COVER_JPEG_QUALITY).is_none());
+        // 缓存键按来源身份,不含 token
+        let k1 = cover_key(&CoverSrc::Sidecar(PathBuf::from("/a/cover.jpg")));
+        let k2 = cover_key(&CoverSrc::Sidecar(PathBuf::from("/a/cover.jpg")));
+        let k3 = cover_key(&CoverSrc::Remote { url: "https://x/1.jpg".into(), headers: vec![] });
+        assert_eq!(k1, k2);
+        assert_ne!(k1, k3);
+    }
+
+    #[tokio::test]
+    async fn cover_endpoint_serves_sidecar_and_degrades_to_404() {
+        let relay = Relay::start().await.unwrap();
+        let http = reqwest::Client::new();
+        let dir = std::env::temp_dir().join(format!("lw-cover-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let side = dir.join("cover.png");
+        std::fs::write(&side, png_bytes(900, 900)).unwrap();
+
+        // 侧车图:200 + JPEG + 已缩到 512;同一来源再注册一个 token 照样命中(键按来源)
+        let url = relay.register_cover(CoverSrc::Sidecar(side.clone()));
+        let r = http.get(&url).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        assert_eq!(r.headers().get("content-type").unwrap(), "image/jpeg");
+        let bytes = r.bytes().await.unwrap();
+        let img = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((img.width(), img.height()), (512, 512));
+        let key = cover_key(&CoverSrc::Sidecar(side.clone()));
+        assert!(relay.inner.covers.lock().unwrap().get(&key).is_some(), "进了封面缓存");
+
+        // 侧车图不存在 / 内嵌图 ffmpeg 起不来 / 远端拿不到 → 一律 404(前端回落 ♪)
+        let gone = relay.register_cover(CoverSrc::Sidecar(dir.join("nope.jpg")));
+        assert_eq!(http.get(&gone).send().await.unwrap().status().as_u16(), 404);
+        let emb = relay.register_cover(CoverSrc::Embedded {
+            path: dir.join("nope.mp3"),
+            ffmpeg: PathBuf::from("/nonexistent/ffmpeg"),
+        });
+        assert_eq!(http.get(&emb).send().await.unwrap().status().as_u16(), 404);
+        let remote = relay.register_cover(CoverSrc::Remote {
+            url: "http://127.0.0.1:9/cover.jpg".into(),
+            headers: vec![],
+        });
+        assert_eq!(http.get(&remote).send().await.unwrap().status().as_u16(), 404);
+        // 播放条目蹭不了这个端点
+        let file_url = relay.register_file(PathBuf::from("/tmp/whatever.mp3"));
+        let token = file_url.rsplit('/').next().unwrap();
+        let wrong = format!("http://127.0.0.1:{}/cover/{token}", relay.inner.port);
+        assert_eq!(http.get(&wrong).send().await.unwrap().status().as_u16(), 404);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

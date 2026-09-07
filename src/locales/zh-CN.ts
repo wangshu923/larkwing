@@ -295,7 +295,7 @@ export default {
     speedPick: '倍速 {rate}x(点击选档,滚轮微调)',
     mute: '静音',
     unmute: '取消静音',
-    // 看片快捷键(键位表在 VideoOverlay,帮助浮层 / tooltip 从同一张表生成)
+    // 播放快捷键(键位表在 useMediaKeys,视频浮层与音频播放条共用;帮助浮层 / tooltip 从同一张表生成)
     keys: {
       title: '快捷键',
       playPause: '播放 / 暂停',
@@ -305,12 +305,17 @@ export default {
       mute: '静音',
       speed: '倍速慢一档 / 快一档',
       episode: '上一集 / 下一集',
+      track: '上一首 / 下一首',
+      mode: '切换播放模式',
       list: '选集列表',
+      trackList: '曲目列表',
       skip: '跳过片头 / 标记片头片尾',
       audioTrack: '切换音轨',
       subtitle: '切换字幕',
+      lyrics: '显示 / 隐藏歌词',
       fullscreen: '全屏',
       esc: '退出全屏 / 关闭',
+      escBar: '收起面板 / 回到输入框',
       help: '这张表',
     },
     // 按键 OSD 读数
@@ -322,7 +327,23 @@ export default {
       seek: '{s} 秒',
       nextEp: '下一集',
       prevEp: '上一集',
+      nextTrack: '下一首',
+      prevTrack: '上一首',
+      lyricsOn: '歌词:开',
+      lyricsOff: '歌词:关',
     },
+    // 播放模式(一个钮三档:歌单 列表循环 → 单曲循环 → 随机;单曲 放完就停 ↔ 单曲循环)
+    mode: {
+      once: '顺序播放',
+      loopAll: '列表循环',
+      loopOne: '单曲循环',
+      shuffle: '随机播放',
+    },
+    modePick: '播放模式:{mode}(点击切换)',
+    // 封面 / 「正在播放」大卡
+    nowPlaying: '正在播放',
+    coverOpen: '看看正在放什么',
+    coverClose: '收起',
     // 片头片尾:标记菜单(进度条右键 / 剪刀钮 / S)、跳过回看口、片尾倒计时
     skip: {
       menu: '片头片尾',
@@ -348,15 +369,10 @@ export default {
     episodeN: '第 {n} 集',
     episodeList: '选集',
     trackList: '曲目',
-    // 音频播放条(歌/故事)用「首」词族;循环/随机按钮 title 直述当前状态
+    // 音频播放条(歌/故事)用「首」词族
     prevTrack: '上一首',
     nextTrack: '下一首',
     trackOf: '第 {cur}/{total} 首',
-    loopOff: '循环:关',
-    loopAll: '列表循环中',
-    loopOne: '单曲循环中',
-    shuffleOn: '随机播放中',
-    shuffleOff: '随机:关',
     // 音轨切换(双语片):按钮显示当前轨的友好名;语言码词典没收录的显示原码
     audioTrack: '音轨:{label}(点击切换)',
     lyricsShow: '显示歌词',

@@ -490,11 +490,15 @@ export interface NowPlaying {
   source: string
   /** 有值 = 多集剧集:UI 显「第N/共M集」+ 上/下一集按钮;ended 时若非末集自动续播。 */
   playlist?: PlaylistPos
-  /** 循环模式镜像(core 是唯一真相,每次 Play 全量捎带):off / one(单曲,前端 el.loop)/ all(列表)。
-   *  可选:浏览器预览假数据可不带(按 off 处理)。 */
-  loop_mode?: 'off' | 'one' | 'all'
-  /** 随机播放镜像(多集队列才可能 true)。 */
-  shuffle?: boolean
+  /** 播放模式镜像(core 是唯一真相,每次 Play 全量捎带;中途改由 media 事件 `mode` 对齐):
+   *  once(放完就停)/ loop_all(列表循环,歌单默认)/ loop_one(单曲循环,前端 el.loop)/ shuffle(随机)。
+   *  可选:浏览器预览假数据可不带(按 once 处理)。 */
+  play_mode?: PlayMode
+  /** 封面地址(relay `/cover/{token}`,一张 ≤512px 的 JPEG)。**有值 = 有图可取**;缺 = 显 ♪ 占位。
+   *  本地歌:文件内嵌图 > 同目录 cover/folder/front/album.*;网络:源页面封面(视频也带,当 poster)。 */
+  cover_url?: string
+  /** 专辑名(本地歌的标签;网络流 / 视频没有)。 */
+  album?: string
   /** 倍速镜像(0.5–3):新点播复位 1、切集/自动续播沿用。可选:浏览器预览假数据可不带(按 1 处理)。 */
   rate?: number
   /** 全部音轨(本地探测;≥2 条才出切换钮)。缺省/空 = 单音轨或网络流。 */
@@ -524,10 +528,12 @@ export interface SkipInfo {
   source: 'manual' | 'bili' | 'chapter' | 'detected' | string
 }
 
+/** 播放模式(镜像 Rust media::PlayMode 的过桥串)。 */
+export type PlayMode = 'once' | 'loop_all' | 'loop_one' | 'shuffle'
+
 /** 剧集列表面板要的整份队列(镜像 Rust media::PlaylistView;按需取,不塞进 Play 事件)。 */
 export interface PlaylistView {
   index: number
-  shuffle: boolean
   title?: string
   entries: { title: string }[]
 }
@@ -535,6 +541,8 @@ export interface PlaylistView {
 export type MediaEvent =
   | { type: 'play'; data: NowPlaying }
   | { type: 'control'; data: { action: string; value?: number } }
+  /** 播放模式变了(嘴控 / 模式钮;core 已归一,前端只认结果态)。 */
+  | { type: 'mode'; data: { mode: PlayMode } }
   | { type: 'skip'; data: { skip?: SkipInfo } }
   | { type: 'auth_required'; data: { source: string } }
   | { type: 'login_hint'; data: { source: string } }
