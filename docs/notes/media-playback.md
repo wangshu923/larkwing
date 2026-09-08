@@ -105,3 +105,12 @@
 
   - **B 站扫码登录 Mac 上连坏两层(2026-07-06,本节的镜像方向:Mac-only、Windows 掩盖;两修都 `#[cfg(target_os = "macos")]`,Windows 分支零改动)**:① **「您的浏览器版本过低」拒开**——WKWebView 默认 UA 缺 `Version/x Safari/x` 版本段,passport 登录页**前端 JS** 按 `navigator.userAgent` 判旧直接拒(服务端对新旧 UA 回同一壳 HTML,拦截纯客户端渲染);修 = `commands.rs::media_login` 开窗时补真 Safari 冻结形 UA(`Version/17.6 Safari/605.1.15`,各段 Apple 已冻结不陈化;Tauri `.user_agent()` 连 `navigator.userAgent` 一起改)。② **登录成功却读不到 SESSDATA(轮询永不入库,窗不自动关)**——wry(0.55)mac 的 `cookies_for_url` 按「cookie 域 == URL 域」**精确相等**过滤,`.bilibili.com`(带点)对 `www.bilibili.com` 永不相等 → 登录 cookie 全被滤掉;Windows 走 WebView2 原生 `GetCookies(uri)` 正确域匹配故真机没事(这层分叉在 **wry 自己**)。修 = mac 改 `win.cookies()` 取全量 + `cookie_domain_matches` 自做域后缀匹配(有单测);Windows 维持 `cookies_for_url`(已真机验过,且其原生 API 偶尔不回 domain 字段、套自滤会误杀)。同族先例:API 侧裸 UA 被 412(`bilibili.rs::UA` 挂 Chrome UA),登录窗当时漏了这道。排查抓手:日志见「登录态已入库」才算数,窗开着不关 = 轮询没读到。
 
+
+## relay 注册表从「只增不减」改成按字节权重有界(2026-09-08)
+
+> 来源:2026-09-08 优化批(全仓体检 → 一起修)。规则句在 AGENT §7.1,常量进 §4.11 待拍板。
+
+- **病**:`media/relay.rs` 的 `streams: Mutex<HashMap<String, Arc<Entry>>>` **从不清理** —— 老注释自己承认这件事(「`streams` 注册表本身从不清理(每次播放留一个 entry)」,写在 `THUMB_CACHE_MAX` 那条解释「为什么缩略图缓存要全局有界」时)。每次点播注册 1–3 个 token(播放臂 + `Thumb`/`Sprites` + `Cover`),切集 / 切音轨 / 兜底重放各再留一份;连播一季或歌单循环几天就是几十上百个常驻。轻的 entry 只是几个 `PathBuf` 无所谓,**真占地方的是 `Entry::FileAdaptive.video_init`**(注册时预生成并缓存的整份 ftyp+moov,4K 长片能到几 MB)、`Dash.mpd`、`Sprites` 的帧索引。
+- **为什么不能按条数一刀切**(这是设计上唯一的坎):`MediaRuntime::attachment_url` → `file_url` → `relay.register_file(path)` —— **聊天历史里每张图也在同一张表里注册一个 `Entry::File`**(一条约 100 字节)。重开一个 200 张图的会话就是 200 个 token,且每次 `resolveThumbs` 都会为同一张图注册新 token(旧的从前就那么泄漏着)。按条数限量 → 老图的 localhost URL 被挤成 404 → 图卡破图。
+- **修**:`StreamRegistry`(map + 插入序 `VecDeque` + 权重和)按 **字节权重** FIFO 淘汰,权重由 `Entry::weight()` 粗估(`BASE 256` + `video_init.len()` / `mpd.len()` / sheet 索引;其余臂只有几个路径,记 BASE)。三道界:`STREAMS_MAX_BYTES` 64MB(重型 entry 的常驻上限)· `STREAMS_MAX_ENTRIES` 500(条数 backstop,几乎只由图片附件触达,一屏聊天最多 200 张 → 留足余量)· `STREAMS_MIN_KEEP` 8(**保底优先于前两道** —— 全是巨型 entry 时宁可字节略超,也不许淘汰最近几条:**正在播的那条就在里面**)。淘汰是 FIFO 而非 LRU,因为播放是顺序往前走的、老 entry 播完就没人请求。
+- **测试踩的一处**(值得记):第一版单测断言「压回后 `bytes <= STREAMS_MAX_BYTES`」直接红 —— 40 个 8MB entry 被压到 8 条 = 64.01MB,略超。这不是 bug 而是 MIN_KEEP 保底的**有意**结果,断言该写成「压到保底条数」;顺手把这个优先级写进常量注释,免得后人来"修"。守卫 `relay::tests::stream_registry_evicts_by_bytes_and_keeps_recent` 三段:500 条轻 entry 一个都不许掉(老图回归)· 40 个重 entry 压到保底且最新那条必在 · 单条就超上限时也不许把自己淘汰掉。

@@ -2,6 +2,18 @@
 
 > 2026-09-07 从 AGENT.md 页脚搬出(逐字)。它是「哪次会话改了哪条规则」的链条,曾用来对 git log 查漏回写;以后每次整编在**本节之前**加一段(最新在上),AGENT.md 页脚只留最近一次的一行。
 
+## 2026-09-08 全仓体检 → 优化批
+
+用户一句「看看还有什么需要优化的东西」→ 四路并行体检(Rust core 健壮性 / 前端 / AGENT 符号漂移 / 测试与 CI 覆盖)→ 用户「一起修吧」→ 四路并行落地(三个 worktree agent + 主树自己做前端与 relay)。
+
+**体检结论**:代码本身干净(TODO / console.log / @ts-ignore 全仓 0,测试 807 全绿,i18n 零漂移,AGENT 引用的 203 个符号只 1 个过时),缺的是结构性的四类 —— ① **没有任何 CI 在 push/PR 跑**(唯一 workflow 只在 tag 触发,807 个测试从未在 CI 跑过)② 流式期间整屏重排版 ③ 几处常驻资源无界 ④ 几族 helper 重复。
+
+**规则变更**:§6.6 三条(errorHandler 落地 / 键集交给脚本 / `useSettings.set` 补 toast)· §6.7 两条(**scoped CSS 吃不到 v-html** —— 12 条 markdown 规则静静失效三个月 / **流式期间别在模板里做重活** 量化立规)· §7.1 relay 注册表有界 · §8.4 同族推论(重 DB 命令也要 async + spawn_blocking)· §8.5 补路(CI 有了 windows-check,但不取代本地靶场)· §4.11 两处(四族归一范例 + 资源管护三族待拍板)· §10 **新增「CI」节**。
+
+**当日落地**:CI 三个 job(mac test+clippy `-D warnings` / ubuntu vue-tsc+i18n / windows 交叉 check)+ `scripts/check-i18n.mjs` 守五条 + MSRV 归 workspace 继承 + `[profile.release]` LTO/strip(禁 panic=abort)· 前端 `MdText.vue`(markdown 67 次/tick → 1 次/tick,A/B 实测)+ deep watch 换廉价信号 + errorHandler + `frontend_log` 命令 + lazy img + 缩略图并发 · relay `StreamRegistry` 按字节权重有界 · `messages.created_at` 索引(迁移 0034)+ 三处下载写盘出 tokio worker + 五个重 DB 命令 async 化 + N+1 三处 + 两处扫盘进 spawn_blocking · clippy 28 条清零 + 四族 helper 归一(新 `text.rs`)+ MSRV 违规改写 + 删死代码 + TTS 缓存淘汰 + native.log 轮转。
+
+Mac 全绿:core lib **821**(基线 807 + 14 新测试)/ engine 20 / 壳层 11 / 两个 crate `clippy -D warnings` 皆零 / vue-tsc 0 / i18n 5/5(885=885)/ `pnpm build` 通 / 预览页端到端 + markdown 12 条 computed 值逐条量过。真机 watch 见 PLAN「2026-09-08 优化批」;叙事归 `docs/notes/engineering.md`(新)+ desktop-shell.md 三段 + media-playback.md 一段。
+
 ## 2026-09-07·三批 AGENT.md 分家
 
 叙事 / 状态 / 整编链搬出规则总纲:每条规则原位留「规则句 + 落点 + 指针」,原文逐字进 `docs/notes/<主题>.md`,页脚整编链进本文件,§0「现状」段归档在下方;新增 §10「体量纪律」+ 文档地图两行。

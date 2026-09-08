@@ -56,3 +56,29 @@
 
 - **病**:用户视频「明明没有消息出现,聊天流却一直往下滚」——回合在飞、只有折叠的「推理轨迹」药丸没正文,内容被一路顶到顶部、下面留一大片空白。根因链:桌宠 `.roamer` 曾绝对定位在 `.stream`(滚动容器)里、每帧 `translate(dogX, dogY + scrollTop)` 补偿位置;CSS 规定 transform 后的盒子**参与**祖先滚动容器的 scrollable overflow(Chromium/WebView2 一致,预览浏览器同样复现);而 `.body` 姿态容器被 block 的 img 撑成 px×px、从锚点向右下延伸半个身位(注释写「零尺寸」是错的;img 再 -50% 挪回居中,所以看不见的盒子挂在形象下方)→ 桌宠站在底边 44px 处时该盒探出视口 8~22px → 回合在飞每条思考增量触发一次 `scrollTop = scrollHeight` 贴底 → 下一帧桌宠随 scrollTop 再探出 → **正反馈环**,直到回合结束才停。预览 1:1 复现:img 底边 577 在视口(585)内、`.body` 底边 598 在外,24 条增量 scrollTop 663→844。**肉眼/算 img 高度会误判「不是桌宠」**——是合成一个同构测试件逐像素挪、读 scrollHeight 才看出「离底边还有 5px 就涨 22」。
 
+
+## 流式期间整屏重排版 = 模板里做重活(2026-09-08 量化立规)
+
+> 来源:2026-09-08 优化批(用户「看看还有什么需要优化的」→ 四路并行体检 → 一起修)。规则句在 AGENT §6.7 末条。
+
+- **病**:长会话里回合在飞时,聊天区发涩。根因链:`useChat` 的打字机(`tw` loop)每 **16ms** 往在飞那条追加几个字 → `MainLayout` 整体重渲染一次 → 而正文从前写成模板里的**函数调用** `v-html="renderMarkdown(m.text)"`(`lib/md.ts` = marked 解析 + DOMPurify 消毒,**无任何缓存**)→ 于是**每一帧**都对当前会话已加载的全部 wang 气泡(上限 200 行)重跑一遍 markdown 流水线,而真正变了的只有一条。同一根因还带着 `groupChips(g)`(每组每工具步骤 `JSON.parse(args)`)与 `traceTools(m)`(药丸标题里调两次)。
+- **量法(比"感觉流畅了"可靠)**:预览页 `?demo` 里造 60 条带排版的假消息(注意字段名是 `role` 不是 `kind`,写错了 streamGroups 不认、只出 7 个 `.md`),再给一个**全局底层 API** 装计数器。先试 patch `DOMPurify.sanitize` —— **不生效**(动态 import 拿到的不是 md.ts 手里那个实例,ESM 导出也不可写);改 patch `DOMParser.prototype.parseFromString`(DOMPurify 每次 sanitize 恰好走一次)**一拦就中**,先用 `md.renderMarkdown('**probe**')` 验证钩子真在数(防假绿)。然后连改 10~20 次末条 `text` 模拟打字机,数每 tick 的增量。
+- **读数**:67 个 markdown 气泡在场时 —— **内联写法 67 次/tick**(偶尔 134 = 一 tick 内两次刷新);抽成子组件 `MdText.vue`(`computed(() => renderMarkdown(props.text))`)后 **恒 1 次/tick**。A/B 是同一页面、同一计数器、靠 HMR 来回切代码量的(改回内联要连 import 一起改;HMR 换了组件实例,得重新抓 `chat` 并重造历史)。
+- **修**:① `MdText.vue` 一条消息一个实例 —— props.text 没变就不重算,且 props 没变时 Vue 直接跳过该子组件 patch、连内部 vnode 都不重建;② 贴底滚动那个 `watch(messages, …, { deep: true })` 换成廉价信号(`条数 + 末条 text/trace/attachments 长度` 拼串)—— 从前每 tick 深遍历 200 条消息树(含每条的 trace.items 与 attachments),纯为随后 `nextTick` 里读一次 `scrollHeight`;在飞期间长高的只会是末条(新段 push 在尾部),这几个数覆盖了所有会改高度的增量,而「点开想了想」那类由用户点击引起的高度变化本来也不该自动贴底;③ 聊天流 `<img>` 补 `loading="lazy" decoding="async"`;④ `useChat.resolveThumbs` 从逐张 `await api.attachmentUrl` 改 `Promise.all`(每张自己 catch,一张失败不拖累其余)。
+- **记档**:更彻底的做法是把整个「想了想 + 小票 + 正文」段抽成子组件,但那要传 `traceOpen/itemOpen/toggleTrace` 等一大票状态,风险不值 —— markdown 是这条流水线上唯一的重活,抽它就够(1 次/tick 已是理论下限)。
+
+## scoped CSS 吃不到 v-html 产出的元素 —— 12 条 markdown 规则静静失效三个月(2026-09-08)
+
+> 来源:同上批。抽 `MdText.vue` 时顺手量 computed 值才发现。规则句在 AGENT §6.7。
+
+- **病**:`MainLayout.vue` 的 `<style scoped>` 里写了整套 markdown 排版(`.md p / ul / li / h1-h4 / code / pre / blockquote / a / strong / hr / table / th / td`,12 条),但 scoped 编译会把选择器加成 `.md code[data-v-xxx]`,而 `v-html` **现产**的那些元素**不带任何 scope 属性** → 这批**后代**规则一条都没生效。实际效果:行内代码没底色、代码块没框没背景、链接是**浏览器默认蓝**(深色科幻皮上尤其扎眼)、表格没边框、引用没竖线、列表间距是浏览器默认。
+- **为什么三个月没人发现**:marked 产出的 HTML 本身有语义(`<strong>` 就是粗的、`<ul>` 就有缩进),所以「看着像 markdown」,没人怀疑那 12 条 CSS 压根没落地。**判据只能是量 computed 值**:`getComputedStyle(el.querySelector('p code')).backgroundColor` 修前是 `rgba(0,0,0,0)`、修后是 `rgba(95,200,255,0.12)`;12 条逐条量过才算数。
+- **修**:排版规则搬进 `MdText.vue` 的**非 scoped** `<style>`(选择器一律以 `.md` 起头防外溢;`:deep()` 也行,但这套规则只服务一处,非 scoped 更直白)。作用在**宿主元素本身**的两条留在 MainLayout scoped 里 —— `.md { white-space: normal }` 与 `.bubble.wang .md:not(:first-child) { margin-top: 9px }`(后者要看 `.bubble` 上下文):**子组件的根节点会带上父组件的 scope id**,所以 `.md[data-v-父]` 照旧命中,这一点抽子组件前后一致(实测根元素 attrs = `["data-v-3a823e2d","class"]`)。顺带给 `.md table` 加 `display:block; overflow-x:auto; max-width:100%`,宽表格自己横滚、不撑破气泡(§ 响应式:页面本体永不横滚)。
+- ⚠️ **这是观感变化不是纯修 bug**:让 12 条规则第一次生效 = 排版比从前规整/紧凑,进 PLAN watch-items 让用户过目。
+
+## app.config.errorHandler 补上了(§6.6 点名的抓手)(2026-09-08)
+
+> 来源:同上批。AGENT §6.6「i18n 特殊字符陷阱」早就写着「抓这类 render 错最快路 = 设 Vue `app.config.errorHandler`」,但一直没设。
+
+- **为什么要**:Vue **不把** render / watcher / 生命周期里抛的真实 Error 交给 `console.error`,只发一条 warn —— 于是 i18n 文案里混进字面 `{ } @ |` 这类语法字符时,症状只表现为「某个 tab 点了切不过去」(render 抛错、Vue 保留旧 DOM),翻 console 看不见根因。正式版 WebView 更没有 devtools,不落盘等于没发生。
+- **落法**:`main.ts` 里 dev 走 `console.error`(看得见栈)、app 内经新命令 `frontend_log` 落进 `larkwing.log`(`tracing::warn!("[前端异常] …")`)。**与播放层的 `media_log` 分家是有意的**:那条是 info 流水、前缀「[前端播放]」,这条是异常、warn 级,真机翻日志一眼分得开(两处注释互相指路)。**刻意不弹 toast**:走到这儿渲染已经坏了,别再指望 UI 组件把话说出来。
