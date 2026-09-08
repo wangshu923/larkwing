@@ -1578,13 +1578,14 @@ mod tests {
     #[tokio::test]
     async fn send_item_degrades_stale_context_token() {
         use axum::{routing::post, Router};
+        use crate::lockext::LockExt;
         use std::sync::Mutex;
         static SEEN: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 
         async fn sink(body: axum::body::Bytes) -> &'static str {
             let v: Value = serde_json::from_slice(&body).unwrap();
             let with_token = v["msg"].get("context_token").is_some();
-            SEEN.lock().unwrap().push(v);
+            SEEN.lk().push(v);
             if with_token {
                 r#"{"ret":-2,"errmsg":"prepare failed"}"#
             } else {
@@ -1603,7 +1604,7 @@ mod tests {
         let base = format!("http://127.0.0.1:{port}");
         send_text(&net, &base, "tok", "u1", "stale-ctx", "你好").await.unwrap();
 
-        let seen = SEEN.lock().unwrap();
+        let seen = SEEN.lk();
         assert_eq!(seen.len(), 2, "带令牌被拒后去令牌重发一次");
         assert_eq!(seen[0]["msg"]["context_token"], "stale-ctx");
         assert!(seen[1]["msg"].get("context_token").is_none(), "重发不带 context_token");
@@ -1728,12 +1729,13 @@ mod tests {
     async fn flush_pending_resends_on_fresh_token() {
         use axum::{routing::post, Router};
         use std::sync::atomic::{AtomicU16, Ordering};
+        use crate::lockext::LockExt;
         use std::sync::Mutex;
         static PORT: AtomicU16 = AtomicU16::new(0);
         static SENT: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 
         async fn send_sink(body: axum::body::Bytes) -> &'static str {
-            SENT.lock().unwrap().push(serde_json::from_slice(&body).unwrap());
+            SENT.lk().push(serde_json::from_slice(&body).unwrap());
             r#"{"ret":0}"#
         }
         async fn upload_url(_body: axum::body::Bytes) -> String {
@@ -1778,7 +1780,7 @@ mod tests {
         flush_pending_sends(&net, &base, "tok", "u1", "fresh-ctx", &s.settings).await;
 
         // u1 真文件送达:附言文本项在前、file_item 在后,都带新令牌;文字挂起随后补发
-        let sent = SENT.lock().unwrap();
+        let sent = SENT.lk();
         assert_eq!(sent.len(), 3, "附言 + 文件 + 文字三条:{sent:?}");
         assert_eq!(sent[0]["msg"]["item_list"][0]["text_item"]["text"], "给你");
         assert_eq!(sent[0]["msg"]["context_token"], "fresh-ctx");

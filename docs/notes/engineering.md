@@ -2,6 +2,64 @@
 
 > 2026-09-08 起。AGENT.md 只留规则句(§10「CI」节、§4.11「四族归一」与资源管护三族);这里记「为什么这么定、当时是什么状况」。规则以 AGENT.md 为准。
 
+## 毒锁:一个 panic 废掉一整块状态(2026-09-08)
+
+> 起因 = 用户带着完整诊断来的:「毒锁是 Rust 标准库 Mutex 的一个机制。持锁的线程如果 panic 了,这把锁会被永久标记成「中毒」,之后每次 lock() 都返回错误。项目里约 130 处写的是 `.lock().unwrap()`,于是第一个 panic 之后,每个访问点都跟着 panic。要命的地方在于 tokio 任务 panic 不会杀掉进程,所以程序还活着,但那块状态彻底废掉:比如媒体运行时那个锁一中毒,播放、队列、封面、进度全部失效,直到用户重启。」问的是「这个东西改动大不大」。
+
+### 先核premise,两处要修正
+
+- **不是 130 处,是 252 处** —— `.expect(…)` 和 `.unwrap()` 一样 panic,而它在这仓库里几乎一半一半:`.lock().unwrap()` **111** + `.lock().expect(…)` 单行 **113** + 换行形 `.lock()` ⏎ `.unwrap()/.expect()` **15** + `RwLock` 的 `.read()/.write().expect(…)` **13**,分布在 **27 个文件**(25 个 core + 2 个 src-tauri)。用户只 grep 了 unwrap 那一半。
+- **`panic = "abort"` 确实是刻意不加的** —— 根 `Cargo.toml` 顶部有 ⚠️⚠️ 一整段:`attach.rs` 的 PDF 文字层抽取靠 `catch_unwind` 兜 `pdf-extract` 在畸形 PDF 上的 panic,abort 会让「往聊天里拖一个坏 PDF」= 整个 app 当场消失。**所以 unwind 是有意留白,毒锁是活风险,不是理论风险。**
+- **媒体那块的爆炸半径比用户说的小** —— `media/mod.rs:598` 那一带是 **11 个独立小锁**(`pending_play` / `playback` / `playlist` / `mode` / `audio_track` / `audio_track_lang` / `rate` / `current_local` / `progress` / `progress_at` / `skip_ctx`),不是一把大锁。一次中毒废掉的是**那一个字段**(`playlist` 中毒 → 队列 / 下一集 / 选集全死,但音量倍速还活着)。仍然要修,只是没到「播放全废」。
+
+### 选路:扩展 trait 留在 std,不引 parking_lot
+
+两条路都是「宽而浅」的机械改动(每处删一个 token 或换一个方法名,零类型签名变化、零控制流变化、零跨 crate 涟漪 —— `Mutex<T>` 字段声明一个字都没动):
+
+| | parking_lot | 扩展 trait(选这个) |
+|---|---|---|
+| 改法 | 换 import + 删 `.unwrap()` | sed → `.lk()` |
+| 依赖 | **已在 Cargo.lock**(librqbit 拉的 0.12.5)→ 加成直接依赖零编译成本 | 零新依赖 |
+| 中毒时 | 压根没有毒锁标志位 | 有 `Err` 可接 → **有地方记一句 `warn!`** |
+| 附带 | 略快 / 内存略小 | `Condvar` 那处一个字不用碰 |
+
+定的是 trait,决定性理由是 **§3.5「不静默失败」**:无条件吞掉中毒 = 把「整块状态永久死亡」换成「偷偷带着可能半更新的状态继续跑」,那个 `warn!` 是那次 panic 在日志里唯一的痕迹。parking_lot 连这个机会都没有。次要理由:仓库里**已有**这个惯用法的先例(`tools/pdf.rs:74` 的 `unwrap_or_else(|p| p.into_inner())`),归一比引依赖自然。
+
+### `warn!` 必须有界(否则自己把证据挤掉)
+
+第一版想写「每次恢复都 `warn!`」。不行 —— `larkwing.log` 到 5MB 就轮转(§4.11),而中毒的**热**锁(播放进度那种,15s 心跳 + 每次调整)每次访问都吼一句,会把真正有价值的那条 panic 消息挤出日志。**为了记住这次事故而销毁事故现场**,反了。故:前 8 次 + 之后每 1024 次,每条带 `#[track_caller]` 的调用点 + 累计次数;`note_poison` 标 `#[cold]` 不污染取锁热路径的代码布局。计数用一个进程级 `AtomicU64`,不需要 per-lock 状态(那要改类型,涟漪就大了)。
+
+### 机械改动的四个坑
+
+1. **zsh 不对未加引号的变量做词分割** —— `FILES=$(grep -rl …)` 然后 `perl $FILES` 把整串当**一个**文件名,`Can't open …`,一次没跑。改 `grep -rl … > 文件 && xargs perl < 文件`。所幸失败得很响,`git status` 确认工作树没被污染。
+2. **导入插进了多行 `use {…}` 块里面** —— 自动插入脚本认「头部最后一个 `use` 行」,而多行 use 的续行(`    ChatEvent, …`)不匹配「空行/注释/属性」→ 循环 break,`last_use` 停在那个 use 的**开括号行**上。3 个文件中招(`engine/turn.rs`、`commands.rs`、`webrender.rs`),编译器报得莫名其妙(`unresolved import crate::llm::r#use`)。手工挪出来。
+3. **4 个 mod.rs 头部先是 `mod` 声明** —— `media/` `engine/` `channels/` `voice/` 的 use 块在 `pub use` 重导出之后,脚本找不到「头部 use 块」直接报 `!!` 跳过(它**没有**乱插,这点是对的)。手工插进各自的 `crate::` 组。
+4. **嵌套 mod / fn 里的 `use` 不继承父作用域** —— `ftp.rs::fake_ftp`、`web_render.rs::tests`、`weixin.rs` 两个 `#[tokio::test]` 函数体内各有自己的 `use std::sync::Mutex;`,得各加一行 trait 导入;`web_render.rs` 与 `weixin.rs` 的**顶层**导入反而是多余的(调用点全在嵌套作用域里),编译器以 `unused import` 点出来。
+
+### 顺手修掉的四处真问题(机械改动路上撞见的)
+
+这是这批最值钱的部分 —— 都不是「毒锁本身」,是那 4 处**刻意**写成「中毒就静默跳过」的判断,一个个看下来全是 bug:
+
+- **`engine/turn.rs` `Drop for InjectGuard`**:原文 `let Ok(mut st) = self.inject.lock() else { return };` —— 中毒就悄悄放弃,既不上收尾闸(`inject` 会继续往死回合里塞消息)又把排队的消息凭空丢了,**正与它下面那句 `tracing::error!` 自称的「inject 已返回过 true,不能凭空丢」自相矛盾**。
+- **`src-tauri/src/webrender.rs` `WindowEvent::Destroyed`**:中毒就不从注册表摘除会话 → **永久占着一个会话槽**,而 `SESSION_MAX = 2` → 之后 `web_render` 开不出窗。
+- **`channels/mod.rs::set_state`** / **`commands.rs::restart`**:中毒就不更新 / 不清渠道连接状态 → 设置页永远显示过时的连接态。
+- **三个 `Drop` 是 abort 路**:`BgTicket`(bgtasks 收尾)/ `TaskHandle`(HUD 进度条,注释写着「没收尾就没影了(panic / future 被取消):如实告诉 HUD,绝不留僵尸转圈条」)/ `ClearGuard`(确认闸),改前都是 `.lock().expect(…)`。**drop 期间 panic 若正逢 unwind → 直接 abort 进程**。也就是说:这三个专为 panic 路径设计的收尾守卫,自己在 panic 路径上会杀掉整个进程。这比用户描述的「子系统死掉等重启」严重一档。
+
+### `db.rs` 那把锁单独论证过
+
+`Db(Arc<Mutex<Connection>>)` 是唯一一把「继续用可能半更新的状态」需要真论证的锁:中毒意味着有人持着这个 `Connection` panic 了,问题是会不会留下一个没回滚的事务。**不会** —— rusqlite 的 `Transaction` 是 RAII,不 commit 就在 drop 里 rollback;而局部量 drop 顺序是声明的逆序,`Db::tx` 里 `tx` 在 `conn`(那个 guard)**之前** drop → unwind 时必然先回滚、后中毒。下一个调用者拿到的连接是干净的。这段推理逐字写进了 `db.rs::tx` 的 doc,免得后人再推一遍。
+
+### 守卫与验证
+
+- `scripts/check-locks.sh`:五条禁令(unwrap / expect / 换行形 / RwLock / 静默跳过)+ **阳性对照**(解毒调用点 < 100 就判「扫描路径不对,上面那堆 ✓ 全是假绿」),同 `check-i18n.mjs` 立的「每条都报扫了多少」规矩。独立成 CI job(`source-guards`,ubuntu 纯 grep 不编译):秒级出结论,且不与「测试挂了后面 step 就不跑」互相牵连。
+- **金丝雀验过**(§8.5 那条「跑完注入一个假错验证靶场真在查」的路子):往 `tasks.rs` 尾部注入五种违规各一条,五条全被抓到、退出码 1;还原后回 0。**别只看守卫绿了就信它**。
+- 结果:`.lk()/.rd()/.wr()` 共 **278** 处,裸取锁 **0**;测试 **825 lib + 20 engine** 与基线逐条一致(825 含新增的 3 条 lockext 自测,即改动本身零回归),两个 crate `clippy -D warnings` 零警。
+- 一个 clippy 小插曲:`n % 1024 == 0` 被 `manual_is_multiple_of` 拦(rust 1.96 的新 lint),改 `n.is_multiple_of(1024)` —— MSRV 声明已删,新 std API 可以直接用。
+
+### 边界(别误读这批的收益)
+
+**这不修 panic 本身**,只是把「一次 panic → 子系统永久死亡、必须重启」换成「一次 panic → 那一次操作失败、日志有痕、程序继续」。真正的 panic 该修还是要修,而那句有界的 `warn!` 就是让它们变得可发现的东西。
+
 ## 全仓体检:一次「还有什么要优化的」扫出来的东西(2026-09-08)
 
 > 起因 = 用户一句「看看还有什么需要优化的东西」。做法 = 四路并行体检(Rust core 健壮性 / 前端 / AGENT.md 符号漂移 / 测试与 CI 覆盖)+ 自己跑机械检查,然后「一起修」。

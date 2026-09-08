@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::Duration;
+use crate::lockext::{LockExt, RwLockExt};
 
 #[derive(Default)]
 struct Global {
@@ -36,12 +37,12 @@ fn global() -> &'static Global {
 pub fn set_proxy(url: Option<String>) {
     let url = url.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let g = global();
-    let mut cur = g.proxy.write().expect("net proxy lock");
+    let mut cur = g.proxy.wr();
     if *cur != url {
         tracing::info!(proxy = ?url.as_deref().map(scrub_secrets), "代理设置更新");
         *cur = url;
         g.gen.fetch_add(1, Ordering::SeqCst);
-        g.sticky.lock().expect("net sticky lock").clear();
+        g.sticky.lk().clear();
     }
 }
 
@@ -57,19 +58,19 @@ pub fn env_proxy() -> Option<String> {
 }
 
 fn proxy_now() -> Option<String> {
-    global().proxy.read().expect("net proxy lock").clone()
+    global().proxy.rd().clone()
 }
 fn gen_now() -> u64 {
     global().gen.load(Ordering::SeqCst)
 }
 fn prefers_proxy(host: &str) -> bool {
-    global().sticky.lock().expect("net sticky lock").contains(host)
+    global().sticky.lk().contains(host)
 }
 fn mark_proxy(host: &str) {
-    global().sticky.lock().expect("net sticky lock").insert(host.to_string());
+    global().sticky.lk().insert(host.to_string());
 }
 fn unmark_proxy(host: &str) {
-    global().sticky.lock().expect("net sticky lock").remove(host);
+    global().sticky.lk().remove(host);
 }
 
 /// 从 URL 取 host(含端口);取不到回退原串(仅用作 sticky 键 / 日志,无需严谨)。
@@ -105,7 +106,7 @@ impl Client {
     pub fn proxy_client(&self) -> Option<reqwest::Client> {
         let url = proxy_now()?;
         let gen = gen_now();
-        let mut cache = self.proxy_cache.lock().expect("net proxy cache lock");
+        let mut cache = self.proxy_cache.lk();
         if cache.0 != gen {
             let built = match reqwest::Proxy::all(&url) {
                 Ok(p) => (self.configure)(reqwest::Client::builder()).proxy(p).build().ok(),

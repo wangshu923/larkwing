@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 
 use crate::store::Store;
+use crate::lockext::LockExt;
 
 /// 授权表的 settings 键(app 级,文件系统是这台电脑的、不按人分;
 /// 专用命令收口读写,不进 `APP_SETTING_KEYS` 通用白名单 —— llm.model_overrides 同款)。
@@ -368,23 +369,22 @@ struct GrantsInner {
 
 impl Grants {
     fn allows_snapshot(&self) -> Vec<(PathBuf, Mode)> {
-        self.inner.lock().expect("grants poisoned").allows.clone()
+        self.inner.lk().allows.clone()
     }
 
     fn add_allow(&self, dir: PathBuf, mode: Mode) {
-        self.inner.lock().expect("grants poisoned").allows.push((dir, mode));
+        self.inner.lk().allows.push((dir, mode));
     }
 
     fn add_deny(&self, dir: PathBuf, mode: Mode) {
-        self.inner.lock().expect("grants poisoned").denies.push((dir, mode));
+        self.inner.lk().denies.push((dir, mode));
     }
 
     /// 这个目录、这一档,本回合是不是已经被拒过(拒过 read 连 full 也别再问;
     /// 拒过 full 不挡后续 read 请求 —— 用户拒的是「修改」,读也许愿意)。
     fn denied_before(&self, dir: &Path, need: Mode) -> bool {
         self.inner
-            .lock()
-            .expect("grants poisoned")
+            .lk()
             .denies
             .iter()
             .any(|(d, m)| need >= *m && dir_covers(d, dir))

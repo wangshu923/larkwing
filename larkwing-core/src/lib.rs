@@ -16,6 +16,8 @@ pub mod eval;
 pub mod files;
 pub mod ftp;
 pub mod llm;
+// 锁「中毒」的单一解毒口(`.lk()` / `.rd()` / `.wr()`);壳层也用,故 pub。
+pub mod lockext;
 pub mod media;
 pub mod net;
 pub mod scenes;

@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use tokio::sync::mpsc;
 
 use super::{ChatEvent, ChatMessage, ChatRequest, LlmError, LlmProvider, ToolCall, ToolChoice, Usage};
+use crate::lockext::LockExt;
 
 /// 一轮剧本:先流 text,再以 tool_calls 决定 stop_reason(空 = end_turn,非空 = tool_use)。
 #[derive(Debug, Clone, Default)]
@@ -44,14 +45,14 @@ impl FakeLlm {
     /// 剩余剧本条数。给「级联取消真掐死了子回合」这类断言用:被取消的回合不该再开新流,
     /// 后续剧本就该原封不动剩着(ephemeral 子回合不落库,DB 断言看不见孤儿 —— 评审实锤)。
     pub fn remaining(&self) -> usize {
-        self.script.lock().expect("fake script lock").len()
+        self.script.lk().len()
     }
 }
 
 #[async_trait::async_trait]
 impl LlmProvider for FakeLlm {
     async fn chat_stream(&self, req: ChatRequest) -> Result<mpsc::Receiver<ChatEvent>, LlmError> {
-        let scripted = self.script.lock().expect("fake script lock").pop_front();
+        let scripted = self.script.lk().pop_front();
         let (reply, mut tool_calls, usage) = match scripted {
             Some(turn) => (turn.text, turn.tool_calls, turn.usage),
             None => {

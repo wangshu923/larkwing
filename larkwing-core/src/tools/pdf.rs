@@ -70,8 +70,9 @@ pub(super) fn with_pdfium<R>(
     lib: &Path,
     f: impl FnOnce(&pdfium_render::prelude::Pdfium) -> anyhow::Result<R>,
 ) -> anyhow::Result<R> {
+    use crate::lockext::LockExt;
     use pdfium_render::prelude::*;
-    let _gate = PDFIUM_GATE.lock().unwrap_or_else(|p| p.into_inner());
+    let _gate = PDFIUM_GATE.lk();
     let pdfium: &Pdfium = match PDFIUM.get() {
         Some(p) => p,
         None => {

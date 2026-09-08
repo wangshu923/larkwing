@@ -21,6 +21,7 @@ use crate::bus::Text;
 use crate::components::Component;
 
 use super::MediaRuntime;
+use crate::lockext::LockExt;
 
 /// 回合内等待窗:起跑后等这么久,没跑完就转后台接着跑(§4.11 常量单源;方案已确认。
 /// pub(super):压缩包差事〔media/archive.rs〕同一个节奏,不另造第二个数)。
@@ -110,7 +111,7 @@ impl MediaRuntime {
                 let mut lines = tokio::io::BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     if let Some(s) = parse_progress_line(&line) {
-                        *out_secs.lock().expect("progress lock") = s;
+                        *out_secs.lk() = s;
                     }
                 }
             });
@@ -121,7 +122,7 @@ impl MediaRuntime {
             tokio::spawn(async move {
                 let mut lines = tokio::io::BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    let mut t = tail.lock().expect("tail lock");
+                    let mut t = tail.lk();
                     if t.len() >= STDERR_TAIL_LINES {
                         t.pop_front();
                     }
@@ -221,7 +222,7 @@ impl MediaRuntime {
                             break;
                         }
                         // 只在真有推进时打点:僵住的 ffmpeg 不喂看门狗,10min 判卡照常触发
-                        let cur = *out_secs.lock().expect("progress lock");
+                        let cur = *out_secs.lk();
                         if cur > last {
                             last = cur;
                             let (text, frac, done) = progress_bits(cur, duration);
@@ -366,7 +367,7 @@ fn clock_text(s: f64) -> String {
 }
 
 fn tail_text(tail: &Arc<Mutex<VecDeque<String>>>) -> String {
-    let t = tail.lock().expect("tail lock");
+    let t = tail.lk();
     let joined = t.iter().cloned().collect::<Vec<_>>().join("\n");
     let joined = joined.trim();
     if joined.is_empty() {

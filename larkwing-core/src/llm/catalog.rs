@@ -13,6 +13,7 @@ use std::sync::{OnceLock, RwLock};
 use serde::{Deserialize, Serialize};
 
 use super::Usage;
+use crate::lockext::RwLockExt;
 
 /// 能力档位:粗分三档是刻意的 —— 档位背后的映射可随版本重调而 UI/数据不变。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -80,12 +81,12 @@ static OVERRIDES: RwLock<Vec<ModelOverride>> = RwLock::new(Vec::new());
 
 /// engine 调用:用最新覆盖表整体替换 overlay(boot / 用户保存后)。
 pub fn set_overrides(overrides: Vec<ModelOverride>) {
-    *OVERRIDES.write().expect("catalog overrides lock poisoned") = overrides;
+    *OVERRIDES.wr() = overrides;
 }
 
 /// 当前覆盖表快照(给设置页回读 / 测试)。
 pub fn overrides() -> Vec<ModelOverride> {
-    OVERRIDES.read().expect("catalog overrides lock poisoned").clone()
+    OVERRIDES.rd().clone()
 }
 
 /// 按 model id 精确(大小写不敏感)取覆盖。用户填什么键什么 → 不模糊匹配。

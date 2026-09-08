@@ -766,13 +766,14 @@ mod tests {
             FakeRender(o, Mutex::new(None))
         }
     }
+    use crate::lockext::LockExt;
     use std::sync::Mutex;
     #[async_trait]
     impl WebRenderer for FakeRender {
         async fn render(&self, req: RenderRequest) -> anyhow::Result<RenderOutcome> {
             // 镜像真壳层契约:confirmed 重发不再回闸(用户已点头,动作执行)。
             let confirmed = req.confirmed;
-            *self.1.lock().unwrap() = Some(req);
+            *self.1.lk() = Some(req);
             Ok(RenderOutcome {
                 page: self.0.page.clone(),
                 download: self.0.download.clone(),
@@ -892,7 +893,7 @@ mod tests {
         assert!(out.contains("x.example.com"), "{out}");
         assert!(out.contains("会话 lw-render-3 还开着"), "{out}");
         // 只渲染了一次(没有 confirmed 重发)
-        let req = fake.1.lock().unwrap().clone().unwrap();
+        let req = fake.1.lk().clone().unwrap();
         assert!(!req.confirmed);
         // 审计落了 denied 一行(action = 目标原文,动词由消费端组 §6.6)
         let log = ctx.store.confirms.list_recent(5).unwrap();
@@ -917,7 +918,7 @@ mod tests {
         // 允许后 = 正常操作结果(第二次渲染的页面)
         assert!(out.contains("BUTTON「确认支付 ¥128.00」"), "{out}");
         assert!(!out.contains("选择先不执行"), "{out}");
-        let req = fake.1.lock().unwrap().clone().unwrap();
+        let req = fake.1.lk().clone().unwrap();
         assert!(req.confirmed, "重发必须带 confirmed(内部字段)");
         assert_eq!(req.expect_text.as_deref(), Some("确认支付 ¥128.00"));
         assert!(!req.force_confirm);
@@ -941,7 +942,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("没有确认通道"), "{err:#}");
-        let req = fake.1.lock().unwrap().clone().unwrap();
+        let req = fake.1.lk().clone().unwrap();
         assert!(req.force_confirm, "自报要置 force_confirm 透传壳层");
         // 自报但没有落地动作(纯看页):忽略,不置 force_confirm
         let fake2 = Arc::new(FakeRender::new(RenderOutcome {
@@ -954,7 +955,7 @@ mod tests {
             .run(serde_json::json!({"url": "https://x.example.com", "confirm": true}), &ctx)
             .await
             .unwrap();
-        assert!(!fake2.1.lock().unwrap().clone().unwrap().force_confirm);
+        assert!(!fake2.1.lk().clone().unwrap().force_confirm);
     }
 
     #[tokio::test]
@@ -1034,7 +1035,7 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("BUTTON「下载电子票据」"), "{out}");
-        let req = fake.1.lock().unwrap().clone().unwrap();
+        let req = fake.1.lk().clone().unwrap();
         assert_eq!(req.session.as_deref(), Some("lw-render-9"));
         assert_eq!(req.click_ref, Some(3));
         assert!(req.url.is_empty(), "没给 url = 停在当前页");
@@ -1044,7 +1045,7 @@ mod tests {
             .run(serde_json::json!({"session": "lw-render-9", "back": "true"}), &ctx)
             .await
             .unwrap();
-        assert!(fake.1.lock().unwrap().clone().unwrap().back);
+        assert!(fake.1.lk().clone().unwrap().back);
     }
 
     #[tokio::test]
@@ -1130,7 +1131,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let req = fake.1.lock().unwrap().clone().unwrap();
+        let req = fake.1.lk().clone().unwrap();
         assert_eq!(req.type_ref, Some(2));
         assert_eq!(req.type_text.as_deref(), Some("a@b.com"));
         assert!(req.submit);
@@ -1143,7 +1144,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let req = fake.1.lock().unwrap().clone().unwrap();
+        let req = fake.1.lk().clone().unwrap();
         assert_eq!(req.fill.len(), 2);
         assert_eq!((req.fill[0].ref_no, req.fill[0].value.as_str()), (1, "张三"));
         assert_eq!((req.fill[1].ref_no, req.fill[1].value.as_str()), (3, "李四"));
@@ -1153,7 +1154,7 @@ mod tests {
             .run(serde_json::json!({"session": "s", "select_ref": 5, "option": "北京"}), &ctx)
             .await
             .unwrap();
-        let req = fake.1.lock().unwrap().clone().unwrap();
+        let req = fake.1.lk().clone().unwrap();
         assert_eq!(req.select_ref, Some(5));
         assert_eq!(req.select_option.as_deref(), Some("北京"));
         let _ = WebRender::new()
@@ -1163,7 +1164,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let req = fake.1.lock().unwrap().clone().unwrap();
+        let req = fake.1.lk().clone().unwrap();
         assert_eq!(req.press_key.as_deref(), Some("Enter"));
         assert_eq!(req.scroll.as_deref(), Some("down"));
         assert_eq!(req.wait_text.as_deref(), Some("结果"));
@@ -1227,7 +1228,7 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("传文件[4]:单据.pdf"), "{out}");
-        let req = fake.1.lock().unwrap().clone().unwrap();
+        let req = fake.1.lk().clone().unwrap();
         assert_eq!(req.upload_ref, Some(4));
         assert_eq!(req.upload_paths, vec![f.clone()]);
         let _ = std::fs::remove_file(f);
@@ -1341,7 +1342,7 @@ mod tests {
             .unwrap();
         assert_eq!(out.images, vec![shot.to_string()]);
         assert!(out.text.contains("已附上当前页面截图"), "{}", out.text);
-        assert!(fake.1.lock().unwrap().clone().unwrap().screenshot);
+        assert!(fake.1.lk().clone().unwrap().screenshot);
         // run(纯文本降级路):不带图,文本仍在
         let text = WebRender::new()
             .run(serde_json::json!({"session": "s", "screenshot": true}), &ctx)

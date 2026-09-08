@@ -3,10 +3,11 @@ name: ci
 # push / PR 时的**日常闸**(与 release.yml 分工:那个只在打 tag / 手动触发时出包)。
 #
 # 为什么有它:在此之前本仓库**没有任何 CI 在 push/PR 上跑** —— 800+ 个 Rust 测试、
-# vue-tsc、i18n 镜像全靠本机手跑,漏一次就带着红进 main。三个 job 各守一类:
+# vue-tsc、i18n 镜像全靠本机手跑,漏一次就带着红进 main。四个 job 各守一类:
 #   · rust          = 测试 + clippy(跑在 macOS:core 依赖 sherpa-onnx 的**预编译**原生库,
 #                     ubuntu 那份未验过,且开发机本就是 mac,基线一致最省心)
 #   · frontend      = vue-tsc + i18n 词典体检(纯 JS/TS,无原生依赖 → 用最便宜的 ubuntu)
+#   · source-guards = 纯 grep 的源码约定守卫(眼下:毒锁 §6.10),秒级、不编译
 #   · windows-check = 交叉 typecheck,见该 job 自己的注释(这条是 AGENT §8.5 的正解)
 #
 # 装配 / 缓存步骤**照抄 release.yml**(Rust 缓存、sherpa 预编译库缓存、pnpm+Node),
@@ -101,6 +102,20 @@ jobs:
       # 不硬编助手名、静态引用都有定义。详见脚本头部注释。
       - name: i18n 词典体检
         run: node scripts/check-i18n.mjs
+
+  # ── 源码守卫:纯 grep,不编译 ─────────────────────────────────────────────
+  # 刻意**独立成 job**(而不是往 rust job 里加一步):它秒级出结论、且与「测试挂了
+  # 就看不到后面 step」互不牵连 —— 同 rust job 里「clippy 放测试之后」那条考虑。
+  source-guards:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # AGENT §6.10 的机器化守卫:全仓不许再出现裸 `.lock().unwrap()` / `.expect(…)`
+      #(std 毒锁 = 一个 panic 让那块状态永久废掉),一律走 lockext 的 .lk()/.rd()/.wr()。
+      # 脚本自带阳性对照,防「正则没匹配到东西却静默全绿」。
+      - name: 毒锁守卫
+        run: bash scripts/check-locks.sh
 
   # ── Windows:交叉 typecheck(AGENT §8.5 的正解)──────────────────────────
   # 病(§8.5 逐字):`#[cfg(windows)]` 块在 mac 上**只 parse 不 typecheck** → Windows-only 代码的

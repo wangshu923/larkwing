@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::llm::{
     ChatEvent, ChatMessage, ChatRequest, ContentPart, LlmProvider, ToolCall, ToolChoice, Usage,
 };
+use crate::lockext::LockExt;
 use crate::bus::{AppEvent, Mood};
 use crate::store::Store;
 use crate::tools::{Tool, ToolCtx, ToolOutput};
@@ -531,7 +532,7 @@ impl Turn {
                 if call.name == "plan_set" && status == "ok" && !ephemeral {
                     if let Ok(p) = crate::tools::plan::parse_args(&call.args) {
                         bus.publish(AppEvent::Plan(crate::bus::PlanCard::of(conv_id, &p)));
-                        *plan.lock().expect("plan lock poisoned") = p;
+                        *plan.lk() = p;
                     }
                 }
                 // show_image 亮的图:refs 随 tool 行 payload 落库(重开会话派生图卡)+
@@ -595,7 +596,7 @@ impl Turn {
                 let line = self_check_line(
                     round,
                     &task_quote,
-                    &plan.lock().expect("plan lock poisoned"),
+                    &plan.lk(),
                 );
                 request.messages.push(ChatMessage::user(line));
             }
@@ -633,7 +634,13 @@ struct InjectGuard {
 impl Drop for InjectGuard {
     fn drop(&mut self) {
         let leftovers = {
-            let Ok(mut st) = self.inject.lock() else { return };
+            // 这里**必须**用解毒取锁(`.lk()`),两个理由:
+            // ① 原先是 `let Ok(..) else { return }` —— 锁中毒就悄悄放弃,既不上收尾闸
+            //    (inject 会继续往死回合里塞)又把排队的消息凭空丢了,正与下面那句
+            //    error! 自称的「不能凭空丢」相左;
+            // ② 这是 `Drop`,而 drop 期间 panic 若正逢 unwind 会直接 abort 进程 ——
+            //    收尾路径上不能有任何会 panic 的取锁。
+            let mut st = self.inject.lk();
             st.finishing = true; // 原子闸上:此后 inject 一律拒绝,改由前端起新回合
             std::mem::take(&mut st.buffer)
         };
@@ -669,7 +676,7 @@ async fn drain_injections(
     persist: bool,
 ) {
     let items = {
-        let mut st = inject.lock().expect("inject lock poisoned");
+        let mut st = inject.lk();
         std::mem::take(&mut st.buffer)
     };
     for it in items {
@@ -680,7 +687,7 @@ async fn drain_injections(
 /// 收尾前原子检查:队列空 → 置 finishing 收尾(返回空);非空 → 取出注入交调用方
 /// (调用方落完本段回复后再 apply,保证 assistant(回复) 在 user(注入) 之前,历史顺序正确)。
 fn take_or_finish(inject: &Arc<Mutex<super::InjectState>>) -> Vec<super::InjectReady> {
-    let mut st = inject.lock().expect("inject lock poisoned");
+    let mut st = inject.lk();
     if st.buffer.is_empty() {
         st.finishing = true; // 原子闸上:此后 inject 命令一律拒绝(防丢)
         Vec::new()
@@ -791,7 +798,7 @@ mod tests {
         let conv = store.chat.create_conversation(uid, "companion").unwrap();
         let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
         let inject = Arc::new(Mutex::new(InjectState::default()));
-        inject.lock().unwrap().buffer.push(ready("等下,换成粤语"));
+        inject.lk().buffer.push(ready("等下,换成粤语"));
 
         {
             let _guard = InjectGuard {
@@ -803,8 +810,8 @@ mod tests {
             };
             // 回合在这里死掉(取消/失败出口都走同一条 drop)
         }
-        assert!(inject.lock().unwrap().finishing, "收尾闸照旧置位");
-        assert!(inject.lock().unwrap().buffer.is_empty(), "剩余项被取走(不留在内存里等人捡)");
+        assert!(inject.lk().finishing, "收尾闸照旧置位");
+        assert!(inject.lk().buffer.is_empty(), "剩余项被取走(不留在内存里等人捡)");
 
         // 落库经运行时异步完成:有界轮询,别用固定 sleep(慢机器上会假红)
         let mut found = false;
@@ -825,19 +832,19 @@ mod tests {
         let inject = Arc::new(Mutex::new(InjectState::default()));
         let pending = take_or_finish(&inject);
         assert!(pending.is_empty(), "空队列返回空");
-        assert!(inject.lock().unwrap().finishing, "收尾后闸应置位");
+        assert!(inject.lk().finishing, "收尾后闸应置位");
     }
 
     // 收尾前有插队 → 取出注入、不置 finishing、队列清空(交调用方落完本段回复后再 apply)
     #[test]
     fn take_or_finish_takes_items_without_finishing() {
         let inject = Arc::new(Mutex::new(InjectState::default()));
-        inject.lock().unwrap().buffer.push(ready("等下,改成科幻风"));
+        inject.lk().buffer.push(ready("等下,改成科幻风"));
         let pending = take_or_finish(&inject);
         assert_eq!(pending.len(), 1, "非空时取出注入");
         assert_eq!(pending[0].display, "等下,改成科幻风");
-        assert!(!inject.lock().unwrap().finishing, "有插队时不置 finishing");
-        assert!(inject.lock().unwrap().buffer.is_empty(), "取出后队列清空");
+        assert!(!inject.lk().finishing, "有插队时不置 finishing");
+        assert!(inject.lk().buffer.is_empty(), "取出后队列清空");
     }
 }
 

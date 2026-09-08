@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
+use larkwing_core::lockext::LockExt;
 use larkwing_core::webrender::{
     PendingConfirm, RenderOutcome, RenderRequest, RenderedPage, WebRenderer,
 };
@@ -82,7 +83,7 @@ struct ReadCache {
 
 impl SessionEntry {
     fn touch(&self) {
-        *self.last_used.lock().expect("webrender last_used") = Instant::now();
+        *self.last_used.lk() = Instant::now();
     }
 }
 
@@ -102,16 +103,16 @@ impl ShellWebRenderer {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 let expired: Vec<(String, Arc<SessionEntry>)> = {
-                    let map = sweep.lock().expect("webrender sessions");
+                    let map = sweep.lk();
                     map.iter()
                         .filter(|(_, e)| {
-                            e.last_used.lock().expect("webrender last_used").elapsed() > SESSION_TTL
+                            e.last_used.lk().elapsed() > SESSION_TTL
                         })
                         .map(|(k, e)| (k.clone(), e.clone()))
                         .collect()
                 };
                 for (id, entry) in expired {
-                    sweep.lock().expect("webrender sessions").remove(&id);
+                    sweep.lk().remove(&id);
                     let _ = entry.win.destroy();
                     tracing::debug!(session = %id, "webrender 会话窗超时收摊");
                 }
@@ -168,10 +169,10 @@ async fn browse_step_inner(
     // ---- 1. 会话窗:续用或新建 ----
     let (sid, entry, fresh) = match &req.session {
         Some(id) => {
-            let found = sessions.lock().expect("webrender sessions").get(id).cloned();
+            let found = sessions.lk().get(id).cloned();
             match found {
                 Some(e) => {
-                    *e.download_dir.lock().expect("webrender dl dir") = req.download_dir.clone();
+                    *e.download_dir.lk() = req.download_dir.clone();
                     (id.clone(), e, false)
                 }
                 None => bail!("这个浏览会话已经收摊了(超时/被新窗挤掉)——带 url 重新打开"),
@@ -444,10 +445,10 @@ fn open_session(
 ) -> Result<(String, Arc<SessionEntry>)> {
     // 挤位:最旧的先收摊(锁内选人,锁外销毁)
     let evict: Vec<(String, Arc<SessionEntry>)> = {
-        let map = sessions.lock().expect("webrender sessions");
+        let map = sessions.lk();
         if map.len() >= SESSION_MAX {
             let mut all: Vec<_> = map.iter().map(|(k, e)| (k.clone(), e.clone())).collect();
-            all.sort_by_key(|(_, e)| *e.last_used.lock().expect("webrender last_used"));
+            all.sort_by_key(|(_, e)| *e.last_used.lk());
             all.truncate(map.len() + 1 - SESSION_MAX);
             all
         } else {
@@ -455,7 +456,7 @@ fn open_session(
         }
     };
     for (id, e) in evict {
-        sessions.lock().expect("webrender sessions").remove(&id);
+        sessions.lk().remove(&id);
         let _ = e.win.destroy();
         tracing::debug!(session = %id, "webrender 会话窗被新窗挤掉");
     }
@@ -502,7 +503,7 @@ fn open_session(
         // 的地址自然走 on_download。
         .initialization_script(POPUP_TAME_JS)
         .on_navigation(move |u| {
-            nav_slot.lock().expect("webrender nav slot").push((Instant::now(), u.to_string()));
+            nav_slot.lk().push((Instant::now(), u.to_string()));
             true // 只观察不拦
         })
         .on_download(move |_wv, ev| {
@@ -513,11 +514,11 @@ fn open_session(
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     let name = larkwing_core::files::sanitize_filename(&suggested);
-                    let dir = dl_dir.lock().expect("webrender dl dir").clone();
+                    let dir = dl_dir.lk().clone();
                     let _ = std::fs::create_dir_all(&dir);
                     let dest = larkwing_core::files::dedupe_path(&dir.join(name));
                     *destination = dest.clone();
-                    *dl_slot.lock().expect("webrender dl slot") = Some(dest);
+                    *dl_slot.lk() = Some(dest);
                 }
                 tauri::webview::DownloadEvent::Finished { success, .. } => {
                     let _ = dl_tx.send(success);
@@ -550,10 +551,9 @@ fn open_session(
                 }
             }
             tauri::WindowEvent::Destroyed => {
-                // 用户手动关窗 / 被销毁:注册表同步摘除(幂等——清扫/挤位路径已先摘)
-                if let Ok(mut m) = sessions_evt.lock() {
-                    m.remove(&sid_evt);
-                }
+                // 用户手动关窗 / 被销毁:注册表同步摘除(幂等——清扫/挤位路径已先摘)。
+                // 必须真摘掉:漏一次就永久占着一个会话槽(SESSION_MAX=2),之后开不出窗。
+                sessions_evt.lk().remove(&sid_evt);
             }
             _ => {}
         });
@@ -569,7 +569,7 @@ fn open_session(
         read_cache: Mutex::new(None),
         last_used: Mutex::new(Instant::now()),
     });
-    sessions.lock().expect("webrender sessions").insert(sid.clone(), entry.clone());
+    sessions.lk().insert(sid.clone(), entry.clone());
     Ok((sid, entry))
 }
 
@@ -630,7 +630,7 @@ async fn wait_for_text(
 async fn drain_downloads(entry: &Arc<SessionEntry>) {
     let mut rx = entry.dl_done.lock().await;
     while rx.try_recv().is_ok() {}
-    *entry.dl_final.lock().expect("webrender dl slot") = None;
+    *entry.dl_final.lk() = None;
 }
 
 /// 点击后的等待。分寸(真机两轮教训的合成):
@@ -656,19 +656,19 @@ async fn wait_click_outcome(
         let loaded = entry.load_seq.load(Ordering::Relaxed) > seq0;
         match tokio::time::timeout_at(tick.min(deadline), rx.recv()).await {
             Ok(Some(true)) => {
-                let path = entry.dl_final.lock().expect("webrender dl slot").clone();
+                let path = entry.dl_final.lk().clone();
                 return (path, last_nav_after(&entry.navs, click_moment).is_some(), loaded);
             }
             Ok(Some(false)) => {
                 // 下载失败:清掉半截文件,如实两手空空
-                if let Some(p) = entry.dl_final.lock().expect("webrender dl slot").take() {
+                if let Some(p) = entry.dl_final.lk().take() {
                     let _ = std::fs::remove_file(p);
                 }
                 return (None, last_nav_after(&entry.navs, click_moment).is_some(), loaded);
             }
             Ok(None) => return (None, false, false), // 窗没了
             Err(_) => {
-                let started = entry.dl_final.lock().expect("webrender dl slot").is_some();
+                let started = entry.dl_final.lk().is_some();
                 let navigated = last_nav_after(&entry.navs, click_moment).is_some();
                 let now = tokio::time::Instant::now();
                 if now >= deadline {
@@ -737,7 +737,7 @@ async fn read_slice(
 ) -> Result<larkwing_core::webrender::ReadSlice> {
     let seq = entry.load_seq.load(Ordering::Relaxed);
     let cached = {
-        let c = entry.read_cache.lock().expect("webrender read cache");
+        let c = entry.read_cache.lk();
         c.as_ref()
             .filter(|c| c.seq == seq)
             .map(|c| (c.title.clone(), c.text.clone(), c.capped))
@@ -782,7 +782,7 @@ async fn read_slice(
             let cache =
                 ReadCache { seq, title: p.title.clone(), text: Arc::new(p.text), capped: p.capped };
             let out = (cache.title.clone(), cache.text.clone(), cache.capped);
-            *entry.read_cache.lock().expect("webrender read cache") = Some(cache);
+            *entry.read_cache.lk() = Some(cache);
             out
         }
     };
@@ -830,8 +830,7 @@ fn last_nav_after(
     navs: &Arc<Mutex<Vec<(Instant, String)>>>,
     after: Instant,
 ) -> Option<String> {
-    navs.lock()
-        .expect("webrender nav slot")
+    navs.lk()
         .iter()
         .rev()
         .find(|(at, _)| *at > after)

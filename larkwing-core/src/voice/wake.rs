@@ -19,6 +19,7 @@ use super::prompts::{PromptBank, PromptKind, SharedPromptBank};
 use super::speaker::SpeakerId;
 use super::{collect_utterance, hangover_secs, new_vad, peak_normalize, CaptureOut, UTTER_PREROLL_S};
 use crate::bus::{VoiceEvent, VoicePhase};
+use crate::lockext::LockExt;
 
 pub(super) enum WakeCmd {
     Stop,
@@ -730,7 +731,7 @@ fn on_hit(
     // triage_transcript;按本次不按词表 —— 词表整体剥会误伤真实续句里恰好同词的开头)。
     // 应答音银行没就绪(首启预合成中/断网降级)→ 回落「叮」,绝不静默让人喊了没动静(§3.5);
     // 「叮」是纯正弦不进转写,played_ack = None = 零剥离。
-    let prompts = d.prompts.lock().expect("prompts lock").clone();
+    let prompts = d.prompts.lk().clone();
     let played_ack = match prompts.play_async(PromptKind::Ack) {
         Some(play) => Some(play.text),
         None => {
@@ -791,7 +792,7 @@ fn on_wake(
     hangover: f32,
 ) -> Result<Phase> {
     // 取当前应答音银行快照:运行时可能已按新音色热替换,本轮交互用这一份(下轮再取新的)。
-    let prompts = d.prompts.lock().expect("prompts lock").clone();
+    let prompts = d.prompts.lk().clone();
     d.rt.publish(VoiceEvent::WakeTriggered);
     // 应答已在命中那一刻出声(on_hit;2026-07-11「立刻出声应答、录音不断」)——这里不再
     // 重复应答、也**不 drain**:命中到此刻的积压帧里可能有用户紧接着说的话,清了就把

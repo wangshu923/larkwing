@@ -17,6 +17,7 @@ use larkwing_core::engine::{
     AppError, BootSnapshot, DayUsage, Engine, FloatIdle, ModelChoice, ModelMeta, MsgStats, ProviderPatch,
     ProviderView, SettingEntry, TurnEvent,
 };
+use larkwing_core::lockext::LockExt;
 use larkwing_core::llm::catalog::ModelOverride;
 use larkwing_core::llm::registry::ProviderPreset;
 use larkwing_core::llm::AccountBalance;
@@ -75,13 +76,11 @@ impl ChannelSup {
     pub fn restart(&self) {
         let new_ct = CancellationToken::new();
         let old = {
-            let mut g = self.ct.lock().expect("channels ct lock");
+            let mut g = self.ct.lk();
             std::mem::replace(&mut *g, new_ct.clone())
         };
         old.cancel();
-        if let Ok(mut m) = self.status.lock() {
-            m.clear();
-        }
+        self.status.lk().clear();
         let (engine, status) = (self.engine.clone(), self.status.clone());
         let (voice, media) = (self.voice.clone(), self.media.clone());
         tauri::async_runtime::spawn(async move {

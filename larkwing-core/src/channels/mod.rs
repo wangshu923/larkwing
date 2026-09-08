@@ -57,6 +57,7 @@ use anyhow::Context;
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::{Engine, InAttachment, TurnEvent, UserMeta};
+use crate::lockext::LockExt;
 use crate::net::{self, scrub};
 
 /// 攒批提示(§6.6 债:渠道操作性话术,不经模型;三渠道共用)。用户 2026-07-11 选定「极简功能」版。
@@ -83,7 +84,7 @@ struct AttachBuffer {
 impl AttachBuffer {
     /// 收进缓冲;返回是否「本批第一个」(缓冲空→满)= 调用方要不要发一次提示。
     fn buffer(&self, channel: &str, ext_id: &str, atts: Vec<InAttachment>) -> bool {
-        let mut m = self.inner.lock().expect("attach_buf poisoned");
+        let mut m = self.inner.lk();
         // 攒新批时顺手清过期僵尸(有人发了文件再没回来打字 → 别让 base64 bytes 长留内存)
         m.retain(|_, p| p.first_at.elapsed() < ATTACH_TTL);
         let key = (channel.to_string(), ext_id.to_string());
@@ -101,7 +102,7 @@ impl AttachBuffer {
 
     /// 取走并清空;超 `ATTACH_TTL` 的丢弃当没攒过(隔太久的文件不混进新意图)。
     fn take(&self, channel: &str, ext_id: &str) -> Vec<InAttachment> {
-        let mut m = self.inner.lock().expect("attach_buf poisoned");
+        let mut m = self.inner.lk();
         match m.remove(&(channel.to_string(), ext_id.to_string())) {
             Some(p) if p.first_at.elapsed() < ATTACH_TTL => p.items,
             _ => Vec::new(),
@@ -185,14 +186,13 @@ impl ChannelCtx {
     /// 因超时/取消自己收尾,这里不额外处理)。
     fn confirm_wait_set(&self, channel: &str, ext_id: &str, id: u64) {
         self.confirm_waits
-            .lock()
-            .expect("confirm_waits poisoned")
+            .lk()
             .insert((channel.to_string(), ext_id.to_string()), id);
     }
 
     /// 卡片终态(超时/桌面先点了):按 id 把等待摘掉(不知道 chat,按值扫)。
     fn confirm_wait_clear(&self, id: u64) {
-        self.confirm_waits.lock().expect("confirm_waits poisoned").retain(|_, v| *v != id);
+        self.confirm_waits.lk().retain(|_, v| *v != id);
     }
 
     /// 渠道回话先过确认闸(§7.8):该 chat 挂着确认时,这条**纯文本**回话先做应答判定。
@@ -205,8 +205,8 @@ impl ChannelCtx {
         text: &str,
     ) -> Option<&'static str> {
         let key = (channel.to_string(), ext_id.to_string());
-        let id = *self.confirm_waits.lock().expect("confirm_waits poisoned").get(&key)?;
-        self.confirm_waits.lock().expect("confirm_waits poisoned").remove(&key);
+        let id = *self.confirm_waits.lk().get(&key)?;
+        self.confirm_waits.lk().remove(&key);
         if crate::confirm::channel_reply_allows(text) {
             // 渠道回话恒按「仅这次」:永久授权是改机器配置,只留给有 UI 的地方(§7.2)
             if self.engine.confirmer().resolve(id, crate::confirm::ConfirmReply::AllowOnce, "channel") {
@@ -222,9 +222,7 @@ impl ChannelCtx {
     }
 
     pub(crate) fn set_state(&self, channel: &str, running: bool, err: Option<String>) {
-        if let Ok(mut m) = self.status.lock() {
-            m.insert(channel.into(), ChannelState { running, last_error: err });
-        }
+        self.status.lk().insert(channel.into(), ChannelState { running, last_error: err });
     }
 
     /// settings 取非空值(渠道**非秘密**配置:开关 / 白名单)。

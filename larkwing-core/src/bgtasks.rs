@@ -18,6 +18,7 @@ use anyhow::Result;
 
 // 时间戳单源在 `store::now_ms`(全库统一 unix 毫秒);本模块只借它的短名,不自己再写一份。
 use crate::store::{now_ms, Store};
+use crate::lockext::LockExt;
 
 /// 同时在跑的后台任务上限(2026-07-27 用户拍板 20 = 失控 backstop;满了如实退回不排队)。
 pub const BG_MAX_CONCURRENT: usize = 20;
@@ -104,7 +105,7 @@ struct Fin {
 
 impl BgEntry {
     fn running(&self) -> bool {
-        self.st.lock().expect("bg st lock").finished.is_none()
+        self.st.lk().finished.is_none()
     }
 }
 
@@ -126,7 +127,7 @@ impl BgTasks {
         self.ensure_sweeper();
         let now = now_ms();
         let entry = {
-            let mut entries = self.inner.entries.lock().expect("bg entries lock");
+            let mut entries = self.inner.entries.lk();
             let running = entries.iter().filter(|e| e.running()).count();
             anyhow::ensure!(
                 running < BG_MAX_CONCURRENT,
@@ -172,8 +173,7 @@ impl BgTasks {
     pub fn running_count_of(&self, prefix: &str) -> usize {
         self.inner
             .entries
-            .lock()
-            .expect("bg entries lock")
+            .lk()
             .iter()
             .filter(|e| e.running() && e.title.starts_with(prefix))
             .count()
@@ -182,14 +182,14 @@ impl BgTasks {
     /// spawn 之后把 abort 句柄挂上(看门狗判卡后据此掐掉僵死任务)。
     pub fn attach_abort(&self, id: u64, abort: tokio::task::AbortHandle) {
         if let Some(e) = self.find(id) {
-            e.st.lock().expect("bg st lock").abort = Some(abort);
+            e.st.lk().abort = Some(abort);
         }
     }
 
     /// 叫停(协作式):置旗标,任务在下一项开始前自查退出。返回任务名;不在跑 = None。
     pub fn cancel(&self, id: u64) -> Option<String> {
         let e = self.find(id)?;
-        let mut st = e.st.lock().expect("bg st lock");
+        let mut st = e.st.lk();
         if st.finished.is_some() {
             return None;
         }
@@ -198,13 +198,13 @@ impl BgTasks {
     }
 
     fn find(&self, id: u64) -> Option<Arc<BgEntry>> {
-        self.inner.entries.lock().expect("bg entries lock").iter().find(|e| e.id == id).cloned()
+        self.inner.entries.lk().iter().find(|e| e.id == id).cloned()
     }
 
     /// 〔此刻〕背景一行:运行中任务的极简摘要(带编号,模型可直接 task_cancel);
     /// 没有运行中的 = None(不占背景)。
     pub fn ambient_line(&self) -> Option<String> {
-        let entries = self.inner.entries.lock().expect("bg entries lock");
+        let entries = self.inner.entries.lk();
         let running: Vec<&Arc<BgEntry>> = entries.iter().filter(|e| e.running()).collect();
         if running.is_empty() {
             return None;
@@ -213,7 +213,7 @@ impl BgTasks {
             .iter()
             .take(AMBIENT_MAX)
             .map(|e| {
-                let st = e.st.lock().expect("bg st lock");
+                let st = e.st.lk();
                 format!(
                     "「{}」(编号{}) {}正在{}",
                     e.title,
@@ -232,11 +232,11 @@ impl BgTasks {
     /// task_status 的全量视图:运行中(编号/进度/当前项/已用时/累计没成点名)+ 刚结束的。
     pub fn status_report(&self) -> String {
         let now = now_ms();
-        let entries = self.inner.entries.lock().expect("bg entries lock");
+        let entries = self.inner.entries.lk();
         let mut running = Vec::new();
         let mut finished = Vec::new();
         for e in entries.iter() {
-            let st = e.st.lock().expect("bg st lock");
+            let st = e.st.lk();
             match &st.finished {
                 None => {
                     let mut line = format!(
@@ -291,11 +291,11 @@ impl BgTasks {
     /// 照常汇报。abort 让僵死任务的 TaskHandle 走 drop-自动-fail(HUD 如实标红)。
     pub(crate) fn sweep_once(&self, now: i64) {
         let stalled: Vec<Arc<BgEntry>> = {
-            let entries = self.inner.entries.lock().expect("bg entries lock");
+            let entries = self.inner.entries.lk();
             entries
                 .iter()
                 .filter(|e| {
-                    let st = e.st.lock().expect("bg st lock");
+                    let st = e.st.lk();
                     st.finished.is_none() && now - st.last_beat_ms > STALL_MS
                 })
                 .cloned()
@@ -303,7 +303,7 @@ impl BgTasks {
         };
         for e in stalled {
             let (summary, abort) = {
-                let mut st = e.st.lock().expect("bg st lock");
+                let mut st = e.st.lk();
                 if st.finished.is_some() {
                     continue; // 竞态:刚好收尾了
                 }
@@ -380,7 +380,7 @@ impl BgTicket {
 
     /// 打点:已完成 done 个,正在处理 current(顺带喂看门狗的活体信号)。
     pub fn beat(&self, done: usize, current: impl Into<String>) {
-        let mut st = self.entry.st.lock().expect("bg st lock");
+        let mut st = self.entry.st.lk();
         st.done_units = done;
         st.current = current.into();
         st.last_beat_ms = now_ms();
@@ -388,7 +388,7 @@ impl BgTicket {
 
     /// 记一个没成的(点名封顶,总数照计)。
     pub fn miss(&self, name: &str) {
-        let mut st = self.entry.st.lock().expect("bg st lock");
+        let mut st = self.entry.st.lk();
         st.miss_count += 1;
         if st.misses.len() < MISS_KEEP {
             st.misses.push(name.to_string());
@@ -396,7 +396,7 @@ impl BgTicket {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.entry.st.lock().expect("bg st lock").cancelled
+        self.entry.st.lk().cancelled
     }
 
     /// 正常收尾(完成或按要求停下):记终态 + 插收尾汇报唤回合。
@@ -405,7 +405,7 @@ impl BgTicket {
     pub fn finish(self, ok: bool, summary: impl Into<String>) {
         let summary = summary.into();
         {
-            let mut st = self.entry.st.lock().expect("bg st lock");
+            let mut st = self.entry.st.lk();
             if st.finished.is_some() {
                 return; // 看门狗已收尾并汇报过,不双份
             }
@@ -419,7 +419,7 @@ impl BgTicket {
 impl Drop for BgTicket {
     fn drop(&mut self) {
         let summary = {
-            let mut st = self.entry.st.lock().expect("bg st lock");
+            let mut st = self.entry.st.lk();
             if st.finished.is_some() {
                 return; // 正常收尾 / 看门狗已处理
             }

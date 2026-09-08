@@ -35,6 +35,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::bus::{AppEvent, Bus, VoiceEvent, VoicePhase};
+use crate::lockext::LockExt;
 use crate::scenes::Scenes;
 use crate::store::Store;
 use crate::tasks::Tasks;
@@ -880,7 +881,7 @@ impl VoiceRuntime {
 
         // 抢会话槽(与听写互斥,二者都开麦);失败 = 语音正忙
         let (ctl, gen) = {
-            let mut slot = self.inner.session.lock().expect("voice session lock");
+            let mut slot = self.inner.session.lk();
             if slot.is_some() {
                 bail!("语音正忙,稍后再校准");
             }
@@ -952,7 +953,7 @@ impl VoiceRuntime {
 
         // 录音收尾:释放会话槽 + 恢复唤醒(计算不碰麦,先放开)
         {
-            let mut slot = self.inner.session.lock().expect("voice session lock");
+            let mut slot = self.inner.session.lk();
             if slot.as_ref().map(|s| s.gen) == Some(gen) {
                 *slot = None;
             }
@@ -1024,7 +1025,7 @@ impl VoiceRuntime {
     }
 
     pub fn wake_running(&self) -> bool {
-        self.inner.wake.lock().expect("wake lock").is_some()
+        self.inner.wake.lk().is_some()
     }
 
     /// 当前唤醒词 = **名字派生**(2026-07-10 用户拍板「起什么名字就怎么唤醒」,原独立设置
@@ -1105,7 +1106,7 @@ impl VoiceRuntime {
         let (tx, rx) = std::sync::mpsc::channel();
         let gen = WAKE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         {
-            let mut slot = self.inner.wake.lock().expect("wake lock");
+            let mut slot = self.inner.wake.lk();
             if slot.is_some() {
                 return Ok(()); // 并发开关:别人抢先了
             }
@@ -1157,18 +1158,18 @@ impl VoiceRuntime {
     /// KWS 检测与麦克风全程不动(不打断"竖着耳朵听"),命中缓存的音色秒回(问题1-B)。
     /// 没开唤醒 = no-op(下次 wake_start 自然按新音色建)。
     pub async fn refresh_prompts(&self) {
-        let slot = match self.inner.wake.lock().expect("wake lock").as_ref() {
+        let slot = match self.inner.wake.lk().as_ref() {
             Some(h) => h.prompts.clone(),
             None => return,
         };
         let scene_voice = self.inner.scenes.default_scene().voice.clone();
         let bank = prompts::PromptBank::prepare(self, &scene_voice).await;
-        *slot.lock().expect("prompts lock") = Arc::new(bank);
+        *slot.lk() = Arc::new(bank);
         tracing::info!("唤醒应答音已按新音色重建(未重启唤醒循环)");
     }
 
     fn wake_cmd(&self, cmd: wake::WakeCmd) {
-        if let Some(h) = self.inner.wake.lock().expect("wake lock").as_ref() {
+        if let Some(h) = self.inner.wake.lk().as_ref() {
             let _ = h.cmd.send(cmd);
         }
     }
@@ -1187,7 +1188,7 @@ impl VoiceRuntime {
     }
 
     pub(super) fn wake_cleanup(&self) {
-        *self.inner.wake.lock().expect("wake lock") = None;
+        *self.inner.wake.lk() = None;
     }
 
     /// loop 退出路的认领式清理:只有 slot 还是**自己那一代**才清(off→on 重启时旧线程
@@ -1195,7 +1196,7 @@ impl VoiceRuntime {
     /// 让新 loop 也退)。返回「清的是不是自己」= 要不要广播 running:false
     /// (被 wake_stop 清过 = stop 已广播;被新一代顶替 = 唤醒还活着,都不该再发 false)。
     pub(super) fn wake_cleanup_gen(&self, gen: u64) -> bool {
-        let mut slot = self.inner.wake.lock().expect("wake lock");
+        let mut slot = self.inner.wake.lk();
         match slot.as_ref() {
             Some(h) if h.gen == gen => {
                 *slot = None;
@@ -1258,7 +1259,7 @@ impl VoiceRuntime {
     /// 再起专职线程跑 采集→VAD→ASR 管线;产出走 Voice 事件车道。
     pub async fn listen_start(&self) -> Result<()> {
         let (ctl, gen) = {
-            let mut slot = self.inner.session.lock().expect("voice session lock");
+            let mut slot = self.inner.session.lk();
             if slot.is_some() {
                 return Ok(());
             }
@@ -1304,7 +1305,7 @@ impl VoiceRuntime {
     pub fn listen_stop(&self, accept: bool) {
         let v = if accept { CTL_ACCEPT } else { CTL_CANCEL };
         self.inner.wake_ctl.store(v, Ordering::Relaxed);
-        let slot = self.inner.session.lock().expect("voice session lock");
+        let slot = self.inner.session.lk();
         if let Some(s) = slot.as_ref() {
             s.ctl.store(v, Ordering::Relaxed);
         }
@@ -1532,7 +1533,7 @@ impl VoiceRuntime {
     /// 会话收尾的唯一出口:清槽(只清自己这代)+ 发产出事件 + 回 Idle + 恢复唤醒。
     fn finish_session(&self, gen: u64, outcome: Result<SessionOutcome>) {
         {
-            let mut slot = self.inner.session.lock().expect("voice session lock");
+            let mut slot = self.inner.session.lk();
             if slot.as_ref().map(|s| s.gen) == Some(gen) {
                 *slot = None;
             }
@@ -1630,7 +1631,7 @@ impl VoiceRuntime {
     fn open_push_pipe(&self) -> CapturePipe {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(64);
         let alive = std::sync::Arc::new(());
-        let mut taps = self.inner.push_taps.lock().expect("push_taps lock");
+        let mut taps = self.inner.push_taps.lk();
         // ⚠️ **开管时也要剪死管(2026-08-22 修)**:原先只在 `push_audio` 里靠「发送失败」
         // 剪 —— 而唤醒循环的看门狗恰恰是**因为一直没有帧**才每 30s 重开一次采集,于是
         // browser 源下每 30s 挂一个新 tap、旧的谁也剪不掉(剪除靠的正是那个不会来的帧),
@@ -1648,7 +1649,7 @@ impl VoiceRuntime {
         if pcm.is_empty() {
             return;
         }
-        let mut taps = self.inner.push_taps.lock().expect("push_taps lock");
+        let mut taps = self.inner.push_taps.lk();
         taps.retain(|(w, _)| w.strong_count() > 0); // 管子已 drop 的先剪掉(不必等发送失败)
         taps.retain(|(_, tx)| match tx.try_send(pcm.clone()) {
             Ok(()) => true,
@@ -2228,7 +2229,7 @@ mod tests {
         }
         let live = rt.open_capture_auto().unwrap();
         assert_eq!(
-            rt.inner.push_taps.lock().unwrap().len(),
+            rt.inner.push_taps.lk().len(),
             1,
             "反复重开只该留最新那根;死管不能靠「等一个不会来的帧」才剪"
         );
@@ -2249,7 +2250,7 @@ mod tests {
         );
         drop(a); // 管子 drop = 「关麦」
         rt.push_audio(vec![0.3_f32; 8]);
-        assert_eq!(rt.inner.push_taps.lock().unwrap().len(), 1, "死管在下次推帧时剪除");
+        assert_eq!(rt.inner.push_taps.lk().len(), 1, "死管在下次推帧时剪除");
         assert!(
             b.rx.recv_timeout(std::time::Duration::from_millis(200)).is_ok(),
             "幸存 tap 不受影响"

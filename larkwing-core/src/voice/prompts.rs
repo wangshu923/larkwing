@@ -12,6 +12,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::scenes::SceneVoice;
+use crate::lockext::LockExt;
 
 pub(super) struct Clip {
     pub samples: Vec<f32>,
@@ -291,7 +292,7 @@ pub(super) fn play_pcm_blocking_signaled(
                 pos2.store(p, Ordering::Relaxed);
                 if p >= data2.len() {
                     let (m, cv) = &*done2;
-                    *m.lock().expect("done lock") = true;
+                    *m.lk() = true;
                     cv.notify_all();
                 }
             },
@@ -303,7 +304,7 @@ pub(super) fn play_pcm_blocking_signaled(
 
     let (m, cv) = &*done;
     let cap = Duration::from_millis(total as u64 * 1000 / out_rate.max(1) as u64 + 1500);
-    let guard = m.lock().expect("done lock");
+    let guard = m.lk();
     let _ = cv.wait_timeout_while(guard, cap, |fin| !*fin).expect("condvar");
     // 输出回调已读完整段 = 应答音收尾。先放行开录(wake 据此 0 间隙起听),再 sleep 让设备
     // 缓冲里最后一截放净 —— 这点尾音此刻已在录,靠硬件 AEC 抑回声(宪法 §9 假设家用麦带 AEC)。

@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use super::{fingerprint, is_local_path, EpisodeRef, MediaRuntime};
 use crate::components::Component;
 use crate::store::SkipRow;
+use crate::lockext::LockExt;
 
 /// 开头取多久去比(秒):OP 常见在前 5 分钟内结束,冷开场最长见过 6 分钟(B 站标注实测 345 s 起的 OP)。
 pub(super) const HEAD_SECS: u32 = 360;
@@ -51,7 +52,7 @@ impl MediaRuntime {
     /// 本地视频剧集开播时调:本集没有检测结果且 ffmpeg 在手且没人在跑 → 后台起一趟。
     pub(super) fn maybe_spawn_detect(&self) {
         let (key, entries, index) = {
-            let guard = self.inner.playlist.lock().unwrap();
+            let guard = self.inner.playlist.lk();
             let Some(pl) = guard.as_ref() else { return };
             (pl.series_key.clone(), pl.entries.clone(), pl.index)
         };
@@ -194,8 +195,7 @@ impl MediaRuntime {
         let still_here = self
             .inner
             .playlist
-            .lock()
-            .unwrap()
+            .lk()
             .as_ref()
             .is_some_and(|pl| pl.series_key == key && pl.index == index);
         if still_here {

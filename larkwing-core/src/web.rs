@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use scraper::{Html, Selector};
+use crate::lockext::LockExt;
 
 /// 同 URL 正文短缓存:防同一回合/相邻回合重复抓(任务 HUD 不掺和,这层全静默)。
 const CACHE_TTL: Duration = Duration::from_secs(600);
@@ -358,7 +359,7 @@ impl WebClient {
     }
 
     fn cache_get(&self, url: &str) -> Option<String> {
-        let mut cache = self.cache.lock().expect("web cache lock poisoned");
+        let mut cache = self.cache.lk();
         cache.retain(|_, (at, _)| at.elapsed() < CACHE_TTL);
         cache.get(url).map(|(_, v)| v.clone())
     }
@@ -368,7 +369,7 @@ impl WebClient {
             Ok(j) => j,
             Err(_) => return, // 序列化失败只丢缓存,不丢结果
         };
-        let mut cache = self.cache.lock().expect("web cache lock poisoned");
+        let mut cache = self.cache.lk();
         cache.insert(url.to_string(), (Instant::now(), json));
     }
 }

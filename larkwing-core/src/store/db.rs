@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{Connection, Transaction};
+use crate::lockext::LockExt;
 
 /// 一条迁移:id 全局唯一、带序号前缀(如 `0003_chat_init`),按 id 排序执行。
 #[derive(Clone, Copy)]
@@ -34,13 +35,19 @@ impl Db {
 
     /// 拿锁执行。域方法的唯一入口。
     pub fn with<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let conn = self.0.lock().expect("db mutex poisoned");
+        let conn = self.0.lk();
         f(&conn)
     }
 
     /// 跨域事务。
+    ///
+    /// **为什么这把锁也能解毒接着用**(`.lk()`,`lockext` 那条规则里唯一需要单独论证的):
+    /// 中毒意味着有人持着这个 `Connection` panic 了,问题是「会不会留下一个没回滚的事务」。
+    /// 不会 —— rusqlite 的 `Transaction` 是 RAII,不 commit 就在 drop 里 rollback;
+    /// 而局部量的 drop 顺序是声明的逆序(`tx` 在 `conn` 这个 guard **之前** drop),
+    /// 所以 unwind 时必然先回滚、后中毒。等下一个调用者拿到这个连接时,它是干净的。
     pub fn tx<T>(&self, f: impl FnOnce(&Transaction) -> Result<T>) -> Result<T> {
-        let mut conn = self.0.lock().expect("db mutex poisoned");
+        let mut conn = self.0.lk();
         let tx = conn.transaction()?;
         let out = f(&tx)?;
         tx.commit()?;

@@ -259,6 +259,13 @@
 - yt-dlp / ffmpeg / 语音模型 / pdfium 等大组件走 `components` 模块**用时下载**到数据目录,**安装包里不带**(性质同浏览器下载文件——所以「不打包 Python」红线不碰)。
 - 镜像数据化(`media.gh_mirrors` 等,可热调)+ 校验(有 `SHA256SUMS` 则校验,ffmpeg 不发 SUMS 只靠 TLS,记档)+ PATH 兜底给开发机。**模型 = 数据**,按「语言 → 最强组件」目录化(ModelScope/hf-mirror 优先 + gh 镜像兜底)。
 
+### 6.10 毒锁:std 取锁一律走 `lockext`,禁止裸 `.lock().unwrap()`(2026-09-08)
+- **规则**:碰 `std::sync::Mutex` / `RwLock` 一律用 `crate::lockext` 的 **`.lk()` / `.rd()` / `.wr()`**(壳层侧 `larkwing_core::lockext`);**禁止**裸 `.lock().unwrap()` / `.expect(…)`,也禁止 `if let Ok(..) = ..lock()` 这种「中毒就静默跳过」。唯一豁免 = `lockext.rs` 自身。
+- **缘由**:std 的毒锁机制 —— 持锁线程 panic,这把锁被**永久**标记中毒,之后每次 `lock()` 都 `Err` → 写成 `.unwrap()` 就是「第一个 panic 之后每个访问点都跟着 panic」。而 tokio 任务 panic **不杀进程**(且 `panic = "abort"` 是根 `Cargo.toml` 刻意不加的,`attach.rs` 的 `catch_unwind` 要靠 unwind),于是**程序活着、那块状态永久废掉,直到用户重启**。更狠的是 `Drop` 里那种:drop 期间 panic 若正逢 unwind = **直接 abort 进程**(改前 `BgTicket` / `TaskHandle` / `ClearGuard` 三个收尾守卫都在这条路上,而它们恰恰是为 panic 路径设计的)。
+- **代价与纪律**:`into_inner()` 拿回来的数据**可能是半更新的**(panic 打断了某次修改)。对本项目这些锁(注册表 / 缓存 / 播放态)「半更新的 HashMap」远好过「永久死掉的子系统」;**唯一不能接受的是悄悄这么干** → `lockext` 内置 `warn!`(§3.5 不静默失败),**有界吼**(前 8 次 + 之后每 1024 次,带 `#[track_caller]` 调用点与累计数;不设界会把真正的 panic 消息挤出 5MB 就轮转的 `larkwing.log`)。
+- **落点**:`larkwing-core/src/lockext.rs`(trait + 恢复计数 + 三条自测:中毒后仍可用 / 健康时零差异)。机器守卫 = `scripts/check-locks.sh`(`bash scripts/check-locks.sh`,已进 push/PR CI 的 `source-guards` job;五条禁令 + **阳性对照**防「正则没匹配到东西却静默全绿」,同 `check-i18n.mjs` 的规矩)。
+- **判据**:`grep '\.lock()\.unwrap()'` 全仓应为零;新写并发状态时问一句「这把锁中毒了,这块功能是不是就没了」。→ 详见 docs/notes/engineering.md「毒锁:一个 panic 废掉一整块状态」
+
 ---
 
 ## 7. 各功能域约定速查(规则 + 指针)

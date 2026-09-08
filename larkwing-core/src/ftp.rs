@@ -35,6 +35,7 @@ use suppaftp::types::FileType;
 use suppaftp::FtpError;
 
 use crate::files::human_size;
+use crate::lockext::LockExt;
 
 /// 建连 + 登录的总超时。**死链是这里最常见的情形**,要快点失败并给明白话,
 /// 别让用户对着转圈等。
@@ -261,7 +262,7 @@ impl Transfer<'_> {
     /// 已落盘字节数 = REST 偏移的**唯一**来源(读文件真实长度,不信内存计数——
     /// 写盘半途失败 / 上一轮死在哪都由它兜)。
     fn on_disk(&self) -> Result<u64> {
-        let f = self.file.lock().expect("ftp 临时件锁 poisoned");
+        let f = self.file.lk();
         Ok(f.metadata().context("读不到临时文件长度")?.len())
     }
 
@@ -272,7 +273,7 @@ impl Transfer<'_> {
         use std::io::Write;
         let file = self.file.clone();
         match tokio::task::spawn_blocking(move || {
-            let res = file.lock().expect("ftp 临时件锁 poisoned").write_all(&buf[..n]);
+            let res = file.lk().write_all(&buf[..n]);
             (buf, res)
         })
         .await
@@ -627,6 +628,8 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use std::time::Duration;
 
+        use crate::lockext::LockExt;
+
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::{TcpListener, TcpStream};
 
@@ -657,8 +660,7 @@ mod tests {
         impl Server {
             pub fn cmds(&self, verb: &str) -> Vec<String> {
                 self.log
-                    .lock()
-                    .unwrap()
+                    .lk()
                     .iter()
                     .filter(|l| l.starts_with(verb))
                     .cloned()
@@ -667,8 +669,7 @@ mod tests {
             /// 只留 REST / RETR 两种,看续传时序
             pub fn transfer_seq(&self) -> Vec<String> {
                 self.log
-                    .lock()
-                    .unwrap()
+                    .lk()
                     .iter()
                     .filter(|l| l.starts_with("REST ") || l.starts_with("RETR "))
                     .cloned()
@@ -711,7 +712,7 @@ mod tests {
                     return;
                 }
                 let cmd = line.trim_end().to_string();
-                log.lock().unwrap().push(cmd.clone());
+                log.lk().push(cmd.clone());
                 let (verb, arg) = cmd.split_once(' ').unwrap_or((cmd.as_str(), ""));
                 let reply: String = match verb.to_ascii_uppercase().as_str() {
                     "USER" => "331 password please".into(),
@@ -746,7 +747,7 @@ mod tests {
                         };
                         wr.write_all(b"150 Opening BINARY connection\r\n").await.ok();
                         let idx = {
-                            let mut c = shared.retr_count.lock().unwrap();
+                            let mut c = shared.retr_count.lk();
                             let i = *c;
                             *c += 1;
                             i

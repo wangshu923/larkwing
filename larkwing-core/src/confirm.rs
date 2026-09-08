@@ -18,6 +18,7 @@ use tokio::sync::oneshot;
 
 use crate::bus::{AppEvent, Bus};
 use crate::store::Store;
+use crate::lockext::LockExt;
 
 // ---------- 词表(§4.11 用户拍板,2026-07-15)----------
 
@@ -260,7 +261,7 @@ impl Confirmer {
             via: None,
         };
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, PendingEntry { tx, card: card.clone() });
+        self.pending.lk().insert(id, PendingEntry { tx, card: card.clone() });
         // guard:ask 被 drop(回合取消)也把卡收干净
         let guard = ClearGuard { confirmer: self, id, armed: true };
         self.bus.publish(AppEvent::Confirm(card.clone()));
@@ -280,7 +281,7 @@ impl Confirmer {
             Ok(Err(_)) | Err(_) => ConfirmDecision::TimedOut,
         };
         // 终态广播 + 摘表(resolve 路已摘,这里兜超时路)
-        self.pending.lock().unwrap().remove(&id);
+        self.pending.lk().remove(&id);
         // 卡片终态只有 allowed/denied/expired(前端状态机不管 always);审计 decision
         // 分 allowed / allowed_always / denied,「一直允许」在流水里看得出来。
         let (state, log_decision, via) = match &decision {
@@ -303,7 +304,7 @@ impl Confirmer {
     /// 应答入口(前端命令/渠道回话/语音听音)。先到先得;id 不在 pending(已过期/已应)
     /// 返回 false,调用方据此告知「已经过期了」。
     pub fn resolve(&self, id: u64, reply: ConfirmReply, via: &str) -> bool {
-        let entry = self.pending.lock().unwrap().remove(&id);
+        let entry = self.pending.lk().remove(&id);
         match entry {
             Some(e) => e.tx.send((reply, via.to_string())).is_ok(),
             None => false,
@@ -312,14 +313,13 @@ impl Confirmer {
 
     /// 这张卡还挂着吗(语音听音开录前查:念问句期间别处已点头就不用听了)。
     pub fn has_pending(&self, id: u64) -> bool {
-        self.pending.lock().unwrap().contains_key(&id)
+        self.pending.lk().contains_key(&id)
     }
 
     /// 某会话当前挂着的确认(语音侧「我该不该听」/渠道拦截查 pending 用)。
     pub fn pending_for_conv(&self, conv_id: i64) -> Option<ConfirmCard> {
         self.pending
-            .lock()
-            .unwrap()
+            .lk()
             .values()
             .map(|e| &e.card)
             .find(|c| c.conv_id == conv_id)
@@ -347,7 +347,7 @@ impl Drop for ClearGuard<'_> {
         if !self.armed {
             return;
         }
-        if let Some(e) = self.confirmer.pending.lock().unwrap().remove(&self.id) {
+        if let Some(e) = self.confirmer.pending.lk().remove(&self.id) {
             let mut card = e.card;
             card.state = "expired".into();
             self.confirmer.bus.publish(AppEvent::Confirm(card));

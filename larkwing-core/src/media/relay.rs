@@ -22,6 +22,7 @@ use tokio::io::AsyncReadExt;
 
 use super::resolver::UpStream;
 use super::SpriteSheet;
+use crate::lockext::LockExt;
 
 /// 视频转码用哪个 H.264 编码器。**探测出来的、每 entry 固定**(init 与各段必须同编码器,否则
 /// avcC 配置不一致、MSE 拼不上)。有硬件编码器就用 GPU(省 CPU,§硬件加速),没有则回落软件
@@ -503,8 +504,7 @@ impl Relay {
         let token = self.token();
         self.inner
             .streams
-            .lock()
-            .expect("relay streams lock poisoned")
+            .lk()
             .insert(token.clone(), Arc::new(entry));
         format!("http://127.0.0.1:{}/{path}/{token}", self.inner.port)
     }
@@ -516,7 +516,7 @@ impl Relay {
         let token = self.token();
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
-            let mut map = self.inner.collect.lock().expect("relay collect lock poisoned");
+            let mut map = self.inner.collect.lk();
             map.retain(|_, s| !s.is_closed());
             map.insert(token.clone(), tx);
         }
@@ -604,8 +604,7 @@ impl Relay {
         let token = self.token();
         self.inner
             .streams
-            .lock()
-            .expect("relay streams lock poisoned")
+            .lk()
             .insert(token.clone(), Arc::new(Entry::Dash { mpd, video, audio }));
         Ok(format!("http://127.0.0.1:{}/dash/{token}/manifest.mpd", self.inner.port))
     }
@@ -626,7 +625,7 @@ impl Relay {
             self.video_encoder(&ffmpeg).await
         };
         let token = self.token();
-        self.inner.streams.lock().expect("relay streams lock poisoned").insert(
+        self.inner.streams.lk().insert(
             token.clone(),
             Arc::new(Entry::FileHls { path, ffmpeg, duration, enc, audio_track }),
         );
@@ -651,7 +650,7 @@ impl Relay {
         subs: Vec<SubSource>,
     ) -> String {
         let token = self.token();
-        self.inner.streams.lock().expect("relay streams lock poisoned").insert(
+        self.inner.streams.lk().insert(
             token.clone(),
             Arc::new(Entry::FileAdaptive {
                 path,
@@ -833,7 +832,7 @@ fn parse_range(header: Option<&axum::http::HeaderValue>, len: u64) -> RangeSpec 
 }
 
 fn lookup(state: &Inner, token: &str) -> Option<Arc<Entry>> {
-    state.streams.lock().expect("relay streams lock poisoned").get(token)
+    state.streams.lk().get(token)
 }
 
 fn bad(status: StatusCode) -> Response {
@@ -935,7 +934,7 @@ async fn collect(
     if body.len() > COLLECT_MAX_BYTES {
         return bad(StatusCode::PAYLOAD_TOO_LARGE);
     }
-    let sender = state.collect.lock().expect("relay collect lock poisoned").remove(&token);
+    let sender = state.collect.lk().remove(&token);
     let Some(tx) = sender else { return bad(StatusCode::NOT_FOUND) };
     let _ = tx.send(body); // 发起方已放弃(超时收摊)= 静默丢,无人可通知
     Response::builder()
@@ -1514,14 +1513,14 @@ async fn thumb(
     };
     let key = (token, at);
 
-    if let Some(bytes) = state.thumbs.lock().expect("relay thumbs lock poisoned").get(&key) {
+    if let Some(bytes) = state.thumbs.lk().get(&key) {
         return thumb_response(bytes);
     }
     // 串行:排队期间前面那位可能正好抽的就是这一格 → 拿到许可先再查一次缓存
     let Ok(_permit) = state.thumb_gate.acquire().await else {
         return bad(StatusCode::SERVICE_UNAVAILABLE); // 闸被关(进程收尾),不该发生
     };
-    if let Some(bytes) = state.thumbs.lock().expect("relay thumbs lock poisoned").get(&key) {
+    if let Some(bytes) = state.thumbs.lk().get(&key) {
         return thumb_response(bytes);
     }
 
@@ -1533,7 +1532,7 @@ async fn thumb(
     // 抽不出(片尾之后的格 / 只有音轨 / 参数不合 / 大图下不来)与超时都走这:一律 404 降级
     let Some(out) = out.filter(|b| !b.is_empty()) else { return bad(StatusCode::NOT_FOUND) };
     let bytes = Arc::new(out);
-    state.thumbs.lock().expect("relay thumbs lock poisoned").put(key, bytes.clone());
+    state.thumbs.lk().put(key, bytes.clone());
     thumb_response(bytes)
 }
 
@@ -1601,12 +1600,12 @@ async fn sprite_thumb(state: &Inner, sheet: &Arc<SpriteSheet>, frame: usize) -> 
 
 /// 取一张雪碧图大图的编码字节:先查整图缓存,没有则带防盗链头下载(`fetch_image_bytes`),成功即入缓存。
 async fn fetch_sprite_image(state: &Inner, sheet: &SpriteSheet, url: &str) -> Option<Arc<Vec<u8>>> {
-    if let Some(bytes) = state.sprites.lock().expect("relay sprites lock poisoned").get(&url.to_string()) {
+    if let Some(bytes) = state.sprites.lk().get(&url.to_string()) {
         return Some(bytes);
     }
     let buf = fetch_image_bytes(state, url, &sheet.headers, SPRITE_IMG_MAX_BYTES).await?;
     let bytes = Arc::new(buf);
-    state.sprites.lock().expect("relay sprites lock poisoned").put(url.to_string(), bytes.clone());
+    state.sprites.lk().put(url.to_string(), bytes.clone());
     Some(bytes)
 }
 
@@ -1661,13 +1660,13 @@ async fn cover(State(state): State<Arc<Inner>>, AxPath(token): AxPath<String>) -
     let Some(entry) = lookup(&state, &token) else { return bad(StatusCode::NOT_FOUND) };
     let Entry::Cover(src) = entry.as_ref() else { return bad(StatusCode::NOT_FOUND) };
     let key = cover_key(src);
-    if let Some(bytes) = state.covers.lock().expect("relay covers lock poisoned").get(&key) {
+    if let Some(bytes) = state.covers.lk().get(&key) {
         return thumb_response(bytes);
     }
     let Ok(_permit) = state.thumb_gate.acquire().await else {
         return bad(StatusCode::SERVICE_UNAVAILABLE);
     };
-    if let Some(bytes) = state.covers.lock().expect("relay covers lock poisoned").get(&key) {
+    if let Some(bytes) = state.covers.lk().get(&key) {
         return thumb_response(bytes);
     }
     let raw: Option<Vec<u8>> = match src {
@@ -1700,7 +1699,7 @@ async fn cover(State(state): State<Arc<Inner>>, AxPath(token): AxPath<String>) -
     };
     let Some(out) = out.filter(|b| !b.is_empty()) else { return bad(StatusCode::NOT_FOUND) };
     let bytes = Arc::new(out);
-    state.covers.lock().expect("relay covers lock poisoned").put(key, bytes.clone());
+    state.covers.lk().put(key, bytes.clone());
     thumb_response(bytes)
 }
 
@@ -1965,7 +1964,7 @@ mod tests {
         let (_url2, rx2) = relay.register_collect();
         drop(rx2);
         let _ = relay.register_collect();
-        assert_eq!(relay.inner.collect.lock().unwrap().len(), 1, "死项被清扫,只剩新注册的");
+        assert_eq!(relay.inner.collect.lk().len(), 1, "死项被清扫,只剩新注册的");
     }
 
     #[test]
@@ -1987,7 +1986,7 @@ mod tests {
         let b = relay.register_direct(UpStream { url: "u2".into(), ..Default::default() });
         assert_ne!(a, b);
         assert!(a.starts_with("http://127.0.0.1:12345/s/"));
-        assert_eq!(relay.inner.streams.lock().unwrap().map.len(), 2);
+        assert_eq!(relay.inner.streams.lk().map.len(), 2);
     }
 
     /// 注册表淘汰:轻 entry 按条数 backstop、重 entry 按字节,且**永不淘汰最近 MIN_KEEP 条**
@@ -2411,7 +2410,7 @@ mod tests {
         let img = image::load_from_memory(&bytes).unwrap();
         assert_eq!((img.width(), img.height()), (512, 512));
         let key = cover_key(&CoverSrc::Sidecar(side.clone()));
-        assert!(relay.inner.covers.lock().unwrap().get(&key).is_some(), "进了封面缓存");
+        assert!(relay.inner.covers.lk().get(&key).is_some(), "进了封面缓存");
 
         // 侧车图不存在 / 内嵌图 ffmpeg 起不来 / 远端拿不到 → 一律 404(前端回落 ♪)
         let gone = relay.register_cover(CoverSrc::Sidecar(dir.join("nope.jpg")));

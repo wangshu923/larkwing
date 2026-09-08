@@ -46,6 +46,7 @@ use serde::Serialize;
 
 use crate::bus::{AppEvent, Bus, MediaEvent, TaskRetry, Text};
 use crate::components::{Component, Components, DEFAULT_GH_MIRRORS};
+use crate::lockext::LockExt;
 use crate::store::Store;
 use crate::tasks::Tasks;
 
@@ -771,7 +772,7 @@ impl MediaRuntime {
 
     /// 记下一次「因需登录而卡住」的播放,待登录成功后自动重放。
     fn record_pending(&self, user_id: i64, source: &str, page_url: &str, audio_only: bool) {
-        self.inner.pending_play.lock().unwrap().insert(
+        self.inner.pending_play.lk().insert(
             source.to_string(),
             PendingPlay {
                 user_id,
@@ -784,7 +785,7 @@ impl MediaRuntime {
 
     /// 取走某源的待重放(取即消费,不重复);超过 TTL 的丢弃、返回 None。
     fn take_pending_play(&self, source: &str) -> Option<PendingPlay> {
-        let p = self.inner.pending_play.lock().unwrap().remove(source)?;
+        let p = self.inner.pending_play.lk().remove(source)?;
         (p.at.elapsed() <= PENDING_PLAY_TTL).then_some(p)
     }
 
@@ -878,10 +879,10 @@ impl MediaRuntime {
         // 新播放请求 = 新内容意图:播放模式/音轨/倍速都复位;切集不经这里 —— 三者跨集粘住
         // (2026-09-07 用户实锤「1.5 倍看剧下一集变 1.0」:复位口径是「新点播」,不是「新一集」)。
         // 模式先归零,队列建好后再按内容定默认(歌单 = 列表循环,见 PlayMode::default_for)。
-        *self.inner.mode.lock().unwrap() = PlayMode::Once;
-        *self.inner.audio_track.lock().unwrap() = 0;
-        *self.inner.audio_track_lang.lock().unwrap() = None;
-        *self.inner.rate.lock().unwrap() = 1.0;
+        *self.inner.mode.lk() = PlayMode::Once;
+        *self.inner.audio_track.lk() = 0;
+        *self.inner.audio_track_lang.lk() = None;
+        *self.inner.rate.lk() = 1.0;
         // 目录入参 = 音频文件夹:强制只出声;≥2 首由 build_queue 组队连播,恰 1 首退化成放
         // 那一首,一首没有如实退回(播放链吃不了目录,绝不喂它;§3.5 不静默)。
         let single_fallback;
@@ -908,7 +909,7 @@ impl MediaRuntime {
         };
         let (pos, target, resume_at) =
             self.build_queue(page_url, audio_only, restart, episode).await?;
-        *self.inner.mode.lock().unwrap() = PlayMode::default_for(audio_only, pos.is_some());
+        *self.inner.mode.lk() = PlayMode::default_for(audio_only, pos.is_some());
         self.play_entry(user_id, &target, audio_only, pos, resume_at).await
     }
 
@@ -953,7 +954,7 @@ impl MediaRuntime {
         let Some(Series { key, title: series_title, entries }) =
             discovered.filter(|s| s.entries.len() >= 2)
         else {
-            *self.inner.playlist.lock().unwrap() = None;
+            *self.inner.playlist.lk() = None;
             anyhow::ensure!(episode.is_none(), "这不是多集内容,没有「第几集」可选");
             let resume_at = if restart || audio_only {
                 None
@@ -1012,7 +1013,7 @@ impl MediaRuntime {
             "续播决策"
         );
         let target = entries[index].url.clone();
-        *self.inner.playlist.lock().unwrap() = Some(Playlist {
+        *self.inner.playlist.lk() = Some(Playlist {
             series_key: key,
             series_title,
             entries,
@@ -1039,9 +1040,9 @@ impl MediaRuntime {
     /// 切集共用体(相对挪 / 第 N 集绝对定位):算目标 index → 越界报错 → 切集即落续播进度 →
     /// 那一集现取现播(不重建队列、流地址永不过期)。
     async fn switch_episode(&self, user_id: i64, target: EpisodeTarget) -> Result<PlayOutcome> {
-        let mode = *self.inner.mode.lock().unwrap();
+        let mode = *self.inner.mode.lk();
         let (target_url, audio_only, pos) = {
-            let mut guard = self.inner.playlist.lock().unwrap();
+            let mut guard = self.inner.playlist.lk();
             let pl = guard
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("现在没有在播放剧集,没有可切换的集"))?;
@@ -1098,9 +1099,9 @@ impl MediaRuntime {
     /// 只服务自动续播路;用户嘴控 next/prev 仍走 `advance`(放完就停时到头报错的反馈是对的)。
     /// (单曲循环由前端 `el.loop` 原生循环,ended 压根不触发;真走到这〔视频片尾倒计时〕= 重放本集。)
     pub async fn auto_next(&self, user_id: i64) -> Result<Option<PlayOutcome>> {
-        let mode = *self.inner.mode.lock().unwrap();
+        let mode = *self.inner.mode.lk();
         let target = {
-            let mut guard = self.inner.playlist.lock().unwrap();
+            let mut guard = self.inner.playlist.lk();
             let Some(pl) = guard.as_mut() else { return Ok(None) }; // 单集:交回前端收尾
             match mode {
                 // 随机:这轮没放过的里挑;都放过 → 重开一轮(随机恒循环不停)。
@@ -1312,7 +1313,7 @@ impl MediaRuntime {
             if audio_only { None } else { self.compute_skip(clips, resolved.duration_seconds) };
 
         // 网络流没有本地音轨概念(来源已定轨)→ 清掉本地现场,切音轨会如实退回
-        *self.inner.current_local.lock().unwrap() = None;
+        *self.inner.current_local.lk() = None;
         // 封面 = 源页面的封面图(B 站视频封面;放歌时就是那条视频的封面):经 relay 代取(带防盗链头,
         // 雪碧图同款),前端拿 `/cover/{token}`。没有 = None。
         let cover_url = resolved.thumbnail.clone().map(|url| {
@@ -2033,7 +2034,7 @@ impl MediaRuntime {
         if tracks.len() >= 2 {
             tracing::info!(path = %path.display(), tracks = ?tracks, track = sel_track, "音轨清单");
         }
-        *self.inner.current_local.lock().unwrap() = Some(CurrentLocal {
+        *self.inner.current_local.lk() = Some(CurrentLocal {
             page_url: path_str.to_string(),
             audio_only,
             tracks: tracks.clone(),
@@ -2093,8 +2094,7 @@ impl MediaRuntime {
                 let intro = self
                     .inner
                     .skip_ctx
-                    .lock()
-                    .unwrap()
+                    .lk()
                     .as_ref()
                     .and_then(|c| c.current.as_ref())
                     .and_then(|s| s.intro);
@@ -2108,7 +2108,7 @@ impl MediaRuntime {
             // 单曲上「循环放」= 循环这一首;「取消循环 / 别随机了」= 回该内容的默认(歌单 = 列表循环,
             // 单曲 / 视频 = 放完就停)。结果态经 `MediaEvent::Mode` 发给前端(不发 Control,前端不猜)。
             "loop_one" | "loop_all" | "loop_off" | "shuffle_on" | "shuffle_off" => {
-                let mut guard = self.inner.playlist.lock().unwrap();
+                let mut guard = self.inner.playlist.lk();
                 let (has_queue, audio_only) =
                     guard.as_ref().map(|pl| (true, pl.audio_only)).unwrap_or((false, false));
                 let next = match action {
@@ -2128,7 +2128,7 @@ impl MediaRuntime {
                     }
                 }
                 drop(guard);
-                *self.inner.mode.lock().unwrap() = next;
+                *self.inner.mode.lk() = next;
                 self.publish(MediaEvent::Mode { mode: next.as_str().into() });
                 return Ok("ok".into());
             }
@@ -2145,7 +2145,7 @@ impl MediaRuntime {
                     SPEED_RANGE.end()
                 );
                 // 先落 core 状态(切集 / 自动续播的 NowPlaying 据此捎带),再随 Control 事件让前端对齐。
-                *self.inner.rate.lock().unwrap() = v;
+                *self.inner.rate.lk() = v;
             }
             "seek" => {
                 let v = value.context("seek 需要 value(秒)")?;
@@ -2174,9 +2174,9 @@ impl MediaRuntime {
     /// `skip_ctx` 供重算;结果既是 `NowPlaying.skip` 也是 `MediaEvent::Skip` 的载荷。
     fn compute_skip(&self, auto: Vec<skip::AutoSeg>, duration: Option<f64>) -> Option<skip::SkipInfo> {
         let (key, order, current) = {
-            let guard = self.inner.playlist.lock().unwrap();
+            let guard = self.inner.playlist.lk();
             let Some(pl) = guard.as_ref() else {
-                *self.inner.skip_ctx.lock().unwrap() = None;
+                *self.inner.skip_ctx.lk() = None;
                 return None;
             };
             (
@@ -2192,19 +2192,19 @@ impl MediaRuntime {
         segs.extend(auto.iter().cloned());
         let order_refs: Vec<&str> = order.iter().map(String::as_str).collect();
         let info = skip::resolve(&order_refs, &current, duration, &manual, &segs);
-        *self.inner.skip_ctx.lock().unwrap() =
+        *self.inner.skip_ctx.lk() =
             Some(SkipCtx { auto, duration, current: info.clone() });
         info
     }
 
     /// 标记 / 检测结果变了:用存着的原料重算并广播(前端替换 `NowPlaying.skip`)。
     fn refresh_skip(&self) -> Option<skip::SkipInfo> {
-        let (auto, duration) = match self.inner.skip_ctx.lock().unwrap().as_ref() {
+        let (auto, duration) = match self.inner.skip_ctx.lk().as_ref() {
             Some(c) => (c.auto.clone(), c.duration),
             None => return None,
         };
         // 时长以前端回报的为准(起播时探不出的 /m/ 混流路,播起来后前端知道)
-        let duration = duration.or(self.inner.playback.lock().unwrap().duration_secs);
+        let duration = duration.or(self.inner.playback.lk().duration_secs);
         let info = self.compute_skip(auto, duration);
         self.publish(MediaEvent::Skip { skip: info.clone() });
         info
@@ -2215,7 +2215,7 @@ impl MediaRuntime {
     /// 换算到本集)。`value` 缺省 = 播放器此刻位置。
     fn mark_skip(&self, action: &str, value: Option<f64>) -> Result<String> {
         let (key, order, current, index) = {
-            let guard = self.inner.playlist.lock().unwrap();
+            let guard = self.inner.playlist.lk();
             let Some(pl) = guard.as_ref() else {
                 anyhow::bail!("现在没有在放剧集,片头片尾标记只对多集内容有意义");
             };
@@ -2234,10 +2234,9 @@ impl MediaRuntime {
         let duration = self
             .inner
             .playback
-            .lock()
-            .unwrap()
+            .lk()
             .duration_secs
-            .or_else(|| self.inner.skip_ctx.lock().unwrap().as_ref().and_then(|c| c.duration));
+            .or_else(|| self.inner.skip_ctx.lk().as_ref().and_then(|c| c.duration));
         let rows = self.inner.store.media_skip.list(&key)?;
         let manual: Vec<skip::ManualRule> =
             rows.iter().filter(|r| r.source == "manual").map(skip::ManualRule::from_row).collect();
@@ -2305,8 +2304,7 @@ impl MediaRuntime {
         let key = self
             .inner
             .playlist
-            .lock()
-            .unwrap()
+            .lk()
             .as_ref()
             .map(|pl| pl.series_key.clone())
             .context("现在没有在放剧集,没有可清除的标记")?;
@@ -2320,8 +2318,8 @@ impl MediaRuntime {
     /// 越界(新一集音轨数变少)回 0。没显式选过 = 纯钳位(老行为)。
     fn pick_audio_track(&self, tracks: &[probe::AudioTrack]) -> usize {
         let total = tracks.len();
-        let mut idx = self.inner.audio_track.lock().unwrap();
-        if let Some(lang) = self.inner.audio_track_lang.lock().unwrap().as_deref() {
+        let mut idx = self.inner.audio_track.lk();
+        if let Some(lang) = self.inner.audio_track_lang.lk().as_deref() {
             let same = |t: &probe::AudioTrack| t.lang.as_deref() == Some(lang);
             if !tracks.get(*idx).is_some_and(same) {
                 if let Some(j) = tracks.iter().position(same) {
@@ -2337,7 +2335,7 @@ impl MediaRuntime {
 
     /// 播放器「此刻」位置(秒):最近回报值 + 播放中按倍速外推(与 playback_summary 同口径)。
     fn current_position(&self) -> Option<f64> {
-        let pb = self.inner.playback.lock().unwrap().clone();
+        let pb = self.inner.playback.lk().clone();
         let mut cur = pb.position_secs?;
         if !pb.paused {
             if let Some(at) = pb.at {
@@ -2355,11 +2353,11 @@ impl MediaRuntime {
     /// 其余管线:按选中轨重建(ffmpeg `-map`),`NowPlaying.resume_at` 带上当前位置接着放。
     /// 返回给模型的观察文本(§3.5 各种没得切都如实说)。
     pub async fn set_audio_track(&self, n: usize) -> Result<String> {
-        let Some(cur) = self.inner.current_local.lock().unwrap().clone() else {
+        let Some(cur) = self.inner.current_local.lk().clone() else {
             anyhow::bail!("现在没有在放本地内容,切换不了音轨(网络流的音轨由来源决定)");
         };
         anyhow::ensure!(
-            self.inner.playback.lock().unwrap().title.is_some(),
+            self.inner.playback.lk().title.is_some(),
             "现在没有在播放,切换不了音轨"
         );
         let total = cur.tracks.len();
@@ -2370,27 +2368,27 @@ impl MediaRuntime {
             track_menu(&cur.tracks)
         );
         let idx = n - 1;
-        let prev = *self.inner.audio_track.lock().unwrap();
+        let prev = *self.inner.audio_track.lk();
         if idx == prev {
             return Ok(format!("已经在第 {n} 条音轨({})了", track_desc(&cur.tracks[idx], n)));
         }
-        let prev_lang = self.inner.audio_track_lang.lock().unwrap().clone();
-        *self.inner.audio_track.lock().unwrap() = idx;
+        let prev_lang = self.inner.audio_track_lang.lk().clone();
+        *self.inner.audio_track.lk() = idx;
         // 记下语言码:切集时按语言对号(两集轨序不同也不串)。
-        *self.inner.audio_track_lang.lock().unwrap() = cur.tracks[idx].lang.clone();
+        *self.inner.audio_track_lang.lk() = cur.tracks[idx].lang.clone();
         // 统一走「重建 + 原位续播」(mac 直传也一样):真机实锤 WKWebView **播放中**改
         // audioTracks.enabled 不重新路由音频(静音且切回也不恢复);loadedmetadata 时的收敛
         // 有效 → 重载后由起播收敛把新轨启起来,本地文件重载亚秒级,与 Windows 同一条路。
         let resume = self.current_position();
-        let pos = self.inner.playlist.lock().unwrap().as_ref().map(|pl| PlaylistPos {
+        let pos = self.inner.playlist.lk().as_ref().map(|pl| PlaylistPos {
             index: pl.index,
             total: pl.entries.len(),
             resumed: false,
         });
         if let Err(e) = self.play_local(&cur.page_url, cur.audio_only, pos, true, resume).await {
             // 重建失败:选择回滚(老管线还在播旧轨,状态别悬空指向没生效的轨)
-            *self.inner.audio_track.lock().unwrap() = prev;
-            *self.inner.audio_track_lang.lock().unwrap() = prev_lang;
+            *self.inner.audio_track.lk() = prev;
+            *self.inner.audio_track_lang.lk() = prev_lang;
             return Err(e);
         }
         Ok(format!(
@@ -2401,7 +2399,7 @@ impl MediaRuntime {
 
     /// 当前倍速(NowPlaying 镜像用;新点播复位 1,切集沿用)。
     fn rate(&self) -> f64 {
-        *self.inner.rate.lock().unwrap()
+        *self.inner.rate.lk()
     }
 
     /// 起播成功:登记续播身份(前端心跳据此落集内位置)+ 落「现在放到这一集 / 这部」。
@@ -2411,7 +2409,7 @@ impl MediaRuntime {
         let audio = matches!(np.kind, MediaKind::Audio);
         let target = match &np.playlist {
             Some(p) => {
-                let guard = self.inner.playlist.lock().unwrap();
+                let guard = self.inner.playlist.lk();
                 guard.as_ref().and_then(|pl| pl.entries.get(p.index)).map(|e| {
                     let series_title = guard.as_ref().and_then(|pl| pl.series_title.clone());
                     (pl_key(&guard), e.id.clone(), e.title.clone(), series_title.unwrap_or_default())
@@ -2426,7 +2424,7 @@ impl MediaRuntime {
             )),
         };
         let Some((key, episode_id, title, series_title)) = target else {
-            *self.inner.progress.lock().unwrap() = None;
+            *self.inner.progress.lk() = None;
             return;
         };
         if let Err(e) = self.inner.store.media_progress.set_episode(
@@ -2439,30 +2437,30 @@ impl MediaRuntime {
         ) {
             tracing::warn!("续播进度落不了盘(不影响播放): {e:#}");
         }
-        *self.inner.progress.lock().unwrap() =
+        *self.inner.progress.lk() =
             Some(ProgressTarget { key, episode_id, title: np.title.clone() });
-        *self.inner.progress_at.lock().unwrap() = Some(std::time::Instant::now());
+        *self.inner.progress_at.lk() = Some(std::time::Instant::now());
     }
 
     /// 前端心跳 / 暂停 / 停止 → 集内位置落盘(节拍 PROGRESS_PERSIST_EVERY;暂停 / 停止立刻)。
     /// 只认标题对得上的回报(切集瞬间迟到的旧心跳不许写进新一集);短内容不记;
     /// 停播后清身份。`finished` = 播到片尾区,下次从下一集开头起。
     fn persist_progress(&self, r: &PlaybackReport) {
-        let Some(target) = self.inner.progress.lock().unwrap().clone() else { return };
+        let Some(target) = self.inner.progress.lk().clone() else { return };
         let idle = r.status == "idle";
         if !idle && r.title.as_deref() != Some(target.title.as_str()) {
             return; // 别的内容的回报(切集 / 换片竞态),不是这一行的
         }
         let Some(pos) = r.position.filter(|p| p.is_finite() && *p >= 0.0) else {
             if idle {
-                *self.inner.progress.lock().unwrap() = None;
+                *self.inner.progress.lk() = None;
             }
             return;
         };
         let dur = r.duration.filter(|d| d.is_finite() && *d > 0.0).unwrap_or(0.0);
         let immediate = idle || r.status == "paused";
         if !immediate {
-            let mut at = self.inner.progress_at.lock().unwrap();
+            let mut at = self.inner.progress_at.lk();
             if at.is_some_and(|t| t.elapsed() < PROGRESS_PERSIST_EVERY) {
                 return;
             }
@@ -2471,7 +2469,7 @@ impl MediaRuntime {
         // 短内容(歌 / 短片)不记集内位置:重听从头是常识,记了反而怪
         if dur > 0.0 && dur < RESUME_MIN_DURATION_S {
             if idle {
-                *self.inner.progress.lock().unwrap() = None;
+                *self.inner.progress.lk() = None;
             }
             return;
         }
@@ -2486,13 +2484,13 @@ impl MediaRuntime {
             tracing::warn!("集内进度落不了盘: {e:#}");
         }
         if idle {
-            *self.inner.progress.lock().unwrap() = None;
+            *self.inner.progress.lk() = None;
         }
     }
 
     /// 当前队列的整份清单(剧集列表面板 / 曲目列表按需取;None = 没在放多集内容)。
     pub fn playlist_view(&self) -> Option<PlaylistView> {
-        let guard = self.inner.playlist.lock().unwrap();
+        let guard = self.inner.playlist.lk();
         guard.as_ref().map(|pl| PlaylistView {
             index: pl.index,
             title: pl.series_title.clone(),
@@ -2506,14 +2504,14 @@ impl MediaRuntime {
 
     /// 播放模式镜像(NowPlaying 每次捎带全量,前端以此对齐 el.loop/按钮态,零猜测)。
     fn play_mode_str(&self) -> String {
-        self.inner.mode.lock().unwrap().as_str().to_string()
+        self.inner.mode.lk().as_str().to_string()
     }
 
     /// 起播时乐观 seed「正在放」(前端随后经 report 校准;这步只是让模型立刻就知道在放什么)。
     /// `pos` = (index, total):在播剧集时把「第N/共M集」一并记下,喂模型「此刻」背景。
     /// 音量跨播放粘住(前端基准如此)→ seed 保留旧值;进度/倍速是新内容的事,清零等回报。
     fn seed_playing(&self, title: &str, pos: Option<(usize, usize)>) {
-        let mut guard = self.inner.playback.lock().unwrap();
+        let mut guard = self.inner.playback.lk();
         let volume_pct = guard.volume_pct;
         *guard = Playback {
             title: Some(title.to_string()),
@@ -2530,7 +2528,7 @@ impl MediaRuntime {
     /// 音量也粘住(idle 不清,与前端「跨播放粘住」一致);其余 idle 清空。
     pub fn set_playback(&self, r: PlaybackReport) {
         {
-            let mut guard = self.inner.playback.lock().unwrap();
+            let mut guard = self.inner.playback.lk();
             let volume_pct =
                 r.volume.map(|v| v.clamp(0.0, 100.0).round() as u8).or(guard.volume_pct);
             *guard = match r.status.as_str() {
@@ -2557,7 +2555,7 @@ impl MediaRuntime {
     /// 跟播放有关时才参考、平时别主动提」。在播剧集时带「第N/共M集」;有回报时带**进度/音量/
     /// 倍速** —— 模型据此才能「音量调到 50」「快进 5 分钟」(相对操作 = 自己按当前值算绝对值)。
     pub fn playback_summary(&self) -> Option<String> {
-        let pb = self.inner.playback.lock().unwrap().clone();
+        let pb = self.inner.playback.lk().clone();
         // 剧集补一段「(第N集/共M集)」,让模型知道进度(如被问"放到哪了""下一集")。
         let ep = pb
             .pos
@@ -2587,11 +2585,10 @@ impl MediaRuntime {
             .unwrap_or_default();
         // 多音轨清单:模型据此把「换英文/国语」对到轨号(media_control 的 audio_track)。
         let audio = {
-            let sel = *self.inner.audio_track.lock().unwrap();
+            let sel = *self.inner.audio_track.lk();
             self.inner
                 .current_local
-                .lock()
-                .unwrap()
+                .lk()
                 .as_ref()
                 .filter(|c| c.tracks.len() >= 2)
                 .map(|c| {
@@ -2600,7 +2597,7 @@ impl MediaRuntime {
                 .unwrap_or_default()
         };
         // 播放模式:模型据此答「现在是循环吗」、对「别循环了/换随机」给对动作。
-        let mode = self.inner.mode.lock().unwrap().ambient();
+        let mode = self.inner.mode.lk().ambient();
         Some(match (pb.title, pb.paused) {
             (None, _) => "播放器现在空闲,没有在播放任何内容".to_string(),
             (Some(t), false) => format!("播放器正在播放《{t}》{ep}{progress}{vol}{rate}{mode}{audio}"),
@@ -2990,8 +2987,8 @@ mod tests {
             channels: Some(2),
         };
         let set = |idx: usize, lang: Option<&str>| {
-            *rt.inner.audio_track.lock().unwrap() = idx;
-            *rt.inner.audio_track_lang.lock().unwrap() = lang.map(Into::into);
+            *rt.inner.audio_track.lk() = idx;
+            *rt.inner.audio_track_lang.lk() = lang.map(Into::into);
         };
         set(1, Some("eng"));
         assert_eq!(rt.pick_audio_track(&[tr(Some("eng")), tr(Some("chi"))]), 0, "轨序反了按语言");
@@ -3001,7 +2998,7 @@ mod tests {
         assert_eq!(rt.pick_audio_track(&[tr(Some("chi"))]), 0, "越界回 0");
         set(3, None);
         assert_eq!(rt.pick_audio_track(&[tr(None), tr(None)]), 0, "没显式选过纯钳位");
-        assert_eq!(*rt.inner.audio_track.lock().unwrap(), 0, "结果回写");
+        assert_eq!(*rt.inner.audio_track.lk(), 0, "结果回写");
     }
 
     #[test]
@@ -3177,23 +3174,23 @@ mod tests {
         assert!(rt.playback_summary().unwrap().contains("单曲循环中"));
         // 单曲上「循环放」归一成单曲循环(没有列表可循环)
         rt.control("loop_all", None).unwrap();
-        assert_eq!(*rt.inner.mode.lock().unwrap(), PlayMode::LoopOne);
+        assert_eq!(*rt.inner.mode.lk(), PlayMode::LoopOne);
         assert!(rt.playback_summary().unwrap().contains("单曲循环中"));
         rt.control("loop_off", None).unwrap();
         assert!(!rt.playback_summary().unwrap().contains("循环中"));
 
         // 歌单:默认列表循环;「取消循环」回的是默认(列表循环),随机可开、关随机也回默认
-        *rt.inner.playlist.lock().unwrap() = Some(mk_shuffle_playlist(3));
-        *rt.inner.mode.lock().unwrap() = PlayMode::default_for(true, true);
+        *rt.inner.playlist.lk() = Some(mk_shuffle_playlist(3));
+        *rt.inner.mode.lk() = PlayMode::default_for(true, true);
         assert!(rt.playback_summary().unwrap().contains("列表循环中"));
         rt.control("shuffle_on", None).unwrap();
         assert!(rt.playback_summary().unwrap().contains("随机播放中"));
-        assert_eq!(rt.inner.playlist.lock().unwrap().as_ref().unwrap().played, vec![0], "履历从当前起算");
+        assert_eq!(rt.inner.playlist.lk().as_ref().unwrap().played, vec![0], "履历从当前起算");
         rt.control("shuffle_off", None).unwrap();
-        assert_eq!(*rt.inner.mode.lock().unwrap(), PlayMode::LoopAll);
+        assert_eq!(*rt.inner.mode.lk(), PlayMode::LoopAll);
         rt.control("loop_one", None).unwrap();
         rt.control("loop_off", None).unwrap();
-        assert_eq!(*rt.inner.mode.lock().unwrap(), PlayMode::LoopAll, "loop_off 回歌单默认");
+        assert_eq!(*rt.inner.mode.lk(), PlayMode::LoopAll, "loop_off 回歌单默认");
         // 视频剧集的默认是放完就停
         assert_eq!(PlayMode::default_for(false, true), PlayMode::Once);
         assert_eq!(PlayMode::default_for(true, false), PlayMode::Once);
@@ -3206,10 +3203,10 @@ mod tests {
         let mut pl = mk_shuffle_playlist(3);
         pl.index = 2;
         pl.played = vec![0, 1, 2];
-        *rt.inner.playlist.lock().unwrap() = Some(pl);
+        *rt.inner.playlist.lk() = Some(pl);
         let pick = |rt: &MediaRuntime, mode: PlayMode| {
-            *rt.inner.mode.lock().unwrap() = mode;
-            let mut guard = rt.inner.playlist.lock().unwrap();
+            *rt.inner.mode.lk() = mode;
+            let mut guard = rt.inner.playlist.lk();
             let pl = guard.as_mut().unwrap();
             match mode {
                 PlayMode::Shuffle => shuffle_advance(pl, true, 5),
@@ -3231,7 +3228,7 @@ mod tests {
         let (rt, mut rx) = runtime("atrack");
         assert!(rt.set_audio_track(2).await.is_err(), "没在放本地内容如实退回");
         // 注入现场:直传双音轨(chi/eng)
-        *rt.inner.current_local.lock().unwrap() = Some(CurrentLocal {
+        *rt.inner.current_local.lk() = Some(CurrentLocal {
             page_url: "/x/双语片.mp4".into(),
             audio_only: false,
             tracks: vec![
@@ -3254,7 +3251,7 @@ mod tests {
         // 这里文件不存在 → 如实报错且选择回滚(真切换在 e2e/真机验)
         let _ = &mut rx;
         assert!(rt.set_audio_track(2).await.is_err());
-        assert_eq!(*rt.inner.audio_track.lock().unwrap(), 0, "失败回滚选择");
+        assert_eq!(*rt.inner.audio_track.lk(), 0, "失败回滚选择");
     }
 
     #[tokio::test]
@@ -3314,7 +3311,7 @@ mod tests {
         assert_eq!(np.playlist.unwrap().index, 2, "列表是环,到顶回卷不报错");
 
         // 放完就停(视频剧集的默认;歌单只能内部置,嘴控没有这一档):末首放完 → 交回前端收尾,到头报错
-        *rt.inner.mode.lock().unwrap() = PlayMode::Once;
+        *rt.inner.mode.lk() = PlayMode::Once;
         assert!(rt.auto_next(1).await.unwrap().is_none(), "末首且放完就停 → 收尾");
         assert!(rt.advance(1, 1).await.is_err(), "放完就停:已是最后一首");
 
@@ -3339,7 +3336,7 @@ mod tests {
         assert!(rt.auto_next(1).await.unwrap().is_some(), "随机放完一轮重开一轮");
         // 「别随机了」= 回歌单默认(列表循环),接着顺序放
         rt.control("shuffle_off", None).unwrap();
-        assert_eq!(*rt.inner.mode.lock().unwrap(), PlayMode::LoopAll);
+        assert_eq!(*rt.inner.mode.lk(), PlayMode::LoopAll);
         assert!(rt.auto_next(1).await.unwrap().is_some());
 
         // 新播放请求复位模式(音量粘住、模式不粘):歌单回到默认列表循环
@@ -3774,7 +3771,7 @@ mod tests {
         // 别的内容的心跳(换片 / 切集竞态)写不进这一行
         rt.set_playback(report("别的片", "playing", 900.0, 1400.0));
         assert_eq!(
-            rt.inner.store.media_progress.get(&pl_key(&rt.inner.playlist.lock().unwrap())).unwrap().unwrap().position_seconds,
+            rt.inner.store.media_progress.get(&pl_key(&rt.inner.playlist.lk())).unwrap().unwrap().position_seconds,
             700.0
         );
         // 播到片尾区(1350/1400)= 看完 → 再放 = 第2集从头
@@ -3865,7 +3862,7 @@ mod tests {
         let (rt, _rx) = runtime("pending-exp");
         // 直接塞一个「过期」条目(at 早于 TTL);checked_sub 在极早期 Instant 上可能为 None,跳过即可
         if let Some(stale) = Instant::now().checked_sub(PENDING_PLAY_TTL + Duration::from_secs(1)) {
-            rt.inner.pending_play.lock().unwrap().insert(
+            rt.inner.pending_play.lk().insert(
                 "bilibili".into(),
                 PendingPlay {
                     user_id: 1,

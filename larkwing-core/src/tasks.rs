@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::bus::{AppEvent, Bus, TaskRetry, TaskState, TaskView, Text};
+use crate::lockext::LockExt;
 
 #[derive(Clone)]
 pub struct Tasks {
@@ -46,7 +47,7 @@ pub struct TaskHandle {
 
 impl TaskHandle {
     fn publish(&self, f: impl FnOnce(&mut TaskView)) {
-        let mut view = self.view.lock().expect("task view lock poisoned");
+        let mut view = self.view.lk();
         f(&mut view);
         self.bus.publish(AppEvent::Task(view.clone()));
     }
@@ -109,7 +110,7 @@ impl Drop for TaskHandle {
             return;
         }
         // 没收尾就没影了(panic / future 被取消):如实告诉 HUD,绝不留僵尸转圈条
-        let mut view = self.view.lock().expect("task view lock poisoned");
+        let mut view = self.view.lk();
         view.state = TaskState::Failed;
         view.error = Some(Text::new("task.err.dropped"));
         self.bus.publish(AppEvent::Task(view.clone()));
@@ -168,8 +169,8 @@ mod tests {
         let a = tasks.start("a", Text::new("x"));
         let b = tasks.start("b", Text::new("y"));
         let (ai, bi) = (
-            a.view.lock().unwrap().task_id,
-            b.view.lock().unwrap().task_id,
+            a.view.lk().task_id,
+            b.view.lk().task_id,
         );
         assert_ne!(ai, bi);
         a.done();

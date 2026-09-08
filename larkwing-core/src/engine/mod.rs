@@ -21,6 +21,7 @@ use serde::Deserialize;
 
 use crate::llm::registry::{resolve_env, Protocol, ProviderRegistry, ProviderSpec, Strategy};
 use crate::llm::{LlmError, LlmProvider, ToolCall, ToolDef};
+use crate::lockext::{LockExt, RwLockExt};
 use crate::scenes::{Scenes, DEFAULT_SCENE_ID};
 use crate::store::{Briefing, Conversation, DiaryEntry, Memory, Message, SearchHit, Store, User};
 use crate::tools::Tools;
@@ -811,10 +812,9 @@ impl Engine {
         // (批量 job 收尾唤回合「不知道还剩哪些」)正是靠这行接住。
         let plan_line = self
             .sessions
-            .lock()
-            .expect("sessions lock poisoned")
+            .lk()
             .get(&conv_id)
-            .and_then(|s| s.plan.lock().expect("plan lock poisoned").ambient_line());
+            .and_then(|s| s.plan.lk().ambient_line());
         if let Some(s) = plan_line {
             lines.push(s);
         }
@@ -853,14 +853,14 @@ impl Engine {
 
     /// 直接注入单 provider(测试 / FakeLlm);None = 清空回首跑态。
     pub fn set_provider(&self, p: Option<Arc<dyn LlmProvider>>) {
-        *self.llm.write().expect("llm lock poisoned") = match p {
+        *self.llm.wr() = match p {
             Some(p) => vec![("custom".into(), p)],
             None => Vec::new(),
         };
     }
 
     pub fn has_provider(&self) -> bool {
-        !self.llm.read().expect("llm lock poisoned").is_empty()
+        !self.llm.rd().is_empty()
     }
 
     /// 从 settings 重建供应商候选(开机装配 / 任何 llm.* 配置变更后调用)。
@@ -888,7 +888,7 @@ impl Engine {
             order = ?candidates.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
             "供应商候选已重建"
         );
-        *self.llm.write().expect("llm lock poisoned") = candidates;
+        *self.llm.wr() = candidates;
         Ok(())
     }
 
@@ -1106,10 +1106,10 @@ impl Engine {
     pub async fn delete_conversation(&self, conv_id: i64) -> Result<(), AppError> {
         self.cancel(conv_id).await;
         self.store.chat.delete_conversation(conv_id)?;
-        let removed = self.sessions.lock().expect("sessions lock poisoned").remove(&conv_id);
+        let removed = self.sessions.lk().remove(&conv_id);
         // 会话没了,HUD/悬浮窗上的计划卡跟着收(空快照 = 收卡信号,§6.5)
         if let Some(slot) = removed {
-            if !slot.plan.lock().expect("plan lock poisoned").is_empty() {
+            if !slot.plan.lk().is_empty() {
                 self.bus.publish(crate::bus::AppEvent::Plan(crate::bus::PlanCard {
                     conv_id,
                     title: None,
@@ -1803,14 +1803,14 @@ impl Engine {
     /// 复用现有档位目录(`catalog::tier_of`),**不新增模型名 / 设置项**(不触发 §4.11、守 §3 收口)。
     /// 单 provider 用户 = 选到它本身 = 与主选一致(**零回归**)。锁内只取 Arc 快照,await 在锁外。
     fn background_provider(&self) -> Option<Arc<dyn LlmProvider>> {
-        let candidates = self.llm.read().expect("llm lock poisoned");
+        let candidates = self.llm.rd();
         cheapest_candidate(&candidates).cloned()
     }
 
     /// 累加该会话「自上次提炼以来的用户回合数」,到阈值则归零并返回 true(该后台提炼了)。
     /// 纯计数(只改 SessionSlot 瞬态、无 IO),便于单测;真正的提炼由 `spawn_consolidate` 起。
     fn bump_consolidate_due(&self, conv_id: i64) -> bool {
-        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+        let mut sessions = self.sessions.lk();
         let slot = sessions.entry(conv_id).or_default();
         slot.turns_since_consolidate += 1;
         if slot.turns_since_consolidate >= CONSOLIDATE_EVERY_TURNS {
@@ -1843,7 +1843,7 @@ impl Engine {
         }
         // 上次提炼还没跑完 = 跳过这轮(防并发重复落库;flag 持在会话槽,spawn 任务跑完清)
         let flag = {
-            let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+            let mut sessions = self.sessions.lk();
             sessions.entry(conv_id).or_default().consolidating.clone()
         };
         if flag.swap(true, Ordering::AcqRel) {
@@ -1884,7 +1884,7 @@ impl Engine {
             return; // 随主动关怀总开关收口(§3 一个开关,不添新概念)
         }
         {
-            let sessions = self.sessions.lock().expect("sessions lock poisoned");
+            let sessions = self.sessions.lk();
             let busy = sessions
                 .values()
                 .any(|slot| slot.inflight.as_ref().is_some_and(|h| !h.join.is_finished()));
@@ -2314,7 +2314,7 @@ impl Engine {
     pub async fn llm_balance(&self) -> Option<crate::llm::AccountBalance> {
         // 锁内只取 Arc 快照,await 在锁外(RwLock guard 不能跨 await)
         let (provider_id, provider) = {
-            let candidates = self.llm.read().expect("llm lock poisoned");
+            let candidates = self.llm.rd();
             candidates.first().map(|(id, p)| (id.clone(), p.clone()))
         }?;
         let balance = provider.balance().await?;
@@ -2332,7 +2332,7 @@ impl Engine {
     /// 幂等取消:没在飞 = no-op。await 旧回合收尾(partial 落库完成)后才返回。
     pub async fn cancel(&self, conv_id: i64) {
         let handle = {
-            let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+            let mut sessions = self.sessions.lk();
             sessions.get_mut(&conv_id).and_then(|slot| slot.inflight.take())
         };
         if let Some(h) = handle {
@@ -2361,7 +2361,7 @@ impl Engine {
                 outcome: crate::bus::TurnOutcome::Done,
             }));
         };
-        let candidates = self.llm.read().expect("llm lock poisoned").clone();
+        let candidates = self.llm.rd().clone();
         if candidates.is_empty() {
             tracing::info!(conv = conv_id, "旁听仲裁:没有可用大脑,放弃");
             dismissed(&self.bus);
@@ -2369,7 +2369,7 @@ impl Engine {
         }
         // 忙检(wake_turn 同款 is_finished):在飞就放弃 —— 别为仲裁打断真对话
         {
-            let sessions = self.sessions.lock().expect("sessions lock poisoned");
+            let sessions = self.sessions.lk();
             let busy = sessions
                 .get(&conv_id)
                 .and_then(|s| s.inflight.as_ref())
@@ -2492,7 +2492,7 @@ impl Engine {
         self.cancel(conv_id).await;
 
         // 2. 前置检查:候选快照(失序读快照,reload 不阻塞在飞回合)
-        let candidates = self.llm.read().expect("llm lock poisoned").clone();
+        let candidates = self.llm.rd().clone();
         if candidates.is_empty() {
             return Err(AppError { kind: ErrorKind::NoApiKey, message: "还没有配置 API key".into() });
         }
@@ -2619,12 +2619,12 @@ impl Engine {
     ) -> bool {
         // 取在飞回合的注入句柄(锁内只 clone Arc)
         let inject = {
-            let sessions = self.sessions.lock().expect("sessions lock poisoned");
+            let sessions = self.sessions.lk();
             sessions.get(&conv_id).and_then(|slot| slot.inject.clone())
         };
         let Some(inject) = inject else { return false };
         // 提前拒:已在收尾就别处理了
-        if inject.lock().expect("inject lock poisoned").finishing {
+        if inject.lk().finishing {
             return false;
         }
         // 处理附件(阻塞下沉线程池)→ 就绪形。附件目录先取(cheap PathBuf),move 进闭包写图。
@@ -2639,7 +2639,7 @@ impl Engine {
             Err(_) => return false,
         };
         // 入队(再查一次 finishing:处理期间回合可能已收尾,原子防丢)
-        let mut st = inject.lock().expect("inject lock poisoned");
+        let mut st = inject.lk();
         if st.finishing {
             return false;
         }
@@ -2676,7 +2676,7 @@ impl Engine {
         let inject = Arc::new(Mutex::new(InjectState::default())); // 插队队列:Turn 与 inject 命令共用
         // 计划槽(§6.5):Turn 嗅探 plan_set 后写它;先于 spawn 取,与收尾块用同一个 slot
         let plan = {
-            let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+            let mut sessions = self.sessions.lk();
             sessions.entry(conv_id).or_default().plan.clone()
         };
         let is_overheard = overheard.is_some();
@@ -2720,7 +2720,7 @@ impl Engine {
         //   · **旁听仲裁撞上在飞 → 旁听让路**(它是机会性的,真输入优先 §8.2)——取消刚起的自己,
         //     绝不能反过来把用户真回合杀掉。
         let loser = {
-            let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+            let mut sessions = self.sessions.lk();
             let slot = sessions.entry(conv_id).or_default();
             register_inflight(slot, TurnHandle { token, join }, is_overheard, inject)
         };
@@ -2741,7 +2741,7 @@ impl Engine {
     /// 完成后经全局事件车道喊"会话有动静"。
     /// 返回 false = 目标会话正有在飞回合,本次不打扰(调度器下个 tick 重试)。
     pub async fn wake_turn(&self, job: &crate::store::Job) -> Result<bool, AppError> {
-        let candidates = self.llm.read().expect("llm lock poisoned").clone();
+        let candidates = self.llm.rd().clone();
         if candidates.is_empty() {
             return Err(AppError { kind: ErrorKind::NoApiKey, message: "还没有配置 API key".into() });
         }
@@ -2776,7 +2776,7 @@ impl Engine {
         // 会话只要聊过一次,之后的提醒就被「会话忙」永远无声跳过(2026-07-04 真机实锤:
         // 提醒到点零动静零日志;重启曾侥幸——sessions 是内存态,重启即清)。
         {
-            let sessions = self.sessions.lock().expect("sessions lock poisoned");
+            let sessions = self.sessions.lk();
             let busy = sessions
                 .get(&conv_id)
                 .and_then(|s| s.inflight.as_ref())
@@ -2946,7 +2946,7 @@ impl Engine {
             );
         }
 
-        let candidates = self.llm.read().expect("llm lock poisoned").clone();
+        let candidates = self.llm.rd().clone();
         anyhow::ensure!(!candidates.is_empty(), "还没有配置 API key,派不了活");
         let budget = tail_budget(&candidates);
 
