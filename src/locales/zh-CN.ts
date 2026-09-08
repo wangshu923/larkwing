@@ -425,6 +425,11 @@ export default {
     // reminderSaved / memorySaved = 回执小票(设了提醒/记了记忆,点击去对应页)
     eventDue: '到点了',
     eventDone: '忙完了',
+    // 历史分页(首屏只载最近 200 条):顶部哨兵一行 + 到头一行 + 命中定位后回尾部
+    loadEarlier: '往上翻,看更早的',
+    loadingEarlier: '正在取更早的…',
+    historyStart: '这就是这个话题的开头了',
+    backToLatest: '回到最新',
     reminderSaved: '已记下',
     reminderSavedHint: '到点我会喊你 · 点开看全部提醒',
     memorySaved: '记住了',

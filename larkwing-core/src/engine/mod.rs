@@ -1027,7 +1027,17 @@ impl Engine {
         Ok(list)
     }
 
-    pub fn load_conversation(&self, conv_id: i64) -> Result<Vec<Message>, AppError> {
+    /// 载一页消息(默认最新一页)。`cursor` 见 `store::chat::MsgCursor`:向上翻页给 `before`、
+    /// 搜索命中定位给 `around`。**三个读命令共用同一游标**,所以同一页的读数与轨迹也对得上。
+    ///
+    /// ⚠️ 分页的固有边界:`mark_triggered` 与轨迹的 tool_call↔result 配对都靠「整段消息序列」
+    /// 推,页首若把 event→assistant 或 call→result 劈开,那一处标记 / 配对会缺(只影响显示,
+    /// 不影响数据)。首屏那页永远完整,只有翻上去的页边界可能撞到。
+    pub fn load_conversation(
+        &self,
+        conv_id: i64,
+        cursor: crate::store::chat::MsgCursor,
+    ) -> Result<Vec<Message>, AppError> {
         // 从消息 payload(UserMeta JSON)解出声纹 / 渠道归人写入的说话人 id(共用同一字段)。
         fn parse_speaker_user(payload: &str) -> Option<i64> {
             serde_json::from_str::<UserMeta>(payload).ok().and_then(|m| m.speaker_user)
@@ -1045,7 +1055,7 @@ impl Engine {
                 }
             }
         }
-        let mut msgs = self.store.chat.recent_messages(conv_id, 200)?;
+        let mut msgs = self.store.chat.page(conv_id, cursor)?;
         // 「谁说的」显名:user 行说话人若非会话归属者(家人插话 / 声纹 / 渠道归人)→ 填名字;
         // 归属者自己说的不标(是「我」)。声纹与渠道共用 payload.speaker_user,一套覆盖两者。
         //
@@ -2142,14 +2152,18 @@ impl Engine {
     /// 历史/提醒气泡的 hover 读数(PLAN §11 D):把库里每回合的用量映射到对应的
     /// assistant 气泡 id —— 前端 load 会话后回填,让自启回合/历史消息也能 hover 看读数
     /// (在飞回合仍由 TurnEvent::Usage 实时常显,不走这条)。
-    pub fn conversation_stats(&self, conv_id: i64) -> Result<Vec<MsgStats>, AppError> {
+    pub fn conversation_stats(
+        &self,
+        conv_id: i64,
+        cursor: crate::store::chat::MsgCursor,
+    ) -> Result<Vec<MsgStats>, AppError> {
         let rollups = self.store.usage.rounds_by_turn(conv_id)?;
         if rollups.is_empty() {
             return Ok(vec![]);
         }
         // 回合锚点(user/event 行 id)→ 该回合"代表气泡"= 其后最后一条有内容的 assistant
         // (跨过中途的纯 tool_call 空 assistant 行;event 行是自启回合锚点,与 round.user_msg_id 对齐)
-        let msgs = self.store.chat.recent_messages(conv_id, 200)?;
+        let msgs = self.store.chat.page(conv_id, cursor)?;
         let mut key_to_assistant: HashMap<i64, i64> = HashMap::new();
         let mut cur: Option<i64> = None;
         for m in &msgs {
@@ -2193,7 +2207,11 @@ impl Engine {
     /// 丢(「调了工具但收尾无可见文字」整段丢轨迹的根因);② `idx_by_call` 整段不清 →
     /// tool 结果行(排在声明它的 assistant 行之后)一定回填得上(旧实现遇「同轮先说话再调工具」
     /// 当场结算复位、结果丢失);③ 同轮文字 + 工具时工具归下一气泡,与 live 封口顺序一致。
-    pub fn conversation_trace(&self, conv_id: i64) -> Result<Vec<TurnTrace>, AppError> {
+    pub fn conversation_trace(
+        &self,
+        conv_id: i64,
+        cursor: crate::store::chat::MsgCursor,
+    ) -> Result<Vec<TurnTrace>, AppError> {
         // 收一回合:尾部未封口的条目折进最后一个可见气泡(有锚才折,无锚 = 静默回合,丢弃),
         // 再把各段非空者落成 TurnTrace。idx 一并清,跨回合不串。
         fn flush_turn(
@@ -2216,7 +2234,7 @@ impl Engine {
             idx.clear();
         }
 
-        let msgs = self.store.chat.recent_messages(conv_id, 200)?;
+        let msgs = self.store.chat.page(conv_id, cursor)?;
         let mut out = Vec::new();
         // 当前(未封口)段:buf 整段不清,tool 结果行排在声明它的 assistant 行之后才到 —— 提前清
         // 就回填不上。封口才把 buf 转入 segments。**一条队列按到达顺序装**,思考与工具天然交错。
@@ -3501,7 +3519,7 @@ mod tests {
         eng.store.chat.append_message(conv.id, "user", "在吗").unwrap();
         eng.store.chat.append_message(conv.id, "assistant", "在的").unwrap();
 
-        let msgs = eng.load_conversation(conv.id).unwrap();
+        let msgs = eng.load_conversation(conv.id, Default::default()).unwrap();
         let find = |c: &str| msgs.iter().find(|m| m.content == c).unwrap().clone();
         assert_eq!(find("主人说的").speaker_name, None, "归属者(主人)自己说的不标名");
         assert_eq!(find("家人说的").speaker_name.as_deref(), Some("小明"), "家人插话标名");
@@ -3705,7 +3723,7 @@ mod tests {
         ch.append_message_full(c, "tool", "开始播放", Some(&toolp("c2", "media_play", "ok"))).unwrap();
         let final_id = ch.append_message(c, "assistant", "正在为你播放").unwrap().id;
 
-        let out = eng.conversation_trace(c).unwrap();
+        let out = eng.conversation_trace(c, Default::default()).unwrap();
         assert_eq!(out.len(), 1, "整回合只一个药丸;得到 {out:?}");
         let tr = &out[0];
         assert_eq!(tr.message_id, final_id, "锚在最后那条可见回复");
@@ -3734,7 +3752,7 @@ mod tests {
         // 收尾轮:说话之前还想了一下
         let fin = ch.append_message_full(c, "assistant", "配好啦", Some(&asst(&[], Some("汇报一下")))).unwrap().id;
 
-        let out = eng.conversation_trace(c).unwrap();
+        let out = eng.conversation_trace(c, Default::default()).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].message_id, fin);
         assert_eq!(
@@ -3764,7 +3782,7 @@ mod tests {
         ch.append_message_full(c, "tool", "已记住", Some(&toolp("c1", "remember", "ok"))).unwrap();
         ch.append_message(c, "assistant", "").unwrap(); // 收尾轮:空文字、无工具
 
-        let out = eng.conversation_trace(c).unwrap();
+        let out = eng.conversation_trace(c, Default::default()).unwrap();
         assert!(out.is_empty(), "全静默回合不产药丸(Option A);得到 {out:?}");
     }
 
@@ -3783,7 +3801,7 @@ mod tests {
         ch.append_message(c, "user", "你好").unwrap();
         ch.append_message(c, "assistant", "你好呀").unwrap();
 
-        let out = eng.conversation_trace(c).unwrap();
+        let out = eng.conversation_trace(c, Default::default()).unwrap();
         assert_eq!(out.len(), 1, "只回合1有药丸,纯文字回合不产;得到 {out:?}");
         assert_eq!(out[0].message_id, t1);
         assert_eq!(sketch(&out[0]), ["media_play"], "回合2没串进回合1");
@@ -3803,7 +3821,7 @@ mod tests {
         ch.append_message_full(c, "tool", "播放中", Some(&toolp("c2", "media_play", "ok"))).unwrap();
         let a3 = ch.append_message(c, "assistant", "放好了").unwrap().id;
 
-        let out = eng.conversation_trace(c).unwrap();
+        let out = eng.conversation_trace(c, Default::default()).unwrap();
         assert_eq!(out.len(), 3, "三个可见气泡各成一段;得到 {out:?}");
         // a1「让我找找」:封口前只有本轮 CoT,本轮声明的 search 归下一气泡
         assert_eq!(out[0].message_id, a1);

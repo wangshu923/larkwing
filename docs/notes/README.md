@@ -6,7 +6,7 @@
 - [影音 · 下载 / 歌词 / BT / ffmpeg / 听音](media-tools.md) — 5 段
 - [回合循环 / 工具运行时 / 上下文与附件](agent-runtime.md) — 9 段
 - [LLM 供应商 / 目录 / 密钥](llm-providers.md) — 4 段
-- [数据目录 / 备份恢复 / 搜索](data-store.md) — 1 段
+- [数据目录 / 备份恢复 / 搜索](data-store.md) — 2 段
 - [文件能力](files.md) — 6 段
 - [web 三件套 / 轻办公原语 / web_render / 确认闸](web-office.md) — 11 段
 - [提醒 / jobs](scheduler.md) — 2 段

@@ -204,9 +204,11 @@ pub async fn list_conversations(state: State<'_, AppState>) -> Result<Vec<Conver
 pub async fn load_conversation(
     state: State<'_, AppState>,
     conv_id: i64,
+    cursor: Option<larkwing_core::store::chat::MsgCursor>,
 ) -> Result<Vec<Message>, AppError> {
     let engine = state.engine.clone();
-    tauri::async_runtime::spawn_blocking(move || engine.load_conversation(conv_id))
+    let cursor = cursor.unwrap_or_default(); // 不给 = 最新一页(前端首屏)
+    tauri::async_runtime::spawn_blocking(move || engine.load_conversation(conv_id, cursor))
         .await
         .map_err(AppError::internal)?
 }
@@ -534,9 +536,11 @@ pub fn usage_conversation(
 pub async fn conversation_stats(
     state: State<'_, AppState>,
     conv_id: i64,
+    cursor: Option<larkwing_core::store::chat::MsgCursor>,
 ) -> Result<Vec<MsgStats>, AppError> {
     let engine = state.engine.clone();
-    tauri::async_runtime::spawn_blocking(move || engine.conversation_stats(conv_id))
+    let cursor = cursor.unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || engine.conversation_stats(conv_id, cursor))
         .await
         .map_err(AppError::internal)?
 }
@@ -546,9 +550,11 @@ pub async fn conversation_stats(
 pub async fn conversation_trace(
     state: State<'_, AppState>,
     conv_id: i64,
+    cursor: Option<larkwing_core::store::chat::MsgCursor>,
 ) -> Result<Vec<larkwing_core::engine::TurnTrace>, AppError> {
     let engine = state.engine.clone();
-    tauri::async_runtime::spawn_blocking(move || engine.conversation_trace(conv_id))
+    let cursor = cursor.unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || engine.conversation_trace(conv_id, cursor))
         .await
         .map_err(AppError::internal)?
 }

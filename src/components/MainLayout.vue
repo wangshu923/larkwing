@@ -40,7 +40,7 @@ const petName = computed(() => settings.get('ui.pet_name') || t('pet.name'))
 const textScale = computed(() => (settings.get('ui.text_scale') === 'large' ? '16.5px' : '14px'))
 const activeRail = ref<'chat' | 'reminders' | 'memory' | 'skills' | 'ops' | 'settings'>('chat')
 
-const { state: chat, send: chatSend, cancel, selectConversation, newConversation, ensureVoiceConv, overheardTargetConv, saveApiKey, dequeue, inject, renameConversation, togglePinConversation, deleteConversation, rollbackTo, forkFrom, voiceConfirmTarget: chatVoiceConfirmTarget } = useChat()
+const { state: chat, send: chatSend, cancel, selectConversation, newConversation, ensureVoiceConv, overheardTargetConv, saveApiKey, dequeue, inject, renameConversation, togglePinConversation, deleteConversation, rollbackTo, forkFrom, loadEarlier: chatLoadEarlier, jumpToMessage, backToLatest: chatBackToLatest, voiceConfirmTarget: chatVoiceConfirmTarget } = useChat()
 const messages = computed(() => chat.messages)
 
 // 日期分隔条文案:今天 / 昨天 / 月-日(跨年带年份)。core 不产文案,这里走 i18n。
@@ -555,10 +555,15 @@ watch(searchQuery, (q) => {
     }
   }, 180)
 })
-async function openHit(convId: number) {
-  await selectConversation(convId)
+async function openHit(hit: SearchHit) {
+  // 从前这里只 selectConversation(= 载最近一页),命中若在 200 条之外,点了**看不到那条**。
+  // 现在载「它周围那一页」并滚过去高亮一下;顶部同时出现「回到最新」。
+  await jumpToMessage(hit.conversation_id, hit.message_id)
   searchQuery.value = ''
   searchHits.value = []
+  await nextTick()
+  const el = streamEl.value?.querySelector('[data-anchor="1"]') as HTMLElement | null
+  if (el) el.scrollIntoView({ block: 'center' })
 }
 
 // 起步建议气泡(发现性,§3.2「替用户说一句话」):空会话(还没用户消息)才显;点一下=替用户发出去。
@@ -773,18 +778,22 @@ onUnmounted(() => {
   window.removeEventListener('keydown', onVoiceKey)
   window.removeEventListener('lw:focus-input', onFocusInput)
 })
-let lastLen = 0
+let lastTailId = 0
 // 贴底跟随:只盯**会撑高气泡**的几个廉价读数,不再 `{ deep: true }` 整棵消息树。
 // 从前是 `watch(messages, …, { deep: true })`:打字机每 16ms 改一次在飞那条的 text,就
 // 深遍历全部消息 + 每条的 trace.items / attachments 一遍(200 行量级),纯为了随后 nextTick
-// 里读一次 scrollHeight。信号取「条数 + 末条的 text/轨迹/附件长度」—— 在飞期间长高的只会
+// 里读一次 scrollHeight。信号取「条数 + 末条的 id/text/轨迹/附件长度」—— 在飞期间长高的只会
 // 是末条(新段 push 在尾部),这几个数覆盖了所有会改变高度的增量;点开「想了想」那类由
 // 用户点击引起的高度变化本来也不该自动贴底。
+//
+// ⚠️ 「新气泡」判据必须是**末条 id 变了**,不能是「条数变了」——「加载更早」往**头部**插一页
+// 也会让条数变,按条数判会把正在翻历史的用户当场拽回底部(等于这个功能白做)。
 watch(
   () => {
     const last = chat.messages[chat.messages.length - 1]
     return [
       chat.messages.length,
+      last?.id ?? 0,
       last?.text.length ?? 0,
       last?.trace?.items.length ?? 0,
       last?.attachments?.length ?? 0,
@@ -794,11 +803,56 @@ watch(
     const s = streamEl.value
     if (!s) return
     // 新气泡无条件贴底;流式增量只在"本来就在底部附近"时跟随,不打断用户翻历史
-    const newBubble = chat.messages.length !== lastLen
-    lastLen = chat.messages.length
+    const tailId = chat.messages[chat.messages.length - 1]?.id ?? 0
+    const newBubble = tailId !== lastTailId
+    lastTailId = tailId
     if (newBubble || s.scrollHeight - s.scrollTop - s.clientHeight < 90) s.scrollTop = s.scrollHeight
   })
 )
+
+// ——「加载更早」:顶部哨兵进视口就取上一页 ——
+const topSentinel = ref<HTMLElement | null>(null)
+let topObs: IntersectionObserver | null = null
+/** 取上一页并**补偿滚动位置**:上方长出内容后,不把 scrollTop 加上新增高度,视口就会跳。 */
+async function loadEarlierKeepingView() {
+  const s = streamEl.value
+  if (!s) return
+  const heightBefore = s.scrollHeight
+  const topBefore = s.scrollTop
+  if (!(await chatLoadEarlier())) return
+  await nextTick()
+  s.scrollTop = topBefore + (s.scrollHeight - heightBefore)
+}
+// 哨兵随 hasEarlier 出现 / 消失(v-if),所以观察器跟着它重挂。
+// 用 IntersectionObserver 而非 scroll 事件:不占滚动主线程;且「插完一页仍没填满视口」时它
+// 会自然再触发一次(loadEarlier 自带防重入与到头闸,不会空转)。
+watch(topSentinel, (el) => {
+  topObs?.disconnect()
+  topObs = null
+  if (!el) return
+  topObs = new IntersectionObserver(
+    (entries) => {
+      if (entries.some((e) => e.isIntersecting)) void loadEarlierKeepingView()
+    },
+    { root: streamEl.value, threshold: 0.05 }
+  )
+  topObs.observe(el)
+})
+onUnmounted(() => topObs?.disconnect())
+
+/** 这一组里是否有搜索命中定位的那条(高亮 + scrollIntoView 的锚)。 */
+function isAnchorGroup(g: StreamGroup): boolean {
+  const id = chat.anchorId
+  return id != null && g.msgs.some((m) => m.id === id)
+}
+
+/** 「回到最新」:从命中定位那页回到会话尾部,并滚到底。 */
+async function backToLatest() {
+  await chatBackToLatest()
+  await nextTick()
+  const s = streamEl.value
+  if (s) s.scrollTop = s.scrollHeight
+}
 </script>
 
 <template>
@@ -852,7 +906,7 @@ watch(
         <button v-if="searchQuery" class="rc-search-clear" @click="searchQuery = ''" :title="t('recents.searchClear')">×</button>
       </div>
       <ul v-if="searchQuery.trim()" class="rc-list rc-results">
-        <li v-for="(h, hi) in searchHits" :key="hi" @click="openHit(h.conversation_id)">
+        <li v-for="(h, hi) in searchHits" :key="hi" @click="openHit(h)">
           <span class="rc-title">{{ h.conversation_title || t('recents.untitled') }}</span>
           <div class="rc-snippet">{{ h.snippet }}</div>
           <span class="rc-time">{{ fmtTime(h.created_at) }}</span>
@@ -960,7 +1014,21 @@ watch(
            下一帧桌宠随 scrollTop 再探出 → 回合在飞时每条思考增量触发一次贴底 = 聊天流无休止往下
            滚进空白(2026-09-04 真机实锤)。 -->
       <div class="stream-wrap">
+      <!-- 命中定位模式:当前看的是「某条消息周围那一页」,给一条回尾部的路。
+           挂在滚动区**外**的同框层(§8.6:悬浮件绝不挂进滚动容器,它的盒子会算进 scrollHeight) -->
+      <button v-if="chat.anchorId != null" class="to-latest" @click="backToLatest">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14" /><path d="M6 13l6 6 6-6" /></svg>
+        <span>{{ t('chat.backToLatest') }}</span>
+      </button>
       <div class="stream" ref="streamEl" @click="onStreamClick">
+        <!-- 顶部哨兵:滚到这儿就取更早的一页(首屏只载最近 200 条)。到头了就换成一行「开头」。
+             用 IntersectionObserver 而非 scroll 事件:不占滚动主线程,且能自然处理「一页太短、
+             装不满视口」的情况(插完仍可见 → 再触发一次,直到填满或到头)。 -->
+        <div v-if="chat.hasEarlier" ref="topSentinel" class="hist-top">
+          <span v-if="chat.loadingEarlier" class="hist-spin"></span>
+          <span>{{ chat.loadingEarlier ? t('chat.loadingEarlier') : t('chat.loadEarlier') }}</span>
+        </div>
+        <div v-else-if="chat.messages.length >= 20" class="hist-top hist-end">{{ t('chat.historyStart') }}</div>
         <template v-for="(g, gi) in streamGroups" :key="g.key">
           <div v-if="g.sep" class="day-sep"><span>{{ g.sep }}</span></div>
           <!-- 自启回合的系统线(event 行):交代"它为什么突然开口"——下面的回复就是它自己
@@ -974,7 +1042,13 @@ watch(
           </div>
           <!-- 气泡:wang 组 = 同一轮的多段(说话→调工具→再说话)合并成**一个**气泡,段间只留
                段落间距,复制/朗读/读数收归组级;逐段的「想了想」/小票跟着各自的段。user 恒单条。 -->
-          <div v-else class="bubble" :class="[g.kind, { cont: g.cont }]" @contextmenu="openBubbleMenu($event, g)">
+          <div
+            v-else
+            class="bubble"
+            :class="[g.kind, { cont: g.cont, anchor: isAnchorGroup(g) }]"
+            :data-anchor="isAnchorGroup(g) ? '1' : undefined"
+            @contextmenu="openBubbleMenu($event, g)"
+          >
           <!-- 说话人显性化:user 标非我的说话人名(家人插话 / 声纹 / 渠道归人)。
                「我」说的 + 旺财的回复都不标,保持干净——只在需要区分时才冒出标签。 -->
           <span v-if="g.kind === 'user' && g.msgs[0].speakerName" class="spk-tag spk-who">{{ g.msgs[0].speakerName }}</span>
@@ -1434,6 +1508,18 @@ watch(
 .receipt-chip svg { width: 12px; height: 12px; flex: none; }
 /* 文本不折行:窄气泡被小票撑宽(到气泡上限),真放不下才省略号截 */
 .receipt-chip .rc-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* —— 历史分页(「加载更早」)——:顶部哨兵一行 + 到头一行 + 命中高亮 + 回尾部浮钮。
+   只用语义 token,换肤跟随;浮钮挂在 .stream-wrap(滚动区外)不影响 scrollHeight(§8.6)。 */
+.hist-top { display: flex; align-items: center; justify-content: center; gap: 7px; padding: 10px 0 4px; color: var(--text-dim); font-size: 11.5px; }
+.hist-end { opacity: .55; }
+.hist-spin { width: 11px; height: 11px; border: 1.5px solid rgba(var(--accent-rgb), .35); border-top-color: var(--accent); border-radius: 50%; animation: hist-spin .7s linear infinite; }
+@keyframes hist-spin { to { transform: rotate(360deg); } }
+/* 搜索命中定位:那条气泡描一圈主题色,不改布局(只动 box-shadow,免得高度变化搅乱刚算好的滚动位) */
+.bubble.anchor { box-shadow: 0 0 0 2px rgba(var(--accent-rgb), .55); }
+.to-latest { position: absolute; right: 16px; bottom: 12px; z-index: 4; display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 999px; border: 1px solid rgba(var(--accent-rgb), .4); background: var(--surface); backdrop-filter: blur(14px); color: var(--accent); font-size: 12px; cursor: pointer; }
+.to-latest:hover { border-color: rgba(var(--accent-rgb), .7); }
+.to-latest svg { width: 13px; height: 13px; }
 
 /* —— 气泡富文本(markdown):wang 回复用,修掉逐字 span 吞换行的老问题 ——
    ⚠️ `.md` **内部**元素的那套排版规则(p / ul / code / pre / a / table…)已搬去

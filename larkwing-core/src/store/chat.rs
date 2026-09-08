@@ -97,6 +97,8 @@ pub struct Message {
 /// 字段保持 snake_case(与 Message/Conversation 一致,前端接口同形)。
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchHit {
+    /// 命中那条消息自己的 id:点搜索结果要跳到它(`MsgCursor.around`)。IPC 增量字段。
+    pub message_id: i64,
     pub conversation_id: i64,
     pub conversation_title: String,
     pub channel: String,
@@ -104,6 +106,20 @@ pub struct SearchHit {
     pub snippet: String,
     pub created_at: i64,
 }
+
+/// 取哪一页消息(UI 分页游标):三个读路径(载会话 / hover 读数 / 「想了想」轨迹)共用同一个
+/// 游标,页大小恒 `UI_PAGE`,所以三者取到的**是同一段消息** —— 翻上去的老气泡照样有读数与轨迹。
+/// 两个字段互斥,`around` 优先;都不给 = 最新一页(= 分页之前的固定行为,前端不传即得)。
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct MsgCursor {
+    /// 只要 id 比它小的(向上翻页,「加载更早」)。
+    pub before: Option<i64>,
+    /// 以这条为中心前后各取半页(搜索命中定位:让命中那条落在页中间、上下都有语境)。
+    pub around: Option<i64>,
+}
+
+/// UI 一页多少条消息。原先是三处各写死的 `recent_messages(conv_id, 200)`,分页后成了页大小。
+pub const UI_PAGE: i64 = 200;
 
 /// 标题默认 = 首条用户消息截断(字符数,不花 LLM)。
 /// LLM 命名(engine/title.rs)以此为占位:后台生成好再 `set_title_if` 静默替换。
@@ -435,6 +451,54 @@ impl ChatRepo {
         })
     }
 
+    /// 按游标取一页(升序返回,与 `recent_messages` 同形)。三个读命令的唯一取料口。
+    pub fn page(&self, conv: i64, cursor: MsgCursor) -> Result<Vec<Message>> {
+        match (cursor.around, cursor.before) {
+            // 命中定位:前后各半页 —— 命中那条落在中间,上下文都看得见
+            (Some(anchor), _) => self.messages_around(conv, anchor, UI_PAGE / 2),
+            (None, Some(before)) => self.messages_before(conv, before, UI_PAGE),
+            (None, None) => self.recent_messages(conv, UI_PAGE),
+        }
+    }
+
+    /// id 严格小于 `before` 的最后 limit 条,升序返回(向上翻页)。
+    /// 走 `idx_messages_conv (conversation_id, id)`,与首屏同一条索引。
+    pub fn messages_before(&self, conv: i64, before: i64, limit: i64) -> Result<Vec<Message>> {
+        self.db.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, conversation_id, role, content, created_at, payload FROM (
+                    SELECT id, conversation_id, role, content, created_at, payload
+                    FROM messages WHERE conversation_id = ?1 AND id < ?2
+                    ORDER BY id DESC LIMIT ?3
+                 ) ORDER BY id ASC",
+            )?;
+            let list = stmt
+                .query_map(rusqlite::params![conv, before, limit], row_to_message)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(list)
+        })
+    }
+
+    /// 以 `anchor` 为中心:它自己 + 之前 `half` 条 + 之后 `half` 条,升序返回。
+    /// anchor 已不在(被回溯截断过)也不报错 —— 照 id 位置取邻域,返回什么算什么。
+    pub fn messages_around(&self, conv: i64, anchor: i64, half: i64) -> Result<Vec<Message>> {
+        // 前半段:含 anchor 自己(id <= anchor 的最后 half+1 条)
+        let mut list = self.messages_before(conv, anchor.saturating_add(1), half + 1)?;
+        self.db.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, conversation_id, role, content, created_at, payload
+                 FROM messages WHERE conversation_id = ?1 AND id > ?2
+                 ORDER BY id ASC LIMIT ?3",
+            )?;
+            let tail = stmt
+                .query_map(rusqlite::params![conv, anchor, half], row_to_message)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            list.extend(tail);
+            Ok(())
+        })?;
+        Ok(list)
+    }
+
     /// 最后 limit 条,升序返回(供 UI 首屏)。
     pub fn recent_messages(&self, conv: i64, limit: i64) -> Result<Vec<Message>> {
         self.db.with(|c| {
@@ -550,7 +614,7 @@ impl ChatRepo {
         let ql = q.to_lowercase();
         self.db.with(|c| {
             let mut stmt = c.prepare(
-                "SELECT m.conversation_id, c.title, c.channel, m.role, m.content, m.created_at
+                "SELECT m.conversation_id, c.title, c.channel, m.role, m.content, m.created_at, m.id
                  FROM messages m JOIN conversations c ON c.id = m.conversation_id
                  WHERE c.user_id = ?1
                    AND m.role IN ('user', 'assistant')
@@ -561,6 +625,7 @@ impl ChatRepo {
                 .query_map(rusqlite::params![user, pattern, limit], |r| {
                     let content: String = r.get(4)?;
                     Ok(SearchHit {
+                        message_id: r.get(6)?,
                         conversation_id: r.get(0)?,
                         conversation_title: r.get(1)?,
                         channel: r.get(2)?,
@@ -681,6 +746,53 @@ mod tests {
         let store = Store::open(&dir.join("t.db")).unwrap();
         let me = store.users.ensure_default_user().unwrap();
         (store, me.id)
+    }
+
+    /// 分页三形:最新一页 / 向上翻 / 命中定位。**升序、不重不漏**是前端 prepend 去重与
+    /// 「装满一页 = 上面可能还有」判据的地基,所以逐条钉住。
+    #[test]
+    fn page_cursor_walks_history_without_gaps_or_overlap() {
+        let (st, me) = store("page-cursor");
+        let conv = st.chat.create_conversation(me, "companion").unwrap();
+        // 25 条:1..=25
+        let ids: Vec<i64> = (1..=25)
+            .map(|i| st.chat.append_message(conv.id, "user", &format!("m{i}")).unwrap().id)
+            .collect();
+
+        // ① 最新一页(游标全空):页大小够大 → 全给,升序
+        let latest = st.chat.page(conv.id, MsgCursor::default()).unwrap();
+        assert_eq!(latest.len(), 25);
+        assert!(latest.windows(2).all(|w| w[0].id < w[1].id), "必须升序");
+        assert_eq!(latest.last().unwrap().content, "m25", "尾部是最新那条");
+
+        // ② 向上翻:严格 id <,不含游标那条本身 → 与上一页首尾相接、不重不漏
+        let page2 = st.chat.messages_before(conv.id, ids[10], 5).unwrap(); // ids[10] = 第 11 条
+        assert_eq!(
+            page2.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            ["m6", "m7", "m8", "m9", "m10"],
+            "取的是它前面 5 条,不含自己"
+        );
+        // 再往上翻一页:接着上一页的最早那条继续
+        let page3 = st.chat.messages_before(conv.id, page2[0].id, 5).unwrap();
+        assert_eq!(page3.last().unwrap().content, "m5", "与上一页严格相接");
+
+        // ③ 命中定位:前后各 half,命中那条落在中间
+        let around = st.chat.messages_around(conv.id, ids[12], 3).unwrap(); // 第 13 条
+        assert_eq!(
+            around.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            ["m10", "m11", "m12", "m13", "m14", "m15", "m16"],
+            "前 3 + 自己 + 后 3"
+        );
+        // around 优先于 before(两者都给时):判据要能真正区分两条路 ——
+        // before 那条只会给 ids[2] 之前的一小段(m1、m2),而 around 会给 anchor 的**邻域**(含它之后的)。
+        let both =
+            st.chat.page(conv.id, MsgCursor { before: Some(ids[2]), around: Some(ids[12]) }).unwrap();
+        assert!(both.iter().any(|m| m.content == "m20"), "around 优先:取的是 anchor 邻域,不是 before 那一小段");
+
+        // ④ 边界:到头了给空(前端据此把 hasEarlier 封掉)、anchor 已不存在也不炸
+        assert!(st.chat.messages_before(conv.id, ids[0], 5).unwrap().is_empty(), "最早那条之前 = 空");
+        let gone = st.chat.messages_around(conv.id, 999_999, 3).unwrap();
+        assert_eq!(gone.last().unwrap().content, "m25", "anchor 不在 → 照 id 位置取邻域,不报错");
     }
 
     #[test]

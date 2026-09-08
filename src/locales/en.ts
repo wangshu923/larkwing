@@ -424,6 +424,11 @@ export default {
     // reminderSaved / memorySaved are receipt chips (reminder set / memory saved, tap → that page)
     eventDue: 'Time’s up',
     eventDone: 'All done',
+    // history paging (first screen loads only the latest 200)
+    loadEarlier: 'Scroll up for earlier messages',
+    loadingEarlier: 'Loading earlier…',
+    historyStart: 'This is the start of the conversation',
+    backToLatest: 'Back to latest',
     reminderSaved: 'Noted',
     reminderSavedHint: 'I’ll call you when it’s time · tap to see all reminders',
     memorySaved: 'Remembered',

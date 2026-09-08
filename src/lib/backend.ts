@@ -45,8 +45,23 @@ export interface Message {
   trigger?: string | null
 }
 
+/** 消息分页游标(对应 Rust `store::chat::MsgCursor`):两字段互斥,`around` 优先;
+ *  都不给 = 最新一页。 */
+export interface MsgCursor {
+  /** 只要 id 比它小的(向上翻页「加载更早」)。 */
+  before?: number
+  /** 以这条为中心前后各取半页(搜索命中定位)。 */
+  around?: number
+}
+
+/** UI 一页多少条消息 —— **与 Rust `store::chat::UI_PAGE` 双源**(改一个要改另一个)。
+ *  前端只拿它做「这一页满了 = 上面可能还有」的判据,省一次「问后端还有没有更早」的 IPC。 */
+export const MSG_PAGE = 200
+
 /** 聊天搜索命中(跨会话):带会话标题/渠道供列表展示;snippet 是截断的展示片段。 */
 export interface SearchHit {
+  /** 命中那条消息的 id:点结果要跳到它(经 MsgCursor.around 载那一页)。 */
+  message_id: number
   conversation_id: number
   conversation_title: string
   channel: string
@@ -1162,15 +1177,20 @@ export const api = {
   usageToday: () => invoke<DayUsage>('usage_today'),
   usageConversation: (convId: number) => invoke<UsageTotals>('usage_conversation', { convId }),
   /** 历史/提醒气泡读数(load 会话后回填,让自启回合也能 hover 看时间/token)。 */
-  conversationStats: (convId: number) => invoke<MsgStats[]>('conversation_stats', { convId }),
+  conversationStats: (convId: number, cursor?: MsgCursor) =>
+    invoke<MsgStats[]>('conversation_stats', { convId, cursor }),
   /** 历史回放的「想了想」轨迹(load 会话后回填到代表气泡)。 */
-  conversationTrace: (convId: number) => invoke<TurnTrace[]>('conversation_trace', { convId }),
+  conversationTrace: (convId: number, cursor?: MsgCursor) =>
+    invoke<TurnTrace[]>('conversation_trace', { convId, cursor }),
   llmBalance: () => invoke<AccountBalance | null>('llm_balance'),
   /** 悬浮窗待机轮播:下个提醒 + 最近一句(余额/今日花费复用 llmBalance/usageToday)。 */
   floatIdle: () => invoke<FloatIdle>('float_idle'),
   newConversation: (channel?: string) => invoke<Conversation>('new_conversation', { channel }),
   listConversations: () => invoke<Conversation[]>('list_conversations'),
-  loadConversation: (convId: number) => invoke<Message[]>('load_conversation', { convId }),
+  /** 载一页消息。不给 cursor = 最新一页(首屏);`before` 向上翻;`around` 命中定位。
+   *  三个读命令(消息 / 读数 / 轨迹)共用同一游标,取到的是同一段消息。 */
+  loadConversation: (convId: number, cursor?: MsgCursor) =>
+    invoke<Message[]>('load_conversation', { convId, cursor }),
   /** 跨会话搜索聊天记录(子串,排除工具/系统行);最近命中在前。 */
   searchMessages: (query: string, limit = 50) =>
     invoke<SearchHit[]>('search_messages', { query, limit }),

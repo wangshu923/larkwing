@@ -5,6 +5,7 @@ import { reactive, watch } from 'vue'
 import {
   api,
   isTauri,
+  MSG_PAGE,
   onAppEvent,
   type AccountBalance,
   type AttachmentRef,
@@ -12,6 +13,7 @@ import {
   type DayUsage,
   type ErrorKind,
   type Message,
+  type MsgCursor,
   type OutAttachment,
   type TraceItem,
   type TraceStep,
@@ -94,6 +96,13 @@ const state = reactive({
    *  在此按终态打标(done=完成 / failed=失败);进入该会话即清。瞬态派生态,不进库、重启清零。 */
   convBadges: {} as Record<number, 'done' | 'failed'>,
   openingLine: '', // 真值来自场景数据(boot);空时显示字典里的 fallback
+  /** 上面还有没有更早的消息(首屏只载最近一页)。判据 = 上一页是否装满 MSG_PAGE。 */
+  hasEarlier: false,
+  /** 正在取更早的一页(顶部转圈 + 防重入)。 */
+  loadingEarlier: false,
+  /** 命中定位模式:非 null = 当前看的是「某条消息周围那一页」而不是尾部
+   *  → 顶部显「回到最新」,并把这条高亮一下。回到最新 / 切会话即清。 */
+  anchorId: null as number | null,
   /** 记账灯带:本回合消耗(工具轮累加)/ 今日累计 / 账户余额;null = 还没数据。 */
   usage: {
     turn: null as UsageDigest | null,
@@ -120,6 +129,16 @@ let listGen = 0
 function setMessages(list: UiMessage[]) {
   listGen++
   state.messages = list
+}
+/** 往**头部**插一页更早的消息(「加载更早」唯一入口)。
+ *  刻意**不动 listGen**:在飞回合的闭包攥着尾部那个 `wang` 对象的引用,而头部插入既没换掉
+ *  数组本身、也没碰尾部元素 —— 引用仍然有效,回合照写照上屏。(整表替换才必须 ++listGen。)
+ *  去重按 id:游标是严格 `id <`,正常不会重叠;真重叠了也宁可丢弃重复的,别出现两条同 id 气泡。 */
+function prependMessages(list: UiMessage[]) {
+  if (!list.length) return
+  const known = new Set(state.messages.map((m) => m.id))
+  const fresh = list.filter((m) => !known.has(m.id))
+  if (fresh.length) state.messages.unshift(...fresh)
 }
 // 在飞的**语音(唤醒)回合**目标会话;null = 当前没有。确认闸(§7.8)据此判「这张确认卡
 // 属于当前语音回合」→ 念出来问 + 开口头确认听音(人可能不在屏幕前);打字/mic 回合只卡片。
@@ -486,10 +505,10 @@ function loadConvUsage(convId: number) {
 
 /** 历史/提醒/自启回合的气泡读数(PLAN §11 D):load 会话后从库回填 stats,让这些气泡
  *  也能 hover 看时间/token(在飞回合走 TurnEvent::Usage 实时常显,不经这里)。 */
-async function hydrateStats(convId: number) {
+async function hydrateStats(convId: number, cursor?: MsgCursor) {
   if (!state.inTauri) return
   try {
-    const list = await api.conversationStats(convId)
+    const list = await api.conversationStats(convId, cursor)
     if (state.convId !== convId) return // 查询期间切走了,别把旧账写到新话题
     const map = new Map(list.map((s) => [s.message_id, s]))
     for (const m of state.messages) {
@@ -512,10 +531,10 @@ async function hydrateStats(convId: number) {
 
 /** 历史/自启回合的「想了想」轨迹(PLAN §9):load 会话后回填到代表气泡
  *  (在飞回合由 TurnEvent 实时攒,不走这条)。 */
-async function hydrateTrace(convId: number) {
+async function hydrateTrace(convId: number, cursor?: MsgCursor) {
   if (!state.inTauri) return
   try {
-    const list = await api.conversationTrace(convId)
+    const list = await api.conversationTrace(convId, cursor)
     if (state.convId !== convId) return
     const map = new Map(list.map((tr) => [tr.message_id, tr]))
     for (const m of state.messages) {
@@ -1205,20 +1224,83 @@ async function selectConversation(convId: number) {
 
 /** 从库重载某会话的消息到视图(切会话用;也给「在飞时被切走又切回」的回合收尾时补上屏用)。
  *  只在它仍是当前会话时才落地 —— 加载期间又切走了就别把旧会话的内容写到新视图上。 */
-async function reloadMessages(convId: number, opts: { openingIfEmpty?: boolean } = {}) {
+async function reloadMessages(
+  convId: number,
+  opts: { openingIfEmpty?: boolean; cursor?: MsgCursor } = {}
+) {
   try {
-    const msgs = await api.loadConversation(convId)
+    const msgs = await api.loadConversation(convId, opts.cursor)
     if (state.convId !== convId) return // 加载期间又切走了
     setMessages(toUiList(msgs))
+    // 分页态:这一页装满了 = 上面可能还有(省一次「还有没有更早」的 IPC);
+    // around 定位那页则一定不在尾部,`anchorId` 由调用方设。
+    state.hasEarlier = msgs.length >= MSG_PAGE
+    state.anchorId = opts.cursor?.around ?? null
     void resolveThumbs() // 历史图缩略图回填
-    void hydrateStats(convId) // 切回的历史会话:气泡 hover 读数从库回填
-    void hydrateTrace(convId) // …和「想了想」轨迹
+    void hydrateStats(convId, opts.cursor) // 切回的历史会话:气泡 hover 读数从库回填
+    void hydrateTrace(convId, opts.cursor) // …和「想了想」轨迹(与消息同一页)
     if (opts.openingIfEmpty && !msgs.length) pushOpening()
     state.mood = 'idle'
   } catch (e) {
     console.error('加载会话失败', e)
     useToast().error(t('toast.actionFailed'))
   }
+}
+
+/** 「加载更早」:取当前最早那条**之前**的一页,插到头部。返回是否真插了东西
+ *  (MainLayout 据此做滚动位置补偿 —— 不补的话视口会因为上方长出内容而跳)。
+ *  防重入 + 到头即封(`hasEarlier=false` 之后顶部哨兵不再触发)。 */
+async function loadEarlier(): Promise<boolean> {
+  if (!state.inTauri || state.loadingEarlier || !state.hasEarlier) return false
+  const convId = state.convId
+  // 升序列表里第一个**正** id 就是最早的库消息(负 id = 开场白/本地占位,不能当游标)
+  const oldest = state.messages.find((m) => m.id > 0)?.id
+  if (!oldest) {
+    state.hasEarlier = false
+    return false
+  }
+  state.loadingEarlier = true
+  try {
+    const cursor: MsgCursor = { before: oldest }
+    const msgs = await api.loadConversation(convId, cursor)
+    if (state.convId !== convId) return false // 取的期间切走了,别把旧会话的历史插进新视图
+    state.hasEarlier = msgs.length >= MSG_PAGE
+    if (!msgs.length) return false
+    prependMessages(toUiList(msgs))
+    void resolveThumbs()
+    void hydrateStats(convId, cursor)
+    void hydrateTrace(convId, cursor)
+    return true
+  } catch (e) {
+    console.error('加载更早的消息失败', e)
+    useToast().error(t('toast.actionFailed'))
+    return false
+  } finally {
+    state.loadingEarlier = false
+  }
+}
+
+/** 跳到某条历史消息(聊天搜索点命中):载「它周围那一页」并进入定位模式。
+ *  与 selectConversation 的区别 = 载的不是尾部那页,所以顶部会出现「回到最新」。 */
+async function jumpToMessage(convId: number, msgId: number) {
+  twFlush()
+  state.queue.splice(0)
+  turnInFlight = false
+  voiceTurnConv = null
+  state.convId = convId
+  delete state.convBadges[convId]
+  loadConvUsage(convId)
+  if (!state.inTauri) return
+  await reloadMessages(convId, { cursor: { around: msgId } })
+}
+
+/** 定位模式回到尾部(「回到最新」)。 */
+async function backToLatest() {
+  if (!state.inTauri) {
+    state.anchorId = null
+    return
+  }
+  await reloadMessages(state.convId)
 }
 
 async function newConversation(channel?: string) {
@@ -1447,5 +1529,5 @@ function fakeStream(msg: UiMessage, full: string, speak = false) {
 export function useChat() {
   void boot()
   wireVoiceActivity()
-  return { state, send, cancel, selectConversation, newConversation, ensureVoiceConv, overheardTargetConv, saveApiKey, dequeue, inject, renameConversation, togglePinConversation, deleteConversation, rollbackTo, forkFrom, voiceConfirmTarget: () => voiceTurnConv }
+  return { state, send, cancel, selectConversation, newConversation, ensureVoiceConv, overheardTargetConv, saveApiKey, dequeue, inject, renameConversation, togglePinConversation, deleteConversation, rollbackTo, forkFrom, loadEarlier, jumpToMessage, backToLatest, voiceConfirmTarget: () => voiceTurnConv }
 }
