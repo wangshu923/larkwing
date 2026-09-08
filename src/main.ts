@@ -2,7 +2,7 @@ import { createApp } from 'vue'
 import './style.css'
 import App from './App.vue'
 import { i18n } from './i18n'
-import { isTauri } from './lib/backend'
+import { api, isTauri } from './lib/backend'
 
 // 收口 WebView 外壳(§3「不暴露/强默认」):消费产品不该露出浏览器自带的右键菜单与刷新。
 // 分两档(用户 2026-06-18 拍板):
@@ -37,4 +37,20 @@ if (isTauri()) {
   }
 }
 
-createApp(App).use(i18n).mount('#app')
+const app = createApp(App)
+
+// 全局错误处理器(AGENT §6.6 点名的抓手,这次补上):Vue **不会**把组件 render / watcher /
+// 生命周期里抛的真实 Error 交给 console.error,只发一条 warn —— 于是 i18n 文案里混进字面
+// `{ } @ |` 这类语法字符时,症状只表现为「某个 tab 点了切不过去」(render 抛错、Vue 保留旧
+// DOM),翻 console 也看不见根因。正式版 WebView 更没有 devtools,不落盘就等于没发生。
+// 这里两条都做:dev 走 console(看得见栈),app 内经 frontend_log 落进 larkwing.log。
+// 刻意**不弹 toast**:走到这儿说明渲染已经坏了,再指望 UI 组件把话说出来不靠谱。
+app.config.errorHandler = (err, _instance, info) => {
+  const e = err as Error
+  console.error(`[vue] ${info}`, err)
+  if (isTauri()) {
+    void api.frontendLog(`${info}: ${e?.message ?? String(err)}\n${e?.stack ?? ''}`)
+  }
+}
+
+app.use(i18n).mount('#app')

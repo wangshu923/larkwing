@@ -1182,7 +1182,7 @@ fn aes_ecb_encrypt(plaintext: &[u8], key: &[u8; 16]) -> Vec<u8> {
     let pad = 16 - (plaintext.len() % 16);
     let mut buf = Vec::with_capacity(plaintext.len() + pad);
     buf.extend_from_slice(plaintext);
-    buf.extend(std::iter::repeat(pad as u8).take(pad));
+    buf.extend(std::iter::repeat_n(pad as u8, pad));
     for chunk in buf.chunks_mut(16) {
         let block = GenericArray::from_mut_slice(chunk);
         cipher.encrypt_block(block);
@@ -1191,7 +1191,7 @@ fn aes_ecb_encrypt(plaintext: &[u8], key: &[u8; 16]) -> Vec<u8> {
 }
 
 fn aes_ecb_decrypt(ciphertext: &[u8], key: &[u8; 16]) -> Result<Vec<u8>> {
-    ensure!(!ciphertext.is_empty() && ciphertext.len() % 16 == 0, "密文长度非 16 的倍数");
+    ensure!(!ciphertext.is_empty() && ciphertext.len().is_multiple_of(16), "密文长度非 16 的倍数");
     let cipher = Aes128::new(GenericArray::from_slice(key));
     let mut buf = ciphertext.to_vec();
     for chunk in buf.chunks_mut(16) {

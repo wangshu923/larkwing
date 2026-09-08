@@ -778,13 +778,10 @@ fn extract_links(doc: &Html, base_url: &str) -> (Vec<PageLink>, usize) {
     (out, total)
 }
 
-/// 按字符数截断(给模型的预算闸)。
+/// 按字符数截断(给模型的预算闸)。算法在 `crate::text::clip` 单源(绝不按字节切),
+/// 这里只定本站点的尾缀话术。
 pub fn clip(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    let cut: String = s.chars().take(max_chars).collect();
-    format!("{cut}…(已截断)")
+    crate::text::clip(s, max_chars, "…(已截断)")
 }
 
 #[cfg(test)]

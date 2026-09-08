@@ -106,7 +106,7 @@ impl Tool for FfmpegRun {
             anyhow::ensure!(
                 args.get("dir")
                     .and_then(serde_json::Value::as_str)
-                    .map_or(true, |s| s.trim().is_empty()),
+                    .is_none_or(|s| s.trim().is_empty()),
                 "给了 dir 没给 output——要产文件就给 output;只探测就都别给"
             );
             let mut reads: Vec<String> =

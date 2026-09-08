@@ -23,6 +23,9 @@ pub enum Component {
     Pdfium,
 }
 
+/// 解包器:(包内目标条目的名字后缀, 解包函数)。`Archive` 挑出哪一支,取用点只管调。
+type Extractor = (&'static str, fn(&Path, &str, &Path) -> Result<()>);
+
 /// 压缩形态:None = 裸二进制;Zip / TarGz = 取出 entry 名以 suffix 结尾的那一个文件。
 enum Archive {
     None,
@@ -241,12 +244,11 @@ impl Components {
         }
 
         // 3. 解压(zip/tgz 包取出目标文件;裸二进制跳过)
-        let extract: Option<(&'static str, fn(&Path, &str, &Path) -> Result<()>)> =
-            match spec.archive {
-                Archive::None => None,
-                Archive::Zip { entry_suffix } => Some((entry_suffix, unzip_entry)),
-                Archive::TarGz { entry_suffix } => Some((entry_suffix, untar_gz_entry)),
-            };
+        let extract: Option<Extractor> = match spec.archive {
+            Archive::None => None,
+            Archive::Zip { entry_suffix } => Some((entry_suffix, unzip_entry)),
+            Archive::TarGz { entry_suffix } => Some((entry_suffix, untar_gz_entry)),
+        };
         if let Some((entry_suffix, extractor)) = extract {
             task.step("step.extract", serde_json::Value::Null);
             let (arc_path, out_path) = (part.clone(), self.dir.join(format!("{}.bin", spec.bin_name)));

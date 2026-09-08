@@ -17,8 +17,8 @@ import { emitPetBehavior, onFloatSay, openExternal, api, isMacOS, type SearchHit
 import { useTasks } from '../composables/useTasks'
 import { resolveActivity, usePetDemoShow, type PetActivity } from '../composables/usePetActivity'
 import { usePetBehavior, type PetBehavior } from '../composables/usePetBehavior'
-import { renderMarkdown } from '../lib/md'
 import { copyText } from '../lib/clipboard'
+import MdText from './MdText.vue'
 import MemoryView from '../views/MemoryView.vue'
 import OpsView from '../views/OpsView.vue'
 import SkillsView from '../views/SkillsView.vue'
@@ -774,14 +774,31 @@ onUnmounted(() => {
   window.removeEventListener('lw:focus-input', onFocusInput)
 })
 let lastLen = 0
-watch(messages, () => nextTick(() => {
-  const s = streamEl.value
-  if (!s) return
-  // 新气泡无条件贴底;流式增量只在"本来就在底部附近"时跟随,不打断用户翻历史
-  const newBubble = chat.messages.length !== lastLen
-  lastLen = chat.messages.length
-  if (newBubble || s.scrollHeight - s.scrollTop - s.clientHeight < 90) s.scrollTop = s.scrollHeight
-}), { deep: true })
+// 贴底跟随:只盯**会撑高气泡**的几个廉价读数,不再 `{ deep: true }` 整棵消息树。
+// 从前是 `watch(messages, …, { deep: true })`:打字机每 16ms 改一次在飞那条的 text,就
+// 深遍历全部消息 + 每条的 trace.items / attachments 一遍(200 行量级),纯为了随后 nextTick
+// 里读一次 scrollHeight。信号取「条数 + 末条的 text/轨迹/附件长度」—— 在飞期间长高的只会
+// 是末条(新段 push 在尾部),这几个数覆盖了所有会改变高度的增量;点开「想了想」那类由
+// 用户点击引起的高度变化本来也不该自动贴底。
+watch(
+  () => {
+    const last = chat.messages[chat.messages.length - 1]
+    return [
+      chat.messages.length,
+      last?.text.length ?? 0,
+      last?.trace?.items.length ?? 0,
+      last?.attachments?.length ?? 0,
+    ].join(',')
+  },
+  () => nextTick(() => {
+    const s = streamEl.value
+    if (!s) return
+    // 新气泡无条件贴底;流式增量只在"本来就在底部附近"时跟随,不打断用户翻历史
+    const newBubble = chat.messages.length !== lastLen
+    lastLen = chat.messages.length
+    if (newBubble || s.scrollHeight - s.scrollTop - s.clientHeight < 90) s.scrollTop = s.scrollHeight
+  })
+)
 </script>
 
 <template>
@@ -1002,11 +1019,11 @@ watch(messages, () => nextTick(() => {
             </div>
             <!-- wang 走富文本(markdown);user 是用户原话,纯文本保留换行、不解析标记 -->
             <template v-if="g.kind === 'wang'">
-              <div class="md" v-html="renderMarkdown(m.text)"></div>
+              <MdText :text="m.text" />
               <!-- show_image 亮的图:段文字后出图卡(live 挂后段、重载派生挂前段,合并组里同一落位) -->
               <div v-if="m.attachments?.length" class="atts atts-wang">
                 <template v-for="(a, ai) in m.attachments" :key="ai">
-                  <img v-if="a.kind === 'image' && a.dataUrl" :src="a.dataUrl" class="att-img" alt="" />
+                  <img v-if="a.kind === 'image' && a.dataUrl" :src="a.dataUrl" class="att-img" alt="" loading="lazy" decoding="async" />
                   <span v-else class="att-chip">
                     <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2" /><path d="M3 16l5-4 4 3 3-2 6 5" /></svg>
                     {{ a.name }}
@@ -1017,7 +1034,7 @@ watch(messages, () => nextTick(() => {
             <template v-else>
               <div v-if="m.attachments?.length" class="atts">
                 <template v-for="(a, ai) in m.attachments" :key="ai">
-                  <img v-if="a.kind === 'image' && a.dataUrl" :src="a.dataUrl" class="att-img" alt="" />
+                  <img v-if="a.kind === 'image' && a.dataUrl" :src="a.dataUrl" class="att-img" alt="" loading="lazy" decoding="async" />
                   <span v-else class="att-chip">
                     <svg v-if="a.kind === 'image'" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2" /><path d="M3 16l5-4 4 3 3-2 6 5" /></svg>
                     <svg v-else viewBox="0 0 24 24"><path d="M6 2h8l4 4v16H6z" /><path d="M14 2v4h4" /></svg>
@@ -1418,26 +1435,15 @@ watch(messages, () => nextTick(() => {
 /* 文本不折行:窄气泡被小票撑宽(到气泡上限),真放不下才省略号截 */
 .receipt-chip .rc-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-/* —— 气泡富文本(markdown):wang 回复用,修掉逐字 span 吞换行的老问题 —— */
+/* —— 气泡富文本(markdown):wang 回复用,修掉逐字 span 吞换行的老问题 ——
+   ⚠️ `.md` **内部**元素的那套排版规则(p / ul / code / pre / a / table…)已搬去
+   `MdText.vue` 的**非 scoped** 块 —— 它们作用在 v-html 产出的元素上,而 scoped CSS
+   给选择器加的 `[data-v-…]` 那些元素一个都没有,写在这里等于**一条都不生效**
+   (2026-09-08 实测:行内 code 无底色、代码块无框、链接是浏览器默认蓝)。
+   留在这里的两条作用于 `.md` 元素**本身**(子组件根节点带父 scope id,照旧命中)。 */
 .md { white-space: normal; }
 /* 合并气泡里的后续段:与前一段(文本/想了想/小票)只留段落级间距,读起来是一条消息 */
 .bubble.wang .md:not(:first-child) { margin-top: 9px; }
-.md > :first-child { margin-top: 0; }
-.md > :last-child { margin-bottom: 0; }
-.md p { margin: 0 0 8px; }
-.md ul, .md ol { margin: 6px 0; padding-left: 20px; }
-.md li { margin: 2px 0; }
-.md h1, .md h2, .md h3, .md h4 { margin: 10px 0 6px; font-weight: 600; line-height: 1.3; }
-.md h1 { font-size: 1.3em; } .md h2 { font-size: 1.18em; } .md h3 { font-size: 1.06em; } .md h4 { font-size: 1em; }
-.md code { font-family: ui-monospace, "SF Mono", monospace; font-size: .9em; background: rgba(var(--accent-rgb), 0.12); padding: 1px 5px; border-radius: 5px; }
-.md pre { background: var(--surface-deep); border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; overflow-x: auto; margin: 8px 0; }
-.md pre code { background: none; padding: 0; font-size: 12.5px; line-height: 1.5; }
-.md blockquote { margin: 8px 0; padding: 2px 0 2px 12px; border-left: 2px solid var(--line); color: var(--text-dim); }
-.md a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
-.md strong, .md b { font-weight: 600; color: var(--text); }
-.md hr { border: none; border-top: 1px solid var(--line); margin: 10px 0; }
-.md table { border-collapse: collapse; margin: 8px 0; font-size: .94em; }
-.md th, .md td { border: 1px solid var(--line); padding: 4px 8px; text-align: left; }
 /* 用户原话:纯文本,保留换行、不解析 markdown */
 .usertext { white-space: pre-wrap; word-break: break-word; }
 

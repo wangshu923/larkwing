@@ -1236,6 +1236,9 @@ export const api = {
     invoke<void>('media_replay_compat', { pageUrl, audioOnly }),
   /** 前端播放层诊断 → 写进 larkwing.log(正式版无 JS console,真机定位自适应问题靠它)。 */
   mediaLog: (msg: string) => invoke<void>('media_log', { msg }).catch(() => {}),
+  /** 前端未捕获异常 → larkwing.log(§6.6:render 期的错被 Vue 吞成 warn,正式版又没 console)。
+   *  唯一调用点 = main.ts 的 app.config.errorHandler;吞掉自身失败,绝不在错误处理里再抛错。 */
+  frontendLog: (msg: string) => invoke<void>('frontend_log', { msg }).catch(() => {}),
   /** boot 时把**这台机器的解码能力**告诉 core(P1):解得动什么由 WebView 自己回答,
    *  不再由 Rust 按白名单猜。灌不进去 = core 回落白名单(行为同从前),故 fire-and-forget。 */
   setMediaCodecs: (codecs: MediaCodecs) =>

@@ -375,10 +375,6 @@ impl ProviderRegistry {
         &self.specs
     }
 
-    pub fn is_empty_usable(&self) -> bool {
-        !self.specs.iter().any(ProviderSpec::usable)
-    }
-
     /// 选型 = 排序后的候选列表:首位是主选,其余是建连失败时的故障切换顺序。
     /// 规则(引擎内政,UI 永不暴露):
     /// - Thrifty 低档优先 / SmartFirst 高档优先 / Balanced 保持列表序(用户排的顺序即偏好);

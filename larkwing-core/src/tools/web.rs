@@ -616,17 +616,10 @@ impl WebDownload {
     }
 }
 
-/// web_download 的 HTTP 客户端。同步档与后台档共用 UA / 连接超时,**只有总超时不同**:
-/// 同步档 280s(回合内够用);后台档 `None` = 不设总超时 —— 几 GB 的文件跑几十分钟是
-/// 常态,280s 会把它腰斩;停不下来那头由票据取消 + bgtasks 的卡死看门狗兜。
+/// web_download 的 HTTP 客户端 = `net::download_client` 带上浏览器 UA(构造单源在 net,
+/// §4.6;同步档与后台档只差总超时,`None` = 后台档不设总超时,见那边注释)。
 fn download_client(total_timeout: Option<Duration>) -> crate::net::Client {
-    crate::net::Client::new(move |b| {
-        let b = b.user_agent(crate::web::UA).connect_timeout(Duration::from_secs(10));
-        match total_timeout {
-            Some(t) => b.timeout(t),
-            None => b,
-        }
-    })
+    crate::net::download_client(Some(crate::web::UA), total_timeout)
 }
 
 /// 临时件路径:半截下载绝不顶着正式名躺在下载夹里。
@@ -734,14 +727,18 @@ fn ext_for_mime(ct: &str) -> Option<&'static str> {
 
 /// 流式写盘 + 体积硬闸(超限即停,调用方负责清理临时件)。返回写入字节数。
 /// `progress` = 后台档才传:`(票据, 预期总字节)`,每 ~1MB 打一次点(顺带查取消)。
+///
+/// 写盘走 `tokio::fs`(不是 `std::fs`):后台档上限 50GB,慢盘 / NAS 上每次 write 都是可观阻塞,
+/// 而这个循环跑在 tokio worker 线程上 —— 一趟大下载能把整个 worker 按住(§ 效率审计 2026-09-08)。
 async fn stream_to_file(
     mut resp: reqwest::Response,
     dest: &std::path::Path,
     cap: u64,
     progress: Option<(&crate::bgtasks::BgTicket, u64)>,
 ) -> anyhow::Result<u64> {
-    use std::io::Write;
-    let mut f = std::fs::File::create(dest)
+    use tokio::io::AsyncWriteExt;
+    let mut f = tokio::fs::File::create(dest)
+        .await
         .with_context(|| format!("建不了文件 {}", dest.display()))?;
     let mut total: u64 = 0;
     let mut next_beat: u64 = 0;
@@ -752,7 +749,7 @@ async fn stream_to_file(
             "文件超过 {} 上限,已停止",
             super::fs::human_size(cap)
         );
-        f.write_all(&chunk)?;
+        f.write_all(&chunk).await?;
         if let Some((ticket, expect)) = progress {
             if ticket.is_cancelled() {
                 anyhow::bail!("按要求停下了");
@@ -767,7 +764,9 @@ async fn stream_to_file(
             }
         }
     }
-    f.flush()?;
+    // 必须显式 flush:tokio 的 File 自带内部缓冲,不像 std 那样每次 write 直落 OS ——
+    // 少这一下,调用方随后把 `.part` 改名成成品时可能丢掉最后一截。
+    f.flush().await?;
     Ok(total)
 }
 

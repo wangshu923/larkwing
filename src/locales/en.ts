@@ -513,6 +513,8 @@ export default {
     // don't silently drop oversized attachments either (§3.5)
     attTooBig: '“{name}” is over {limit} — it wasn’t attached',
     autoBackupStale: 'Auto backup hasn’t succeeded in a while — check that the backup drive is still there',
+    // don't silently roll a setting back either (§3.5)
+    settingFailed: 'That setting didn’t save — try again?',
   },
   // one-click update (backlog ⑤·A): the "new version" card + manual-check feedback
   update: {

@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Result;
 
-use crate::store::Store;
+// 时间戳单源在 `store::now_ms`(全库统一 unix 毫秒);本模块只借它的短名,不自己再写一份。
+use crate::store::{now_ms, Store};
 
 /// 同时在跑的后台任务上限(2026-07-27 用户拍板 20 = 失控 backstop;满了如实退回不排队)。
 pub const BG_MAX_CONCURRENT: usize = 20;
@@ -34,13 +35,6 @@ const AMBIENT_MAX: usize = 3;
 const NAMES_MAX_CHARS: usize = 2000;
 /// 运行中视图(task_status)保留多少个没成的名字:打印仍按字数截,这里只是别无限攒。
 const MISS_KEEP: usize = 300;
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
 
 /// 点名清单:字数预算内尽量列全,装不下的以「等 N 个」交代总数(token 不随批量大小爆,
 /// 但也别为省几百字把模型变成瞎子——它得答得出「到底是哪几个」)。至少列一个。

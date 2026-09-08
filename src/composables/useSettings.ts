@@ -12,6 +12,10 @@ import {
   type ProviderPatch,
   type ProviderView,
 } from '../lib/backend'
+import { useToast } from './useToast'
+// 用 i18n.global.t 而非 useI18n():这是 composable 模块作用域,不在组件 setup 里。
+// (踩过的坑见 AGENT §6.6:useChat 里局部变量 `t` 遮蔽过 i18n 的 t。)
+import { i18n } from '../i18n'
 
 const DEFAULTS: Record<string, string> = {
   'ui.pet_name': '', // 空 = 用字典里的默认名(pet.name)
@@ -178,6 +182,9 @@ async function set(key: string, value: string) {
   } catch (e) {
     console.error('设置保存失败', key, e)
     state.values[key] = prev // 回滚,UI 与库不分叉
+    // §3.5 / §6.6:用户**主动操作**失败要吭一声。从前只 console.error + 静默回滚,
+    // 正式版没 console —— 用户点了开关、看它自己弹回去,只当是自己手滑。
+    useToast().error(i18n.global.t('toast.settingFailed'))
   }
 }
 

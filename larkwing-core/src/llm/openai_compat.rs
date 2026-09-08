@@ -342,10 +342,6 @@ fn parse_chunk(
     events
 }
 
-fn truncate_chars(s: &str, max: usize) -> String {
-    s.chars().take(max).collect()
-}
-
 #[async_trait::async_trait]
 impl LlmProvider for OpenAiCompatProvider {
     fn model_id(&self) -> &str {
@@ -414,7 +410,8 @@ impl LlmProvider for OpenAiCompatProvider {
                 401 | 403 => LlmError::BadApiKey,
                 s => LlmError::Api {
                     status: s,
-                    message: truncate_chars(&message, 500),
+                    // 纯截断不加尾缀(尾缀会被当成上游报文的一部分读)
+                    message: crate::text::clip(&message, 500, ""),
                 },
             });
         }

@@ -347,13 +347,11 @@ async fn resolve_for_download(
     }
 }
 
-/// 下载客户端:与页面抓取(15s 总超时)分家,大文件要时间。§4.6 统一走 net::Client
-/// (墙内 CDN 直连优先);防盗链 Referer/UA 由 yt-dlp 给、请求时原样带上,不在客户端层写死。
+/// 下载客户端:与页面抓取(15s 总超时)分家,大文件要时间。构造单源 `net::download_client`
+/// (§4.6 统一走 net::Client,墙内 CDN 直连优先);**不设 UA** —— 防盗链 Referer/UA 由
+/// yt-dlp 给、请求时原样带上,不在客户端层写死。
 fn download_client() -> crate::net::Client {
-    crate::net::Client::new(|b| {
-        b.connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(280))
-    })
+    crate::net::download_client(None, Some(std::time::Duration::from_secs(280)))
 }
 
 /// 字幕拉取用的防盗链头(首路流的头;字幕与流同站,同一套 Referer/UA 无害够用)。
@@ -540,13 +538,18 @@ fn audio_ext(up: &UpStream) -> (&'static str, bool) {
 }
 
 /// 流式落盘(硬闸按实际字节数,不信服务器自报)。
+///
+/// 写盘走 `tokio::fs`:这个循环跑在 tokio worker 上,慢盘 / NAS 的同步 write 会把 worker
+/// 按住(§ 效率审计 2026-09-08)。tokio 的 File 有内部缓冲 → 末尾那次 `flush` 必须保留,
+/// 否则调用方改名成品时可能丢最后一截。
 async fn stream_to_part(
     mut resp: reqwest::Response,
     dest: &Path,
     cap: u64,
 ) -> Result<u64> {
-    use std::io::Write;
-    let mut f = std::fs::File::create(dest)
+    use tokio::io::AsyncWriteExt;
+    let mut f = tokio::fs::File::create(dest)
+        .await
         .with_context(|| format!("建不了文件 {}", dest.display()))?;
     let mut total: u64 = 0;
     while let Some(chunk) = resp.chunk().await.context("下载中断")? {
@@ -556,9 +559,9 @@ async fn stream_to_part(
             "音频文件超过 {} 上限,已停止",
             crate::files::human_size(cap)
         );
-        f.write_all(&chunk)?;
+        f.write_all(&chunk).await?;
     }
-    f.flush()?;
+    f.flush().await?;
     Ok(total)
 }
 

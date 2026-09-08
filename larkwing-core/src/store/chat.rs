@@ -37,6 +37,16 @@ pub const MIGRATIONS: &[Migration] = &[
         "0007_conversations_pinned",
         "ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;",
     ),
+    // 时间轴索引(2026-09-08 效率审计):`messages` 只增不删,而三条**跨会话按时刻**的查询
+    // (`messages_between` / `last_message_at` / `count_user_messages_between`)原先只能全表扫 ——
+    // 唯一的索引 `idx_messages_conv` 前导列是 conversation_id,按 created_at 过滤用不上它。
+    // 调用方 = 家庭日记水位线(每 5 分钟真跑一次),而 `Db::with` 是**单连接互斥锁**:扫全表
+    // 期间同时刻的回合落库全在锁上排队。加这条索引后 `MAX(created_at)` 变成一次索引端点查、
+    // 区间过滤变成范围扫。纯读侧优化,语义零变化。
+    m(
+        "0034_messages_created_index",
+        "CREATE INDEX idx_messages_created ON messages (created_at);",
+    ),
 ];
 
 /// 会话渠道(渠道=数据):列保持开放 TEXT 让未来渠道当数据加,已知值给常量防拼错。
@@ -687,6 +697,46 @@ mod tests {
         assert_eq!(derive_title(&long).chars().count(), TITLE_MAX_CHARS);
         assert_eq!(derive_title("。。。"), "。。。"); // 首字符即标点 → 退回整行,不出空标题
         assert_eq!(derive_title(""), "");
+    }
+
+    /// 三条**跨会话按时刻**的查询(家庭日记水位线每 5 分钟真跑一次)必须吃到
+    /// `idx_messages_created`(迁移 0034)——`messages` 只增不删,全表扫会攥着
+    /// `Db::with` 那把单连接锁,把同时刻的回合落库一起拖住(§ 效率审计 2026-09-08)。
+    /// 用 `EXPLAIN QUERY PLAN` 钉死:计划里必须点名这条索引、且不出现对 messages 的全表 SCAN。
+    #[test]
+    fn created_at_queries_ride_the_time_index() {
+        let (store, user) = store("created-idx");
+        let conv = store.chat.create_conversation(user, "companion").unwrap();
+        store.chat.append_message(conv.id, "user", "垫一条,别让计划器面对空表").unwrap();
+
+        let plan = |sql: &str| -> String {
+            store
+                .chat
+                .db
+                .with(|c| {
+                    let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                    let rows = stmt
+                        .query_map([], |r| r.get::<_, String>(3))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(rows.join(" | "))
+                })
+                .unwrap()
+        };
+        for sql in [
+            // last_message_at
+            "SELECT MAX(created_at) FROM messages",
+            // count_user_messages_between
+            "SELECT COUNT(*) FROM messages WHERE created_at >= 1 AND created_at < 2 \
+             AND role = 'user' AND content <> ''",
+            // messages_between
+            "SELECT id FROM messages WHERE created_at >= 1 AND created_at < 2 \
+             AND role IN ('user','assistant') AND content <> '' \
+             ORDER BY created_at ASC, id ASC LIMIT 3",
+        ] {
+            let p = plan(sql);
+            assert!(p.contains("idx_messages_created"), "该走时间索引,实际计划:{p}\nSQL: {sql}");
+            assert!(!p.contains("SCAN messages"), "不该全表扫,实际计划:{p}\nSQL: {sql}");
+        }
     }
 
     #[test]

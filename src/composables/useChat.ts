@@ -171,17 +171,26 @@ function toUi(m: Message): UiMessage {
  *  填进 dataUrl(经 reactive 代理改 → 触发重渲染)。取不到就留名字兜底,不炸。 */
 async function resolveThumbs() {
   if (!state.inTauri) return
+  // 并发取:从前是逐张 `await`(串行 IPC),图多的历史会话开起来要等 N 个往返。
+  // 每张自己 catch —— 取不到的那张留「📷 名字」兜底,绝不因一张失败拖累其余(§3.5)。
+  const pending: Promise<void>[] = []
   for (const m of state.messages) {
     for (const a of m.attachments ?? []) {
       if (a.kind === 'image' && a.file && !a.dataUrl) {
-        try {
-          a.dataUrl = await api.attachmentUrl(a.file)
-        } catch {
-          /* 取不到(文件被清 / relay 没起)→ 留「📷 名字」,不影响其它 */
-        }
+        pending.push(
+          api
+            .attachmentUrl(a.file)
+            .then((url) => {
+              a.dataUrl = url
+            })
+            .catch(() => {
+              /* 取不到(文件被清 / relay 没起)→ 留「📷 名字」,不影响其它 */
+            })
+        )
       }
     }
   }
+  await Promise.all(pending)
 }
 
 /** 内部行不进聊天流:'tool' 行、空话的 assistant 行(纯 tool_call 轮)、__IGNORE__ 行

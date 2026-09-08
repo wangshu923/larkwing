@@ -261,7 +261,13 @@ pub(crate) async fn run(
         return Ok(0);
     }
     let from_ms = wm.max(upper - LOOKBACK_MAX_DAYS * 86_400_000);
-    let materials = collect_materials(store, from_ms, upper)?;
+    // 取料是这条路上最重的一段(逐日查 + 全家名字),挪进阻塞线程池(§6.2 Repo 全同步、
+    // 异步调用方自己 spawn_blocking)。**只搬取料**:水位线的读 / 写与各道早退闸留在原处、
+    // 顺序一字不动 —— 那几步是这个函数的语义骨架,搬动它们的收益不值那份风险。
+    let materials = {
+        let store = store.clone();
+        tokio::task::spawn_blocking(move || collect_materials(&store, from_ms, upper)).await??
+    };
     if materials.is_empty() {
         set_wm(upper)?; // 没开机/没动静的日子:直接翻篇,不烧钱
         return Ok(0);

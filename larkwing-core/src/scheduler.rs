@@ -219,7 +219,7 @@ async fn tick_cond(
 
     // 命中:静音时段(夜里)顺延到早上,不半夜喊人
     let hour = Local.timestamp_millis_opt(now).single().map(|t| t.hour()).unwrap_or(12);
-    if hour >= QUIET_START_HOUR || hour < QUIET_END_HOUR {
+    if in_quiet_hours(hour) {
         advance(engine, job.id, next_8am(now)).await?;
         tracing::info!(job = job.id, "条件满足但在静音时段,顺延到早上");
         return Ok(());
@@ -243,6 +243,12 @@ async fn advance(engine: &Engine, id: i64, next: i64) -> anyhow::Result<()> {
     let store = engine.store().clone();
     tokio::task::spawn_blocking(move || store.jobs.advance(id, next)).await??;
     Ok(())
+}
+
+/// 这个钟点在静音时段里吗。静音窗**跨零点**(22:00–08:00),所以写成「不在白天那一段里」——
+/// `hour >= 22 || hour < 8` 与 `!(8..22).contains(&hour)` 同义,后者过 clippy(manual_range_contains)。
+fn in_quiet_hours(hour: u32) -> bool {
+    !(QUIET_END_HOUR..QUIET_START_HOUR).contains(&hour)
 }
 
 /// now 之后最近的本地 08:00(静音时段顺延用)。
@@ -269,6 +275,17 @@ mod tests {
 
     fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> i64 {
         Local.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap().timestamp_millis()
+    }
+
+    /// 静音窗跨零点:22/23/0…7 点算静音,8…21 点不算(边界两头都钉住)。
+    #[test]
+    fn quiet_hours_wrap_around_midnight() {
+        for h in [22, 23, 0, 3, 7] {
+            assert!(in_quiet_hours(h), "{h} 点该算静音");
+        }
+        for h in [8, 12, 21] {
+            assert!(!in_quiet_hours(h), "{h} 点不该算静音");
+        }
     }
 
     #[test]

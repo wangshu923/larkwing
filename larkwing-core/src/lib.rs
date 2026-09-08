@@ -24,6 +24,8 @@ pub mod scheduler;
 pub mod skills_builtin;
 pub mod store;
 pub mod tasks;
+// 文本小工具(按字符截断的单一真相源);crate 内部件,不过桥。
+pub(crate) mod text;
 pub mod tools;
 pub mod usage;
 pub mod voice;

@@ -15,6 +15,7 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
+use std::time::Duration;
 
 #[derive(Default)]
 struct Global {
@@ -155,6 +156,36 @@ impl Client {
         Err(last_err.expect("两趟里至少一趟产生了传输错误"))
     }
 }
+
+/// 大文件下载专用的 `Client`(**构造单源**:web_download 与音乐下载两处曾各写一份)。
+///
+/// - **连接超时固定 10s**:死链快失败,别让用户干等。
+/// - `total_timeout = Some(t)`:回合内同步档(现两处都是 280s,回合内够用)。
+/// - `total_timeout = None`:后台档**不设总超时** —— 几 GB 的文件跑几十分钟是常态,
+///   总超时会把它腰斩;停不下来那头由票据取消 + bgtasks 的卡死看门狗兜。
+/// - `ua = Some(…)`:抓页面那一路要装成浏览器;`None` = 不设 UA
+///   (音乐下载的防盗链 Referer/UA 由 yt-dlp 逐请求给,客户端层不写死)。
+///
+/// 走这里 = 仍是 `net::Client`(§4.6 出站唯一接缝:全局代理总开关 / 直连优先 / per-host sticky)。
+pub(crate) fn download_client(
+    ua: Option<&'static str>,
+    total_timeout: Option<Duration>,
+) -> Client {
+    Client::new(move |b| {
+        let b = b.connect_timeout(Duration::from_secs(DOWNLOAD_CONNECT_TIMEOUT_SECS));
+        let b = match ua {
+            Some(u) => b.user_agent(u),
+            None => b,
+        };
+        match total_timeout {
+            Some(t) => b.timeout(t),
+            None => b,
+        }
+    })
+}
+
+/// 下载类连接超时(单源;见 `download_client`)。
+const DOWNLOAD_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 /// 渲染后的错误/日志文本里把 URL 携带的凭证抹掉(**唯一收口**,2026-08-22)。
 ///

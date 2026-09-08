@@ -117,8 +117,8 @@ impl TtsEngine for SherpaVits {
 pub type CloneResolver =
     std::sync::Arc<dyn Fn(&str) -> Result<(std::path::PathBuf, String)> + Send + Sync>;
 
-/// 本地零样本音色克隆(ZipVoice,k2-fsa;PLAN §11 D-clone):参考音 prompt_audio(5-30s)
-/// + 文字稿 prompt_text 在生成时传入 → 克隆任意说话人,**免训练**;中英双语 distill int8,
+/// 本地零样本音色克隆(ZipVoice,k2-fsa;PLAN §11 D-clone):参考音 prompt_audio(5-30s) +
+/// 文字稿 prompt_text 在生成时传入 → 克隆任意说话人,**免训练**;中英双语 distill int8,
 /// 跨语种(英文参考音说中文)亦可。出 wav(同 melo,免 mp3 编码)。模型贵,加载一次进 OnceCell。
 /// `voice` 参数 = `clone:<id>`,由 `resolve` 闭包查 (参考音 wav 路径, 文字稿)。
 pub struct ZipVoiceTts {
@@ -442,9 +442,117 @@ pub fn cache_key(voice: &str, rate_pct: i32, text: &str) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+// ---------------------------------------------------------------------------
+// 缓存管护(§6.9「可重建缓存不进库、走文件」的另一半:也不能只增不减)
+// ---------------------------------------------------------------------------
+//
+// `<数据根>/voice/tts/` 按 `cache_key` 落盘,原先**全模块零淘汰逻辑** —— 常驻 app 每天
+// 用语音应答,长期只涨不落。这里补一道按总大小封顶的清扫:超限就从**最旧的**删起
+// (mtime 近似 LRU),降到水位线以下即停。
+//
+// ⚠️ 下面三个常量是**保守起步值,待用户拍板**(§4.11 写死的产品默认值)。单源在此。
+
+/// 缓存总大小上限。家用一天几十句、每句几十 KB —— 512MB 够放上万句;真占满说明用法变了
+/// (长文朗读之类),届时再调。
+pub const CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+/// 超限时删到「上限的百分之几」为止。一次腾出余量,免得每次合成都贴着阈值反复扫。
+pub const CACHE_LOW_WATER_PCT: u64 = 80;
+/// **保护期**:这么新的文件一律不删(哪怕超限)。正在播的那一份、启动预合成的应答音银行
+/// 都落在保护期内 —— 删掉正在播的会让那一次播放失败,故「宁可少删」。
+pub const CACHE_MIN_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+/// 至多多久扫一遍(清扫挂在「有新文件落盘」之后,故没在合成就完全不扫)。
+pub const CACHE_SWEEP_EVERY_MS: i64 = 6 * 60 * 60 * 1000;
+
+/// 缓存目录里的一份文件(纯数据,便于把「该删哪些」做成纯函数单测)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheEntry {
+    /// 文件名(不含目录;清扫只回报名字,由调用方拼路径去删)。
+    pub name: String,
+    pub bytes: u64,
+    /// 距今多久(秒)。mtime 取不到的按 0 = 当最新的看待(宁可少删)。
+    pub age_secs: u64,
+}
+
+/// 该删哪些缓存文件(**纯函数,不碰文件系统**)。
+///
+/// - 总量 ≤ `max_bytes` → 一个都不删(常态,一行 `read_dir` 的开销就到底了);
+/// - 超了 → 只在「够旧」(`age_secs >= min_age_secs`)的候选里,按**最旧优先**删,
+///   降到水位线(`max_bytes` 的 `CACHE_LOW_WATER_PCT`%)以下即停;
+/// - 候选删完仍超限 → **就这样**,一个新文件都不动(宁可少删,见 `CACHE_MIN_AGE_SECS`)。
+///
+/// 同龄之间按文件名定序 → 结果确定、可断言。
+pub fn plan_cache_eviction(
+    entries: &[CacheEntry],
+    max_bytes: u64,
+    min_age_secs: u64,
+) -> Vec<String> {
+    let mut total: u64 = entries.iter().map(|e| e.bytes).sum();
+    if total <= max_bytes {
+        return Vec::new();
+    }
+    let target = max_bytes / 100 * CACHE_LOW_WATER_PCT;
+    let mut cands: Vec<&CacheEntry> =
+        entries.iter().filter(|e| e.age_secs >= min_age_secs).collect();
+    // 最旧优先(age 大的先删);同龄按名字,保证结果确定。
+    cands.sort_by(|a, b| b.age_secs.cmp(&a.age_secs).then_with(|| a.name.cmp(&b.name)));
+    let mut doomed = Vec::new();
+    for e in cands {
+        if total <= target {
+            break;
+        }
+        total = total.saturating_sub(e.bytes);
+        doomed.push(e.name.clone());
+    }
+    doomed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(name: &str, bytes: u64, age_secs: u64) -> CacheEntry {
+        CacheEntry { name: name.to_string(), bytes, age_secs }
+    }
+
+    /// 没超限 = 一个都不删(绝大多数时候走这条)。
+    #[test]
+    fn eviction_keeps_everything_under_the_cap() {
+        let e = vec![entry("a", 40, 999), entry("b", 40, 999)];
+        assert!(plan_cache_eviction(&e, 100, 0).is_empty());
+        // 正好等于上限也不删
+        assert!(plan_cache_eviction(&e, 80, 0).is_empty());
+    }
+
+    /// 超限:最旧优先,删到水位线(上限 80%)以下就停 —— 不会一路删空。
+    #[test]
+    fn eviction_drops_oldest_first_down_to_low_water() {
+        let e = vec![
+            entry("new", 30, 100),
+            entry("old", 30, 900),
+            entry("mid", 30, 500),
+            entry("oldest", 30, 1000),
+        ];
+        // 总 120 > 100,水位线 = 80 → 要腾出 ≥40 → 删两个最旧的
+        assert_eq!(plan_cache_eviction(&e, 100, 0), vec!["oldest", "old"]);
+    }
+
+    /// 保护期:够新的一律不删,哪怕删完候选还超限(宁可少删)。
+    #[test]
+    fn eviction_never_touches_files_inside_the_grace_window() {
+        let e = vec![entry("fresh1", 60, 10), entry("fresh2", 60, 20), entry("stale", 10, 999)];
+        // 总 130 > 100:唯一够旧的 stale 删掉也还超限,但新文件一个不碰
+        assert_eq!(plan_cache_eviction(&e, 100, 100), vec!["stale"]);
+        // 全都在保护期内 → 什么都不删
+        let all_fresh = vec![entry("a", 90, 1), entry("b", 90, 2)];
+        assert!(plan_cache_eviction(&all_fresh, 100, 100).is_empty());
+    }
+
+    /// 同龄按名字定序 → 结果确定(否则 read_dir 的顺序会让行为飘)。
+    #[test]
+    fn eviction_is_deterministic_for_same_age() {
+        let e = vec![entry("b", 50, 500), entry("a", 50, 500), entry("c", 50, 500)];
+        assert_eq!(plan_cache_eviction(&e, 100, 0), vec!["a", "b"]);
+    }
 
     #[test]
     fn cache_key_varies_by_voice_rate_text() {

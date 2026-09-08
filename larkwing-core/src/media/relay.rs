@@ -208,6 +208,29 @@ enum Entry {
     Cover(CoverSrc),
 }
 
+impl Entry {
+    /// 这个 entry 常驻堆上多少字节(粗估,只为 `StreamRegistry` 的淘汰排序用,不求精确)。
+    /// 绝大多数臂只有几个 PathBuf / String(几百字节,统一记 `BASE`);真占地方的只有
+    /// `FileAdaptive.video_init`(整份 moov)、`Dash.mpd` 与雪碧图的帧索引。
+    fn weight(&self) -> usize {
+        /// 每个 entry 的固定开销(HashMap 槽 + token String + 几个 PathBuf)的量级。
+        const BASE: usize = 256;
+        BASE + match self {
+            Entry::FileAdaptive { video_init, segments, subs, .. } => {
+                video_init.len()
+                    + segments.len() * std::mem::size_of::<(f64, f64)>()
+                    + subs.len() * std::mem::size_of::<SubSource>()
+            }
+            Entry::Dash { mpd, .. } => mpd.len(),
+            // sheet 是 Arc:多个 entry 可能共享同一份,重复记一点无害(宁可高估早淘汰)。
+            Entry::Sprites { sheet } => {
+                sheet.index.len() * std::mem::size_of::<f64>() + sheet.images.len() * 64
+            }
+            _ => 0,
+        }
+    }
+}
+
 /// 封面从哪来(三条路同一个端点、同一个前端契约)。
 #[derive(Debug, Clone)]
 pub enum CoverSrc {
@@ -254,8 +277,8 @@ const HLS_MAX_SEGMENTS: u64 = 20_000;
 /// 时间量化格(秒):hover 时间先落格再取图 —— 同格不换 URL,光标在几十像素内抖动零请求。
 /// 10s 与视频网站雪碧图的常见间隔同量级;副作用是缩略图最多"旧" 10s,预览够用。
 const THUMB_GRID: f64 = 10.0;
-/// 缩略图缓存上限(张)。**全局有界、不按 token 分**:`streams` 注册表本身从不清理(每次播放
-/// 留一个 entry),挂在 token 下的缓存会随播放次数一起长;全局 FIFO 才封得住。48 张 × ~20KB ≈ 1MB。
+/// 缩略图缓存上限(张)。**全局有界、不按 token 分**:挂在 token 下的缓存会随播放次数一起长;
+/// 全局 FIFO 才封得住。48 张 × ~20KB ≈ 1MB。(`streams` 注册表自己的界见 `STREAMS_MAX_*`。)
 const THUMB_CACHE_MAX: usize = 48;
 /// 单张缩略图字节上限(抽出来的 JPEG 约 10–30KB;超这个数说明参数不对,别把它收进内存)。
 const THUMB_MAX_BYTES: usize = 512 * 1024;
@@ -309,6 +332,56 @@ struct FifoCache<K> {
     order: std::collections::VecDeque<K>,
 }
 
+/* ——— `streams` 注册表的两道界(单源在此;**§4.11 待用户确认**)———
+ * 从前这张表**只增不减**:每次点播留 1–3 个 entry(播放臂 + 缩略图/雪碧图 + 封面),切集、
+ * 切音轨、重放各再留一份;连播一季或歌单循环几天就是几十上百个常驻。轻的 entry 只是几个
+ * PathBuf 无所谓,真占地方的是 `FileAdaptive.video_init`(整份 ftyp+moov,4K 长片能到几 MB)。
+ * 所以按**字节权重**淘汰而不是按条数:`attachment_url` 也在这张表里注册(聊天历史每张图
+ * 一个 `Entry::File`,一条 ~100 字节),按条数一刀切会把老图的 URL 挤成 404、图卡破图。 */
+/// 常驻字节上限:超了就从最老的开始淘汰(FIFO —— 播放是顺序往前走的,老 entry 播完就没人请求)。
+const STREAMS_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// 条数 backstop:字节权重估不准的那类(全是小 entry)也不能无限堆。500 条小 entry ≈ 几十 KB,
+/// 而一屏聊天最多 200 张图 —— 留足余量,正常用永远碰不到,只防「翻了几十个会话」的累积。
+const STREAMS_MAX_ENTRIES: usize = 500;
+/// 淘汰的保底:无论权重多大,最近这么多条一律留着。防「几个巨型 adaptive 就撑爆上限、
+/// 把**正在播的那条**也淘汰掉」——正在播的永远在最近几条里。
+/// **保底优先于上面两道界**:全是巨型 entry 时宁可字节略微超标,也不许淘汰最近这几条。
+const STREAMS_MIN_KEEP: usize = 8;
+
+/// token → entry 的注册表,带 FIFO 有界淘汰(界见上面三个常量)。
+#[derive(Default)]
+struct StreamRegistry {
+    map: HashMap<String, Arc<Entry>>,
+    /// 注册顺序,淘汰从头开始。
+    order: std::collections::VecDeque<String>,
+    /// `map` 里各 entry 的粗估权重之和(见 `Entry::weight`)。
+    bytes: usize,
+}
+
+impl StreamRegistry {
+    fn insert(&mut self, token: String, entry: Arc<Entry>) {
+        self.bytes = self.bytes.saturating_add(entry.weight());
+        if let Some(old) = self.map.insert(token.clone(), entry) {
+            // token 是 sha256 派生、实际不会撞;真撞了也要把旧权重扣回去,别让 bytes 漂。
+            self.bytes = self.bytes.saturating_sub(old.weight());
+        } else {
+            self.order.push_back(token);
+        }
+        while self.map.len() > STREAMS_MIN_KEEP
+            && (self.bytes > STREAMS_MAX_BYTES || self.map.len() > STREAMS_MAX_ENTRIES)
+        {
+            let Some(oldest) = self.order.pop_front() else { break };
+            if let Some(dropped) = self.map.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(dropped.weight());
+            }
+        }
+    }
+
+    fn get(&self, token: &str) -> Option<Arc<Entry>> {
+        self.map.get(token).cloned()
+    }
+}
+
 /// 裁好的缩略图缓存(本地 ffmpeg 抽的帧 / 雪碧图裁的格,同一份)。
 type ThumbCache = FifoCache<(String, u64)>;
 
@@ -341,7 +414,8 @@ impl<K: std::hash::Hash + Eq + Clone> FifoCache<K> {
 
 struct Inner {
     port: u16,
-    streams: Mutex<HashMap<String, Arc<Entry>>>,
+    /// token → entry;**有界**(见 `StreamRegistry` 与 `STREAMS_MAX_*`)。
+    streams: Mutex<StreamRegistry>,
     net: crate::net::Client,
     counter: AtomicU64,
     /// 探出来的视频编码器(硬件优先),整进程探一次缓存;转码点复用,免每次试编码。
@@ -375,7 +449,7 @@ impl Relay {
         let port = listener.local_addr()?.port();
         let inner = Arc::new(Inner {
             port,
-            streams: Mutex::new(HashMap::new()),
+            streams: Mutex::new(StreamRegistry::default()),
             // 上游是大文件流:只设建连超时,不设整体超时(空闲保护靠链路自身断流)。
             // 走统一 net::Client(CLAUDE.md §5):墙内 CDN 直连优先永不代理,未来墙外源(YouTube 等)直连失败自动落代理。
             net: crate::net::Client::new(|b| b.connect_timeout(std::time::Duration::from_secs(10))),
@@ -660,8 +734,8 @@ async fn fetch_head(net: &crate::net::Client, up: &UpStream, cap: u64) -> Option
     Some(buf)
 }
 
-/// 合成一份 on-demand DASH MPD(纯函数,可测):两条单文件流各一个 Representation,用 SegmentBase
-/// + indexRange(sidx)+ Initialization range。shaka 据此 Range 拉 init/index/段、自己管时间轴 →
+/// 合成一份 on-demand DASH MPD(纯函数,可测):两条单文件流各一个 Representation,用 SegmentBase +
+/// indexRange(sidx)+ Initialization range。shaka 据此 Range 拉 init/index/段、自己管时间轴 →
 /// 原生精确 seek + 音画同步。codecs/bandwidth 来自 yt-dlp(缺则给保守默认);音频采样率/声道 shaka
 /// 会从 init 段读真值,故 MPD 不写、免对不上。段地址用相对 `v`/`a`(相对 manifest URL → /dash/{token}/v|a)。
 fn build_mpd(
@@ -759,7 +833,7 @@ fn parse_range(header: Option<&axum::http::HeaderValue>, len: u64) -> RangeSpec 
 }
 
 fn lookup(state: &Inner, token: &str) -> Option<Arc<Entry>> {
-    state.streams.lock().expect("relay streams lock poisoned").get(token).cloned()
+    state.streams.lock().expect("relay streams lock poisoned").get(token)
 }
 
 fn bad(status: StatusCode) -> Response {
@@ -1898,7 +1972,7 @@ mod tests {
     fn tokens_are_unique_and_urls_local() {
         let inner = Arc::new(Inner {
             port: 12345,
-            streams: Mutex::new(HashMap::new()),
+            streams: Mutex::new(StreamRegistry::default()),
             net: crate::net::Client::new(|b| b),
             counter: AtomicU64::new(1),
             hw_encoder: tokio::sync::OnceCell::new(),
@@ -1913,7 +1987,58 @@ mod tests {
         let b = relay.register_direct(UpStream { url: "u2".into(), ..Default::default() });
         assert_ne!(a, b);
         assert!(a.starts_with("http://127.0.0.1:12345/s/"));
-        assert_eq!(relay.inner.streams.lock().unwrap().len(), 2);
+        assert_eq!(relay.inner.streams.lock().unwrap().map.len(), 2);
+    }
+
+    /// 注册表淘汰:轻 entry 按条数 backstop、重 entry 按字节,且**永不淘汰最近 MIN_KEEP 条**
+    /// (正在播的那条恒在其中)。纯内存、不起服务。
+    #[test]
+    fn stream_registry_evicts_by_bytes_and_keeps_recent() {
+        // ① 一堆轻 entry(聊天历史每张图一个 Entry::File):远不到字节上限,只受条数 backstop 管。
+        //    这一条是「按条数一刀切会把老图挤成 404」的回归守卫:500 条以内一个都不许掉。
+        let mut reg = StreamRegistry::default();
+        for i in 0..STREAMS_MAX_ENTRIES {
+            reg.insert(format!("t{i}"), Arc::new(Entry::File(PathBuf::from(format!("/x/{i}.png")))));
+        }
+        assert_eq!(reg.map.len(), STREAMS_MAX_ENTRIES, "没到条数上限,一条都不该淘汰");
+        assert!(reg.get("t0").is_some(), "最老的图 URL 仍然有效");
+        assert!(reg.bytes < STREAMS_MAX_BYTES, "轻 entry 的权重远够不上字节上限");
+        // 再插一条 → 只淘汰最老的那一条
+        reg.insert("extra".into(), Arc::new(Entry::File(PathBuf::from("/x/extra.png"))));
+        assert_eq!(reg.map.len(), STREAMS_MAX_ENTRIES);
+        assert!(reg.get("t0").is_none(), "超出条数上限,最老的被淘汰");
+        assert!(reg.get("extra").is_some());
+
+        // ② 重 entry(FileAdaptive 缓存整份 moov):字节上限先到,老的被淘汰、最新的必须活着。
+        let mut reg = StreamRegistry::default();
+        let heavy = |mb: usize| {
+            Arc::new(Entry::FileAdaptive {
+                path: PathBuf::from("/x/m.mkv"),
+                ffmpeg: PathBuf::from("ffmpeg"),
+                copy_video: true,
+                copy_audio: true,
+                enc: VideoEncoder::Software,
+                video_mime: "video/mp4".into(),
+                video_init: vec![0u8; mb * 1024 * 1024],
+                segments: vec![(0.0, 6.0); 100],
+                duration: 600.0,
+                audio_track: 0,
+                subs: Vec::new(),
+            })
+        };
+        for i in 0..40 {
+            reg.insert(format!("h{i}"), heavy(8)); // 40 × 8MB = 320MB 远超 64MB 上限
+        }
+        // 压到保底条数为止(**保底优先于字节上限**:全是巨型 entry 时宁可略微超字节,
+        // 也不能把最近这几条淘汰掉 —— 正在播的那条就在里面)。320MB → 8 条 ≈ 64MB。
+        assert_eq!(reg.map.len(), STREAMS_MIN_KEEP, "重 entry 被压到保底条数");
+        assert!(reg.get("h39").is_some(), "最新注册的(= 正在播的)必须还在");
+        assert!(reg.get("h0").is_none(), "最老的重 entry 已被淘汰");
+
+        // ③ MIN_KEEP 保底:单条就超上限时也不许把自己淘汰掉(否则正在播的当场 404)。
+        let mut reg = StreamRegistry::default();
+        reg.insert("only".into(), heavy(128)); // 一条就 128MB > 64MB 上限
+        assert!(reg.get("only").is_some(), "最近 MIN_KEEP 条恒留,哪怕单条超限");
     }
 
     /// 直转端到端:本地起一个假上游,断言防盗链头与 Range 都透传、响应镜像。

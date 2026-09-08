@@ -123,10 +123,7 @@ struct WatchDump {
 impl WatchDump {
     fn from_env() -> Option<Self> {
         let dir = std::env::var("LARKWING_KWS_DUMP_DIR").ok().filter(|s| !s.is_empty())?;
-        let millis = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
+        let millis = crate::store::now_ms();
         let path = PathBuf::from(dir).join(format!("kws_watch_{millis}.wav"));
         let mut file = match std::fs::File::create(&path) {
             Ok(f) => f,

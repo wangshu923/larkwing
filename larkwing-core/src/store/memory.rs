@@ -321,33 +321,35 @@ impl MemoryRepo {
     pub fn maintain(&self, user: i64, now: i64) -> Result<MaintenanceReport> {
         self.db.with(|c| {
             let tx = c.unchecked_transaction()?;
-            let mut rep = MaintenanceReport::default();
-            // ① 衰减:操作类(非 identity)闲置超宽限、salience>0 → 扣一步(下限 0)。
-            //    闲置 = now - max(last_used_at, created_at)(老行 last_used_at 可能为空 → 退回建档时间)。
-            rep.decayed = tx.execute(
-                "UPDATE memories
+            // 字段表达式按书写顺序求值(Rust 语言保证)→ 五步仍是 ①→⑤ 的顺序执行。
+            let rep = MaintenanceReport {
+                // ① 衰减:操作类(非 identity)闲置超宽限、salience>0 → 扣一步(下限 0)。
+                //    闲置 = now - max(last_used_at, created_at)(老行 last_used_at 可能为空 → 退回建档时间)。
+                decayed: tx.execute(
+                    "UPDATE memories
                    SET salience = MAX(0, salience - ?3), updated_at = ?4
                  WHERE user_id = ?1 AND kind != ?2 AND salience > 0
                    AND (?4 - COALESCE(last_used_at, created_at)) > ?5",
-                rusqlite::params![user, KIND_IDENTITY, DECAY_STEP, now, DECAY_IDLE_GRACE_MS],
-            )?;
-            // ② 下沉:常驻 + 非 identity + 凉(salience ≤ 界)→ 转按需(可逆,recall / 回忆页仍在)。
-            rep.demoted = tx.execute(
-                "UPDATE memories SET resident = 0, updated_at = ?3
+                    rusqlite::params![user, KIND_IDENTITY, DECAY_STEP, now, DECAY_IDLE_GRACE_MS],
+                )?,
+                // ② 下沉:常驻 + 非 identity + 凉(salience ≤ 界)→ 转按需(可逆,recall / 回忆页仍在)。
+                demoted: tx.execute(
+                    "UPDATE memories SET resident = 0, updated_at = ?3
                  WHERE user_id = ?1 AND kind != ?2 AND resident = 1 AND salience <= ?4",
-                rusqlite::params![user, KIND_IDENTITY, now, COLD_SALIENCE],
-            )?;
-            // ③ 升层:按需 + salience 够高 → 进前缀;预算内直接进,挤也只挤「比它更弱的」常驻(§4.8 有界)。
-            rep.promoted = promote_high_salience(&tx, user, now)?;
-            // ④ 合并近重复:同 kind、内容互相包含 → 留更好的(explicit>distilled / 高 salience / 更完整),删另一条。
-            rep.merged = merge_duplicates(&tx, user, now)?;
-            // ⑤ 硬清过期:已下沉 + 凉 + 闲置超久 + 非 identity → 删(必先经下沉,「先降级后删」§13.4)。
-            rep.expired = tx.execute(
-                "DELETE FROM memories
+                    rusqlite::params![user, KIND_IDENTITY, now, COLD_SALIENCE],
+                )?,
+                // ③ 升层:按需 + salience 够高 → 进前缀;预算内直接进,挤也只挤「比它更弱的」常驻(§4.8 有界)。
+                promoted: promote_high_salience(&tx, user, now)?,
+                // ④ 合并近重复:同 kind、内容互相包含 → 留更好的(explicit>distilled / 高 salience / 更完整),删另一条。
+                merged: merge_duplicates(&tx, user, now)?,
+                // ⑤ 硬清过期:已下沉 + 凉 + 闲置超久 + 非 identity → 删(必先经下沉,「先降级后删」§13.4)。
+                expired: tx.execute(
+                    "DELETE FROM memories
                  WHERE user_id = ?1 AND kind != ?2 AND resident = 0 AND salience <= ?3
                    AND (?4 - COALESCE(last_used_at, created_at)) > ?5",
-                rusqlite::params![user, KIND_IDENTITY, COLD_SALIENCE, now, EXPIRE_IDLE_MS],
-            )?;
+                    rusqlite::params![user, KIND_IDENTITY, COLD_SALIENCE, now, EXPIRE_IDLE_MS],
+                )?,
+            };
             // 落观测行(§6.4 只进不改):仅当这轮真动过记忆才记,省空行;与维护同事务(中途崩则一并回滚)。
             if rep.touched() {
                 tx.execute(

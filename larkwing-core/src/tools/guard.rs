@@ -721,7 +721,7 @@ mod tests {
     async fn ensure_allow_always_persists_scope() {
         let ctx = e2e_ctx("always", Some(crate::confirm::ConfirmReply::AllowAlways));
         let p = outside_dir("always");
-        ensure(&ctx, Access::Create, &[p.clone()]).await.expect("一直允许 → 放行");
+        ensure(&ctx, Access::Create, std::slice::from_ref(&p)).await.expect("一直允许 → 放行");
         // 入表 = 下次不问(免确认通道也过)
         let list = load_scopes(&ctx.store);
         assert_eq!(list.len(), 1, "{list:?}");
@@ -730,7 +730,7 @@ mod tests {
         let ctx2 = e2e_ctx("always2", None);
         // 换一个 store 不共享;直接用原 ctx 验二次调用零弹卡(confirmer 只答一次也无妨:
         // 已在圈内根本不会 ask)
-        ensure(&ctx, Access::Read, &[p.clone()]).await.expect("已入表,读也过");
+        ensure(&ctx, Access::Read, std::slice::from_ref(&p)).await.expect("已入表,读也过");
         ensure(&ctx, Access::Create, &[p]).await.expect("已入表,再存也过");
         drop(ctx2);
     }
@@ -740,14 +740,14 @@ mod tests {
         // 仅这次:放行且不落表
         let ctx = e2e_ctx("once", Some(crate::confirm::ConfirmReply::AllowOnce));
         let p = outside_dir("once");
-        ensure(&ctx, Access::Read, &[p.clone()]).await.expect("仅这次 → 放行");
+        ensure(&ctx, Access::Read, std::slice::from_ref(&p)).await.expect("仅这次 → 放行");
         assert!(load_scopes(&ctx.store).is_empty(), "仅这次不落表");
         ensure(&ctx, Access::Read, &[p]).await.expect("本回合内同目录同档不再问(grants)");
 
         // 拒:bail + 本回合内同目录不再弹(直接拒,话术带「已拒绝过」)
         let ctx = e2e_ctx("deny", Some(crate::confirm::ConfirmReply::Deny));
         let p = outside_dir("deny");
-        let err = ensure(&ctx, Access::Delete, &[p.clone()]).await.unwrap_err();
+        let err = ensure(&ctx, Access::Delete, std::slice::from_ref(&p)).await.unwrap_err();
         assert!(err.to_string().contains("没有允许"), "{err:#}");
         let err2 = ensure(&ctx, Access::Delete, &[p]).await.unwrap_err();
         assert!(err2.to_string().contains("已经拒绝过"), "{err2:#}");

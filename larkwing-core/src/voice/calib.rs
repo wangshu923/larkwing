@@ -4,8 +4,8 @@
 //! - sherpa KWS **不暴露分数**,只给命中/不命中 → 标定 = 二值阈值扫描(非读连续分)。
 //! - **拼写轴(B)**:canonical 读音 + `to_pinyin_multi` 异读,经模型词表 split_syllable 编码、
 //!   去重;只采纳「比 canonical 在更严阈值上仍稳触发」的异读(≥1 档),否则留 canonical。
-//! - **阈值轴(A)**:**只建一次** spotter(加载一次 onnx),逐阈值用 `create_stream_with_keywords`
-//!   + 每词内联 `#threshold` 注入关键词喂正/负样本(不重建模型——重建 9 次在 Windows 上会卡到分钟级);
+//! - **阈值轴(A)**:**只建一次** spotter(加载一次 onnx),逐阈值用 `create_stream_with_keywords` +
+//!   每词内联 `#threshold` 注入关键词喂正/负样本(不重建模型——重建 9 次在 Windows 上会卡到分钟级);
 //!   得 recall[拼写][阈值] 与 false-accept[拼写][阈值];**偏召回**选阈(用户痛点是「叫不应」):
 //!   取「负样本不误触的最宽松档」上方一档作余量,封顶在召回悬崖。
 //! - 写回:阈值经 `threshold_to_sensitivity` 落到既有 `voice.wake.sensitivity`(滑块随之更新);
@@ -198,17 +198,22 @@ fn keywords_at(variants: &[Variant], thr: f32) -> String {
         .join("\n")
 }
 
+/// 扫描结果:两张 `[拼写][阈值]` 矩阵 —— `recall` = 命中的正样本数,`fa` = 负样本是否误触。
+type SweepGrid = (Vec<Vec<u32>>, Vec<Vec<bool>>);
+
 /// 扫描:**只建一次 spotter**(加载一次 onnx),逐阈值用 `create_stream_with_keywords` + 内联
 /// `#threshold` 注入关键词喂全部正/负样本。返回 (recall[拼写][阈值]=命中正样本数,
 /// fa[拼写][阈值]=负样本是否误触)。
 /// 旧法每阈值重建一次 spotter(9 次重载模型),Windows 上能卡到分钟级(见 examples/calib_perf);
 /// 改成"建一次、按流换词"后,扫描只剩纯解码,秒级。
+///
+/// (返回类型抽成 `SweepGrid` 别名:两张 [拼写][阈值] 矩阵,裸写太长 clippy 也嫌复杂。)
 fn sweep(
     kws_dir: &Path,
     variants: &[Variant],
     positives: &[Vec<f32>],
     negative: &[f32],
-) -> Result<(Vec<Vec<u32>>, Vec<Vec<bool>>)> {
+) -> Result<SweepGrid> {
     let n_var = variants.len();
     let n_thr = GRID.len();
     let mut recall = vec![vec![0u32; n_thr]; n_var];
@@ -222,16 +227,16 @@ fn sweep(
         let kw = keywords_at(variants, thr);
         for utt in positives {
             let fired = detect(&spotter, &kw, utt);
-            for i in 0..n_var {
+            for (i, row) in recall.iter_mut().enumerate() {
                 if fired.contains(&tag(i)) {
-                    recall[i][ti] += 1;
+                    row[ti] += 1;
                 }
             }
         }
         let fired_neg = detect(&spotter, &kw, negative);
-        for i in 0..n_var {
+        for (i, row) in fa.iter_mut().enumerate() {
             if fired_neg.contains(&tag(i)) {
-                fa[i][ti] = true;
+                row[ti] = true;
             }
         }
     }

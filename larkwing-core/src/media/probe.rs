@@ -437,7 +437,7 @@ fn parse_ffmpeg_stderr_with(stderr: &str, mac_native: bool) -> LocalProbe {
             // 逗号分段:`aac (LC), 48000 Hz, stereo, fltp, 128 kb/s` —— 布局词在采样率之后,
             // 逐段试着认(位置不保证:有的编码少一段),认不出就是 None、不猜。
             let channels =
-                rest.split(',').skip(1).find_map(|seg| channels_from_layout(seg)).or(None);
+                rest.split(',').skip(1).find_map(channels_from_layout).or(None);
             p.audio_tracks.push(AudioTrack {
                 codec: if codec.is_empty() { "?".into() } else { codec.to_string() },
                 lang,
@@ -1092,6 +1092,9 @@ pub fn video_h264_codec(moov: &[u8]) -> Option<String> {
 /// 关键帧**收尾(copy 只能在关键帧断开)。返回 `(start_secs, dur_secs)` 列表:start 恒是真实关键帧
 /// 时刻,末段补到 `duration`。纯函数、可测。keyframes 为空 → 空列表(调用方回落固定 6s 重编码)。
 /// 关键帧稀疏时段会长于 target(正确,只是段大);过密则 ≈target。
+// `!(x > 0.0)` 是**故意的 NaN 防护,别按 lint 建议改**(同 `media::fixed_segments`):探测出来的
+// 时长可能是 NaN,而 `x <= 0.0` 对 NaN 判 false → 会漏过闸门去切段;换 `partial_cmp` 同理绕不开。
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
 pub fn plan_copy_segments(keyframes: &[f64], duration: f64, target: f64) -> Vec<(f64, f64)> {
     if keyframes.is_empty() || !(duration > 0.0) || !(target > 0.0) {
         return Vec::new();
@@ -1555,7 +1558,7 @@ mod tests {
             let f = dir.join(format!("{}.mp4", want));
             let ok = std::process::Command::new("ffmpeg")
                 .args(["-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
-                .arg(format!("sine=frequency=440:duration=1:sample_rate=48000"))
+                .arg("sine=frequency=440:duration=1:sample_rate=48000")
                 .args(["-ac", &channel_arg(layout), "-c:a", "aac"])
                 .arg(&f)
                 .status()

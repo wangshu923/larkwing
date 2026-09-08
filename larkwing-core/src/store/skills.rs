@@ -199,13 +199,19 @@ impl SkillRepo {
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            let mut sec = c.prepare(
-                "SELECT name FROM skill_sections WHERE skill_id = ?1 ORDER BY ord",
-            )?;
+            // 附录节名一次取全表再按技能分组(原先每个技能一次查询,最多 SKILLS_MAX=64 次;
+            // § 效率审计 2026-09-08)。`ORDER BY skill_id, ord` 保证每组内仍按 ord ——
+            // 与原先每组各自 `ORDER BY ord` 同序。
+            let mut sec =
+                c.prepare("SELECT skill_id, name FROM skill_sections ORDER BY skill_id, ord")?;
+            let mut by_skill: std::collections::HashMap<i64, Vec<String>> =
+                std::collections::HashMap::new();
+            for pair in sec.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+                let (skill_id, name) = pair?;
+                by_skill.entry(skill_id).or_default().push(name);
+            }
             for row in &mut rows {
-                row.sections = sec
-                    .query_map([row.skill.id], |r| r.get(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                row.sections = by_skill.remove(&row.skill.id).unwrap_or_default();
             }
             Ok(rows)
         })
@@ -600,5 +606,30 @@ mod tests {
         // find 带回节名
         let (_, sections) = s.skills.find("网页办事").unwrap().unwrap();
         assert_eq!(sections, ["登录墙"]);
+    }
+
+    /// 附录节改成「一次取全表再分组」(§ 效率审计 2026-09-08,原先每个技能一次查询):
+    /// 各技能拿到的是**自己**那几节、**组内仍按 ord**、没有附录的技能拿到空清单。
+    #[test]
+    fn sections_are_grouped_per_skill_and_keep_their_order() {
+        let s = store("sections-group");
+        let mut a = builtin("a", "技能甲", "总纲");
+        a.sections = vec![
+            ("第一节".into(), "1".into()),
+            ("第二节".into(), "2".into()),
+            ("第三节".into(), "3".into()),
+        ];
+        let b = builtin("b", "技能乙", "没有附录"); // 无附录:必须是空清单,不能借到别人的
+        let mut c = builtin("c", "技能丙", "总纲");
+        c.sections = vec![("独一节".into(), "x".into())];
+        s.skills.sync_builtins(&[a, b, c]).unwrap();
+
+        let rows = s.skills.list_with_stats().unwrap();
+        let by_name = |n: &str| {
+            rows.iter().find(|r| r.skill.name == n).expect("技能应在列表里").sections.clone()
+        };
+        assert_eq!(by_name("技能甲"), ["第一节", "第二节", "第三节"], "组内按 ord,不串序");
+        assert!(by_name("技能乙").is_empty(), "没有附录的技能拿空清单");
+        assert_eq!(by_name("技能丙"), ["独一节"]);
     }
 }

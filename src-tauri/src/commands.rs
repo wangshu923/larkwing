@@ -187,27 +187,43 @@ pub fn new_conversation(
         .new_conversation(channel.as_deref().unwrap_or(larkwing_core::store::chat::CHANNEL_UI))
 }
 
+/// ⚠️ 这一组「读库读得比较重」的命令一律 **async + spawn_blocking**(§8.4 已核实的执行模型:
+/// 同步 `#[tauri::command]` 在 IPC/UI 线程上**内联**跑完 —— 库越大越卡界面,还跟回合落库抢
+/// `Db::with` 那把单连接锁)。形状照 `backup_data` / `restore_precheck` 的先例:
+/// 先从 state 里 clone 出 `Arc<Engine>`(`State` 不能跨 await 持有),再进闭包。
+/// **返回类型一字不改** —— 前端 `backend.ts` 对此零感知。
 #[tauri::command]
-pub fn list_conversations(state: State<'_, AppState>) -> Result<Vec<Conversation>, AppError> {
-    state.engine.list_conversations()
+pub async fn list_conversations(state: State<'_, AppState>) -> Result<Vec<Conversation>, AppError> {
+    let engine = state.engine.clone();
+    tauri::async_runtime::spawn_blocking(move || engine.list_conversations())
+        .await
+        .map_err(AppError::internal)?
 }
 
 #[tauri::command]
-pub fn load_conversation(
+pub async fn load_conversation(
     state: State<'_, AppState>,
     conv_id: i64,
 ) -> Result<Vec<Message>, AppError> {
-    state.engine.load_conversation(conv_id)
+    let engine = state.engine.clone();
+    tauri::async_runtime::spawn_blocking(move || engine.load_conversation(conv_id))
+        .await
+        .map_err(AppError::internal)?
 }
 
 /// 跨会话搜索聊天记录(子串匹配,排除工具 / 系统事件行)。最近命中在前,封顶 limit。
+/// (`messages ⋈ conversations` 的 `LIKE` 全表扫,是这一组里最重的一条。)
 #[tauri::command]
-pub fn search_messages(
+pub async fn search_messages(
     state: State<'_, AppState>,
     query: String,
     limit: i64,
 ) -> Result<Vec<SearchHit>, AppError> {
-    state.engine.search_messages(&query, limit.clamp(1, 200))
+    let engine = state.engine.clone();
+    let limit = limit.clamp(1, 200);
+    tauri::async_runtime::spawn_blocking(move || engine.search_messages(&query, limit))
+        .await
+        .map_err(AppError::internal)?
 }
 
 /// 先取消在飞 → 级联删消息 → 清会话槽。
@@ -513,21 +529,28 @@ pub fn usage_conversation(
 }
 
 /// 历史/提醒气泡的 hover 读数(PLAN §11 D):load 会话后回填,让自启回合也能看读数。
+/// async + spawn_blocking 同 `load_conversation` 那条注释(usage 流水 + 200 条消息两查)。
 #[tauri::command]
-pub fn conversation_stats(
+pub async fn conversation_stats(
     state: State<'_, AppState>,
     conv_id: i64,
 ) -> Result<Vec<MsgStats>, AppError> {
-    state.engine.conversation_stats(conv_id)
+    let engine = state.engine.clone();
+    tauri::async_runtime::spawn_blocking(move || engine.conversation_stats(conv_id))
+        .await
+        .map_err(AppError::internal)?
 }
 
 /// 历史回放的「想了想」轨迹(PLAN §9 思考漏出):load 会话后回填到代表气泡。
 #[tauri::command]
-pub fn conversation_trace(
+pub async fn conversation_trace(
     state: State<'_, AppState>,
     conv_id: i64,
 ) -> Result<Vec<larkwing_core::engine::TurnTrace>, AppError> {
-    state.engine.conversation_trace(conv_id)
+    let engine = state.engine.clone();
+    tauri::async_runtime::spawn_blocking(move || engine.conversation_trace(conv_id))
+        .await
+        .map_err(AppError::internal)?
 }
 
 /// 悬浮窗待机轮播数据(PLAN §12):下个提醒 + 最近一句(只读;余额/今日花费复用现成命令)。
@@ -1127,6 +1150,16 @@ pub async fn attachment_url(state: State<'_, AppState>, file: String) -> Result<
 #[tauri::command]
 pub fn media_log(msg: String) {
     tracing::info!("[前端播放] {msg}");
+}
+
+/// 前端**未捕获异常**落盘(`main.ts` 的 `app.config.errorHandler` 唯一消费者)。
+/// 缘由见 AGENT §6.6「i18n 特殊字符陷阱」:组件 render 期抛的错被 Vue 吞成 warn,
+/// 表面症状只是「tab 点了切不过去」,而正式版 WebView 没有 console —— 不落盘就等于没发生。
+/// 与上面 `media_log` 分家是有意的:那条是播放层的 info 流水,这条是异常,warn 级、前缀不同,
+/// 真机翻日志时一眼分得开。仅记日志,不改状态、不弹 UI(render 已经坏了,别再指望 UI)。
+#[tauri::command]
+pub fn frontend_log(msg: String) {
+    tracing::warn!("[前端异常] {msg}");
 }
 
 /// 兜底重放:本地「音视频分离自适应」在前端手写 MSE 上播放失败时,前端调此命令,

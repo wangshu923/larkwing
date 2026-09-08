@@ -174,6 +174,10 @@ impl Denoiser {
 mod tests {
     use super::*;
 
+    /// `apply_denoise` 的 `run` 闭包签名写成函数指针形(裸写太长,clippy 也嫌复杂):
+    /// PCM + 采样率 → (处理后 PCM, 处理后采样率)。
+    type DenoiseFn = fn(&[f32], u32) -> Result<(Vec<f32>, u32)>;
+
     /// 削波占比:必须在归一前量,数值 = 近满幅样本 / 总样本。
     #[test]
     fn clip_ratio_counts_near_full_scale() {
@@ -201,7 +205,7 @@ mod tests {
         for i in 0..50 {
             // 半数语音帧(响)、半数间隙帧(底噪 0.001 = −60dB)
             let amp = if i % 2 == 0 { 0.3 } else { 0.001 };
-            pcm.extend(std::iter::repeat(amp).take(frame));
+            pcm.extend(std::iter::repeat_n(amp, frame));
         }
         let floor = noise_floor_db(&pcm, rate);
         assert!((floor - -60.0).abs() < 1.0, "该量到间隙的 −60dB,实测 {floor}");
@@ -218,7 +222,7 @@ mod tests {
 
         // 没有模型:原样不动
         let mut pcm = orig.clone();
-        let none: Option<fn(&[f32], u32) -> Result<(Vec<f32>, u32)>> = None;
+        let none: Option<DenoiseFn> = None;
         assert!(!apply_denoise(&mut pcm, 16_000, none));
         assert_eq!(pcm, orig);
 

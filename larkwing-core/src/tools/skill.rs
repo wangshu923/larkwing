@@ -18,9 +18,9 @@ const NAME_MAX_CHARS: usize = 24;
 const WHEN_MAX_CHARS: usize = 80;
 const CONTENT_MAX_CHARS: usize = 4000;
 
-fn arg_str<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
-    args.get(key).and_then(serde_json::Value::as_str).map(str::trim).filter(|s| !s.is_empty())
-}
+// 「取非空字符串入参」单源在 `tools::arg_str_opt`(与 arg_bool / arg_u64 同一个家);
+// 本模块要的是 Option 形(自带 `.context(…)` 话术),故用 opt 版。
+use super::arg_str_opt as arg_str;
 
 // ---------------------------------------------------------------------------
 // skill_lookup

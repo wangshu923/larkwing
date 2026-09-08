@@ -401,6 +401,8 @@ pub fn suite() -> Vec<Scenario> {
             // **可精确机测的标准绝不进 rubric,LLM 判官只留语义判定**(harness 分层纪律)。
             // 只约束「提了年检」的回复:纯闲聊里的反问不归这条产品纪律管。
             .check(custom("提年检时至多一个问号(不追击;计数不靠判官)", |o| {
+                // (2026-09-08:这里曾为迁就 MSRV 1.77.2 写成 `map_or(true, …)`;当天
+                //  用户拍板删掉 MSRV 声明后 clippy 自己把它简化回 `is_none_or` —— 等价,照收。)
                 o.replies.last().is_none_or(|r| {
                     !r.contains("年检")
                         // 全角问号写 unicode 转义(同 judge-diary 句数机测):字面全角会被

@@ -30,14 +30,10 @@ use super::{
 const LIVE_ARGS_MAX: usize = 400;
 const LIVE_RESULT_MAX: usize = 300;
 
-/// 按**字符**截断并标出省略(不劈开多字节;够短就原样)。
+/// 按**字符**截断并标出省略(不劈开多字节;够短就原样)。算法在 `crate::text::clip_fmt`
+/// 单源,这里只定本站点的尾缀话术(带「还剩多少字」)。
 fn clip(s: &str, max: usize) -> String {
-    let n = s.chars().count();
-    if n <= max {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(max).collect();
-    format!("{head}…(还有 {} 字,跑完看全)", n - max)
+    crate::text::clip_fmt(s, max, |rest| format!("…(还有 {rest} 字,跑完看全)"))
 }
 
 #[cfg(test)]
@@ -592,7 +588,7 @@ impl Turn {
                 if stall >= MAX_STALL_ROUNDS {
                     tracing::warn!(conv = conv_id, round, stall, "连续多轮无新进展,判定空转,强制收尾");
                 }
-            } else if round % SELF_CHECK_EVERY == 0 {
+            } else if round.is_multiple_of(SELF_CHECK_EVERY) {
                 // 软提示自检(PLAN §8,§6.5 罗盘化):中立一句进 request 尾部 —— 不落库
                 // (不进历史 / 不重放)、处于已变动的工具结果尾后(不破前缀缓存)。带任务
                 // 原话 + 计划未完项:让当前模型评的不只是「要不要停」,更是「还剩什么没干」。

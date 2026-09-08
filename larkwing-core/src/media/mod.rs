@@ -201,6 +201,9 @@ fn derive_route(stream_url: &str, manifest_url: Option<&str>) -> PlaybackRoute {
 
 /// 固定 `target` 秒的段计划(转码用,不必关键帧对齐——转码每段从新 IDR 重编):
 /// `(0,t),(t,t),…,(末段,余量)`。末段补到 `duration`。纯函数。
+// `!(x > 0.0)` 是**故意的 NaN 防护,别按 lint 建议改**:探测/解析出来的时长可能是 NaN,
+// 而 `x <= 0.0` 对 NaN 判 false → 会漏过闸门去切段;换成 `partial_cmp` 同理绕不开。
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
 fn fixed_segments(duration: f64, target: f64) -> Vec<(f64, f64)> {
     if !(duration > 0.0) || !(target > 0.0) {
         return Vec::new();
@@ -386,8 +389,8 @@ const RESUME_TAIL_S: f64 = 90.0;
 const RESUME_MIN_DURATION_S: f64 = 600.0;
 
 /// 前端播放器的「此刻」状态快照。播放真相在前端 WebView(播放在那跑、放完只有它知道);
-/// core 起播时乐观 seed,前端在生命周期切换(playing/paused/ended/stop)+ 音量/倍速/seek 调整
-/// + 播放中低频心跳时经 `report_media_state` 命令回报校准。app 级瞬态(§6.4 派生可丢:
+/// core 起播时乐观 seed,前端在生命周期切换(playing/paused/ended/stop)+ 音量/倍速/seek 调整 +
+/// 播放中低频心跳时经 `report_media_state` 命令回报校准。app 级瞬态(§6.4 派生可丢:
 /// 丢了 = 按空闲算、不出错)。回合装配时读成一行「此刻」背景喂模型 → 修「歌放完了模型却
 /// 以为还在播着」,并让模型知道当前音量/进度(才能「调到 50」「快进 5 分钟」这类绝对/相对操作)。
 #[derive(Debug, Clone, Default)]
@@ -884,7 +887,14 @@ impl MediaRuntime {
         let single_fallback;
         let (page_url, audio_only) = if is_dir_path(page_url) {
             let dir = std::path::Path::new(page_url);
-            let files = audio_folder_files(dir);
+            // 扫盘挪 spawn_blocking(同 1700 行的 sniff_container 口径):NAS/SMB 上几千文件的
+            // 文件夹 read_dir 是秒级阻塞,不该压在 tokio worker 上(§ 效率审计 2026-09-08)。
+            let files = {
+                let d = dir.to_path_buf();
+                tokio::task::spawn_blocking(move || audio_folder_files(&d))
+                    .await
+                    .unwrap_or_default()
+            };
             match files.len() {
                 0 => anyhow::bail!("这个文件夹里没有能播放的音频文件"),
                 1 => {
@@ -921,7 +931,10 @@ impl MediaRuntime {
         episode: Option<usize>,
     ) -> Result<(Option<PlaylistPos>, String, Option<f64>)> {
         let discovered = if is_local_path(page_url) {
-            local_episodes(std::path::Path::new(page_url))
+            // 同上:整个文件夹的 read_dir + 自然排序进阻塞线程池,失败(任务没了)= 当没发现剧集,
+            // 与 read_dir 读不了时的现行退化路一致(单集播放)。
+            let p = std::path::PathBuf::from(page_url);
+            tokio::task::spawn_blocking(move || local_episodes(&p)).await.unwrap_or(None)
         } else if let Some(source) = self.source_of_url(page_url) {
             let cookie =
                 cookies::load(&self.inner.store, source.id()).map(|c| cookies::header_value(&c));
@@ -1398,6 +1411,11 @@ impl MediaRuntime {
     /// 否则转 H.264)、音频**一整条连续编码** → 前端手写 MSE 播,治「逐段音频 priming 漂移」+ 省 CPU。
     /// 返回 `(stream_url, manifest_url, route)`。任一前提不满足(无时长 / ffmpeg 取不到 / init 生成失败 /
     /// 解不出 H.264 codec)→ **回落现有 muxed HLS**(能放、只是老样子),绝不阻断播放(§兜底)。
+    ///
+    /// 参数多(8 个)是有意的:每一个都是 `capability::plan_route` 定完后**照着执行**的开关,
+    /// 攒成参数结构体只是把同样的字段搬个地方,还得连带改 `hls_or_fallback` 那一族的调用链 ——
+    /// 不值。故 `#[allow(clippy::too_many_arguments)]`,别按 lint 拆。
+    #[allow(clippy::too_many_arguments)]
     async fn adaptive_or_fallback(
         &self,
         relay: &relay::Relay,
@@ -2271,7 +2289,7 @@ impl MediaRuntime {
                 }
                 if let Some(o) = s.outro_start {
                     if s.intro.is_some() {
-                        out.push_str(",");
+                        out.push(',');
                     }
                     out.push_str(&format!("片尾从 {} 开始", fmt_clock(o)));
                 }
@@ -3504,13 +3522,12 @@ mod tests {
         // 对得上 —— 合成夹具再像也不等于真 ffmpeg 的排布,这里拿真段交叉验证一次。
         let ts = probe::init_timescales(&init).first().copied().expect("init 该解出 timescale").1;
         let mut measured = Vec::new();
-        for i in 0..planned.len() {
+        for (i, &want) in planned.iter().enumerate() {
             let seg = reqwest::get(format!("{base}v{i}")).await.unwrap().bytes().await.unwrap();
             let parsed = probe::fragment_duration(&seg, ts).expect("真段该量得出时长");
             assert!(
-                (parsed - planned[i]).abs() < timeline::SEAM_TOL,
-                "[{container}] 第 {i} 段:解析量得 {parsed}s,计划 {}s —— 运行时抽查的量具与计划对不上",
-                planned[i]
+                (parsed - want).abs() < timeline::SEAM_TOL,
+                "[{container}] 第 {i} 段:解析量得 {parsed}s,计划 {want}s —— 运行时抽查的量具与计划对不上",
             );
             let tmp = dir.join(format!("seg{i}.mp4"));
             let mut bytes = init.to_vec();

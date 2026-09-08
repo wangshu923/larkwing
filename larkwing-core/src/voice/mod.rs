@@ -114,6 +114,9 @@ struct Inner {
     /// TTS 引擎(trait 接缝;在线默认 EdgeTts)与句级缓存目录。
     tts: Arc<dyn tts::TtsEngine>,
     tts_dir: PathBuf,
+    /// 上次清扫 TTS 缓存的时刻(unix 毫秒;0 = 本进程还没扫过)。清扫挂在「有新文件落盘」
+    /// 之后并按 `tts::CACHE_SWEEP_EVERY_MS` 限频 —— 不合成就不涨,不涨就完全不扫。
+    tts_swept_at: std::sync::atomic::AtomicI64,
     /// 非可重入 TTS 引擎(sherpa OfflineTts:melo/克隆)的串行锁——并发 generate 会原生崩溃。
     tts_lock: tokio::sync::Mutex<()>,
     /// 离线 TTS(melo-vits,163M):按需加载一次进 OnceCell(voice.tts_backend=offline)。
@@ -225,6 +228,7 @@ impl VoiceRuntime {
                 gen: AtomicU64::new(0),
                 tts: Arc::new(tts::EdgeTts),
                 tts_dir: dir.join("tts"),
+                tts_swept_at: std::sync::atomic::AtomicI64::new(0),
                 tts_lock: tokio::sync::Mutex::new(()),
                 tts_offline: tokio::sync::OnceCell::new(),
                 tts_clone: tokio::sync::OnceCell::new(),
@@ -520,13 +524,7 @@ impl VoiceRuntime {
         self.wake_suspend(false);
         let (pcm, transcript, check) = joined.context("录音任务挂了")??;
         // id 不可变(uuid 形,时间戳即足够:录入是人手逐次操作);重录 = 新条目。
-        let id = format!(
-            "v{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0)
-        );
+        let id = format!("v{}", crate::store::now_ms());
         tokio::fs::create_dir_all(&self.inner.clones_dir).await?;
         let wav = tts::pcm_f32_to_wav(&pcm, TARGET_RATE);
         tokio::fs::write(self.inner.clones_dir.join(format!("{id}.wav")), &wav).await?;
@@ -545,13 +543,7 @@ impl VoiceRuntime {
             .decode(wav_base64.trim())
             .context("音频 base64 解码失败")?;
         anyhow::ensure!(wav.len() > 44, "音频数据为空或过小");
-        let id = format!(
-            "v{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0)
-        );
+        let id = format!("v{}", crate::store::now_ms());
         tokio::fs::create_dir_all(&self.inner.clones_dir).await?;
         let wav_path = self.inner.clones_dir.join(format!("{id}.wav"));
         tokio::fs::write(&wav_path, &wav).await?;
@@ -669,7 +661,36 @@ impl VoiceRuntime {
         let tmp = self.inner.tts_dir.join(format!("{key}.{}.part", std::process::id()));
         tokio::fs::write(&tmp, &bytes).await?;
         tokio::fs::rename(&tmp, &path).await?;
+        // 刚新增一份缓存 → 顺手看看总量该不该清扫(限频、后台跑,不挡本次合成)。
+        self.maybe_sweep_tts_cache();
         Ok(path)
+    }
+
+    /// TTS 缓存管护:总量超上限就从**最旧的**删起(§6.9 —— 可重建的缓存不进库走文件,
+    /// 但也不能只增不减:常驻 app 每天用语音应答,原先零淘汰逻辑)。
+    ///
+    /// 范式照 `src-tauri/logkeep.rs`(日志管护的先例):幂等、**失败只 warn**、
+    /// 绝不影响合成本身。触发点 = 缓存刚长出一份新文件之后,按
+    /// `tts::CACHE_SWEEP_EVERY_MS` 限频 —— 不合成就不涨,不涨就完全不扫,零常驻线程。
+    fn maybe_sweep_tts_cache(&self) {
+        use std::sync::atomic::Ordering;
+        let now = crate::store::now_ms();
+        let last = self.inner.tts_swept_at.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < tts::CACHE_SWEEP_EVERY_MS {
+            return;
+        }
+        // CAS 抢占:并发合成同时到这儿也只跑一遍(输的那个直接算了,反正限频)。
+        if self
+            .inner
+            .tts_swept_at
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let dir = self.inner.tts_dir.clone();
+        // read_dir + 逐个 metadata 是阻塞活;丢 spawn_blocking,合成路径不等它。
+        tokio::task::spawn_blocking(move || sweep_tts_cache(&dir));
     }
 
     // ---- 声纹认人(PLAN §11 D):记忆归人的解锁钥匙 ----
@@ -1861,7 +1882,7 @@ pub(super) fn collect_utterance(
                     let rms = (win.iter().map(|s| s * s).sum::<f32>() / win.len() as f32).sqrt();
                     level_peak = level_peak.max((rms * 10.0).min(1.0));
                     windows += 1;
-                    if windows % LEVEL_EVERY_WINDOWS == 0 {
+                    if windows.is_multiple_of(LEVEL_EVERY_WINDOWS) {
                         rt.publish(VoiceEvent::Level { level: level_peak });
                         level_peak = 0.0;
                     }
@@ -1965,6 +1986,64 @@ fn peak_normalize(pcm: &mut [f32]) {
             *s = (*s * gain).clamp(-1.0, 1.0); // clamp 此后恒不触发(gain×真峰 ≤ 0.99),留作纵深
         }
     }
+}
+
+/// 清扫一遍 TTS 缓存目录(阻塞侧;`maybe_sweep_tts_cache` 丢进 spawn_blocking 调它)。
+///
+/// 盘点 → `tts::plan_cache_eviction` 算该删哪些(纯函数、已单测)→ 删。全程**失败只 warn**:
+/// 缓存管护是后台家务,读不了目录 / 删不掉某个文件都不该影响正在合成的那句话。
+/// 半截合成中的 `.part` 临时件不碰(它正被 `synth_cached` 写着)。
+fn sweep_tts_cache(dir: &std::path::Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        // 目录还没建(从没合成过)是常态,不值一条 warn
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::warn!(dir = %dir.display(), error = %e, "TTS 缓存目录读不了,跳过本轮管护");
+            return;
+        }
+    };
+    let now = std::time::SystemTime::now();
+    let mut list = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(md) = entry.metadata() else { continue };
+        if !md.is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+        if name.ends_with(".part") {
+            continue; // 正在写的临时件
+        }
+        // mtime 取不到 → 当 0 秒(= 最新),落在保护期内不会被删(宁可少删)
+        let age_secs = md
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        list.push(tts::CacheEntry { name, bytes: md.len(), age_secs });
+    }
+    let doomed = tts::plan_cache_eviction(&list, tts::CACHE_MAX_BYTES, tts::CACHE_MIN_AGE_SECS);
+    if doomed.is_empty() {
+        return;
+    }
+    let (mut gone, mut freed) = (0usize, 0u64);
+    for name in &doomed {
+        let bytes = list.iter().find(|e| &e.name == name).map(|e| e.bytes).unwrap_or(0);
+        match std::fs::remove_file(dir.join(name)) {
+            Ok(()) => {
+                gone += 1;
+                freed += bytes;
+            }
+            Err(e) => tracing::warn!(file = %name, error = %e, "TTS 缓存文件删不掉,跳过"),
+        }
+    }
+    tracing::info!(
+        removed = gone,
+        freed_mb = freed / (1024 * 1024),
+        kept = list.len() - gone,
+        "TTS 缓存超上限,清掉了最旧的几份"
+    );
 }
 
 /// 标定样本校验:ASR 转写是否就是/含唤醒词(宽松,容 ASR 听岔一两字)。

@@ -403,19 +403,10 @@ fn read_text_window(p: &Path, offset: usize, want: usize) -> anyhow::Result<(Str
     Ok((out, total))
 }
 
-/// 顶层或数组项里取一个非空字符串字段。
-fn arg_str(v: &serde_json::Value, key: &str) -> anyhow::Result<String> {
-    v.get(key)
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .with_context(|| format!("缺少 {key} 参数"))
-}
-
 /// 取一个**路径**字段:非空 + `~` 前缀宽容展开(`tools::expand_home`,§4.4)。
+/// 「非空字符串字段」的取法单源在 `tools::arg_str`(与 arg_bool / arg_u64 同一个家)。
 fn arg_path(v: &serde_json::Value, key: &str) -> anyhow::Result<String> {
-    Ok(super::expand_home(&arg_str(v, key)?))
+    Ok(super::expand_home(&super::arg_str(v, key)?))
 }
 
 /// 取 `key` 下的 `[{src, dst}, …]`(src/dst 都是路径,`~` 展开)。
@@ -1208,7 +1199,7 @@ impl Tool for FsEdit {
     async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
         let path = arg_path(&args, "path")?;
         super::guard::ensure(ctx, super::guard::Access::Modify, std::slice::from_ref(&path)).await?;
-        let find = arg_str(&args, "find")?;
+        let find = super::arg_str(&args, "find")?;
         let replace = args.get("replace").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
         let store = ctx.store.clone();
         let user_id = ctx.user_id;

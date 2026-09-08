@@ -6,17 +6,56 @@
 //! 重定向失败只 warn —— 少一份线索,不挡功能(§3.5 兜底而非门槛)。
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-/// 追加超过此值就在 boot 时清一次(native 输出量很低,防极端刷屏把盘写大)。
-const TRUNCATE_AT: u64 = 5 * 1024 * 1024;
+/// 超过此值就在 boot 时轮转一代(native 输出量很低,防极端刷屏把盘写大)。
+/// 只留一代 ⇒ 磁盘上限 ≈ 2×这个值。`logkeep` 只认 `larkwing.log.YYYY-MM-DD` 形,管不到这份,
+/// 故自己管。**这个数字待用户拍板**(§4.11 写死的产品默认值),单源在此。
+const ROTATE_AT: u64 = 5 * 1024 * 1024;
+
+/// boot 期对现有 `native.log` 的处置(**纯判定,可单测**;真动手在 `rotate_if_big`)。
+#[derive(Debug, PartialEq, Eq)]
+enum Boot {
+    /// 继续往后追加(文件不存在 / 读不到大小 / 还没到阈值)。
+    Append,
+    /// 轮转成 `native.log.1`(覆盖上一代)再从空文件起。
+    Rotate,
+}
+
+/// `None` = 文件不存在或 metadata 读不到 → 照旧追加(读不到就别乱动别人的文件)。
+fn plan_boot(size: Option<u64>) -> Boot {
+    match size {
+        Some(n) if n > ROTATE_AT => Boot::Rotate,
+        _ => Boot::Append,
+    }
+}
+
+/// 在完整文件名后追加后缀(`with_extension` 会把 `.log` 换掉,不能用)。
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// 现有 native.log 超阈值 → 改名成 `native.log.1`(上一代直接被顶掉,只留一代)。
+/// **必须在 fd 2 重定向之前做**:此刻本进程还没打开它,改名零竞态、零后台线程。
+/// 原先是 `write(&path, b"")` 一把清空 —— 最后那 5MB 线索(常是崩前的原生报错)全丢了。
+fn rotate_if_big(path: &Path) {
+    if plan_boot(std::fs::metadata(path).ok().map(|m| m.len())) != Boot::Rotate {
+        return;
+    }
+    let prev = sibling(path, ".1");
+    match std::fs::rename(path, &prev) {
+        Ok(()) => tracing::info!(prev = %prev.display(), "native.log 超上限,旧的轮转成 .1"),
+        // 轮转失败不挡启动:大不了继续追加(§3.5 兜底而非门槛)
+        Err(e) => tracing::warn!(err = %e, "native.log 轮转失败,继续追加"),
+    }
+}
 
 /// 把本进程的原生 stderr(fd 2)重定向到 `logs_dir/native.log`,并写一行 boot 分隔标记。
 pub fn redirect_stderr(logs_dir: &Path, version: &str) {
     let path = logs_dir.join("native.log");
-    if std::fs::metadata(&path).map(|m| m.len() > TRUNCATE_AT).unwrap_or(false) {
-        let _ = std::fs::write(&path, b"");
-    }
+    rotate_if_big(&path);
     // 标记行先用普通文件句柄写(重定向前后都可靠),定位「这一次启动」的起点
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let ts = std::time::SystemTime::now()
@@ -63,4 +102,50 @@ fn redirect_impl(path: &Path) -> std::io::Result<()> {
         return Err(std::io::Error::other("dup2 到 stderr 失败"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 判定表:读不到大小 / 没到阈值 → 追加;严格超过阈值 → 轮转(等于阈值不算超)。
+    #[test]
+    fn plan_boot_rotates_only_above_the_cap() {
+        assert_eq!(plan_boot(None), Boot::Append, "文件不存在 = 照旧追加");
+        assert_eq!(plan_boot(Some(0)), Boot::Append);
+        assert_eq!(plan_boot(Some(ROTATE_AT)), Boot::Append, "正好到阈值不轮转");
+        assert_eq!(plan_boot(Some(ROTATE_AT + 1)), Boot::Rotate);
+        assert_eq!(plan_boot(Some(ROTATE_AT * 3)), Boot::Rotate);
+    }
+
+    /// 后缀追加在**完整文件名**之后(`with_extension` 会把 `.log` 吃掉)。
+    #[test]
+    fn sibling_appends_after_the_whole_name() {
+        assert_eq!(sibling(Path::new("/l/native.log"), ".1"), PathBuf::from("/l/native.log.1"));
+    }
+
+    /// 端到端:超限的现有文件被改名成 .1(内容留着,不是清空);.1 已存在则被顶掉。
+    #[test]
+    fn rotate_moves_old_content_aside_and_keeps_one_generation() {
+        let dir = std::env::temp_dir().join(format!("larkwing-nativelog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("native.log");
+        let prev = dir.join("native.log.1");
+
+        // 没到阈值:原地不动,也不产生 .1
+        std::fs::write(&path, b"small").unwrap();
+        rotate_if_big(&path);
+        assert_eq!(std::fs::read(&path).unwrap(), b"small");
+        assert!(!prev.exists());
+
+        // 超阈值:改名成 .1,内容留着(原先是清空,线索全丢)
+        std::fs::write(&prev, b"older generation").unwrap();
+        std::fs::write(&path, vec![b'x'; (ROTATE_AT + 1) as usize]).unwrap();
+        rotate_if_big(&path);
+        assert!(!path.exists(), "轮转后旧文件已挪走,调用方随后 create 新的");
+        assert_eq!(std::fs::metadata(&prev).unwrap().len(), ROTATE_AT + 1, ".1 = 刚才那份");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

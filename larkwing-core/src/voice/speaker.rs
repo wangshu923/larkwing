@@ -19,8 +19,10 @@ pub struct SpeakerId {
 
 impl SpeakerId {
     pub fn load(model: &Path) -> Result<SpeakerId> {
-        let mut cfg = sherpa_onnx::SpeakerEmbeddingExtractorConfig::default();
-        cfg.model = Some(model.to_string_lossy().into_owned());
+        let cfg = sherpa_onnx::SpeakerEmbeddingExtractorConfig {
+            model: Some(model.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
         let t0 = std::time::Instant::now();
         let extractor = sherpa_onnx::SpeakerEmbeddingExtractor::create(&cfg)
             .ok_or_else(|| anyhow!("声纹模型加载失败"))?;

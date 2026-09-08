@@ -440,6 +440,7 @@ pub fn run() {
       commands::report_media_state,
       commands::set_media_codecs,
       commands::media_log,
+      commands::frontend_log,
       commands::media_replay_compat,
       commands::attachment_url,
       commands::remote_status,

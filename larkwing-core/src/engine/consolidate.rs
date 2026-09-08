@@ -139,12 +139,23 @@ pub(crate) async fn run(
     conv_id: i64,
     lookback: i64,
 ) -> Result<usize> {
-    let recent = store.chat.recent_messages(conv_id, lookback)?;
-    // 没有用户发言 = 没有可提炼的材料(任务专属会话只有 event 行时跳过)
-    if !recent.iter().any(|m| m.role == "user") {
-        return Ok(0);
-    }
-    let existing = store.memory.list(user_id)?;
+    // 取料挪进阻塞线程池(§6.2 Repo 全同步、异步调用方自己 spawn_blocking):这是个 async fn,
+    // 原先两条同步查询直接压在 tokio worker 上。**查询顺序与早退口径一字不动**——
+    // 「没有用户发言就别去查记忆表」也照旧(判断跟着搬进闭包里,不多查一次)。
+    let loaded = {
+        let store = store.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<(Vec<Message>, Vec<Memory>)>> {
+            let recent = store.chat.recent_messages(conv_id, lookback)?;
+            // 没有用户发言 = 没有可提炼的材料(任务专属会话只有 event 行时跳过)
+            if !recent.iter().any(|m| m.role == "user") {
+                return Ok(None);
+            }
+            let existing = store.memory.list(user_id)?;
+            Ok(Some((recent, existing)))
+        })
+        .await??
+    };
+    let Some((recent, existing)) = loaded else { return Ok(0) };
     let mut req = build_request(&recent, &existing);
     // 提炼认全局反应模式 `llm.thinking`,**解析与回合循环完全一致**(engine/mod.rs:1461):
     // **缺省 → Medium**(2026-06-19 起后台提炼默认开思考)。依据 = eval A/B 实测:关思考时提炼

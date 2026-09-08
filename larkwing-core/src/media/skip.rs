@@ -5,6 +5,7 @@
 //!   2. **B 站 OP/ED 段**(番剧 playurl 的 clip_info_list,人工标注、逐集精确);
 //!   3. **章节元数据**(mkv/mp4 里名为 OP/ED 的章节);
 //!   4. **指纹检测**(相邻集音频公共段,见 `introdetect`)。
+//!
 //! 前端消费:自然播进片头段 → 跳到段尾;自然越过片尾起点且有下一集 → 3 秒倒计时切集(用户拍板
 //! 2026-09-07)。全部纯函数,不碰 IO;数据形状与判定单源在此。
 
@@ -155,10 +156,10 @@ pub fn resolve(
 
     // 越界 / 太短剔除:片头必须 ≥ MIN_SEG_SECS 且不出片长;片尾起点得在 0 与结尾之间
     let intro = intro.filter(|s| {
-        s.end > s.start + MIN_SEG_SECS && s.start >= 0.0 && duration.map_or(true, |d| s.end < d)
+        s.end > s.start + MIN_SEG_SECS && s.start >= 0.0 && duration.is_none_or(|d| s.end < d)
     });
     let outro_start =
-        outro_start.filter(|o| *o > 0.0 && duration.map_or(true, |d| *o < d - 1.0));
+        outro_start.filter(|o| *o > 0.0 && duration.is_none_or(|d| *o < d - 1.0));
     if intro.is_none() && outro_start.is_none() {
         return None;
     }

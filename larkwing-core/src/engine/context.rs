@@ -132,6 +132,7 @@ pub(super) const TAIL_RESERVE_DEN: u32 = 2;
 ///   (CJK 最坏 ~1 token/字 → token 数当字数上界 = 安全。小窗口缩防溢出;大窗口在 [默认, MAX] 间装文档)。
 /// - 计价方式:**无缓存**(每轮全价重发尾巴)→ 封到 `DEFAULT`、少留勤压;**有缓存 / 按次**
 ///   (重用便宜 / token 不计较)→ 按窗口放大(常态)。
+///
 /// 只缩或在 [默认, MAX] 间放大,绝不无界增长。起步值,真用可调(§13.7「只能真用才能调」)。
 pub(super) fn tail_budget_chars(
     window_tokens: Option<u32>,
@@ -177,7 +178,7 @@ pub(super) fn windowed_start(history: &[Message], base: usize, budget: usize) ->
     let mut chosen = last_round; // 兜底:至少保末轮
     let mut i = 0usize;
     while i <= last_round {
-        if (base + i) % WINDOW_CHUNK == 0 && suffix <= budget {
+        if (base + i).is_multiple_of(WINDOW_CHUNK) && suffix <= budget {
             chosen = i;
             break;
         }
@@ -665,7 +666,7 @@ mod tests {
         assert!(start > 0, "超预算必须裁");
         // 起点对齐 WINDOW_CHUNK 的绝对倍数(base=0)或吸附后落在末轮(边界兜底)
         let last_round = h.iter().rposition(|m| m.role == "user").unwrap();
-        assert!(start % WINDOW_CHUNK == 0 || start == last_round, "起点应整块对齐或为末轮");
+        assert!(start.is_multiple_of(WINDOW_CHUNK) || start == last_round, "起点应整块对齐或为末轮");
         // 起点落在 user 边界(不劈开工具配对/回合)
         assert_eq!(h[start].role, "user", "窗口起点须为回合起点(user)");
         // 保留段在预算内

@@ -106,7 +106,7 @@ pub fn memory_written(kind: Option<&str>, contains: &str) -> Check {
     };
     Check::new(label, move |o| {
         o.memories.iter().any(|m| {
-            m.content.contains(&contains) && kind.as_deref().map_or(true, |k| m.kind == k)
+            m.content.contains(&contains) && kind.as_deref().is_none_or(|k| m.kind == k)
         })
     })
 }
@@ -133,7 +133,7 @@ pub fn memory_with_source(source: &str, contains: Option<&str>) -> Check {
     Check::new(label, move |o| {
         o.all_memories
             .iter()
-            .any(|m| m.source == source && contains.as_deref().map_or(true, |c| m.content.contains(c)))
+            .any(|m| m.source == source && contains.as_deref().is_none_or(|c| m.content.contains(c)))
     })
 }
 

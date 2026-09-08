@@ -241,7 +241,13 @@ fn reply_text(resp: &suppaftp::types::Response) -> String {
 struct Transfer<'a> {
     t: &'a FtpTarget,
     /// 临时件句柄:首连时建(截断),之后每次续传都在**同一个句柄**上追加。
-    file: std::fs::File,
+    ///
+    /// 句柄用 `Arc<Mutex<..>>` 包着是为了能借进 `spawn_blocking`(写盘不占 tokio worker,
+    /// § 效率审计 2026-09-08);**刻意仍是 `std::fs::File` 而不是 `tokio::fs::File`** ——
+    /// 后者自带内部缓冲,而 `on_disk()`(REST 偏移的唯一来源)读的是文件真实长度:
+    /// 缓冲里压着没落盘的字节 = 偏移偏小 = 续传重复追加同一段,拼出来的文件是坏的。
+    /// std 的 write 直落 OS,「已落盘字节 == metadata().len()」这条不变量才成立。
+    file: std::sync::Arc<std::sync::Mutex<std::fs::File>>,
     cap: u64,
     /// 调用方探到的体积(SIZE);None = 服务器不支持 SIZE,那就只能信流的 EOF。
     expected: Option<u64>,
@@ -255,7 +261,26 @@ impl Transfer<'_> {
     /// 已落盘字节数 = REST 偏移的**唯一**来源(读文件真实长度,不信内存计数——
     /// 写盘半途失败 / 上一轮死在哪都由它兜)。
     fn on_disk(&self) -> Result<u64> {
-        Ok(self.file.metadata().context("读不到临时文件长度")?.len())
+        let f = self.file.lock().expect("ftp 临时件锁 poisoned");
+        Ok(f.metadata().context("读不到临时文件长度")?.len())
+    }
+
+    /// 追加一段到临时件末尾 —— **在阻塞线程池上写**,别让慢盘 / NAS 的 write 把 tokio worker
+    /// 按住(§ 效率审计 2026-09-08)。读缓冲一并借进闭包再还回来:免掉每段一次分配 / 拷贝。
+    /// 返回 `(还回来的缓冲, 写盘结果)`。
+    async fn write_chunk(&self, buf: Vec<u8>, n: usize) -> (Vec<u8>, std::io::Result<()>) {
+        use std::io::Write;
+        let file = self.file.clone();
+        match tokio::task::spawn_blocking(move || {
+            let res = file.lock().expect("ftp 临时件锁 poisoned").write_all(&buf[..n]);
+            (buf, res)
+        })
+        .await
+        {
+            Ok(out) => out,
+            // 阻塞任务本身没了(panic / 运行时正在关):当写盘失败处理,由调用方 Fatal 收
+            Err(e) => (Vec::new(), Err(std::io::Error::other(e.to_string()))),
+        }
     }
 
     fn cancelled(&self) -> bool {
@@ -266,7 +291,6 @@ impl Transfer<'_> {
     /// `resuming` = 这不是首连:首连失败按死链快失败(原话术),续传阶段连不上 / 登不上
     /// (资源站常限同 IP 连接数,旧连接没回收就 530)算一次可重试的中断。
     async fn attempt(&mut self, offset: u64, resuming: bool) -> Result<u64, Fault> {
-        use std::io::Write;
         use tokio::io::AsyncReadExt;
 
         if self.cancelled() {
@@ -371,7 +395,9 @@ impl Transfer<'_> {
                     human_size(self.cap)
                 )));
             }
-            if let Err(e) = self.file.write_all(&buf[..n]) {
+            let (returned, wrote) = self.write_chunk(buf, n).await;
+            buf = returned; // 缓冲还回来接着读(写失败时下面就退出了,不会再用它)
+            if let Err(e) = wrote {
                 return Err(Fault::Fatal(anyhow::anyhow!(e).context("写临时文件失败")));
             }
             if let Some(tk) = self.progress {
@@ -456,8 +482,14 @@ async fn download_with(
     progress: Option<&crate::bgtasks::BgTicket>,
     policy: &ResumePolicy,
 ) -> Result<u64> {
-    let file = std::fs::File::create(dest)
-        .with_context(|| format!("建不了文件 {}", dest.display()))?;
+    // 建文件本身也别在 tokio worker 上做(NAS 上开个文件也能顿一下);拿回 std 句柄接着用,
+    // 无缓冲语义不变(见 `Transfer::file` 那条注释)。
+    let file = tokio::fs::File::create(dest)
+        .await
+        .with_context(|| format!("建不了文件 {}", dest.display()))?
+        .into_std()
+        .await;
+    let file = std::sync::Arc::new(std::sync::Mutex::new(file));
     let mut xfer = Transfer { t, file, cap, expected, progress, policy, next_beat: 0 };
     let mut resumes: u32 = 0;
     loop {

@@ -122,6 +122,20 @@ pub(crate) fn arg_u64(args: &serde_json::Value, key: &str, default: u64) -> u64 
     }
 }
 
+/// 从工具入参(顶层或数组项)里取一个**非空**字符串字段:两头空白 trim 掉,trim 完为空
+/// 等同没给(模型爱发 `""` / `"  "` 占位)。缺省 → `None`,交调用方决定给不给默认值。
+pub(crate) fn arg_str_opt<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    args.get(key).and_then(serde_json::Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// `arg_str_opt` 的**必填**形:缺省 / 空串一律报「缺少 X 参数」(经 `run_tools` 当观察
+/// 喂回模型,让它补参数重试;§3.5 绝不静默用默认值顶)。
+pub(crate) fn arg_str(args: &serde_json::Value, key: &str) -> anyhow::Result<String> {
+    arg_str_opt(args, key)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("缺少 {key} 参数"))
+}
+
 /// 路径入参的 `~` 宽容展开(§4.4 Quirks,arg_bool 同族;2026-07-21):用户嘴里的
 /// 「~/Downloads」会被模型原样写进参数(它不知道主目录在哪、也不会自己展开——真机 reasoning
 /// 实锤「以后用的时候再展开」),工具边界统一吃下。mac = `$HOME`,Windows = `C:\Users\<名>`

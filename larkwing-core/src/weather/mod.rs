@@ -216,7 +216,7 @@ fn parse_ipip(body: &str) -> Option<String> {
     let geo = body
         .split("来自于")
         .nth(1)?
-        .trim_start_matches(|c: char| c == ':' || c == '：' || c == ' ');
+        .trim_start_matches([':', '：', ' ']);
     let mut parts: Vec<&str> = geo.split_whitespace().collect();
     parts.pop()?; // 末尾是运营商(电信/联通/starhub.com…)
     let city = parts.pop()?.trim(); // 其后末个地名 = 城市

@@ -123,6 +123,27 @@ impl ChannelRepo {
         })
     }
 
+    /// 批量版 `thread_by_conv` 的**指认部分**:每个会话最新一行映射里**已指认**的家人
+    /// (`conv_id → user_id`)。会话列表富化用 —— 原先按会话逐个 `thread_by_conv`,
+    /// N 条会话 N 次查询(§ 效率审计 2026-09-08)。
+    ///
+    /// 口径与 `thread_by_conv` + 「`user_id.is_some()` 才算指认」逐字一致:先按 conv 取
+    /// **id 最大**那一行(映射是 append-only 历史行、无 UNIQUE,§7.7),**再**看它有没有指认;
+    /// 老行即使指认过,只要有更新的一行盖着就不算(改绑会继承指认,语义等价)。
+    pub fn assigned_users_by_conv(&self) -> Result<std::collections::HashMap<i64, i64>> {
+        self.db.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT conv_id, user_id FROM channel_threads
+                 WHERE id IN (SELECT MAX(id) FROM channel_threads GROUP BY conv_id)
+                   AND user_id IS NOT NULL",
+            )?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows.into_iter().collect())
+        })
+    }
+
     /// 该 chat 名下「最近有动静」的会话:(conv_id, updated_at),已删除的不算。
     /// 会话轮换的判据源——现行会话通常就是最新的;提醒刚在轮换走的老会话到点时,
     /// 老会话反而最新(用户回「收到」该接回那里,不落进没头没尾的新会话)。
@@ -323,6 +344,37 @@ mod tests {
         s.channels.set_label("telegram", "555", "蛋蛋").unwrap();
         let old = s.channels.thread_by_conv(3).unwrap().unwrap();
         assert_eq!(old.label.as_deref(), Some("蛋蛋"), "昵称按 (channel, ext_id) 全行更新");
+    }
+
+    /// 批量归人映射(会话列表富化用)必须与逐个 `thread_by_conv` **逐字同口径**:
+    /// 按 conv 取最新那一行、再看它有没有指认。这里同时钉住两种容易出岔的形状 ——
+    /// 映射是 append-only 历史行(§7.7,已去 UNIQUE),以及「一个 conv 一行都不该重复出现」。
+    #[test]
+    fn assigned_users_by_conv_matches_thread_by_conv() {
+        let s = store("assigned-batch");
+        // 未指认的对话 → 不进表(调用方回落会话归属者)
+        s.channels.bind("telegram", "100", 1).unwrap();
+        // 指认给家人 42:改绑一次,历史行 + 新行都在(反查恒取最新行)
+        s.channels.bind("telegram", "200", 2).unwrap();
+        let t = s.channels.thread_for("telegram", "200").unwrap().unwrap();
+        s.channels.bind_user(t.id, Some(42)).unwrap();
+        s.channels.bind("telegram", "200", 3).unwrap(); // 轮换:新行继承指认
+        // 另一渠道、另一家人
+        s.channels.bind("dingtalk", "cidA", 4).unwrap();
+        let t2 = s.channels.thread_for("dingtalk", "cidA").unwrap().unwrap();
+        s.channels.bind_user(t2.id, Some(7)).unwrap();
+
+        let batch = s.channels.assigned_users_by_conv().unwrap();
+        for conv in [1i64, 2, 3, 4, 999] {
+            let one = s
+                .channels
+                .thread_by_conv(conv)
+                .unwrap()
+                .and_then(|t| t.user_id);
+            assert_eq!(batch.get(&conv).copied(), one, "conv {conv} 的指认结果必须与逐个反查一致");
+        }
+        assert_eq!(batch.len(), 3, "只出「最新行且已指认」的会话:{batch:?}");
+        assert!(!batch.contains_key(&1), "没指认的对话不该出现");
     }
 
     #[test]

@@ -1006,11 +1006,22 @@ impl Engine {
         let mut list = self.store.chat.list_conversations(me.id)?;
         // 发起人显名(说话人显性化 §):渠道指认的家人 / 非主人发起者才标;主人自己的会话不标
         // (是「你」)。系统会话(channel=system)靠 channel 字段前端显「系统」,不占 owner_name。
+        //
+        // 归人映射一次取全(原先每条会话一次 `conversation_owner` = thread_by_conv + get_conversation,
+        // 再可能一次 users.get,侧栏每刷一次就 2–3×N 条查询;`Db::with` 是单连接互斥锁,等于跟
+        // 同时刻的回合落库抢锁。§ 效率审计 2026-09-08)。口径不变:指认过的算指认的家人,
+        // 否则回落会话 `user_id` —— 而这批会话本就是按 `me.id` 查出来的,回落值恒等于 me、不标名,
+        // 所以只有「指认给了别人」才需要名字,连 users 表都不用碰。
+        let assigned = self.store.channels.assigned_users_by_conv()?;
+        let names: HashMap<i64, String> = if assigned.values().any(|uid| *uid != me.id) {
+            self.store.users.list()?.into_iter().map(|u| (u.id, u.name)).collect()
+        } else {
+            HashMap::new()
+        };
         for c in list.iter_mut() {
-            if let Some(uid) = self.conversation_owner(c.id)? {
-                if uid != me.id {
-                    c.owner_name = self.store.users.get(uid)?.map(|u| u.name);
-                }
+            let owner = assigned.get(&c.id).copied().unwrap_or(c.user_id);
+            if owner != me.id {
+                c.owner_name = names.get(&owner).cloned();
             }
         }
         Ok(list)
@@ -1037,14 +1048,27 @@ impl Engine {
         let mut msgs = self.store.chat.recent_messages(conv_id, 200)?;
         // 「谁说的」显名:user 行说话人若非会话归属者(家人插话 / 声纹 / 渠道归人)→ 填名字;
         // 归属者自己说的不标(是「我」)。声纹与渠道共用 payload.speaker_user,一套覆盖两者。
+        //
+        // 名字一次取全家:原先逐行 `users.get(sid)`,一个渠道会话最多 200 次查询(§ 效率审计
+        // 2026-09-08)。payload 仍只解析一遍(先收要显名的行,再决定要不要碰 users 表);
+        // 家人被删 → 查不到名字 = None,与原先 `users.get` 返回 None 同义。
         let owner = self.conversation_owner(conv_id)?;
-        for m in msgs.iter_mut() {
-            if m.role == "user" {
-                if let Some(sid) = m.payload.as_deref().and_then(parse_speaker_user) {
-                    if Some(sid) != owner {
-                        m.speaker_name = self.store.users.get(sid)?.map(|u| u.name);
-                    }
+        let mut pending: Vec<(usize, i64)> = Vec::new();
+        for (i, m) in msgs.iter().enumerate() {
+            if m.role != "user" {
+                continue;
+            }
+            if let Some(sid) = m.payload.as_deref().and_then(parse_speaker_user) {
+                if Some(sid) != owner {
+                    pending.push((i, sid));
                 }
+            }
+        }
+        if !pending.is_empty() {
+            let names: HashMap<i64, String> =
+                self.store.users.list()?.into_iter().map(|u| (u.id, u.name)).collect();
+            for (i, sid) in pending {
+                msgs[i].speaker_name = names.get(&sid).cloned();
             }
         }
         mark_triggered(&mut msgs);
@@ -3187,12 +3211,9 @@ async fn open_stream(
 }
 
 /// 按字符截断(子回合汇报进 report job 用;别按字节切,多字节边界会 panic —— §7.8 ①的教训)。
+/// 算法在 `crate::text::clip` 单源,这里只定本站点的尾缀话术。
 fn clip_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let cut: String = s.chars().take(max).collect();
-    format!("{cut}…(汇报太长截了尾巴;长产出本该落成文件、汇报里给路径)")
+    crate::text::clip(s, max, "…(汇报太长截了尾巴;长产出本该落成文件、汇报里给路径)")
 }
 
 /// 候选里最便宜的一档(catalog tier 最低;`Light < Balanced < Smart`)。同档并列保持候选序
@@ -3486,6 +3507,50 @@ mod tests {
         assert_eq!(find("家人说的").speaker_name.as_deref(), Some("小明"), "家人插话标名");
         assert_eq!(find("该喝水啦").trigger.as_deref(), Some("reminder"), "event 后 assistant 标自动触发");
         assert_eq!(find("在的").trigger, None, "普通对话回复不标触发");
+    }
+
+    /// 会话列表的发起人显名(说话人显性化 §7.7):渠道指认给**别人**的会话才标名字;
+    /// 主人自己的(桌面 / 指认给主人 / 未指认)一律不标;家人被删 → 标不出名字就 None。
+    /// (2026-09-08 效率审计把逐会话 `conversation_owner` + `users.get` 换成两条批量查询,
+    /// 这条测试钉住换法前后口径一致。)
+    #[test]
+    fn list_conversations_labels_only_other_peoples_conversations() {
+        let eng = engine("list-owner");
+        let me = eng.store.users.ensure_default_user().unwrap();
+        let fam = eng.store.users.create("小明").unwrap();
+        let gone = eng.store.users.create("走了的").unwrap();
+
+        let desktop = eng.store.chat.create_conversation(me.id, DEFAULT_SCENE_ID).unwrap();
+        // 渠道会话三种指认:家人 / 主人自己 / 未指认
+        let famc = eng.store.chat.create_conversation(me.id, DEFAULT_SCENE_ID).unwrap();
+        eng.store.channels.bind("telegram", "fam", famc.id).unwrap();
+        let t = eng.store.channels.thread_for("telegram", "fam").unwrap().unwrap();
+        eng.store.channels.bind_user(t.id, Some(fam.id)).unwrap();
+
+        let minec = eng.store.chat.create_conversation(me.id, DEFAULT_SCENE_ID).unwrap();
+        eng.store.channels.bind("telegram", "mine", minec.id).unwrap();
+        let t = eng.store.channels.thread_for("telegram", "mine").unwrap().unwrap();
+        eng.store.channels.bind_user(t.id, Some(me.id)).unwrap();
+
+        let anon = eng.store.chat.create_conversation(me.id, DEFAULT_SCENE_ID).unwrap();
+        eng.store.channels.bind("telegram", "anon", anon.id).unwrap();
+
+        // 指认给已删除的家人:名字查不到 = None(不该 panic、也不该借别人的名)
+        let ghostc = eng.store.chat.create_conversation(me.id, DEFAULT_SCENE_ID).unwrap();
+        eng.store.channels.bind("telegram", "ghost", ghostc.id).unwrap();
+        let t = eng.store.channels.thread_for("telegram", "ghost").unwrap().unwrap();
+        eng.store.channels.bind_user(t.id, Some(gone.id)).unwrap();
+        eng.store.users.delete(gone.id).unwrap();
+
+        let list = eng.list_conversations().unwrap();
+        let name_of = |id: i64| {
+            list.iter().find(|c| c.id == id).expect("会话应在列表里").owner_name.clone()
+        };
+        assert_eq!(name_of(famc.id).as_deref(), Some("小明"), "指认给家人 → 标家人名");
+        assert_eq!(name_of(desktop.id), None, "桌面会话不标");
+        assert_eq!(name_of(minec.id), None, "指认给主人自己不标(是「你」)");
+        assert_eq!(name_of(anon.id), None, "未指认 → 回落会话归属者 = 主人,不标");
+        assert_eq!(name_of(ghostc.id), None, "指认的家人已删 → 名字取不到 = None");
     }
 
     /// 自动提炼计数:前 N-1 轮不触发、第 N 轮触发并归零、不同会话各自独立。
