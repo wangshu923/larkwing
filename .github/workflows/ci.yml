@@ -1,0 +1,159 @@
+name: ci
+
+# push / PR 时的**日常闸**(与 release.yml 分工:那个只在打 tag / 手动触发时出包)。
+#
+# 为什么有它:在此之前本仓库**没有任何 CI 在 push/PR 上跑** —— 800+ 个 Rust 测试、
+# vue-tsc、i18n 镜像全靠本机手跑,漏一次就带着红进 main。三个 job 各守一类:
+#   · rust          = 测试 + clippy(跑在 macOS:core 依赖 sherpa-onnx 的**预编译**原生库,
+#                     ubuntu 那份未验过,且开发机本就是 mac,基线一致最省心)
+#   · frontend      = vue-tsc + i18n 词典体检(纯 JS/TS,无原生依赖 → 用最便宜的 ubuntu)
+#   · windows-check = 交叉 typecheck,见该 job 自己的注释(这条是 AGENT §8.5 的正解)
+#
+# 装配 / 缓存步骤**照抄 release.yml**(Rust 缓存、sherpa 预编译库缓存、pnpm+Node),
+# 别在这儿另发明一套;sherpa 的 cache key 也**刻意与 release.yml 逐字一致** → 两个
+# workflow 共用同一份缓存。
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 同一分支 / PR 连着推几次时,取消上一次还在跑的(省 runner 分钟,也免得看一堆过时结论)。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read # 只读代码就够;建 / 改 Release 是 release.yml 的事
+
+env:
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Rust:单元 + 集成测试,再 clippy ───────────────────────────────────────
+  rust:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-rust-macos
+          # 只在 main 上回写缓存:PR 各存一份会互相挤掉(仓库缓存总量有上限),
+          # PR 仍能**读**到 main 那份 —— rust-cache 官方推荐的用法。
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # sherpa-onnx-sys 的 build script 首次构建会从 GitHub Release 下载该平台的预编译静态库
+      #(数十 MB),落在 workspace 根 target/sherpa-onnx-prebuilt/。单独缓存 = 省下载 + 抗网络抖动。
+      # ⚠️ 版本号随 Cargo.toml 里 sherpa-onnx 更新,并与 release.yml 保持一致(共用缓存)。
+      - name: Cache sherpa-onnx prebuilt libs
+        uses: actions/cache@v5
+        with:
+          path: target/sherpa-onnx-prebuilt
+          key: sherpa-onnx-macos-latest-1.13.2
+
+      - name: 单元测试(core lib)
+        run: cargo test -p larkwing-core --lib
+
+      - name: 集成测试(engine)
+        run: cargo test -p larkwing-core --test engine
+
+      # clippy 放在测试**之后**:一个 job 里前面 step 挂了后面就不跑,
+      # 测试先跑 = 就算 clippy 红着,测试结论照样看得到。
+      - name: clippy(零警告)
+        run: cargo clippy -p larkwing-core --all-targets -- -D warnings
+
+      # 刻意**没有** `cargo fmt --check`:仓库当前不是 rustfmt-clean(larkwing-core/examples/ 等处
+      # 有成片差异),现在加上等于让 CI 长期红着。要开这一步,先单独跑一次全仓 `cargo fmt` 重排
+      #(那是个巨大且会撞别人改动的 diff,属独立批次),再把下面两行放出来:
+      #   - name: 格式检查
+      #     run: cargo fmt --check
+      # 项目没有 rustfmt.toml,实际排版贴合 rustfmt 默认(100 列)。
+
+  # ── 前端:类型检查 + i18n 词典体检 ────────────────────────────────────────
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: 类型检查(vue-tsc)
+        run: pnpm exec vue-tsc --noEmit
+
+      # AGENT §6.6 的机器化守卫:zh/en 键集 + 占位符集相等、无裸露的 { } @ |、
+      # 不硬编助手名、静态引用都有定义。详见脚本头部注释。
+      - name: i18n 词典体检
+        run: node scripts/check-i18n.mjs
+
+  # ── Windows:交叉 typecheck(AGENT §8.5 的正解)──────────────────────────
+  # 病(§8.5 逐字):`#[cfg(windows)]` 块在 mac 上**只 parse 不 typecheck** → Windows-only 代码的
+  # 类型错(API 签名 / 生命周期)全潜伏到发版 CI 的 Windows job 才爆,一来一回 20 分钟,而且
+  # 编译器在前几个错就停 = 一次只见冰山一角。实锤:v0.2.34 首发挂在 print.rs 三个错。
+  # 现在 push/PR 就 check 一遍 —— cfg(windows) 代码眼下有 core 10 个文件 / src-tauri 6 个文件
+  #(winmax.rs、fullscreen.rs、nativelog.rs、print.rs、startup.rs、output_route.rs …),两个 crate 都要过。
+  # 只 check 不 test:Windows 上跑不了原生依赖的行为验证,那仍归真机(§10 验收纪律)。
+  # ⚠️ `.cargo/config.toml` 给 x86_64-pc-windows-msvc 设了 `+crt-static`(/MT,对齐 sherpa 预编译库),
+  #    windows runner 的宿主 target 就是它 → 自动生效,别去改那个文件。
+  windows-check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-rust-windows
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Cache sherpa-onnx prebuilt libs
+        uses: actions/cache@v5
+        with:
+          path: target/sherpa-onnx-prebuilt
+          key: sherpa-onnx-windows-latest-1.13.2
+
+      # 为什么前端也要装 / 编:`src-tauri/src/lib.rs` 里的 `tauri::generate_context!()` 是**编译期**
+      # 宏,要把 tauri.conf.json 的 frontendDist(= ../dist)整个嵌进二进制;而 dist/ 是 gitignore 的。
+      # 所以不先 `pnpm build` 出 dist,下面 `cargo check -p larkwing` 会直接失败。
+      # larkwing-core 那一条不需要 dist,但放同一个 job 里能共用 Rust 缓存,比拆俩 job 划算。
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend (给 generate_context! 出 dist/)
+        run: pnpm build
+
+      - name: cargo check(core,含 tests/examples)
+        run: cargo check -p larkwing-core --all-targets
+
+      - name: cargo check(壳层 larkwing)
+        run: cargo check -p larkwing

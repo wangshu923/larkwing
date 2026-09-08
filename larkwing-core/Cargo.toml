@@ -3,7 +3,6 @@ name = "larkwing-core"
 version.workspace = true
 license.workspace = true
 edition = "2021"
-rust-version = "1.77.2"
 
 [dependencies]
 anyhow = "1"
@@ -47,7 +46,7 @@ pinyin = "0.11.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks", "gzip", "multipart", "cookies", "http2"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 # 音频指纹(media/fingerprint.rs,剧集片头/片尾自动检测的地基):每帧 Hann 窗 → FFT → 16 个
-# 对数频带能量。纯 Rust,rust-version 1.61 与本 crate MSRV 1.77.2 兼容;num-complex 0.4 本就在树里。
+# 对数频带能量。纯 Rust、依赖极轻(自身只要 rustc 1.61);num-complex 0.4 本就在树里。
 rustfft = "6.4"
 # web 工具的 HTML 解析(搜索结果页 + 正文抽取)
 scraper = "0.23"
@@ -109,7 +108,8 @@ md-5 = "0.10"
 hex = "0.4"
 character_converter = "2.1.5"
 # 压缩包原语(archive.rs)的 7z 解压:纯 Rust(aes256 = 带密码的包;bzip2 压缩形少见没开,
-# 撞上如实报)。版本被本 crate rust-version=1.77.2 钉在 0.7(resolver 尊重 MSRV,新版要 1.85+)。
+# 撞上如实报)。**版本写死 0.7**:新版要 rustc 1.85+,升它得连带抬工具链;真要升先在本机编一遍
+# (从前是 MSRV 声明替我们挡着,2026-09-08 删了声明后就只剩这行注释在挡)。
 sevenz-rust2 = { version = "0.7.0", features = ["aes256"] }
 # rar 解压:官方 unrar 源码的绑定(vendored C++,cc 编译;unrar 许可只准解压不准造 RAR——
 # 我们恰好只解,打包恒走 zip)。分卷 rar 给第一卷,库自动跟卷。
@@ -119,7 +119,7 @@ unrar = "0.5.8"
 encoding_rs = "0.8.35"
 # 系统快照(tools/sysstat.rs 的 system_status):CPU/内存/TOP 进程 + 各卷剩余空间。
 # 只开 system+disk 两个面(默认还带 network/component/user/multithread,用不上不背);
-# 版本被 rust-version=1.77.2 钉(sevenz 同款:resolver 尊重 MSRV,新版要 1.85+)。
+# **版本写死 0.33**(sevenz 同款:新版要 1.85+;2026-09-08 起靠这行注释挡,不再有 MSRV 声明兜)。
 sysinfo = { version = "0.33", default-features = false, features = ["system", "disk"] }
 
 # 系统音量(tools/desktop.rs 的 system_volume):Windows 走 Core Audio(IAudioEndpointVolume)。

@@ -8,3 +8,18 @@ members = ["larkwing-core", "src-tauri"]
 version = "0.2.35"
 # 许可证单一真源(根 LICENSE 文件 = MIT):成员 crate 用 `license.workspace = true` 继承。
 license = "MIT"
+# **刻意没有 `rust-version`(2026-09-08 用户拍板删)**:Larkwing 是自己编译出包的桌面应用、不是给人依赖的库,
+# 声明 MSRV 只约束得到自己;而它曾以 1.77.2 反向钉住依赖的版本选择(cargo 的 MSRV-aware resolver),
+# 还制造过「clippy 报 incompatible_msrv、代码要绕开 1.82 的 std API」这类纯自伤。CI 用 stable(`dtolnay/rust-toolchain@stable`),
+# 那才是唯一真实约束。**别再加回来** —— 想钉某个依赖的版本就在依赖行上写死版本 + 注明缘由(sevenz-rust2 / sysinfo 就是这么做的)。
+
+# ── 发布档编译参数 ────────────────────────────────────────────────────────
+# ⚠️⚠️ 绝对不要加 `panic = "abort"` ⚠️⚠️
+#   `larkwing-core/src/attach.rs` 的 PDF 文字层抽取靠 `catch_unwind` 兜住 pdf-extract 在畸形 PDF 上的
+#   panic(§9「PDF 文字层已做、扫描件 OCR 仍不做」)。panic=abort 会把那次 unwind 变成直接杀进程 ——
+#   用户往聊天里拖一个坏 PDF,整个 app 当场消失。给后人:这不是「还没调优」,是有意留白。
+[profile.release]
+lto = true # 跨 crate 优化(代价 = 发版编译显著变慢,只影响 CI/本地手动发版,不影响日常 dev)
+codegen-units = 1 # 单编译单元,让 lto 能看到全局(与 lto=true 配套)
+strip = true # 剥符号表,安装包更小。代价:panic backtrace 的帧名变地址(panic **消息**不受影响,
+# §8.1 的 native.log 照旧能捞到);真要排符号化崩溃栈,临时把这行注掉重编。
