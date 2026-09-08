@@ -171,6 +171,11 @@
 - 单 `larkwing-core` crate(内部分 mod:store / llm / engine / scenes / tools / voice / media / net …),**不拆多 crate**。**mod 边界 = 未来 crate 切割线**:实现只 use 本 mod 的 trait 和 domain,**绝不反向依赖 engine**。
 - 该拆的信号:① 出现第二个复用 core 的可执行体;② 全量编译变慢;③ 想单独开源某 provider。
 - core 类型全部带 serde,壳层零转换直过 IPC;core 可脱壳测试。`src-tauri` 壳层**只做装配 + 转发,不写业务**。
+- **一个 `impl X` 大到该分家,就按职责分成兄弟文件、每个文件一段 `impl X`(2026-09-08 立规)**:`mod.rs` 只留类型 / 结构体 / 装配接缝,行为按职责各归各家(落点 = `engine/{settings,providers,conversations,users,library,background,snapshot,request,dispatch,subagent}.rs` + `media/{play,local,control,progress,skipctl,decode,queue}.rs`;此前两个 mod.rs 各近 4000 行、`impl Engine` 一块 2473 行)。这不是新范式 —— `media/download.rs` / `edit.rs` / `lyrics.rs` 等七个文件本来就是这个形。
+  - **成立的根据 = 子模块看得见父模块的私有项**,所以搬运不动字段可见性、不动签名、不动调用点。**反过来不成立**(父看不见子的、兄弟之间也看不见)→ 被跨文件调用的私有 helper 标 `pub(super)`;搬出去的 `pub` 类型在 mod.rs 加一行 `pub use` 再导出,**调用方路径不变**。
+  - **算「谁调谁」时要扫全 mod 目录,不能只扫 mod.rs** —— 早就存在的兄弟文件也可能在调你要搬的方法(media 的 `probe_with_ffmpeg` / `refresh_skip` 实锤漏算)。
+  - 测试跟着主题走(缩进不变 = 照样字节相同),**共用夹具进 mod.rs 的 `#[cfg(test)] mod testkit`** 标 `pub(super)`(父模块的 `pub(super)` 项对全部后代可见),兄弟文件 `use crate::<mod>::testkit::…`。
+  - **验收 = 非空行多重集比对**:新文件拼起来 vs `git show HEAD:<原文件>`,「丢失的行」必须逐条能解释(只该是加了 `pub(super)` 的签名)。所以**搬运批里看见 bug 也不修**,掺一行真改动这个证明就没了。→ 详见 docs/notes/engineering.md「拆巨型文件」
 
 ### 6.2 store
 - 数据两类:**出厂只读**(场景 JSON `include_str!`、皮肤 CSS)不进库;**用户可变数据**全进一个 SQLite 文件。
@@ -243,6 +248,8 @@
 - **clip-path 会裁掉挂在元素外沿的浮层(2026-07-04 真机实锤)**:切角气泡把 `clip-path` 加在 `.bubble` 上,贴外沿的 hover 浮层(复制/时间/读数,`top:100%`/`bottom:-19px`)全被裁没——「切角没有 hover、圆角有」。对策 = 形状画在 `::before` 背景层(背景/描边一并搬入),元素本身不裁;`.bubble` 的 backdrop-filter 已构成 stacking context,`::before` z-index:-1 稳在内容下。
 - **关键陷阱**:scoped 规则(`.x[data-v]`)与全局 `[data-skin] .x` 基础特异度相同 → scoped 后加载会赢。要么 token 化(首选),要么给全局覆盖加 `:root` 前缀提权。
 - ⚠️ **scoped CSS 吃不到 `v-html` 产出的元素(2026-09-08 实测,曾静静失效三个月)**:scoped 编译把选择器加成 `.md p[data-v-…]`,而 `v-html` 现产的 `<p>`/`<code>`/`<a>` **不带任何 scope 属性** → 那类**后代**规则一条都不生效。实锤:MainLayout 的 `.md code / pre / a / blockquote / table` 等 12 条精心写的规则全程没落地(行内代码无底色、代码块无框、链接是浏览器默认蓝、表格无边框),而人眼只觉得「markdown 能看」,不会怀疑样式压根没生效。**规则:凡样式作用于 `v-html` 内容,写在非 scoped 块(或 `:deep()`)里**,选择器以一个专属类起头防外溢;只有作用在**宿主元素本身**的规则才能留在 scoped 里(子组件根节点会带上父组件的 scope id,所以 `.md[data-v-父]` 照旧命中)。落点 = `MdText.vue` 的非 scoped 块(内部排版)+ MainLayout scoped 里只剩 `.md` 与 `.bubble.wang .md:not(:first-child)` 两条。**判据:改完去 devtools 量一眼 computed 值,别靠"看着差不多"。**
+- ⚠️ **大页面拆分:只抽 script 进 composable,template 与 style 不拆(2026-09-08 立规,上条那个坑的直接推论)**:`SettingsView.vue` 曾 2957 行(script 1663),现 1491 行 —— 逻辑按 tab 抽成 `composables/settings/use*Settings.ts` 七个,SettingsView 用**同名解构**接回来,于是 **template + style 字节级不变**。**刻意不把 template 拆成 `VoiceTab.vue` 之类**:scoped CSS 只给子组件**根节点**带 scope id,后代一律不带 → 那 200+ 行 scoped 样式里每条打在后代上的规则都会**静默失效**(就是上条 `.md code` 白写三个月那种坏法)。要拆得连样式一起搬 + 逐条量 computed,那是另一个决定,别顺手做。
+  - 配套两条:① 模块内的 `let`(如微信扫码的 `wxLoginSeq` 代次)**不能过解构** → 给它一个函数(`leaveRemoteTab()`);② 单例 composable(`useSettings` / `useVoice` / `useWakeCalib` / `useCaptureRoute`)各自调即可、不用透传,`t` 走 `useI18n()`(composable 由 setup 同步调用 = 合法;§6.6 那条 `i18n.global.t` 的坑只管**模块作用域**)。→ 详见 docs/notes/engineering.md「拆巨型文件」
 - **原生 `<select>` 下拉弹层无法皮肤化(2026-07-04)**:关闭态的 `.s-input` 已 token 化;但展开的 `<option>` 弹层是 OS/Chromium 渲染,只认**不透明**底色/字色(科幻 `--surface-deep` 带 alpha 会被忽略→ 回落系统白),高亮行等 popup chrome 更控不到。要像素级贴皮得换**自定义下拉组件**(div 模拟 + 键盘/点外关闭),全项目 5 处 select 共用一个。**已做 `SkinSelect.vue`(2026-07-04,v0.2.5)**:普通元素自绘列表,弹层同 ContextMenu(`var(--surface)`+blur14),键盘可达 + 点外关闭;设置页 5 处 select(档位/计价/家人指认/麦克风/识别模型)全换。加新下拉一律用它,别再用原生 `<select>`。
 - **列表页共用全局类** `.view-*` / `.lp-*`,新列表页照搬别抄卡片 CSS。**所有滚动容器加 `scrollbar-gutter: stable`**(Windows WebView2 经典条占布局宽,Mac overlay 条看不出 → 真实数据撑满会左移跳动)。
 - ⚠️ **往滚动区**头部**插内容,必须补偿 scrollTop,且「贴底」判据不能认条数(2026-09-08「加载更早」立规)**:上方长出内容后不补偿,视口就跳到别处。补偿写成**赋绝对值** `scrollTop = 旧 top + (新 scrollHeight − 旧 scrollHeight)` 而不是 `+=` —— Chromium 自带 scroll anchoring 有时会先替你补一半,赋绝对值天然幂等、不会补两倍(实测预览页:插 40 条长高 1228px,scrollTop 保持不动 → 补偿后正好回到原内容)。**并且「有新气泡就贴底」的判据必须是「末条 id 变了」**,不能是「条数变了」:头部插一页也让条数变,按条数判会把正在翻历史的用户当场拽回底部 = 这功能白做(与 §8.6 那条「贴底 = scrollTop 追 scrollHeight,与任何能改 scrollHeight 的东西天然成环」同族)。
@@ -546,4 +553,4 @@
 
 ---
 
-*最后整编:2026-09-08(**全仓体检 → 优化批**:用户「看看还有什么需要优化的」→ 四路体检 → 「一起修」。规则变更 = §6.6 三条 / §6.7 两条〔scoped CSS 吃不到 v-html · 流式期间别在模板里做重活〕/ §7.1 relay 有界 / §8.4 同族推论 / §8.5 补路 / §4.11 两处 / §10 新增「CI」节;叙事见 `docs/notes/engineering.md`,纪要见 `docs/AGENT-LOG.md`)。前次 2026-09-07·三批(**AGENT.md 分家**:叙事 / 状态 / 整编链搬出,规则句留守)。*
+*最后整编:2026-09-08·二批(**拆巨型文件**:用户「ABC 一起搞吧」→ engine 3897→534 / media 3975→957 / SettingsView 2957→1491,新增 17 个文件、零行为改动。规则变更 = §6.1 新增一条「`impl X` 分家」+ §6.7 新增一条「大页面只抽 script」;叙事见 `docs/notes/engineering.md`「拆巨型文件」,历次整编链见 `docs/AGENT-LOG.md`)。*

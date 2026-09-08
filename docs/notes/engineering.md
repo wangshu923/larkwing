@@ -112,9 +112,54 @@
 - **`strip = true` 的代价**:panic backtrace 的帧名变地址(panic **消息**不受影响,§8.1 的 native.log 照旧能捞);排符号化崩溃栈时临时注掉。
 - ⚠️ **本机没验过发版编译**:fat LTO + `codegen-units = 1` + Windows `+crt-static` + sherpa 静态库,发版编译会显著变慢,且大依赖树上 fat LTO 偶发撞 CI 链接器内存上限。**下一个 `v*` tag 若挂在链接步骤,先把 `lto` 换成 `"thin"`**(进了 PLAN watch-items)。
 
-## 明确没做的(别当遗漏捡)
+## 拆巨型文件:三个一起拆,靠「零差异行」当验收(2026-09-08·二批)
 
-- **拆巨型文件**:`media/mod.rs` 3960 行 / `engine/mod.rs` 3814 行(`impl Engine` 一块约 2435 行 75 个 pub 方法、`set_setting` 一个 230 行 match)/ `SettingsView.vue` 2956 行装 8 个 tab。纯维护性、零行为收益,而 diff 巨大、撞在飞改动的风险高 → 单独一批做,别混在功能批里。
+> 上一批把它记进「明确没做」(理由 = 零行为收益 + diff 巨大),用户随后拍板「ABC 一起搞吧,也不是什么复杂的事儿」。
+> 结果:`engine/mod.rs` 3897→534 · `media/mod.rs` 3975→957 · `SettingsView.vue` 2957→1491,新增 17 个文件。
+
+### Rust 侧能做成纯搬运的原因(也是选这个切法的理由)
+
+**子模块能访问父模块类型的私有字段。** `engine/settings.rs` 里写 `impl Engine { … }` 照样能碰 `self.store` / `self.llm` —— 不需要改任何字段可见性、任何签名、任何调用点。
+
+更关键:**仓库已经在这么干了**。`media/download.rs` / `edit.rs` / `lyrics.rs` / `archive.rs` / `torrent.rs` / `usage.rs` / `introdetect.rs` 七个文件本来就是 `impl MediaRuntime` + `self.inner.…`。所以这不是引入新范式,是把 mod.rs 里剩下的那摊按同一个模子分出去 —— 当初加新功能都懂得开新文件,只有老代码一直在原地堆。
+
+**可见性是单向的,这是唯一要小心的地方**:父 → 子可见,子 → 父、子 → 兄弟都不可见。于是搬出去的私有 helper 若被别的文件调用,就得标 `pub(super)`。engine 11 处 / media 28 处,一个个都是「原签名前面加两个词」。
+
+⚠️ **教训:算跨文件调用时别只扫 mod.rs。** media 这边漏了 `probe_with_ffmpeg` / `refresh_skip` —— 它们被**早就存在**的兄弟模块(`edit.rs` / `introdetect.rs` / `lyrics.rs`)调用,我只分析了 mod.rs 内部的调用图,靠编译器才逮着。
+
+### 验收 = 多重集比对,「丢失的行」必须逐条能解释
+
+搬完把新文件的行拼起来,和 `git show HEAD:<原文件>` 做非空行多重集 diff:
+
+- engine:3651 非空行里「丢失」**12 条** = 11 条加了 `pub(super)` 的签名 + 1 条 `fn engine` 夹具进了 testkit。
+- media:3760 非空行里「丢失」**28 条**,全是加了 `pub(super)` 的签名。
+- SettingsView:2873 非空行里「丢失」**11 条** = 8 条 import 重写 + 1 条内联 `import('../lib/backend')` 补路径深度 + 1 条 `refreshAutoBackup()` 换了 onMounted 的家 + 1 条 `wxLoginSeq++` 换成函数调用。
+
+新增的行全是脚手架(`//!` 文档 / `use super::*` / `impl X {` / `}` / `mod` 声明 / `pub use` 再导出 / `return {…}`)。**这个「零差异行」性质是整批的验收依据 —— 所以搬运期间看见 bug 也不修**,一旦掺进一行真改动,比对就不再是证明。
+
+### 测试:随主题走,共用夹具进 `testkit`
+
+测试 fn 从 `mod tests` 挪进各主题文件自己的 `mod tests`,**缩进不变**(都是 4 格,原来在 `mod tests {}` 里、现在在新文件的 `mod tests {}` 里)→ 照样字节相同。共用夹具(engine 的 `engine(tag)`;media 的 `runtime` / `touch` / `mk_shuffle_playlist` / `report`)进 mod.rs 的 `#[cfg(test)] mod testkit`,标 `pub(super)` → 父模块里 `pub(super)` 的项对**全部后代**可见,兄弟文件 `use crate::engine::testkit::engine` 即可。测试总数前后都是 825 + 20,一条没少没多。
+
+### Vue 侧:只抽 script,template 与 style 一行不动
+
+`SettingsView.vue` 的 2957 行里,script 占 1663 —— 真正的问题在那。抽成 `composables/settings/use*Settings.ts` 七个,SettingsView 用**同名解构**接回来,于是 **template + style 那 1294 行字节级不变**(脚本核过 `==`)。
+
+**为什么不顺手把 template 拆成 `VoiceTab.vue` 之类**:scoped CSS 只给子组件的**根节点**带 scope id,后代一律不带。把 `<div v-if="tab==='voice'">` 挪进子组件,那 214 行 scoped 样式里每一条打在后代上的规则都会**静默失效** —— 正是 §6.7 那条刚被咬的坑(`.md code` 等 12 条规则白写三个月)。要拆得连样式一起搬 + 逐条量 computed,那是另一个决定。
+
+三处不得不真改的地方:
+1. `wxLoginSeq` 是模块内的 `let` 代次(重扫 / 切走 tab 时作废旧轮询),**不能过解构** → 新增 `leaveRemoteTab()` 代劳,view 里的 `watch(tab)` 改调它。这是整批唯一新写的函数。
+2. 设置页那个大 `onMounted` 里混着 `refreshAutoBackup()`(属 data 组)→ 挪进 `useDataSettings` 自己的 `onMounted`,挂载时机不变。
+3. `famOpts`(渠道对话「指认给谁」下拉)夹在大脑那段代码里,其实属家人组 —— 按语义归位,不按文件里的位置归位。
+
+`useSettings` / `useVoice` / `useWakeCalib` / `useCaptureRoute` 都是模块级单例,各 composable 自己调即可,不用透传。`t` 走 `useI18n()`(composable 由 setup 同步调用 → 合法;§6.6 那条 `i18n.global.t` 的坑只管模块作用域)。
+
+### 明确没做
+
+- **`set_setting` 那个 231 行 match 没拆**:原样进 `settings.rs`。掺进真改动就毁了上面那个验收性质;要拆成按前缀分派的几个 fn,单独排一批 —— 那时 diff 只有几十行,能好好审。
+- **`media/local.rs` 1024 行仍是最大的一个**(`play_local` 一个方法 297 行)。它是一条完整的管线搭建流程,再切会把「探测 → 判路 → 搭管线 → 兜底」切散;等真有第二个消费者再说。
+
+## 明确没做的(别当遗漏捡)
 - **`parking_lot` 换掉约 130 处 `lock().unwrap()`**:任一任务在持锁段 panic 就毒锁,之后 `MediaRuntime.inner` / `Engine.sessions` 这类进程级状态整体失效。是设计取舍(新依赖 + 130 处触点),记档不做。
 - **聊天历史「加载更早」**:`load_conversation` 只回最近 200 行,而 `search_messages` 跨全表 —— 命中 200 行之前的消息,点开后看不到那条。修它要改命令签名 + UI 分页 + 命中定位 = **新功能**,不在「优化」范围内。
 - **前端单元测试**:全仓零 vitest;`useLyrics` 解析 / `useScrubHover` 算位 / `useMediaKeys` 键表 / `streamGroups` 分组这类纯函数正是前端出过 bug 的地方,值得补。本批只补了 Rust 侧 14 条。
