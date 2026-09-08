@@ -46,6 +46,7 @@ __pycache__/
 # Claude Code 指令 + 分阶段规划 + Claude 本地配置
 CLAUDE.md
 PLAN.md
+PLAN-ARCHIVE.md
 .claude/
 
 # ── 本地试验录音(AEC spike 等,分析用不进仓库)──────────────────
