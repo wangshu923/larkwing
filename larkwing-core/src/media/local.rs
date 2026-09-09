@@ -748,7 +748,11 @@ mod tests {
         // 流真的能拉到字节
         let body = reqwest::get(&np.stream_url).await.unwrap().bytes().await.unwrap();
         assert_eq!(&body[..], b"FAKE-MP3-BYTES");
-        assert!(matches!(rx.try_recv().unwrap(), AppEvent::Media(MediaEvent::Play(_))));
+        // 全局车道上跑的不只有播放事件(组件下载的任务卡等杂事同走这里),所以断言「Play 发出来了」
+        // 而不是「第一条就是 Play」—— 顺序不作数。
+        let saw_play = std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|e| matches!(e, AppEvent::Media(MediaEvent::Play(_))));
+        assert!(saw_play, "起播该发 Play 事件");
 
         // 不存在的文件 = 错误观察
         assert!(rt.play(1, "/no/such/file.mp4", false, false, None).await.is_err());

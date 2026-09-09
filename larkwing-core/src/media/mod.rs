@@ -837,7 +837,15 @@ mod testkit {
         let store = Store::open(&dir.join("t.db")).unwrap();
         let bus = Bus::new();
         let rx = bus.subscribe();
-        (MediaRuntime::new(dir, store, bus), rx)
+        let rt = MediaRuntime::new(dir, store, bus);
+        // 夹具**预先扣上「已预取」的闩** = 单测一律不为 ffmpeg 联网。`play()` 一进来就
+        // fire-and-forget `prefetch_ffmpeg()`(§6.9 用时下载),开发机 PATH 上有 ffmpeg 所以
+        // 无声无息;**CI 机器上没有** → 每个调 play 的用例都真的去 GitHub 拉几十 MB,还先往
+        // 同一条总线插一条 `AppEvent::Task`(download 开始)—— 断言「收到的第一条事件是 Play」
+        // 就这么被顶掉(2026-09-09 CI 首红,本机 `PATH=/usr/bin:/bin` 可逐字复现)。
+        // 真需要 ffmpeg 的用例走 `ensure_component`(PATH 命中),不受这个闩影响。
+        rt.inner.ffmpeg_prefetch_started.store(true, Ordering::Relaxed);
+        (rt, rx)
     }
 
     pub(super) fn touch(dir: &std::path::Path, name: &str) -> std::path::PathBuf {

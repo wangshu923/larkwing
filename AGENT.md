@@ -536,6 +536,7 @@
 - **clippy 是 `-D warnings`**:现存警告已清零,新代码不许再留(NaN 防护那两处走 `#[allow]` + 注释,见 §4.11 邻近条)。
 - **`cargo fmt --check` 刻意没加**:仓库本身不是 rustfmt-clean(`examples/` 里成片差异 —— 长中文串该折没折),全仓重排的 diff 太大且会撞在飞改动。要开就单独一批做 format,别混在功能批里。
 - **windows job 必须先 `pnpm build`**:`generate_context!()` 是编译期宏、要把 `frontendDist`(`../dist`)嵌进二进制,而 `dist/` 在 `.gitignore` 里 → 不先出 dist,`cargo check -p larkwing` 直接失败。
+- ⚠️ **CI 机器上没有 ffmpeg —— 单测不许依赖 PATH 上的外部组件,更不许为它联网**(2026-09-09 CI 首红):`play()` 一进来就 fire-and-forget `prefetch_ffmpeg()`,开发机 PATH 有 ffmpeg 所以无声无息,CI 上是真去 GitHub 拉几十 MB + 往同一条总线先插一条 `AppEvent::Task`(download 开始)→ 把「收到的第一条事件是 Play」的断言顶掉。修 = media 测试夹具(`media::testkit::runtime`)预扣「已预取」的闩,顺带断言改成顺序无关。**本机复现 CI 环境 = 拿掉 PATH 上的组件**(`PATH=/usr/bin:/bin ./target/debug/deps/larkwing_core-<hash>`);真要 ffmpeg 的用例一律 `#[ignore]`。
 - ⚠️ **CI 绿 ≠ 验过**:它只挡编译 / 测试 / 键集这类**机测**项。下面那条真机纪律一字不变。
 
 ### 现状 / 验收纪律
