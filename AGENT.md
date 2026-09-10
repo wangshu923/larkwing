@@ -537,6 +537,7 @@
 - **`cargo fmt --check` 刻意没加**:仓库本身不是 rustfmt-clean(`examples/` 里成片差异 —— 长中文串该折没折),全仓重排的 diff 太大且会撞在飞改动。要开就单独一批做 format,别混在功能批里。
 - **windows job 必须先 `pnpm build`**:`generate_context!()` 是编译期宏、要把 `frontendDist`(`../dist`)嵌进二进制,而 `dist/` 在 `.gitignore` 里 → 不先出 dist,`cargo check -p larkwing` 直接失败。
 - ⚠️ **CI 机器上没有 ffmpeg —— 单测不许依赖 PATH 上的外部组件,更不许为它联网**(2026-09-09 CI 首红):`play()` 一进来就 fire-and-forget `prefetch_ffmpeg()`,开发机 PATH 有 ffmpeg 所以无声无息,CI 上是真去 GitHub 拉几十 MB + 往同一条总线先插一条 `AppEvent::Task`(download 开始)→ 把「收到的第一条事件是 Play」的断言顶掉。修 = media 测试夹具(`media::testkit::runtime`)预扣「已预取」的闩,顺带断言改成顺序无关。**本机复现 CI 环境 = 拿掉 PATH 上的组件**(`PATH=/usr/bin:/bin ./target/debug/deps/larkwing_core-<hash>`);真要 ffmpeg 的用例一律 `#[ignore]`。
+- ⚠️ **CI 的 toolchain 是浮动 `@stable`(`dtolnay/rust-toolchain@stable`)→ 本地 stable 也得跟着升,别落在后面**(2026-09-10 实锤:本地 1.96 / CI 1.98,新 lint `chunks_exact_to_as_chunks` 在本地压根测不出 → **本机全绿是假绿**,CI 又成了第一道编译器 = §8.5 那个病的另一张脸)。纪律 = 合入前本地跑一遍**上面那三条 CI 原命令**(别另挑一套);CI 红在没见过的 lint 上,先 `rustup update stable` 再修。**刻意不钉版本**:钉了开发机与 CI 继续漂移,还把「每次一两条新 lint」攒成「一次大扫除」——同 `cargo fmt --check` 那条取舍。
 - ⚠️ **CI 绿 ≠ 验过**:它只挡编译 / 测试 / 键集这类**机测**项。下面那条真机纪律一字不变。
 
 ### 现状 / 验收纪律

@@ -215,8 +215,10 @@ fn decode_wav(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
         if id == b"data" {
             let end = (body + len).min(bytes.len());
             let pcm = bytes[body..end]
-                .chunks_exact(2)
-                .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| i16::from_le_bytes(*b) as f32 / 32768.0)
                 .collect();
             return Ok((pcm, rate));
         }

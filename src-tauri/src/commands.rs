@@ -109,8 +109,10 @@ pub fn voice_push_audio(
 ) -> Result<(), AppError> {
     if let tauri::ipc::InvokeBody::Raw(bytes) = request.body() {
         let pcm: Vec<f32> = bytes
-            .chunks_exact(2)
-            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32_768.0)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| i16::from_le_bytes(*b) as f32 / 32_768.0)
             .collect();
         state.voice.push_audio(pcm);
     }

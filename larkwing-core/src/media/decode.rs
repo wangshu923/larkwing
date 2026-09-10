@@ -40,11 +40,7 @@ impl MediaRuntime {
         let out = out.context("ffmpeg 解码超时")?.context("ffmpeg 起不来")?;
         anyhow::ensure!(out.status.success(), "ffmpeg 解码失败(退出码 {:?})", out.status.code());
         anyhow::ensure!(!out.stdout.is_empty(), "解码出的音频为空");
-        Ok(out
-            .stdout
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect())
+        Ok(out.stdout.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect())
     }
 
     /// 本机音频文件 → 16k 单声道 f32 PCM(read_audio 的耳朵喂料)。直接 `-i 路径`,
@@ -86,10 +82,6 @@ impl MediaRuntime {
             .context("ffmpeg 起不来")?;
         anyhow::ensure!(out.status.success(), "ffmpeg 解码失败(退出码 {:?})", out.status.code());
         anyhow::ensure!(!out.stdout.is_empty(), "解码出的音频为空(这个文件里没有能听的声音?)");
-        Ok(out
-            .stdout
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect())
+        Ok(out.stdout.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect())
     }
 }

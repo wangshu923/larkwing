@@ -36,10 +36,8 @@ impl MediaRuntime {
 
     /// 标记 / 检测结果变了:用存着的原料重算并广播(前端替换 `NowPlaying.skip`)。
     pub(super) fn refresh_skip(&self) -> Option<skip::SkipInfo> {
-        let (auto, duration) = match self.inner.skip_ctx.lk().as_ref() {
-            Some(c) => (c.auto.clone(), c.duration),
-            None => return None,
-        };
+        let (auto, duration) =
+            self.inner.skip_ctx.lk().as_ref().map(|c| (c.auto.clone(), c.duration))?;
         // 时长以前端回报的为准(起播时探不出的 /m/ 混流路,播起来后前端知道)
         let duration = duration.or(self.inner.playback.lk().duration_secs);
         let info = self.compute_skip(auto, duration);
