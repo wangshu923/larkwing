@@ -62,9 +62,18 @@ let audio: HTMLAudioElement | null = null
 let videoEl: HTMLVideoElement | null = null
 
 /** 把当前倍速落到播放元素。顺手显式打开 preservesPitch(变速不变调):Chromium/WebKit 默认就开,
- *  写一次当保险 —— 这就是各家播放器宣传的「倍速声音优化」,浏览器白送。 */
+ *  写一次当保险 —— 这就是各家播放器宣传的「倍速声音优化」,浏览器白送。
+ *
+ *  ⚠️ **`defaultPlaybackRate` 必须一起设(2026-09-10 修)**:设 `src` 会跑「媒体加载算法」,
+ *  其中一步是把 `playbackRate` **重置成 `defaultPlaybackRate`**。而本函数的每个调用点都在设 src
+ *  **之前**(切集要在新元素上先落倍速)→ 只设 playbackRate 等于白设。首播看不出来(core 新点播
+ *  本就复位成 1),**切集 / 自动续播捎带 1.75 过来时就露馅:镜像显示 1.75、元素实际 1.0x**。
+ *  预览浏览器(Chromium,同 WebView2 内核)实测四组:全新元素 / 复用元素 / MediaSource objectURL
+ *  三种设 src 的姿势都重置,只有先设 defaultPlaybackRate 才留得住。shaka 的 PlayRateController
+ *  也拿 `video.defaultPlaybackRate` 当「缓冲卡顿后恢复到多少」,一并对齐。 */
 function applyRateToEl(el: HTMLMediaElement) {
   el.preservesPitch = true
+  el.defaultPlaybackRate = state.rate
   el.playbackRate = state.rate
 }
 /** 混流视频 seek = 换 src 重启,这里记基准秒数,显示时间 = base + currentTime。 */
@@ -225,7 +234,7 @@ async function loadVideoInto(el: HTMLVideoElement) {
   const cur = state.current
   if (!cur || cur.kind !== 'video') return
   clearPendingResume() // 换元素/换路:旧的起播定位监听先摘,别让它在新一次加载时跳到旧位置
-  applyRateToEl(el) // 换 src 会把 playbackRate 重置回 1(规范行为),切集后要重新落
+  applyRateToEl(el) // 设 src 前先落倍速(靠 defaultPlaybackRate 熬过加载算法的重置,见 applyRateToEl)
   el.volume = liveVolume()
   // 起播定位(切音轨重建管线的「接着放」):消费一次即清,防浮层重挂载重复回跳
   const resume = cur.resume_at && cur.resume_at > 0 ? cur.resume_at : 0

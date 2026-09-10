@@ -343,10 +343,11 @@ export default {
     nowPlaying: 'Now playing',
     coverOpen: 'See what’s playing',
     coverClose: 'Close',
-    // Intro / outro: mark menu (right-click the bar / scissors / S), skip undo, outro countdown
+    // Intro / outro: mark menu (right-click the bar / scissors / S), skip undo, outro heads-up
     skip: {
       menu: 'Intro & outro',
       now: 'This episode: {info}',
+      dragHint: 'Drag the ticks on the bar to adjust',
       intro: 'Intro {a}–{b}',
       outro: 'Outro from {t}',
       introStart: 'Intro starts here ({t})',
@@ -357,7 +358,7 @@ export default {
       cleared: 'Marks cleared',
       skipped: 'Intro skipped',
       undo: 'Watch it',
-      nextIn: 'Next episode in {s} s',
+      nextIn: 'Up next in {s}s',
       cancel: 'Cancel',
     },
     fullscreen: 'Fullscreen',

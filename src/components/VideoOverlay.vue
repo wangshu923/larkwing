@@ -12,7 +12,7 @@ import KeyHelpCard from './KeyHelpCard.vue'
 import { useContextMenu, type MenuItem } from '../composables/useContextMenu'
 import { registerVideoEl, useMedia } from '../composables/useMedia'
 import { useMediaKeys, VOL_STEP } from '../composables/useMediaKeys'
-import { useScrubHover, useScrubThumb } from '../composables/useScrubHover'
+import { pctFromX, useScrubHover, useScrubThumb } from '../composables/useScrubHover'
 import { win } from '../lib/backend'
 import { fmtClock } from '../lib/fmt'
 
@@ -208,9 +208,12 @@ function onScrubCommit(e: Event) {
  * 治"盲拖":原先要按下去拖起来才看得到目标时间(而且读数在最左边、离光标很远),
  * 按下之前完全没数 —— 而 range 是点哪跳哪。缩略图只有本地片有(thumb_url 有值才出)。 */
 const durationRef = computed(() => state.duration)
+/** range 拇指直径:与下面 CSS 的 `::-webkit-slider-thumb` 同值(轨道两端各被半个拇指占掉,
+ *  算 x→秒数时要减掉它)。hover 读数与拖标记两处共用同一个换算,所以提成常量。 */
+const THUMB_W = 11
 // 夹在面板里(不是夹在进度条里):带缩略图的气泡比窗口态的进度条还宽,夹轨道会顶出小窗。
 const { trackEl, hoverPct, hoverTime, bubbleLeft, bubbleW, onMove, onLeave } =
-  useScrubHover(durationRef, { thumbWidth: 11, clampTo: panelEl })
+  useScrubHover(durationRef, { thumbWidth: THUMB_W, clampTo: panelEl })
 const { src: thumbSrc, available: thumbAvailable } = useScrubThumb(
   computed(() => state.current?.thumb_url),
   hoverTime,
@@ -250,18 +253,18 @@ const listOpen = ref(false)
 /* —— 片头 / 片尾(core 汇成的 NowPlaying.skip:手标 > B 站标注 > 章节 > 指纹检测)——
  * 片头:自然播进 [start, end) → 跳到 end,右下 OSD「已跳过片头 · 回看」5 秒可点回去;用户自己拖进片头
  *   = 想看,不跳(本集不再自动跳)。
- * 片尾:自然越过起点且有下一集 → 3 秒倒计时切集(用户拍板 2026-09-07),可取消;拖进片尾区 = 想看字幕,不切。
+ * 片尾:**提前 5 秒预告「即将播下一集」(可取消),到点直接切**(用户拍板 2026-09-10 —— 原先是越过
+ *   片尾线之后再数 3 秒才切,片尾都开始放了还干等,不对)。拖进片尾区 = 想看字幕/彩蛋,这一集不预告也不切。
  * 「自然播放 vs 拖动」靠相邻两次 timeupdate 的跨度判(> SEEK_JUMP_S = 拖了)。换集全部复位。 */
 const skipInfo = computed(() => state.current?.skip ?? null)
 const SEEK_JUMP_S = 2.5
-const COUNTDOWN_S = 3
+const OUTRO_NOTICE_S = 5
 const skipOsd = ref<{ text: string; undoTo: number } | null>(null)
 let skipOsdTimer = 0
-const countdown = ref<number | null>(null)
-let countdownTimer = 0
+/** 本集的片尾已了结:切过了 / 用户取消了 / 是自己拖进片尾区的。换集复位。 */
+const outroDone = ref(false)
 let lastPos = 0
 let introHandled = false
-let outroHandled = false
 /** 有没有「下一集」可切:顺序未到末集,或模式不是「放完就停」(列表循环 / 单曲 / 随机 → core auto_next 会回卷 / 重放 / 挑)。 */
 const wraps = computed(() => state.playMode !== 'once')
 const hasNext = computed(() => {
@@ -279,21 +282,139 @@ function undoSkip() {
   skipOsd.value = null
   seek(u.undoTo)
 }
-function startCountdown() {
-  countdown.value = COUNTDOWN_S
-  clearInterval(countdownTimer)
-  countdownTimer = window.setInterval(() => {
-    if (countdown.value == null) return
-    countdown.value -= 1
-    if (countdown.value <= 0) {
-      cancelCountdown()
-      autoNext() // 与自然播完同一条路:core 按顺序 / 循环 / 随机定下一集
-    }
-  }, 1000)
+/** 片尾预告:还差几秒到片尾线(1..OUTRO_NOTICE_S),没到窗口 / 已了结 / 没下一集都是 null。
+ *  **纯从播放位派生,不开 interval** —— 暂停、拖走、取消都自然消失,不用管一堆定时器的生命周期。
+ *  暂停时不显:停着不会往前走,挂个「即将」的牌子是说瞎话(一按播放它自己回来)。 */
+const outroNotice = computed(() => {
+  const s = skipInfo.value
+  if (state.status !== 'playing') return null
+  if (!s || s.outro_start == null || outroDone.value || !hasNext.value) return null
+  const left = s.outro_start - state.position
+  if (left <= 0 || left > OUTRO_NOTICE_S) return null
+  return Math.max(1, Math.ceil(left))
+})
+/** 「先别切」:这一集不再预告也不自动切(片尾曲想听完 / 有彩蛋)。自然播到头仍走 ended → autoNext。 */
+function dismissOutro() {
+  outroDone.value = true
 }
-function cancelCountdown() {
-  clearInterval(countdownTimer)
-  countdown.value = null
+
+/* —— 进度条上的片头 / 片尾位置标:看得见,而且能直接拖 ——
+ * 三个点(片头起、片头止、片尾起)让人**事先**看见「这儿会跳」;拖一下松手 = 调到那个位置,
+ * 走的是与右键菜单 / 嘴控同一个 core 入口 `mark_skip` —— 所以语义天然就是「手标、锚在这一集、
+ * **从这集起**生效」(2026-09-10 用户要的就是这个,core 侧零改动)。
+ * 时长未知(混流 /m/ 的 el.duration=Infinity)一个都不画:宁可不标,不标错地方。 */
+type MarkKind = 'intro_start' | 'intro_end' | 'outro_start'
+/** 相邻两个标记之间至少留这么多秒(拖不过去)。 */
+const MARK_MIN_GAP_S = 1
+/** 片头起点在前这么多秒内 = **不画那根线**(§4.11 待确认,2026-09-10 用户「起点贴着 0 时不画」)。
+ *  缘由:`intro_start` 在 core 是可选的(不标就当 0,`skip.rs::resolve`),它只有两件活 ——
+ *  ① 触发闸(自然播进 [start,end) 才跳,治「先来一段前情提要、OP 在 2:30 才起」)② 「回看」的落点。
+ *  片头本来就从头开始的片子(最常见)这两件活都退化了,那根线只是钉在最左边、起播时还被播放头
+ *  拇指压着的噪音。10 秒:够盖住片方 logo 那几秒,又远小于任何真冷开场。
+ *  **同时是它的拖动下限** —— 否则往左拖过界就把手柄拖没了、还拖不回来。真要设更小的起点仍走
+ *  右键菜单「片头从这里开始」(功能照常生效,只是不给手柄)。 */
+const INTRO_START_MIN_S = 10
+/** 按下后没挪过这么多像素 = 当成「点了进度条」而不是「拖标记」。 */
+const MARK_CLICK_SLOP = 3
+/** 正在拖的那个(松手才落库);拖动中标记跟着光标走。 */
+const markDrag = ref<{ kind: MarkKind; pct: number; moved: boolean } | null>(null)
+/** 松手后到 core 广播回新 skip 之间的乐观位置 —— 不留着的话标记会先弹回旧位、再跳到新位,
+ *  看着像「没拖动」。skip 事件到了(或 2 秒兜底)即清。 */
+const pendingMark = ref<{ kind: MarkKind; pct: number } | null>(null)
+let pendingTimer = 0
+watch(skipInfo, () => {
+  pendingMark.value = null
+  clearTimeout(pendingTimer)
+})
+
+const skipMarks = computed(() => {
+  const s = skipInfo.value
+  const d = state.duration
+  if (!s || d <= 0) return []
+  const live = markDrag.value ?? pendingMark.value
+  const raw: [MarkKind, number | null | undefined][] = [
+    ['intro_start', s.intro?.start],
+    ['intro_end', s.intro?.end],
+    ['outro_start', s.outro_start],
+  ]
+  return raw
+    .filter((e): e is [MarkKind, number] => {
+      if (e[1] == null || e[1] <= 0 || e[1] >= d) return false
+      return e[0] !== 'intro_start' || e[1] >= INTRO_START_MIN_S // 贴着 0 的起点不画
+    })
+    .map(([kind, secs]) => ({
+      kind,
+      pct: live?.kind === kind ? live.pct : (secs / d) * 100,
+      dragging: markDrag.value?.kind === kind,
+    }))
+})
+
+/** 光标 x → 进度条上的百分比(与 hover 读数同一套换算)。 */
+function pctAt(clientX: number): number | null {
+  const el = trackEl.value
+  if (!el || !(state.duration > 0)) return null
+  const r = el.getBoundingClientRect()
+  return pctFromX(clientX, r.left, r.width, THUMB_W)
+}
+/** 拖到的秒数按邻居夹一下:片头起 < 片头止 < 片尾起,各留 1 秒;片头起再多一条下限(见
+ *  INTRO_START_MIN_S)。core 自己也有兜底(起点拖过终点它会把起点丢掉、退回从 0 算),前端夹是为了
+ *  **拖不过去**这个手感 —— 而不是让标记悄悄消失。 */
+function clampMark(kind: MarkKind, secs: number): number {
+  const s = skipInfo.value
+  const d = state.duration
+  let lo = 0
+  let hi = d
+  if (kind === 'intro_start') {
+    lo = INTRO_START_MIN_S // 拖到下限就停住,不许拖成「贴着 0」把自己的手柄弄没
+    hi = (s?.intro?.end ?? d) - MARK_MIN_GAP_S
+  } else if (kind === 'intro_end') {
+    lo = (s?.intro?.start ?? 0) + MARK_MIN_GAP_S
+    hi = (s?.outro_start ?? d) - MARK_MIN_GAP_S
+  } else lo = (s?.intro?.end ?? 0) + MARK_MIN_GAP_S
+  return Math.min(Math.max(secs, Math.max(0, lo)), Math.max(0, hi))
+}
+/** 按住一个标记开拖。窗口级 move/up(不用 pointer capture),拖出条外也不丢跟踪 —— 与本文件
+ *  的标题栏拖动 / 缩放把手同一套写法。 */
+function onMarkDown(e: PointerEvent, kind: MarkKind) {
+  const p0 = pctAt(e.clientX)
+  if (p0 == null) return
+  e.preventDefault()
+  e.stopPropagation() // 别让 range 顺手 seek 一下
+  const startX = e.clientX
+  markDrag.value = { kind, pct: p0, moved: false }
+  const move = (ev: PointerEvent) => {
+    const p = pctAt(ev.clientX)
+    const cur = markDrag.value
+    if (p == null || !cur) return
+    const secs = clampMark(kind, (p / 100) * state.duration)
+    markDrag.value = {
+      kind,
+      pct: (secs / state.duration) * 100,
+      moved: cur.moved || Math.abs(ev.clientX - startX) > MARK_CLICK_SLOP,
+    }
+    onMove(ev) // 时间气泡 + 缩略图跟着走:拖「片头止」时能直接看着画面找那一帧
+  }
+  const up = (ev: PointerEvent) => {
+    window.removeEventListener('pointermove', move)
+    window.removeEventListener('pointerup', up)
+    const d = markDrag.value
+    markDrag.value = null
+    onLeave()
+    if (!d) return
+    if (!d.moved) {
+      // 没挪 = 想点进度条。标记只有十来像素宽,但也不该在条上留三个「点了没反应」的死区
+      const p = pctAt(ev.clientX)
+      if (p != null) seek((p / 100) * state.duration)
+      return
+    }
+    pendingMark.value = { kind, pct: d.pct }
+    clearTimeout(pendingTimer)
+    pendingTimer = window.setTimeout(() => (pendingMark.value = null), 2000)
+    markSkip(kind, (d.pct / 100) * state.duration)
+    flashOsd(t('media.skip.marked'))
+  }
+  window.addEventListener('pointermove', move)
+  window.addEventListener('pointerup', up)
 }
 /** 跳过片头(S 键 / 嘴控走 core 的 seek):记为已处理,OSD 给回看口。 */
 function skipIntroNow() {
@@ -308,32 +429,42 @@ watch(
   () => state.current?.stream_url,
   () => {
     introHandled = false
-    outroHandled = false
+    outroDone.value = false
     lastPos = 0
-    cancelCountdown()
     skipOsd.value = null
+    markDrag.value = null
+    pendingMark.value = null
   },
 )
 watch(
   () => state.position,
   (p) => {
-    const jumped = Math.abs(p - lastPos) > SEEK_JUMP_S
+    const prev = lastPos
+    const jumped = Math.abs(p - prev) > SEEK_JUMP_S
     lastPos = p
     const s = skipInfo.value
-    if (!s || state.status !== 'playing' || dragging.value) return
+    // 正在拖标记时一概不动作:那会儿播放头照常往前走,越线切集会把片子从用户手底下换掉
+    if (!s || state.status !== 'playing' || dragging.value || markDrag.value) return
     if (s.intro && !introHandled && p >= s.intro.start && p < s.intro.end - 0.5) {
       introHandled = true
       if (!jumped) skipIntroNow() // 拖进片头 = 想看,只记不跳
     }
-    if (s.outro_start != null && !outroHandled && countdown.value == null && p >= s.outro_start) {
-      outroHandled = true
-      if (!jumped && hasNext.value) startCountdown()
+    if (s.outro_start != null && !outroDone.value) {
+      if (jumped) {
+        // 自己拖进片尾区(含预告窗)= 想看,这一集不预告也不切
+        if (p >= s.outro_start - OUTRO_NOTICE_S) outroDone.value = true
+      } else if (prev < s.outro_start && p >= s.outro_start) {
+        // 判「这一拍**跨过**了片尾线」而不是「已经在线后面」:否则把片尾标记往回拖到播放头之前,
+        // 下一拍就会当场切集(用户只是想调标记,不是想换集)。
+        outroDone.value = true
+        if (hasNext.value) autoNext() // 到点直接切,与自然播完同一条路(core 定下一集)
+      }
     }
   },
 )
 onUnmounted(() => {
-  cancelCountdown()
   clearTimeout(skipOsdTimer)
+  clearTimeout(pendingTimer)
 })
 
 /** 片头片尾标记菜单(进度条右键 = 光标处的时间;剪刀钮 / S 键 = 当前播放位):三项标记 + 本集在用的
@@ -345,7 +476,10 @@ function skipMenuItems(at: number): MenuItem[] {
     const parts: string[] = []
     if (s.intro) parts.push(t('media.skip.intro', { a: fmtClock(s.intro.start), b: fmtClock(s.intro.end) }))
     if (s.outro_start != null) parts.push(t('media.skip.outro', { t: fmtClock(s.outro_start) }))
-    items.push({ label: t('media.skip.now', { info: parts.join(' · ') }), disabled: true }, { separator: true })
+    items.push({ label: t('media.skip.now', { info: parts.join(' · ') }), disabled: true })
+    // 拖标记是「看不见的手势」,在这儿说一句 —— 菜单本来就是发现这套功能的地方
+    if (parts.length) items.push({ label: t('media.skip.dragHint'), disabled: true })
+    items.push({ separator: true })
   }
   const mark = (a: 'intro_start' | 'intro_end' | 'outro_start') => () => {
     markSkip(a, at)
@@ -536,13 +670,13 @@ onUnmounted(() => {
     <Transition name="osd">
       <div v-if="osd" class="osd" aria-live="polite">{{ osd }}</div>
     </Transition>
-    <!-- 跳过片头的回看口(5 秒);片尾倒计时切集(可取消)。都挂右下、控制条之上 -->
+    <!-- 跳过片头的回看口(5 秒);片尾预告「即将播下一集」(可取消,到点自己切)。都挂右下、控制条之上 -->
     <button v-if="skipOsd" class="skip-osd" @click.stop="undoSkip">
       {{ skipOsd.text }} · {{ t('media.skip.undo') }}
     </button>
-    <div v-if="countdown != null" class="countdown" @pointerdown.stop>
-      <span>{{ t('media.skip.nextIn', { s: countdown }) }}</span>
-      <button class="vbtn small" @click.stop="cancelCountdown">{{ t('media.skip.cancel') }}</button>
+    <div v-if="outroNotice != null" class="countdown" @pointerdown.stop>
+      <span>{{ t('media.skip.nextIn', { s: outroNotice }) }}</span>
+      <button class="vbtn small" @click.stop="dismissOutro">{{ t('media.skip.cancel') }}</button>
     </div>
     <!-- 快捷键速查(H):从同一张键位表生成;点外 / Esc / H 关 -->
     <div v-if="helpOpen" class="help" @click="helpOpen = false" @pointerdown.stop>
@@ -609,6 +743,17 @@ onUnmounted(() => {
           @change="onScrubCommit"
           :style="{ '--pct': pct + '%' }"
         />
+        <!-- 片头 / 片尾位置标:压在轨道上的小竖线,可直接拖着调(松手落库,从本集起生效)。
+             事件冒泡到轨道 → hover 读数与右键标记菜单照旧;没挪就松手 = 当普通点击去 seek。 -->
+        <span
+          v-for="m in skipMarks"
+          :key="m.kind"
+          class="skip-mark"
+          :class="{ dragging: m.dragging }"
+          :style="{ '--p': m.pct / 100 }"
+          @pointerdown="onMarkDown($event, m.kind)"
+          aria-hidden="true"
+        ></span>
       </div>
       <button
         v-if="audioTrackCount >= 2 && !compact"
@@ -787,6 +932,42 @@ onUnmounted(() => {
 .scrub-track { position: relative; flex: 1; min-width: 0; display: flex; align-items: center; }
 .scrub-track .slider { margin: 0; }
 
+/* 片头 / 片尾位置标:骑在 3px 轨道上的小竖线(2×10px),提前告诉人「这儿会跳」,还能拖着调。
+   ① z-index 1 才压得住滑杆自绘的轨道底色(它在 DOM 里排后面);② 元素本身是 14×18 的**透明抓手**
+   (2px 的线画在 ::before 里)—— 光标要抓得住,线又不该变粗;③ 事件不拦,冒泡到 .scrub-track,
+   hover 读数 / 右键标记菜单照旧;④ 颜色见 ::before —— 跟着皮肤的 accent 走。 */
+.skip-mark {
+  position: absolute; top: 50%; z-index: 1;
+  /* 按**可用轨道**定位(两端各让出半个拇指),与 range 拇指、hover 读数用的是同一套换算
+     ——直接用 `left: pct%` 会与拇指差出几个像素:刚跳完片头时播放头正停在「片头止」标记上,
+     那点错位一眼看得出,拖动的落点也会偏。11px = THUMB_W,改一处要两处一起改。 */
+  left: calc(5.5px + var(--p) * (100% - 11px));
+  width: 14px; height: 18px; margin-top: -9px;
+  transform: translateX(-50%);
+  cursor: ew-resize;
+  touch-action: none; /* 触摸屏上拖标记别被当成滚动 */
+}
+.skip-mark::before {
+  content: ''; position: absolute; left: 50%; top: 50%;
+  width: 2px; height: 10px; margin: -5px 0 0 -1px;
+  border-radius: 1px;
+  /* 跟着皮肤走 = 取当前皮肤的 accent 往白里提一档:**同一个色相**,放进哪套皮都不跳色;靠
+     明度差(而不是换色相)在**已播区**(纯 accent 填充)上仍读得出是一道刻痕,外描一圈黑补分界。
+     —— 原先用 --attn 是错的:科幻/护眼绿里青配橙硬撞,暖萌/暗夜里 attn 与 accent 几乎同色、
+     在已播区直接隐形(2026-09-10 用户「有些突兀」)。
+     ⚠️ 第一行是老 WebView2(< Chromium 111 不认 color-mix)的兜底 —— 那儿退成纯 accent、
+     靠黑描边仍看得见,而不是整条声明被丢掉变透明(§3.5 不静默失败)。 */
+  background: var(--accent);
+  background: color-mix(in srgb, var(--accent) 32%, #fff);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45);
+  transition: height 0.12s ease, width 0.12s ease;
+}
+/* 抓得住的提示:光标压上去 / 拖动中,线变粗变高并点一层同皮肤的辉光 */
+.skip-mark:hover::before, .skip-mark.dragging::before {
+  width: 3px; height: 15px; margin: -7.5px 0 0 -1.5px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.5), 0 0 8px rgba(var(--accent-rgb), 0.9);
+}
+
 /* 光标处读数:小图在上、时间在下,夹在条内不出框(bubbleLeft 已算好);
    覆盖媒体豁免同控制条 —— 恒黑底浅字,压在画面上才读得清。 */
 .hover-bubble {
@@ -823,7 +1004,7 @@ onUnmounted(() => {
 /* 选集下拉(窗口态):挂在标题栏下方;全屏侧栏由组件自己定位 */
 .eplist.drop { top: 46px; max-height: min(320px, calc(100% - 110px)); }
 
-/* 跳过片头回看口 / 片尾倒计时:右下角、控制条之上(覆盖媒体豁免:恒亮浅字压黑底) */
+/* 跳过片头回看口 / 片尾预告:右下角、控制条之上(覆盖媒体豁免:恒亮浅字压黑底) */
 .skip-osd, .countdown {
   position: absolute; right: 16px; bottom: 64px; z-index: 3;
   display: flex; align-items: center; gap: 10px;

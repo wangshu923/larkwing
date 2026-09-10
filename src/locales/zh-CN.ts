@@ -344,10 +344,11 @@ export default {
     nowPlaying: '正在播放',
     coverOpen: '看看正在放什么',
     coverClose: '收起',
-    // 片头片尾:标记菜单(进度条右键 / 剪刀钮 / S)、跳过回看口、片尾倒计时
+    // 片头片尾:标记菜单(进度条右键 / 剪刀钮 / S)、跳过回看口、片尾预告
     skip: {
       menu: '片头片尾',
       now: '本集:{info}',
+      dragHint: '条上的小竖线可以直接拖着调',
       intro: '片头 {a}–{b}',
       outro: '片尾从 {t} 起',
       introStart: '片头从这里开始({t})',
@@ -358,7 +359,7 @@ export default {
       cleared: '已清除标记',
       skipped: '已跳过片头',
       undo: '回看',
-      nextIn: '{s} 秒后播放下一集',
+      nextIn: '即将播放下一集 · {s} 秒',
       cancel: '取消',
     },
     fullscreen: '全屏',
