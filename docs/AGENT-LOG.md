@@ -19,6 +19,8 @@
 - 规则变更:**§6.1** 新增「叶子文件拆成目录模块的变体」一条(`super::` 多一层不改行、mod.rs 借名字;子文件 `use super::*`;跨子文件 `pub(super)` 汇一次;对外 `pub use` 保路径;未被外部使用的别 re-export)。§4.11 / §7.1 里 `relay.rs` 的常量落点改写为 `relay/mod.rs`。
 - 验收 = 多重集只丢 20 条签名;PLAN §1 加一节「回归一眼」。叙事见 `docs/notes/engineering.md`「拆 relay.rs:目录模块的变体(2026-09-16)」。
 
+同日收尾:三批里新添的八处过程默认(`media_control` 30s / `UPSTREAM_HEAD_TIMEOUT` 10s / 短集 finished 闸 / `SLEEP_MAX_MIN` 720 / `SLEEP_FADE_MS` 20s / `SLEEP_PRESETS` 15·30·60 / 字幕大字 7.5vh / 拖放附件 12MB·64MB)用户拍板「都按现值确认」→ 进 **§4.11** 已确立清单,§7.1 两条 bullet 与代码注释里的「待确认」字样去掉,PLAN §2 两行删除。
+
 ## 2026-09-08·二批 拆巨型文件
 
 上一批把「拆巨型文件」记进了 `docs/notes/engineering.md` 的「明确没做」(理由 = 纯维护性、零行为收益,而 diff 巨大)。这次先给了切法(哪个文件拆成哪几个、为什么 Rust 侧能做成纯搬运、为什么 Vue 侧只抽 script),用户拍板「ABC 一起搞吧,也不是什么复杂的事儿」→ 三批一次做完。

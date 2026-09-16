@@ -782,8 +782,8 @@ function autoNext() {
  * stop_after=0 让 core 清掉(它广播 sleep=None 对齐镜像)。at_end 走 onEnded:不接下一个,停在这一首末尾。
  * **不开 interval 盯钟**:挂在 timeupdate 上(与片尾预告同一口径),暂停着自然不推进 —— 暂停中到点了?一按播放
  * 下一拍就淡出,没差。到点不说话、不进聊天流(哄睡场景静默是重点)。 */
-const SLEEP_FADE_MS = 20_000 // 淡出时长(§4.11 待用户确认,建议 20 秒)
-const SLEEP_PRESETS = [15, 30, 60] as const // 月亮钮档位(§4.11 待用户确认)
+const SLEEP_FADE_MS = 20_000 // 淡出时长(§4.11 用户拍板 2026-09-16)
+const SLEEP_PRESETS = [15, 30, 60] as const // 月亮钮档位(§4.11 用户拍板 2026-09-16)
 let sleepFade: ReturnType<typeof setInterval> | undefined
 function cancelSleepFade() {
   if (sleepFade) {

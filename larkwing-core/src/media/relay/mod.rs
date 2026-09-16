@@ -198,7 +198,7 @@ const AUDIO_FINE_SEEK: f64 = 0.1;
 const STDERR_TAIL_CAP: usize = 8 * 1024;
 /// 上游流头(探 sidx 的前 96KB)的取回超时。relay 的 `net::Client` 刻意只设建连超时(它同时服务
 /// 整片的 `/s/` 流,不能加总超时),所以这两趟小请求各自套一把 —— 不然 CDN 建连后不吐字节,
-/// `register_dash` 永挂、`play()` 整个不返回(2026-09-16 体检修;**§4.11 待用户确认**)。
+/// `register_dash` 永挂、`play()` 整个不返回(2026-09-16 体检修;§4.11 用户同日拍板按现值确认)。
 const UPSTREAM_HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// HLS 播放列表的段数上限(≈ 33 小时 @6s)。存在的理由不是「片子不会更长」,而是 duration
 /// 来自**文件自报**的元数据:坏文件能报出天文数字,而列表是照着它逐段拼字符串的。
@@ -255,7 +255,7 @@ struct FifoCache<K> {
     order: std::collections::VecDeque<K>,
 }
 
-/* ——— `streams` 注册表的两道界(单源在此;**§4.11 待用户确认**)———
+/* ——— `streams` 注册表的两道界(单源在此;§4.11 用户拍板 2026-09-08「合理就可以」= 现值确认)———
  * 从前这张表**只增不减**:每次点播留 1–3 个 entry(播放臂 + 缩略图/雪碧图 + 封面),切集、
  * 切音轨、重放各再留一份;连播一季或歌单循环几天就是几十上百个常驻。轻的 entry 只是几个
  * PathBuf 无所谓,真占地方的是 `FileAdaptive.video_init`(整份 ftyp+moov,4K 长片能到几 MB)。

@@ -319,6 +319,6 @@ input, textarea, [contenteditable="true"] {
 /* —— 视频字幕(WebVTT `::cue`)跟「大字」走(2026-09-16 ★ 用户拍板,零新设置项)——
  * 只能在全局写:`::cue` 是 <video> 的伪元素,而 <video> 长在 VideoOverlay 里,scoped 后代规则打不到(§6.7)。
  * 档位由 MainLayout 把 `ui.text_scale` 写到 <html data-text-scale>。默认字号是 5vh,大字档放到 1.5 倍(7.5vh,
- * **§4.11 待用户确认**);两档都补一圈黑描边提对比(老人看字幕比看按钮更费眼)。位置不归 ::cue 管,另议。 */
+ * §4.11 用户拍板 2026-09-16);两档都补一圈黑描边提对比(老人看字幕比看按钮更费眼)。位置不归 ::cue 管,另议。 */
 video::cue { text-shadow: 0 0 2px #000, 0 0 2px #000, 0 1px 3px #000; }
 :root[data-text-scale="large"] video::cue { font-size: 7.5vh; }

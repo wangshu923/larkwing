@@ -60,7 +60,7 @@ impl MediaControl {
                 }),
                 // 切集 / 切音轨走整条 play_entry(B 站 yt-dlp 解析几秒、mkv 切集要 probe + 关键帧扫描),
                 // 5s 常常不够 —— 超时 = future 被 drop,模型只拿到「超时」、切集半途而废(2026-09-16 体检修;
-                // 30s 与回合内等后台活的 IN_TURN_WAIT 同档,**§4.11 待用户确认**)。纯指令类动作本就秒回。
+                // 30s 与回合内等后台活的 IN_TURN_WAIT 同档,§4.11 用户拍板 2026-09-16 按现值确认)。纯指令类动作本就秒回。
                 timeout: std::time::Duration::from_secs(30),
                 ui_key: "tool.media_control",
             },
