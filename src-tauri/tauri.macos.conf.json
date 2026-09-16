@@ -12,7 +12,7 @@
         "decorations": true,
         "transparent": false,
         "shadow": true,
-        "dragDropEnabled": false
+        "dragDropEnabled": true
       },
       {
         "label": "float",

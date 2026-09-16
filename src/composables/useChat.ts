@@ -48,6 +48,8 @@ export interface UiAttachment {
   dataUrl?: string
   /** 出站 base64(发送用,不进持久展示态)。 */
   base64?: string
+  /** 出站本地路径(原生拖放进来的文件:没有 File 对象拿不到字节,core 发消息时按路径读)。 */
+  path?: string
   /** 历史图片落盘相对名:重开会话经 attachmentUrl 拉回缩略图(填进 dataUrl)。 */
   file?: string
   /** 粘贴收纳的原文(长文粘贴自动折成小票时才有):点小票放回编辑框用,仅本会话内存态。 */
@@ -747,8 +749,8 @@ function inject() {
     return
   }
   const out: OutAttachment[] = attachments
-    .filter((a) => a.base64)
-    .map((a) => ({ name: a.name, mime: a.mime || '', data: a.base64! }))
+    .filter((a) => a.base64 || a.path)
+    .map((a) => ({ name: a.name, mime: a.mime || '', data: a.base64 ?? '', path: a.path }))
   const stash = { text, attachments } // 展示态(带缩略图)暂存,等 Injected 事件落地成气泡
   pendingInjects.push(stash)
   const fallback = () => {
@@ -869,8 +871,8 @@ function send(
   const sentConv = state.convId // 话题快照只认发送时的会话:流中切走了别把旧账写到新话题上
   const myList = listGen // 视图代次快照:整表被换过就说明闭包里的 wang 已成孤儿(见下面的闸)
   const outAtts: OutAttachment[] = attachments
-    .filter((a) => a.base64)
-    .map((a) => ({ name: a.name, mime: a.mime || '', data: a.base64! }))
+    .filter((a) => a.base64 || a.path)
+    .map((a) => ({ name: a.name, mime: a.mime || '', data: a.base64 ?? '', path: a.path }))
   api
     .sendMessage(state.convId, content, { input: source, speak, speaker_user: speaker }, outAtts, (ev) => {
       // 回合属于已切走的会话(发出后切到别的会话):绝不碰当前视图,只在收尾给列表打标。

@@ -89,6 +89,54 @@ impl MediaRuntime {
                 self.publish(MediaEvent::Mode { mode: next.as_str().into() });
                 return Ok("ok".into());
             }
+            // 全屏 / 窗口态(2026-09-16 ★ 用户拍板两动作、不带 value):只对正在放的视频有意义,放歌 / 空闲
+            // 如实退回;执行在前端(原生窗口全屏,§8.1),core 只校验、随 Control 事件发过去。
+            "fullscreen" | "windowed" => {
+                let pb = self.inner.playback.lk().clone();
+                anyhow::ensure!(pb.title.is_some(), "现在没有在播放,没有可全屏的画面");
+                anyhow::ensure!(
+                    pb.kind == Some(MediaKind::Video),
+                    "现在放的是声音、没有画面,全屏没意义"
+                );
+            }
+            // 睡眠定时(2026-09-16 ★):stop_after = N 分钟后停(0 = 取消)、stop_at_end = 这一首 / 这一集放完停。
+            // 状态归 core(〔此刻〕/ 切集的 NowPlaying 镜像读它),结果经 MediaEvent::Sleep 发前端;到点的淡出与
+            // 暂停在前端做(播放真相在那),做完回调 stop_after=0 清掉。
+            "stop_after" => {
+                let v = value.context("stop_after 需要 value(分钟;0 = 取消定时)")?;
+                anyhow::ensure!(v.is_finite() && v >= 0.0, "分钟数不能为负,收到 {v}");
+                anyhow::ensure!(v <= SLEEP_MAX_MIN, "最多定 {SLEEP_MAX_MIN} 分钟,收到 {v}");
+                let next = if v > 0.0 {
+                    anyhow::ensure!(
+                        self.inner.playback.lk().title.is_some(),
+                        "现在没有在播放,没有可定时停的内容"
+                    );
+                    Some(SleepTimer::At {
+                        ends_at_ms: crate::store::now_ms() + (v * 60_000.0).round() as i64,
+                    })
+                } else {
+                    None
+                };
+                *self.inner.sleep.lk() = next;
+                self.publish(MediaEvent::Sleep { sleep: next });
+                return Ok(match next {
+                    None => "已取消定时停止".into(),
+                    Some(_) => {
+                        let shown = if v.fract() == 0.0 { format!("{}", v as i64) } else { format!("{v:.1}") };
+                        format!("好,{shown} 分钟后自动停(到点会轻轻停下、不出声)")
+                    }
+                });
+            }
+            "stop_at_end" => {
+                anyhow::ensure!(
+                    self.inner.playback.lk().title.is_some(),
+                    "现在没有在播放,没有可定时停的内容"
+                );
+                let next = Some(SleepTimer::AtEnd);
+                *self.inner.sleep.lk() = next;
+                self.publish(MediaEvent::Sleep { sleep: next });
+                return Ok("好,这一首(集)放完就停,不接下一个".into());
+            }
             "volume" => {
                 let v = value.context("volume 需要 value(0–100)")?;
                 anyhow::ensure!((0.0..=100.0).contains(&v), "音量范围 0–100,收到 {v}");
@@ -120,6 +168,7 @@ impl MediaRuntime {
             other => anyhow::bail!(
                 "未知动作 {other},可用: pause/resume/stop/louder/softer/volume/speed/seek/\
                  loop_one/loop_all/loop_off/shuffle_on/shuffle_off/audio_track/subtitle/\
+                 fullscreen/windowed/stop_after/stop_at_end/\
                  intro_start/intro_end/outro_start/skip_intro/skip_clear"
             ),
         }
@@ -238,7 +287,7 @@ impl MediaRuntime {
     /// 起播时乐观 seed「正在放」(前端随后经 report 校准;这步只是让模型立刻就知道在放什么)。
     /// `pos` = (index, total):在播剧集时把「第N/共M集」一并记下,喂模型「此刻」背景。
     /// 音量跨播放粘住(前端基准如此)→ seed 保留旧值;进度/倍速是新内容的事,清零等回报。
-    pub(super) fn seed_playing(&self, title: &str, pos: Option<(usize, usize)>) {
+    pub(super) fn seed_playing(&self, title: &str, kind: MediaKind, pos: Option<(usize, usize)>) {
         let mut guard = self.inner.playback.lk();
         let volume_pct = guard.volume_pct;
         *guard = Playback {
@@ -246,6 +295,7 @@ impl MediaRuntime {
             paused: false,
             pos,
             volume_pct,
+            kind: Some(kind),
             ..Playback::default()
         };
     }
@@ -271,8 +321,14 @@ impl MediaRuntime {
                     duration_secs: r.duration.filter(|d| *d > 0.0),
                     rate: r.rate,
                     at: Some(std::time::Instant::now()),
+                    kind: guard.kind,
+                    fullscreen: r.fullscreen.or(guard.fullscreen),
                 },
             };
+        }
+        if r.status == "idle" {
+            // 停播了,睡眠定时随之作废(它是给正在放的内容定的);前端此时 current 已空,不必广播
+            *self.inner.sleep.lk() = None;
         }
         // 同一条心跳顺手落集内进度(续播「第几秒」的唯一数据源;节拍与闸在 persist_progress)
         self.persist_progress(&r);
@@ -336,13 +392,28 @@ impl MediaRuntime {
             .unwrap_or_default();
         // 播放模式:模型据此答「现在是循环吗」、对「别循环了/换随机」给对动作。
         let mode = self.inner.mode.lk().ambient();
+        // 全屏态(只对视频;前端回报):模型据此判「全屏 / 退出全屏 / 小窗放着」哪个有意义。
+        let screen = match (pb.kind, pb.fullscreen) {
+            (Some(MediaKind::Video), Some(true)) => ",全屏中",
+            (Some(MediaKind::Video), Some(false)) => ",窗口态",
+            _ => "",
+        };
+        // 睡眠定时:剩几分钟 / 放完就停(模型据此答「还有多久停」、对「再多放十分钟」重算绝对值)。
+        let sleep = match *self.inner.sleep.lk() {
+            Some(SleepTimer::At { ends_at_ms }) => {
+                let left = ((ends_at_ms - crate::store::now_ms()).max(0) as f64 / 60_000.0).ceil() as i64;
+                format!(",定时 {left} 分钟后自动停")
+            }
+            Some(SleepTimer::AtEnd) => ",定时这一首(集)放完就停".to_string(),
+            None => String::new(),
+        };
         Some(match (pb.title, pb.paused) {
             (None, _) => "播放器现在空闲,没有在播放任何内容".to_string(),
             (Some(t), false) => {
-                format!("播放器正在播放《{t}》{ep}{progress}{vol}{rate}{mode}{audio}{subs}")
+                format!("播放器正在播放《{t}》{ep}{progress}{vol}{rate}{mode}{audio}{subs}{screen}{sleep}")
             }
             (Some(t), true) => {
-                format!("播放器已暂停,停在《{t}》{ep}{progress}{vol}{rate}{mode}{audio}{subs}")
+                format!("播放器已暂停,停在《{t}》{ep}{progress}{vol}{rate}{mode}{audio}{subs}{screen}{sleep}")
             }
         })
     }
@@ -368,6 +439,62 @@ fn subtitle_menu(subs: &[SubtitleRef]) -> String {
 mod tests {
     use super::*;
     use crate::media::testkit::*;
+
+    /// 嘴控全屏 / 退出全屏(2026-09-16 ★):只对正在放的视频有意义 —— 空闲 / 放歌如实退回;视频放着就随
+    /// Control 发前端(原生窗口全屏在前端做);〔此刻〕按前端回报带「全屏中 / 窗口态」。
+    #[tokio::test]
+    async fn fullscreen_control_only_for_video() {
+        let (rt, mut rx) = runtime("fullscreen-ctl");
+        assert!(rt.control("fullscreen", None).is_err(), "空闲时退回");
+        rt.seed_playing("新歌", MediaKind::Audio, None);
+        assert!(rt.control("windowed", None).is_err(), "放歌没画面");
+        rt.seed_playing("电影", MediaKind::Video, None);
+        rt.control("fullscreen", None).unwrap();
+        let saw = std::iter::from_fn(|| rx.try_recv().ok()).any(|e| {
+            matches!(e, AppEvent::Media(MediaEvent::Control { ref action, .. }) if action == "fullscreen")
+        });
+        assert!(saw, "视频在放:随 Control 事件发前端");
+        let report = |fs: bool| PlaybackReport {
+            status: "playing".into(),
+            title: Some("电影".into()),
+            fullscreen: Some(fs),
+            ..Default::default()
+        };
+        rt.set_playback(report(true));
+        assert!(rt.playback_summary().unwrap().contains("全屏中"));
+        rt.set_playback(report(false));
+        assert!(rt.playback_summary().unwrap().contains("窗口态"));
+        // 放歌时前端不报全屏态 → 一个字都不提
+        rt.seed_playing("新歌", MediaKind::Audio, None);
+        let s = rt.playback_summary().unwrap();
+        assert!(!s.contains("全屏") && !s.contains("窗口态"), "{s}");
+    }
+
+    /// 睡眠定时(2026-09-16 ★):stop_after 分钟 / stop_at_end / 0 取消;状态进〔此刻〕与 Sleep 事件;停播即作废。
+    #[tokio::test]
+    async fn sleep_timer_set_cancel_and_ambient() {
+        let (rt, mut rx) = runtime("sleep-ctl");
+        assert!(rt.control("stop_after", Some(30.0)).is_err(), "空闲时没有可定时的内容");
+        rt.seed_playing("评书", MediaKind::Audio, None);
+        assert!(rt.control("stop_after", Some(-1.0)).is_err(), "负数退回");
+        assert!(rt.control("stop_after", Some(SLEEP_MAX_MIN + 1.0)).is_err(), "超上限退回");
+        rt.control("stop_after", Some(30.0)).unwrap();
+        assert!(matches!(*rt.inner.sleep.lk(), Some(SleepTimer::At { .. })));
+        assert!(rt.playback_summary().unwrap().contains("30 分钟后自动停"));
+        rt.control("stop_at_end", None).unwrap();
+        assert_eq!(*rt.inner.sleep.lk(), Some(SleepTimer::AtEnd));
+        assert!(rt.playback_summary().unwrap().contains("放完就停"));
+        rt.control("stop_after", Some(0.0)).unwrap();
+        assert_eq!(*rt.inner.sleep.lk(), None);
+        let sleeps = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|e| matches!(e, AppEvent::Media(MediaEvent::Sleep { .. })))
+            .count();
+        assert_eq!(sleeps, 3, "每次改动一条 Sleep 事件");
+        // 停播 = 定时作废(它是给正在放的内容定的)
+        rt.control("stop_at_end", None).unwrap();
+        rt.set_playback(PlaybackReport { status: "idle".into(), ..Default::default() });
+        assert_eq!(*rt.inner.sleep.lk(), None);
+    }
 
     #[tokio::test]
     async fn control_validates_action_and_publishes() {
@@ -517,14 +644,14 @@ mod tests {
             Some("播放器现在空闲,没有在播放任何内容")
         );
         // 起播乐观 seed → 正在播(单集:无集数)
-        rt.seed_playing("天空之城", None);
+        rt.seed_playing("天空之城", MediaKind::Audio, None);
         assert_eq!(rt.playback_summary().as_deref(), Some("播放器正在播放《天空之城》"));
         // 前端回报暂停(保留集数位置,这里无)
         rt.set_playback(report("paused", Some("天空之城")));
         assert_eq!(rt.playback_summary().as_deref(), Some("播放器已暂停,停在《天空之城》"));
 
         // 剧集:seed 带「第N/共M集」,且前端回报 playing 不丢集数位置
-        rt.seed_playing("海底小纵队", Some((2, 12)));
+        rt.seed_playing("海底小纵队", MediaKind::Video, Some((2, 12)));
         assert_eq!(
             rt.playback_summary().as_deref(),
             Some("播放器正在播放《海底小纵队》(第3集/共12集)")
@@ -556,6 +683,7 @@ mod tests {
             position: Some(83.0),
             duration: Some(7083.0),
             rate: Some(1.5),
+            fullscreen: None,
         });
         assert_eq!(
             rt.playback_summary().as_deref(),
@@ -569,6 +697,7 @@ mod tests {
             position: Some(83.0),
             duration: Some(7083.0),
             rate: Some(1.0),
+            fullscreen: None,
         });
         let s = rt.playback_summary().unwrap();
         assert!(s.contains("进度 1:23/1:58:03"), "刚回报完外推≈0: {s}");
@@ -579,7 +708,7 @@ mod tests {
             rt.playback_summary().as_deref(),
             Some("播放器现在空闲,没有在播放任何内容")
         );
-        rt.seed_playing("新歌", None);
+        rt.seed_playing("新歌", MediaKind::Audio, None);
         assert_eq!(
             rt.playback_summary().as_deref(),
             Some("播放器正在播放《新歌》,音量 40%"),

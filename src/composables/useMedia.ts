@@ -21,7 +21,7 @@ import {
 import { i18n } from '../i18n'
 import { attachMedia, detachAudio } from './useAudioGraph'
 import { isAdaptiveUrl, playAdaptive, type AdaptiveController } from './localAdaptive'
-import { useContextMenu } from './useContextMenu'
+import { useContextMenu, type MenuItem } from './useContextMenu'
 import { useToast } from './useToast'
 
 export type PlayStatus = 'idle' | 'loading' | 'playing' | 'paused'
@@ -178,7 +178,8 @@ function applyAudioTrackToEl(el: HTMLMediaElement) {
 /** 循环落到播放元素:单曲循环用原生 el.loop(无缝、ended 压根不触发)。其余模式不设 loop ——
  *  ended 正常触发,由 core auto_next 按列表循环 / 随机 / 放完就停决定下一首。 */
 function syncLoopToEl() {
-  const native = state.playMode === 'loop_one'
+  // 「放完这一遍就停」的睡眠定时期间临时关掉原生循环:el.loop 开着 ended 压根不触发,没人来停
+  const native = state.playMode === 'loop_one' && state.current?.sleep?.kind !== 'at_end'
   if (audio) audio.loop = native
   if (videoEl) videoEl.loop = native
 }
@@ -362,7 +363,10 @@ function ensureAudio(): HTMLAudioElement {
     audio = new Audio()
     attachMedia(audio) // 响度均衡:设 crossorigin + 挂处理链(须在设 src 前;总开关关则原样播放)
     audio.addEventListener('timeupdate', () => {
-      if (state.current?.kind === 'audio') state.position = audio!.currentTime
+      if (state.current?.kind === 'audio') {
+        state.position = audio!.currentTime
+        checkSleep()
+      }
     })
     audio.addEventListener('durationchange', () => {
       if (state.current?.kind === 'audio' && Number.isFinite(audio!.duration)) {
@@ -402,7 +406,10 @@ export function registerVideoEl(el: HTMLVideoElement | null) {
   }
   attachMedia(el) // 响度均衡:设 crossorigin + 挂处理链(须在下方 loadVideoInto 设 src 前)
   el.addEventListener('timeupdate', () => {
-    if (state.current?.kind === 'video') state.position = videoBase + el.currentTime
+    if (state.current?.kind === 'video') {
+      state.position = videoBase + el.currentTime
+      checkSleep()
+    }
   })
   // 时长:本地/直转单文件的真时长直到元数据加载才知道(np.duration_seconds 常为空 →
   // 进度条死、显示 /0:00 拖不动)。混流(/m/ fMP4)无可靠时长(el.duration=Infinity/NaN),
@@ -653,8 +660,19 @@ function reportToCore(last?: { position: number; duration: number }) {
       position,
       duration: duration > 0 ? duration : null,
       rate: state.rate,
+      fullscreen: state.current?.kind === 'video' ? state.fullscreen : null, // 〔此刻〕带「全屏中 / 窗口态」
     })
     .catch(() => {})
+}
+
+/** 全屏 / 窗口态(F 键、⛶ 钮、嘴控 fullscreen / windowed 都汇到这):只主窗、只对视频。乐观置位,
+ *  VideoOverlay 的 resize 兜底校准;走原生窗口全屏(HTML5 requestFullscreen 在 WebView2 会闪,§8.1)。 */
+function setFullscreen(on: boolean) {
+  if (isFloat || state.current?.kind !== 'video') return
+  if (state.fullscreen === on) return
+  state.fullscreen = on
+  void win.setFullscreen(on).catch(() => {})
+  reportToCore()
 }
 
 /** 主窗(唯一真播放位)把当下播放态广播出去:① 给悬浮窗镜像(被动跟随);② 回报给 core,
@@ -668,6 +686,7 @@ function syncToPeers(last?: { position: number; duration: number }) {
 }
 
 function stopElements() {
+  cancelSleepFade() // 换内容 / 停播:在飞的睡眠淡出作废(音量由下一次 applyVolume / 起播还原)
   if (audio) {
     audio.pause()
     audio.removeAttribute('src')
@@ -727,6 +746,10 @@ let advancing = false
 
 function onEnded() {
   if (advancing) return // 切集在飞:这是旧一集播到头的尾声,不是又一次「放完了」
+  if (state.current?.sleep?.kind === 'at_end') {
+    sleepStopAtEnd() // 「放完这一首就停」:不接下一个,停在末尾(内容留着)
+    return
+  }
   if (state.current?.playlist && isTauri()) {
     autoNext()
     return
@@ -752,6 +775,92 @@ function autoNext() {
       advancing = false
       stop() // 切集失败兜底停
     })
+}
+
+/* —— 睡眠定时(2026-09-16 ★ 用户拍板):core 记 deadline / at_end 并镜像到 state.current.sleep,到点的活在前端 ——
+ * 到点前 SLEEP_FADE_MS 开始把音量按比例压到 0,然后 pause()、音量还原(第二天「接着放」是正常音量),再回调
+ * stop_after=0 让 core 清掉(它广播 sleep=None 对齐镜像)。at_end 走 onEnded:不接下一个,停在这一首末尾。
+ * **不开 interval 盯钟**:挂在 timeupdate 上(与片尾预告同一口径),暂停着自然不推进 —— 暂停中到点了?一按播放
+ * 下一拍就淡出,没差。到点不说话、不进聊天流(哄睡场景静默是重点)。 */
+const SLEEP_FADE_MS = 20_000 // 淡出时长(§4.11 待用户确认,建议 20 秒)
+const SLEEP_PRESETS = [15, 30, 60] as const // 月亮钮档位(§4.11 待用户确认)
+let sleepFade: ReturnType<typeof setInterval> | undefined
+function cancelSleepFade() {
+  if (sleepFade) {
+    clearInterval(sleepFade)
+    sleepFade = undefined
+  }
+}
+function checkSleep() {
+  const s = state.current?.sleep
+  if (!s || s.kind !== 'at' || sleepFade || state.status !== 'playing') return
+  const left = s.ends_at_ms - Date.now()
+  if (left > SLEEP_FADE_MS) return
+  const el = activeEl()
+  if (!el) return
+  const total = Math.max(500, left)
+  const started = Date.now()
+  sleepFade = setInterval(() => {
+    const k = Math.max(0, 1 - (Date.now() - started) / total)
+    el.volume = liveVolume() * k // 按比例压:期间用户调音量 / 唤醒避让照样作用在基准上
+    if (k <= 0) {
+      cancelSleepFade()
+      el.pause()
+      el.volume = liveVolume() // 停下后音量还原
+      clearSleep()
+    }
+  }, 100)
+}
+/** at_end:这一首 / 这一集放完 → 不接下一个,停在末尾(内容留着,状态 paused)。 */
+function sleepStopAtEnd() {
+  state.status = 'paused'
+  clearSleep()
+  syncToPeers()
+}
+/** 到点或用户取消后清掉:本地镜像先清(界面立刻对齐),再告诉 core(它广播 sleep=None)。 */
+function clearSleep() {
+  if (state.current) state.current.sleep = undefined
+  syncLoopToEl() // at_end 期间临时关掉的原生循环还回去
+  if (isTauri()) void api.mediaMode('stop_after', 0).catch(() => {})
+}
+/** 月亮钮设定时(嘴控走 core 同一口 `control`):分钟数(0 = 取消)或 'at_end'。浏览器预览只改本地镜像看视觉。 */
+function setSleep(target: number | 'at_end') {
+  if (isTauri()) {
+    if (target === 'at_end') void api.mediaMode('stop_at_end').catch(() => {})
+    else void api.mediaMode('stop_after', target).catch(() => {})
+    return
+  }
+  if (!state.current) return
+  state.current.sleep =
+    target === 'at_end'
+      ? { kind: 'at_end' }
+      : target > 0
+        ? { kind: 'at', ends_at_ms: Date.now() + target * 60_000 }
+        : undefined
+  syncLoopToEl()
+}
+/** 月亮钮菜单:15 / 30 / 60 分钟、放完这一首(集)、取消(定了才出)。视频浮层与播放条共用。 */
+function openSleepMenu(e: MouseEvent) {
+  const { openMenu } = useContextMenu()
+  const t = i18n.global.t
+  const atEndKey = state.current?.kind === 'video' ? 'media.sleep.atEndEpisode' : 'media.sleep.atEndTrack'
+  const items: MenuItem[] = SLEEP_PRESETS.map((m) => ({
+    label: t('media.sleep.afterMin', { m }),
+    action: () => setSleep(m),
+  }))
+  items.push({ label: t(atEndKey), action: () => setSleep('at_end') })
+  if (state.current?.sleep) {
+    items.push({ separator: true }, { label: t('media.sleep.cancel'), action: () => setSleep(0) })
+  }
+  openMenu(e, items)
+}
+/** 月亮钮的提示文案:没定 = 菜单名;定了 = 还剩几分钟 / 放完就停。 */
+function sleepLabel(): string {
+  const t = i18n.global.t
+  const s = state.current?.sleep
+  if (!s) return t('media.sleep.menu')
+  if (s.kind === 'at_end') return t('media.sleep.leftEnd')
+  return t('media.sleep.leftMin', { m: Math.max(1, Math.ceil((s.ends_at_ms - Date.now()) / 60_000)) })
 }
 
 /** 上/下一集(+1/-1):播放器按钮 + 嘴控都最终汇到 core 的 advance(全局队列);任意窗口可调
@@ -871,6 +980,10 @@ function applyControl(action: string, value?: number) {
     if (el) applyAudioTrackToEl(el)
   } else if (action === 'subtitle' && value != null) {
     setSubtitle(Math.round(value)) // 0 = 关,1 起 = 第几条(core 已校验形状)
+  } else if (action === 'fullscreen') {
+    setFullscreen(true) // core 已校验「在放视频」
+  } else if (action === 'windowed') {
+    setFullscreen(false)
   }
 }
 
@@ -943,6 +1056,11 @@ function onMedia(ev: MediaEvent) {
     case 'skip':
       // 本集片头 / 片尾信息变了(用户标记 / 清除、指纹检测跑完):替换当前条目的 skip,VideoOverlay 据此跳
       if (state.current) state.current.skip = ev.data.skip ?? undefined
+      break
+    case 'sleep':
+      // 睡眠定时变了(嘴控 / 月亮钮 / 到点清):替换镜像;at_end 要临时关原生循环让 ended 触发
+      if (state.current) state.current.sleep = ev.data.sleep ?? undefined
+      syncLoopToEl()
       break
     case 'auth_required':
     case 'login_hint':
@@ -1100,6 +1218,9 @@ export function useMedia() {
     setRate,
     stepRate,
     openRateMenu,
+    setFullscreen,
+    openSleepMenu,
+    sleepLabel,
     next: () => advance(1),
     prev: () => advance(-1),
     fetchPlaylist,

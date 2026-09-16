@@ -265,6 +265,7 @@ async fn handle_picture(
         name: format!("photo.{}", ext_of(mime)),
         mime: mime.into(),
         data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        path: None,
     };
     run_reply(ctx, net, m, caption, vec![att], None).await;
 }
@@ -344,6 +345,7 @@ async fn handle_file(
         name: file_name.to_string(),
         mime: image_mime.unwrap_or("").to_string(), // 文档无 mime:engine 按扩展名分发
         data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        path: None,
     };
     run_reply(ctx, net, m, String::new(), vec![att], None).await;
 }

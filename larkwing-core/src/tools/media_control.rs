@@ -28,6 +28,10 @@ impl MediaControl {
                               「换英文原声/换国语」就挑对应语言那条的轨号;单音轨内容没得切,会如实说)/ \
                               subtitle 开关字幕(value=第几条,从 1 数,0=关;〔此刻〕背景列着可选字幕和语言,\
                               「开中文字幕」就挑 chi/zh 那条)/ \
+                              fullscreen 全屏 / windowed 退出全屏、小窗放着(只对正在放的视频;〔此刻〕带「全屏中 / 窗口态」)/ \
+                              **睡眠定时**:stop_after 几分钟后自动停(value=分钟,「放半小时就停」=30、「放到十点停」按〔此刻〕时间\
+                              自己换算成分钟;value=0 取消)/ stop_at_end 这一首(集)放完就停不接下一个;到点会静静暂停、\
+                              不出声,第二天「接着放」直接续 / \
                               **片头片尾**(只对多集剧集):skip_intro 跳过本集片头 / intro_start、intro_end、\
                               outro_start 标记「片头从这里开始 / 片头到这里为止 / 片尾从这里开始」(value=秒;\
                               用户说「到这里」就不传 value = 取此刻播放位;标记从当前这一集起生效,以后自动跳)/ \
@@ -35,7 +39,8 @@ impl MediaControl {
                               当前音量/播放进度/倍速/第几集/播放模式/音轨在〔此刻〕背景注记里,\
                               相对要求(「再大一点点」「快进五分钟」)按它算出绝对值后用 volume/seek。\
                               用户说「暂停/接着放/别放了/大点声/音量调到 30/1.5 倍速/跳到第 90 秒/\
-                              下一首/看第五集/单曲循环/随机放/换英文原声/跳过片头/片头到这里」时用。没有在放东西就别调。",
+                              下一首/看第五集/单曲循环/随机放/换英文原声/全屏/退出全屏/放半小时就停/\
+                              这首放完就停/跳过片头/片头到这里」时用。没有在放东西就别调。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -43,11 +48,12 @@ impl MediaControl {
                             "type": "string",
                             "enum": ["pause", "resume", "stop", "louder", "softer", "volume", "speed", "seek", "next", "prev", "episode",
                                      "loop_one", "loop_all", "loop_off", "shuffle_on", "shuffle_off", "audio_track", "subtitle",
+                                     "fullscreen", "windowed", "stop_after", "stop_at_end",
                                      "skip_intro", "intro_start", "intro_end", "outro_start", "skip_clear"]
                         },
                         "value": {
                             "type": "number",
-                            "description": "volume=音量(0–100);speed=倍速(0.5–3);seek=定位到第几秒;episode=第几集(从 1 数);subtitle=第几条字幕(0=关);intro_start/intro_end/outro_start=秒(用户说「到这里」就不传,取此刻);其它动作不传"
+                            "description": "volume=音量(0–100);speed=倍速(0.5–3);seek=定位到第几秒;episode=第几集(从 1 数);subtitle=第几条字幕(0=关);stop_after=几分钟后停(0=取消定时);intro_start/intro_end/outro_start=秒(用户说「到这里」就不传,取此刻);其它动作不传"
                         }
                     },
                     "required": ["action"]

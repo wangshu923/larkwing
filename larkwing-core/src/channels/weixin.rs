@@ -403,6 +403,7 @@ async fn handle_message(
                         name: media.name.clone(),
                         mime: media.mime.clone(),
                         data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                        path: None,
                     });
                 }
                 Ok(_) => {

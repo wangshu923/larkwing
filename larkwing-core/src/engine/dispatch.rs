@@ -25,17 +25,37 @@ fn process_attachments(
     let mut doc_text = String::new();
     let mut refs = Vec::new();
     for a in attachments {
-        if crate::attach::is_image(&a.mime) {
+        let is_image = crate::attach::is_image(&a.mime);
+        // 字节来源:拖放进来的本地文件按路径读(有界;2026-09-16 ★ 原生拖放,前端拿不到 File 对象只有路径),
+        // 否则解 base64(选择器 / 粘贴 / 渠道)。解一次,下面双落盘 + 抽文字共用。
+        let from_path = a.path.is_some();
+        let bytes: Option<Vec<u8>> = match &a.path {
+            Some(p) => read_dropped_file(p, is_image),
+            None => base64::engine::general_purpose::STANDARD.decode(a.data.as_bytes()).ok(),
+        };
+        if is_image {
+            if from_path && bytes.is_none() {
+                // 路径读不出(太大 / 已不在):如实留一行,不喂模型一张空图
+                doc_text.push_str(&format!(
+                    "\n\n〔图片:{} 没读出来(文件太大或已不在原处),这次没能看到它〕",
+                    a.name
+                ));
+                refs.push(AttachmentRef { kind: "image".into(), name: a.name.clone(), mime: a.mime.clone(), file: None });
+                continue;
+            }
+            let b64 = if from_path {
+                base64::engine::general_purpose::STANDARD.encode(bytes.as_deref().unwrap_or_default())
+            } else {
+                a.data.clone()
+            };
             image_parts.push(crate::llm::ContentPart::ImageUrl {
-                url: format!("data:{};base64,{}", a.mime, a.data),
+                url: format!("data:{};base64,{b64}", a.mime),
             });
-            // 解一次 base64,双落盘共用(失败只是缺那份落盘,回合照走):
+            // 双落盘共用同一份字节(失败只是缺那份落盘,回合照走):
             //   attachments/ = hash 名缩略图源,UI 回看用(§1 用户反馈:图转一圈只剩名字太糙);
             //   inbox/ = 原名件 + 路径行进上下文(2026-07-13 与文档收件区对称)——「把刚发的图
             //   存到桌面/发给某某」模型才有路径可操作;路径行随内容落库,后续回合(图 bytes
             //   不回放)也还找得到这张图。
-            let bytes =
-                base64::engine::general_purpose::STANDARD.decode(a.data.as_bytes()).ok();
             let file = bytes.as_ref().and_then(|b| save_image_blob(atts_dir, b, &a.mime));
             // 没扩展名的图(渠道来的名字可能光秃)按 mime 补,落到收件区好认好开。
             let clean = crate::files::sanitize_filename(&a.name);
@@ -62,8 +82,25 @@ fn process_attachments(
         // 不需读内容)。再尝试抽文字(能抽的多轮追问还在,§9)。
         // ⚠️ doc_text 带的是**运行时**绝对路径,会随内容进 history 落库 —— 数据根搬家后老对话
         // 里的路径会失效(只影响回看老对话,不影响当下操作),换取模型直接拿到路径能操作。
-        let bytes =
-            base64::engine::general_purpose::STANDARD.decode(a.data.as_bytes()).ok();
+        // 拖放进来的文件**本来就在本地**:不再往收件区抄一份,路径行直接给原处(用户自己的文件夹);
+        // 读不出(太大 / 不在)也照给路径 —— 「把它移到某处」这类操作不需要读内容。
+        if let (Some(p), true) = (&a.path, from_path) {
+            let extracted =
+                bytes.as_ref().and_then(|b| crate::attach::extract_doc_text(&a.name, &a.mime, b));
+            match &extracted {
+                Some(t) => doc_text.push_str(&format!("\n\n〔附件:{} 在本地:{p}〕\n{t}", a.name)),
+                None if bytes.is_none() => doc_text.push_str(&format!(
+                    "\n\n〔附件:{} 在本地:{p}(太大或读不到,没抽出内容;文件在本地,可移动、整理、发送)〕",
+                    a.name
+                )),
+                None => doc_text.push_str(&format!(
+                    "\n\n〔附件:{} 在本地:{p}(读不出文字,可能是扫描件或不认识的格式;文件在本地,可移动、整理、发送)〕",
+                    a.name
+                )),
+            }
+            refs.push(AttachmentRef { kind: "doc".into(), name: a.name.clone(), mime: a.mime.clone(), file: None });
+            continue;
+        }
         let saved = bytes.as_ref().and_then(|b| save_inbox_blob(inbox_dir, &a.name, b));
         let extracted =
             bytes.as_ref().and_then(|b| crate::attach::extract_doc_text(&a.name, &a.mime, b));
@@ -88,6 +125,20 @@ fn process_attachments(
         });
     }
     (image_parts, doc_text, refs)
+}
+
+/// 拖放进来的本地文件按路径读(2026-09-16 ★):**有界** —— 图片沿用视觉输入的老上限(与前端选择器的
+/// 12MB 同口径,再大就是往模型灌字节),文档 64MB(**§4.11 待用户确认**);超了 / 不是文件 / 读不了
+/// → None,调用方如实写一行(§3.5 不静默)。这是程序读用户亲手拖进来的文件,不是模型的手脚,不过授权圈。
+const DROP_IMAGE_MAX_BYTES: u64 = 12 * 1024 * 1024;
+const DROP_DOC_MAX_BYTES: u64 = 64 * 1024 * 1024;
+fn read_dropped_file(path: &str, is_image: bool) -> Option<Vec<u8>> {
+    let cap = if is_image { DROP_IMAGE_MAX_BYTES } else { DROP_DOC_MAX_BYTES };
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > cap {
+        return None;
+    }
+    std::fs::read(path).ok()
 }
 
 /// 收到的文档/文件 bytes 落收件区,返回落定的绝对路径(给模型 fs 操作)。文件名清洗 +
@@ -713,6 +764,7 @@ mod tests {
             name: name.into(),
             mime: mime.into(),
             data: b64.clone(),
+            path: None,
         };
 
         let (parts, doc_text, refs) =
@@ -738,5 +790,50 @@ mod tests {
         let (_, doc3, _) = process_attachments(&[att("photo", "image/jpeg")], &atts, &inbox);
         assert!(inbox.join("photo.jpg").is_file(), "无扩展名按 mime 补");
         assert!(doc3.contains("photo.jpg"), "{doc3}");
+    }
+
+    /// 原生拖放进来的附件按路径读(2026-09-16 ★):图 = 自己编 base64 进视觉 + 缩略图落 attachments;
+    /// 文档 = 路径行直接给原处、不往收件区抄一份;读不出(太大 / 不在)如实留一行,不喂空图。
+    #[test]
+    fn process_attachments_reads_dropped_paths() {
+        let base = std::env::temp_dir().join(format!("lw-drop-att-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let atts = base.join("atts");
+        let inbox = base.join("inbox");
+        let img = base.join("桌面照.png");
+        std::fs::write(&img, b"fake-png-bytes").unwrap();
+        let txt = base.join("说明.txt");
+        std::fs::write(&txt, "第一行\n第二行").unwrap();
+        let by_path = |p: &std::path::Path, mime: &str| InAttachment {
+            name: p.file_name().unwrap().to_string_lossy().into_owned(),
+            mime: mime.into(),
+            data: String::new(),
+            path: Some(p.to_string_lossy().into_owned()),
+        };
+
+        let (parts, doc_text, refs) = process_attachments(
+            &[by_path(&img, "image/png"), by_path(&txt, "text/plain")],
+            &atts,
+            &inbox,
+        );
+        assert_eq!(parts.len(), 1, "图按路径读进视觉");
+        match &parts[0] {
+            crate::llm::ContentPart::ImageUrl { url } => {
+                assert!(url.starts_with("data:image/png;base64,") && url.len() > 30, "自己编的 base64: {url}");
+            }
+            other => panic!("应是 ImageUrl,实际 {other:?}"),
+        }
+        assert!(refs[0].file.is_some(), "缩略图小票照落 attachments");
+        assert!(doc_text.contains("第二行"), "文档抽出文字: {doc_text}");
+        assert!(doc_text.contains(&txt.display().to_string()), "路径行给原处: {doc_text}");
+        assert!(!inbox.join("说明.txt").exists(), "本地文件不往收件区抄");
+        assert_eq!(refs[1].kind, "doc");
+
+        // 文件不在了:如实一行,不喂空图
+        let gone = base.join("没了.png");
+        let (parts, doc_text, _) = process_attachments(&[by_path(&gone, "image/png")], &atts, &inbox);
+        assert!(parts.is_empty(), "读不出的图不进视觉");
+        assert!(doc_text.contains("没读出来"), "{doc_text}");
     }
 }

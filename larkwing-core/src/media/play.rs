@@ -42,6 +42,7 @@ impl MediaRuntime {
         *self.inner.audio_track.lk() = 0;
         *self.inner.audio_track_lang.lk() = None;
         *self.inner.rate.lk() = 1.0;
+        *self.inner.sleep.lk() = None; // 睡眠定时是给上一个内容定的:新点播作废,切集沿用(见 SleepTimer)
         let outcome = self.play_fresh(user_id, page_url, audio_only, restart, episode).await;
         match &outcome {
             Ok(PlayOutcome::Playing(_)) => {}
@@ -132,13 +133,15 @@ impl MediaRuntime {
             None
         };
 
-        // 不成系列(单集 / 发现失败 / <2 集)→ 清队列,退化成单集播放;电影按文件身份续播集内位置。
+        // 不成系列(单集 / 发现失败 / <2 集)→ 清队列,退化成单集播放;电影 / 长音频按文件身份续播集内位置。
         let Some(Series { key, title: series_title, entries }) =
             discovered.filter(|s| s.entries.len() >= 2)
         else {
             *self.inner.playlist.lk() = None;
             anyhow::ensure!(episode.is_none(), "这不是多集内容,没有「第几集」可选");
-            let resume_at = if restart || audio_only {
+            // 单个音频也续(2026-09-16 ★ 用户拍板「短于 10 分钟的音频才算歌、不记」):有声书 / 评书 / 播客
+            // 与电影同一条路;歌由 resume_position 的时长闸挡在读侧(存了也是位置 0)。
+            let resume_at = if restart {
                 None
             } else {
                 let key = single_key(page_url);
@@ -537,8 +540,9 @@ impl MediaRuntime {
             // 源给不出 = None = 拖进度条只出时间气泡。
             thumb_url,
             skip: skip_info,
+            sleep: *self.inner.sleep.lk(),
         };
-        self.seed_playing(&np.title, pos.map(|p| (p.index, p.total)));
+        self.seed_playing(&np.title, np.kind, pos.map(|p| (p.index, p.total)));
         self.publish(MediaEvent::Play(np.clone()));
 
         // 建议气泡素材:还没登录 → 每次启动至多提示一次"登录画质更清晰"
@@ -559,6 +563,7 @@ impl MediaRuntime {
             audio_track: *self.inner.audio_track.lk(),
             audio_track_lang: self.inner.audio_track_lang.lk().clone(),
             rate: *self.inner.rate.lk(),
+            sleep: *self.inner.sleep.lk(),
         }
     }
 
@@ -568,6 +573,7 @@ impl MediaRuntime {
         *self.inner.audio_track.lk() = s.audio_track;
         *self.inner.audio_track_lang.lk() = s.audio_track_lang;
         *self.inner.rate.lk() = s.rate;
+        *self.inner.sleep.lk() = s.sleep;
     }
 }
 
@@ -578,6 +584,7 @@ struct IntentSnapshot {
     audio_track: usize,
     audio_track_lang: Option<String>,
     rate: f64,
+    sleep: Option<SleepTimer>,
 }
 
 /// 切集的指针回滚守卫:起播成功 `disarm`;失败或**半路被 drop**(工具超时 = future 被丢)则析构时把

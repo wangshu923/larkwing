@@ -13,7 +13,8 @@ import { useCharacter } from '../composables/useCharacter'
 import { useMedia } from '../composables/useMedia'
 import { useToast } from '../composables/useToast'
 import { fmtMs, fmtTokens, fmtUsd } from '../lib/fmt'
-import { emitPetBehavior, onFloatSay, openExternal, api, isMacOS, type SearchHit } from '../lib/backend'
+import { emitPetBehavior, onFloatSay, openExternal, api, isMacOS, isTauri, type SearchHit } from '../lib/backend'
+import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { useTasks } from '../composables/useTasks'
 import { resolveActivity, usePetDemoShow, type PetActivity } from '../composables/usePetActivity'
 import { usePetBehavior, type PetBehavior } from '../composables/usePetBehavior'
@@ -38,6 +39,14 @@ const panelOpen = ref(true)
 const shape = computed(() => (settings.get('ui.bubble_shape') === 'cut' ? 'cut' : 'round'))
 const petName = computed(() => settings.get('ui.pet_name') || t('pet.name'))
 const textScale = computed(() => (settings.get('ui.text_scale') === 'large' ? '16.5px' : '14px'))
+// 档位同时写到 <html data-text-scale>:视频字幕(WebVTT ::cue)只能在全局 CSS 里跟大字走(见 style.css)
+watch(
+  () => settings.get('ui.text_scale'),
+  (v) => {
+    document.documentElement.dataset.textScale = v === 'large' ? 'large' : 'standard'
+  },
+  { immediate: true },
+)
 const activeRail = ref<'chat' | 'reminders' | 'memory' | 'skills' | 'ops' | 'settings'>('chat')
 
 const { state: chat, send: chatSend, cancel, selectConversation, newConversation, ensureVoiceConv, overheardTargetConv, saveApiKey, dequeue, inject, renameConversation, togglePinConversation, deleteConversation, rollbackTo, forkFrom, loadEarlier: chatLoadEarlier, jumpToMessage, backToLatest: chatBackToLatest, voiceConfirmTarget: chatVoiceConfirmTarget } = useChat()
@@ -294,7 +303,7 @@ function dragHasFiles(e: DragEvent) {
   return Array.from(e.dataTransfer?.types ?? []).includes('Files')
 }
 function onDragEnter(e: DragEvent) {
-  if (!dragHasFiles(e)) return // 拖文本/选区进来不亮(只对文件)
+  if (isTauri() || !dragHasFiles(e)) return // Tauri 里高亮由原生拖放事件驱动;拖文本/选区进来不亮(只对文件)
   dragDepth++
   dragging.value = true
 }
@@ -305,8 +314,64 @@ function onDragLeave() {
 function onDrop(e: DragEvent) {
   dragDepth = 0
   dragging.value = false
+  if (isTauri()) return // Tauri 里文件走原生拖放(见下),HTML5 这套只留给浏览器预览
   const files = e.dataTransfer ? collectFiles(e.dataTransfer) : []
   if (files.length) addFiles(files)
+}
+
+// —— 原生拖放(2026-09-16 ★ 用户拍板):Tauri 壳里文件拖进来走 webview 的 drag-drop 事件(只有路径、没有
+// File 对象;开了它 Windows 上 HTML5 的 drop 就不再给文件,所以 Tauri 里 HTML5 那套只留给浏览器预览)。
+// 路径交 core 分流:视频 / 音频直接播(程序放用户亲手给的文件,不经工具层不过授权圈、不进聊天流),音频
+// 文件夹当歌单、视频文件夹从第一集起;其它当附件挂进小票,发消息时 core 按路径读字节(顺带没了 12MB 闸,
+// 上限归 core:图 12MB / 文档 64MB)。混拖全当附件,不猜。
+let unlistenDrop: (() => void) | null = null
+onMounted(async () => {
+  if (!isTauri()) return
+  try {
+    unlistenDrop = await getCurrentWebview().onDragDropEvent((ev) => {
+      const p = ev.payload
+      if (p.type === 'enter' || p.type === 'over') dragging.value = true
+      else if (p.type === 'leave') dragging.value = false
+      else if (p.type === 'drop') {
+        dragging.value = false
+        void onNativeDrop(p.paths)
+      }
+    })
+  } catch (e) {
+    console.error('[lw] 原生拖放监听没挂上', e)
+  }
+})
+onUnmounted(() => unlistenDrop?.())
+async function onNativeDrop(paths: string[]) {
+  if (!paths.length) return
+  try {
+    const out = await api.dropPaths(paths)
+    if (out.kind === 'attach') addPaths(out.paths)
+  } catch (e) {
+    // 放不了(文件坏 / 格式不支持):与播放器其它失败同一句,别黑着不吭声(§3.5)
+    console.error('[lw] 拖放播放失败', e)
+    useToast().error(t('toast.mediaFailed', { title: basename(paths[0]) }))
+  }
+}
+const IMAGE_MIME_BY_EXT: Record<string, string> = {
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  bmp: 'image/bmp',
+}
+function basename(p: string) {
+  return p.split(/[\\/]/).pop() || p
+}
+/** 拖进来的非媒体文件按路径挂进小票:图按扩展名认 mime(core 据此走视觉),没有缩略图可显、只显名字。 */
+function addPaths(paths: string[]) {
+  for (const p of paths) {
+    const name = basename(p)
+    const ext = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1).toLowerCase() : ''
+    const mime = IMAGE_MIME_BY_EXT[ext] ?? ''
+    pending.value.push({ kind: mime ? 'image' : 'doc', name, mime, path: p })
+  }
 }
 
 // —— 语音(PLAN §11):听写(mic,UI 交互不念)与唤醒(wake,语音会话必念)
@@ -1224,7 +1289,7 @@ async function backToLatest() {
             :title="a.rawText ? t('chat.pasteBackTitle') : undefined"
             @click="a.rawText && editPasted(i)"
           >
-            <img v-if="a.kind === 'image'" :src="a.dataUrl" class="att-thumb" alt="" />
+            <img v-if="a.kind === 'image' && a.dataUrl" :src="a.dataUrl" class="att-thumb" alt="" />
             <svg v-else class="att-doc" viewBox="0 0 24 24"><path d="M6 2h8l4 4v16H6z" /><path d="M14 2v4h4" /></svg>
             <span class="att-name">{{ a.name }}</span>
             <button class="att-x" @click.stop="removePending(i)" :title="t('chat.attRemove')">✕</button>

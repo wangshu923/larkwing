@@ -198,3 +198,19 @@
 顺手修:兜底重放 `replay_local_compat` 带队列位置 + `current_position`(注释自认「先保能放;切集另说」的简化补完)· 短于 10 分钟的集不记位置但记 `finished`(片尾闸夹到 `min(90s, 时长/2)`,免两分钟短片刚开头就算看完)· `mark_skip` 的 intro_start 落在旧终点之后就丢旧终点(镜像 intro_end 那条)· 指纹检测 found=false 进程内记 `detect_tried` 不重跑(Err 不记,下次照旧再试)· `PendingPlay` 带 restart / episode · torrent 并发闸改 `bgtasks::submit_limited`(数与登记同一把锁,标题前缀单源 `TORRENT_TITLE_PREFIX`)· 本地歌回话「歌手:」不再「UP主:」· 〔此刻〕列字幕清单(`CurrentLocal.subtitles` + `subtitle_menu`)+ 工具描述补 subtitle 一句 · 歌词库网络失败新变体 `LookupFailed`(下载路原折成 NotFound,模型白改歌名;`lyrics_for_download_at` 注入假库地址测 500)· 帮助卡 key 改键位(视频面两行同 label)· 标记 / 跳集失败各自 toast 文案 · 音频切视频时 audio 元素也 `load()`(清掉排队的 pause 事件,不再闪报 paused)· `localAdaptive.fail` 看 `stopped`(停了的上一部片不许对当前内容发兜底重放)· `EpisodeList` 加 `bar` 变体(音频条走 token;side / drop 仍是覆盖媒体豁免黑底,预览暖萌皮量到 `--surface`)· 选集列表滚到当前集改居中 · 单曲循环下片尾预告文案「即将重放本集」。
 
 **当日状态**:Mac core lib 833 / engine 20 / `clippy -D warnings` 零 / vue-tsc 0 / i18n 5/5(893=893);新增 9 条单测。全部只是代码级验证,真机 watch 见 PLAN「2026-09-16 影音体检第一批」。**没做的**(留给二、三批或另议):relay.rs 拆文件、VideoOverlay / PlayerBar 抽 useScrubDrag / useOsd、五份钟面格式化归一、「30s 转后台守望」四份同构、首段接缝抽查转码路白编一段、容器路整文件 demux 扫关键帧、按键接管范围收窄(撞 09-07 拍板,待用户定)、Media Session setPositionState、中途缓冲 buffering 态、悬浮窗迷你播控加上下曲、主窗空会话 chips 第一条动态换「接着看」。
+
+## 影音体检第二批:五个功能(2026-09-16)
+
+> 来源:同一天第二批。体检第四路(产品缺口)报了十条「代码里确认没有、也没被否决」的缺口,挑出五个「一句话嘴控 / 无感默认」能落的 ★,把每个要拍的点(形态 / 默认值 / 边界)列成清单给用户,用户「好啊 分批动工吧」= 全按建议。第三批(relay.rs 拆文件)另走。
+
+**① 嘴控全屏**。缺口很实:动作表里没有 fullscreen,只有起播那一刻自动全屏、退出后没有语音回路,老人不会按 F。落法最小:core `control()` 加 `fullscreen` / `windowed` 两个不带 value 的动作(与 pause / resume 同口径,模型不用记数值语义),只校验「正在放的是视频」—— 这要求 core 知道在放的是画面还是声音,于是 `Playback` 加 `kind`(起播 `seed_playing` 顺手带上)。执行在前端:原来 VideoOverlay 自己一份 `toggleFullscreen`,现在收成 `useMedia::setFullscreen`(F 键 / ⛶ / Esc / 嘴控同一口)。〔此刻〕要能答「现在是全屏吗」,前端回报多带 `fullscreen`。
+
+**② 睡眠定时**。用户砍顺序档时原话把「放一遍就停」指到了「定时停」,这次兑现。三个关键决定:到点是**暂停不是停止**(内容留着,第二天「接着放」直接续);**到点不说话、不进聊天流**(哄睡场景静默是重点);淡出 20 秒。机制上 core 只记状态(`SleepTimer::At{ends_at_ms} | AtEnd`),到点的活在前端 —— 播放真相在前端,而且淡出要按帧改元素音量。**不开 interval 盯钟**:挂在 timeupdate 上(片尾预告同一口径),暂停着自然不推进,「暂停中到点」一按播放下一拍就淡出、没差。两处小坑:`AtEnd` 遇上单曲循环,`el.loop` 开着 `ended` 压根不触发 → `syncLoopToEl` 在 at_end 期间临时关掉原生循环;定时是给「上一个内容」定的 → 新点播复位、切集沿用、停播作废,且进了 `IntentSnapshot`(点播失败也不许把定时打掉)。月亮钮复用 `useContextMenu` 当档位菜单(与倍速菜单同一套),15 / 30 / 60 / 放完这一首(集)/ 取消。
+
+**③ 有声书 / 评书 / 播客记进度**。原规则「放歌不记」是按内容类型判的,这次改成按时长判:短于 10 分钟的音频才算歌,复用 `RESUME_MIN_DURATION_S` 一道闸不加新常量。起播时时长可能还不知道(本地无 ffmpeg / 网络无 duration),所以 `track_progress` 只在**已知**短时长时跳过登记,其余先登记、由读侧 `resume_position` 与写侧 `persist_progress` 按回报时长再闸 —— 歌至多留一行位置 0 的记录。`build_queue` 单集路把 `|| audio_only` 去掉即可。副作用如实记在 watch:超过 10 分钟的纯音乐合集也会续,想从头说一句「从头放」。
+
+**④ 字幕字号跟「大字」走**。全 src 没有 `::cue` 规则,字幕是浏览器默认 5vh。`::cue` 是 `<video>` 的伪元素,而 `<video>` 长在 VideoOverlay 里,MainLayout 的 scoped 规则打不到(§6.7 那条 v-html 坑的同族)→ 只能写在全局 `style.css`,档位由 MainLayout 把 `ui.text_scale` 写到 `<html data-text-scale>`。只管字号 + 描边,位置要改到每条 cue 上,另议。1.5 倍(7.5vh)是建议值,§4.11 待确认。
+
+**⑤ 拖放直接播**。这是五个里最费事的:`dragDropEnabled:false` 是 c9d4a66 为了让 HTML5 drop 收附件关掉的(Windows 上两者互斥),要开原生拖放就得整体换路 —— 附件也改走路径。分流是纯函数 `media/drop.rs::plan_drop`(视频 / 音频文件播第一个、音频文件夹当歌单、视频文件夹自然排序第一集起、其它当附件、**混拖全当附件不猜**、文件夹当不了附件剔掉),壳层命令 `drop_paths` 真去 `play()`;这是程序放用户亲手拖进来的文件,不是模型的手脚 → 不经工具层、不过授权圈、不入表,也不进聊天流(像按了个钮,〔此刻〕自然带「在播 X」)。附件半边:`InAttachment` 加 `path`(serde default,老前端 / 渠道零改),`process_attachments` 的字节来源改成「有 path 按路径有界读,否则解 base64」;图沿用视觉输入的 12MB 老闸(再大就是往模型灌字节),文档 64MB;**本地文件不再往收件区抄一份**,路径行直接给原处 —— 原本抄进收件区是因为渠道来的字节没有本地路径,拖进来的本来就在用户自己的文件夹里。读不出(太大 / 不在)如实一行,图不喂空 data URL。前端在 Tauri 里让 HTML5 的 onDragEnter / onDrop 直接让位(mac 上两套都会触发,不让位就双份处理),高亮由原生 enter / leave 事件驱动;浏览器预览没有 Tauri 事件,HTML5 那套照旧。
+
+**当日状态**:Mac core lib 839 / engine 20 / clippy 两 crate 零 / vue-tsc 0 / i18n 5/5(900=900);新增 6 条单测;预览页月亮钮菜单与 `data-text-scale` 验过。原生拖放与 `::cue` 字号只能真机验。**没做 / 另议**:按键接管范围收窄(撞 09-07 拍板,待用户定)、视频下载、直播 / 电台流、文件关联「用 BT 打开」、章节导航、一键截帧、Media Session setPositionState、缓冲 buffering 态、悬浮窗迷你播控加上下曲、主窗空会话 chips 动态「接着看」。

@@ -533,7 +533,13 @@ export interface NowPlaying {
   /** 本集的片头 / 片尾(手标 / B 站标注 / 章节 / 指纹检测汇成;core `skip::resolve`)。缺 = 不跳。
    *  标记 / 检测结果变了由 media 事件 `skip` 增量替换。 */
   skip?: SkipInfo
+  /** 睡眠定时镜像(core 是真相;中途改由 media 事件 `sleep` 对齐)。缺 = 没定时。 */
+  sleep?: SleepTimer
 }
+
+/** 睡眠定时(镜像 Rust media::SleepTimer):at = 到这个墙钟毫秒停;at_end = 这一首 / 这一集放完停。
+ *  到点的淡出与暂停在前端做(播放真相在这),做完回调 stop_after=0 让 core 清掉。 */
+export type SleepTimer = { kind: 'at'; ends_at_ms: number } | { kind: 'at_end' }
 
 /** 本集怎么跳(镜像 Rust media::skip::SkipInfo):`intro` = 片头段(自然播进去 → 跳到 end);
  *  `outro_start` = 片尾起点(自然越过 + 有下一集 → 3 秒倒计时切集);`source` = 主要来源。 */
@@ -559,6 +565,8 @@ export type MediaEvent =
   /** 播放模式变了(嘴控 / 模式钮;core 已归一,前端只认结果态)。 */
   | { type: 'mode'; data: { mode: PlayMode } }
   | { type: 'skip'; data: { skip?: SkipInfo } }
+  /** 睡眠定时变了(嘴控 / 月亮钮 / 到点前端清):替换 `NowPlaying.sleep`。 */
+  | { type: 'sleep'; data: { sleep?: SleepTimer } }
   | { type: 'auth_required'; data: { source: string } }
   | { type: 'login_hint'; data: { source: string } }
   | { type: 'logged_in'; data: { source: string } }
@@ -575,6 +583,8 @@ export interface PlaybackReport {
   duration?: number | null
   /** 倍速(缺省当 1)。 */
   rate?: number
+  /** 视频是否全屏(只在放视频时带;〔此刻〕据此写「全屏中 / 窗口态」)。 */
+  fullscreen?: boolean | null
 }
 
 /** 这台机器的解码能力快照(boot 探一次给 core;P1)。名字是归一后的编码名(`h264`/`ac3`…)。
@@ -688,9 +698,17 @@ export interface UserMeta {
 export interface OutAttachment {
   name: string
   mime: string
-  /** 原始字节 base64(无 data: 前缀)。 */
+  /** 原始字节 base64(无 data: 前缀)。拖放进来的本地文件不走 base64(`path` 有值、这里空串),core 按路径读。 */
   data: string
+  /** 本地绝对路径(2026-09-16 ★ 原生拖放:前端拿不到 File 对象,只有路径)。 */
+  path?: string
 }
+
+/** 主窗原生拖放的分流结果(镜像 Rust media::DropOutcome):媒体已直接播 / 其它当附件挂小票 / 空。 */
+export type DropOutcome =
+  | { kind: 'played'; title: string }
+  | { kind: 'attach'; paths: string[] }
+  | { kind: 'nothing' }
 
 /** 持久小票(历史里标这条带过图/文档);文档本体不留存,**图片 bytes 落文件**(file 相对名),
  *  重开会话经 attachmentUrl 取回缩略图(不再喂 LLM,§1/§9)。 */
@@ -1243,6 +1261,8 @@ export const api = {
   mediaAutoNext: () => invoke<boolean>('media_auto_next'),
   /** 播放条循环/随机/音轨按钮 → core 校验落状态(与嘴控同一执行口);audio_track 带 value(1 起)。 */
   mediaMode: (action: string, value?: number) => invoke<void>('media_mode', { action, value }),
+  /** 主窗原生拖放的路径交 core 分流:媒体直接播 / 其它当附件回来挂小票 / 空(2026-09-16 ★)。 */
+  dropPaths: (paths: string[]) => invoke<DropOutcome>('drop_paths', { paths }),
   /** 剧集列表 / 曲目列表:按需取整份队列(标题 + 当前下标);null = 没在放多集内容。 */
   mediaPlaylist: () => invoke<PlaylistView | null>('media_playlist'),
   /** 列表里点第 N 集(1 起)= 嘴控「看第五集」同一 core 入口;越界抛错(前端 toast)。 */

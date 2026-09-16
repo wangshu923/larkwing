@@ -29,6 +29,8 @@ const {
   toggleMute,
   stepRate,
   openRateMenu,
+  openSleepMenu,
+  sleepLabel,
   next,
   prev,
   cycleMode,
@@ -344,6 +346,10 @@ onUnmounted(() => {
       :title="t('media.speedPick', { rate: state.rate })"
     >
       {{ state.rate }}x
+    </button>
+    <!-- 睡眠定时(听书哄睡「放半小时就停」):点开档位菜单;定了就亮,tooltip 显还剩几分钟 -->
+    <button class="pbtn track moon" :class="{ on: !!state.current?.sleep }" @click="openSleepMenu" :title="sleepLabel()">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z" /></svg>
     </button>
     <span class="vol" :title="kb(t('media.volume'), '↑↓')">
       <button class="vol-ico" @click="toggleMute" :title="kb(state.muted ? t('media.unmute') : t('media.mute'), 'M')">

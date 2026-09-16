@@ -695,8 +695,9 @@ impl MediaRuntime {
             resume_at,
             thumb_url,
             skip: skip_info,
+            sleep: *self.inner.sleep.lk(),
         };
-        self.seed_playing(&np.title, pos.map(|p| (p.index, p.total)));
+        self.seed_playing(&np.title, np.kind, pos.map(|p| (p.index, p.total)));
         self.publish(MediaEvent::Play(np.clone()));
         // 本地视频剧集:后台起指纹检测(本集还没测过才跑;ffmpeg 不在手 / 上一个还在跑就先不起)
         if !audio_only && pos.is_some() {

@@ -103,6 +103,12 @@ pub enum MediaEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         skip: Option<crate::media::skip::SkipInfo>,
     },
+    /// 睡眠定时变了(嘴控 stop_after / stop_at_end、播放条月亮钮、到点前端清):前端替换 `NowPlaying.sleep`。
+    /// None = 没定时。增量变体,老前端忽略。
+    Sleep {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sleep: Option<crate::media::SleepTimer>,
+    },
     /// 登录态缺失/失效:UI 出"扫码登录"入口;话术由模型按人格组织(中性事件喂回模型)。
     AuthRequired { source: String },
     /// 建议气泡素材:还没登录、首次播放成功后提示一次(登录 = 更高画质)。
@@ -231,6 +237,7 @@ pub struct ConvTitle {
 /// 总线事件:tagged 编码,加变体对前端是增量(未知 type 忽略,与 TurnEvent 同约定)。
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // Media(Play(NowPlaying)) 带整份播放快照本就大;总线事件是瞬态广播值,Box 徒增全部匹配点噪音
 pub enum AppEvent {
     Task(TaskView),
     Media(MediaEvent),

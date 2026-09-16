@@ -21,7 +21,7 @@ use larkwing_core::lockext::LockExt;
 use larkwing_core::llm::catalog::ModelOverride;
 use larkwing_core::llm::registry::ProviderPreset;
 use larkwing_core::llm::AccountBalance;
-use larkwing_core::media::{CookieRec, MediaRuntime};
+use larkwing_core::media::{plan_drop, CookieRec, DropOutcome, DropPlan, MediaRuntime, PlayOutcome};
 use larkwing_core::store::{
     Briefing, ClonedVoice, Conversation, FsOpRow, Memory, Message, SearchHit, UsageTotals, User,
 };
@@ -1020,6 +1020,34 @@ pub fn media_retry(
         }
     });
     Ok(())
+}
+
+/// 主窗原生拖放(2026-09-16 ★ 用户拍板):路径交 core 分流 —— 视频 / 音频直接播(程序放用户亲手给的
+/// 文件,不经工具层、不过授权圈、不进聊天流),音频文件夹当歌单、视频文件夹从第一集起;其它当聊天附件
+/// 回给前端挂进小票(前端只有路径没有 File 对象,字节由 core 发消息时按路径读)。混拖全当附件,不猜。
+/// **必须 async**:`play()` 走整条本地起播链(§8.4)。
+#[tauri::command]
+pub async fn drop_paths(
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+) -> Result<DropOutcome, AppError> {
+    match plan_drop(&paths) {
+        DropPlan::Play { url, audio_only } => {
+            let media = state.media.clone();
+            let user_id = state.engine.store().users.ensure_default_user()?.id;
+            let outcome = media
+                .play(user_id, &url, audio_only, false, None)
+                .await
+                .map_err(AppError::internal)?;
+            Ok(match outcome {
+                PlayOutcome::Playing(np) => DropOutcome::Played { title: np.title },
+                // 本地文件不会撞登录墙;万一走到,按「已受理」回,前端不必再说什么
+                PlayOutcome::AwaitingLogin { .. } => DropOutcome::Played { title: url },
+            })
+        }
+        DropPlan::Attach { paths } => Ok(DropOutcome::Attach { paths }),
+        DropPlan::Nothing => Ok(DropOutcome::Nothing),
+    }
 }
 
 /// 失败下载「重试」(PLAN §10):重下一个组件(yt-dlp/ffmpeg…),直连不绕 LLM。

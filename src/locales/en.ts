@@ -292,6 +292,16 @@ export default {
     volume: 'Volume',
     speed: 'Speed',
     speedPick: 'Speed {rate}x (click to pick, scroll to nudge)',
+    // sleep timer (moon button menu + status hint): pauses quietly when time is up
+    sleep: {
+      menu: 'Sleep timer',
+      afterMin: 'Stop in {m} min',
+      atEndTrack: 'Stop after this track',
+      atEndEpisode: 'Stop after this episode',
+      cancel: 'Cancel timer',
+      leftMin: 'Stops in {m} min',
+      leftEnd: 'Stops after this one',
+    },
     mute: 'Mute',
     unmute: 'Unmute',
     // Player shortcuts (the key table lives in useMediaKeys, shared by the video overlay and the audio bar; help overlay / tooltips are generated from it)

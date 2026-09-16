@@ -328,6 +328,7 @@ async fn handle_photo(
         name: "photo.jpg".into(),
         mime: "image/jpeg".into(), // Bot API 的 photo 恒为服务端压缩 JPEG
         data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        path: None,
     };
     reply_turn(ctx, net, token, chat_id, chat, single, caption, sender, vec![att], None).await;
 }
@@ -374,6 +375,7 @@ async fn handle_document(
         name: if file_name.is_empty() { "file".into() } else { file_name.to_string() },
         mime: as_image.unwrap_or_else(|| mime.to_string()),
         data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        path: None,
     };
     reply_turn(ctx, net, token, chat_id, chat, single, caption, sender, vec![att], None).await;
 }

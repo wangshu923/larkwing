@@ -21,10 +21,14 @@ pub(super) fn resume_position(p: &crate::store::Progress) -> Option<f64> {
 
 impl MediaRuntime {
     /// 起播成功:登记续播身份(前端心跳据此落集内位置)+ 落「现在放到这一集 / 这部」。
-    /// 剧集按队列身份;单部**视频**按文件 / 链接身份(电影看一半明天接着看);单曲不记
-    /// (歌重听从头是常识)。失败不挡播放 —— 续播是锦上添花,只 warn。
+    /// 剧集按队列身份;单部视频 / 单个长音频按文件 / 链接身份(电影看一半、评书听一半明天接着);
+    /// **歌不记**(重听从头是常识)—— 边界按时长:短于 RESUME_MIN_DURATION_S 的音频算歌
+    /// (2026-09-16 ★ 用户拍板取代原「放歌一律不记」;起播时时长未知就先登记,读侧 resume_position
+    /// 与写侧 persist_progress 都按回报时长再闸,短的至多留一行位置 0 的记录)。
+    /// 失败不挡播放 —— 续播是锦上添花,只 warn。
     pub(super) fn track_progress(&self, np: &NowPlaying, page_url: &str, resume_at: Option<f64>, user_id: i64) {
         let audio = matches!(np.kind, MediaKind::Audio);
+        let known_short = np.duration_seconds.is_some_and(|d| d > 0.0 && d < RESUME_MIN_DURATION_S);
         let target = match &np.playlist {
             Some(p) => {
                 let guard = self.inner.playlist.lk();
@@ -33,7 +37,7 @@ impl MediaRuntime {
                     (pl_key(&guard), e.id.clone(), e.title.clone(), series_title.unwrap_or_default())
                 })
             }
-            None if audio => None,
+            None if audio && known_short => None,
             None => Some((
                 single_key(page_url),
                 single_episode_id(page_url),
@@ -149,6 +153,42 @@ mod tests {
         assert!(!mp.get("local:short").unwrap().unwrap().finished, "刚开头不能算看完");
         rt.persist_progress(&report(70.0, 120.0, "ep2"));
         assert!(mp.get("local:short").unwrap().unwrap().finished);
+    }
+
+    /// 单个长音频也续(2026-09-16 ★ 用户拍板「短于 10 分钟的音频才算歌」):有声书 / 评书听一半明天接着;
+    /// 歌听一半再放照样从头(读侧时长闸 + 写侧位置写 0)。
+    #[tokio::test]
+    async fn single_long_audio_resumes_but_songs_do_not() {
+        let (rt, _rx) = runtime("audio-single-resume");
+        let np = |o: PlayOutcome| match o {
+            PlayOutcome::Playing(np) => np,
+            other => panic!("应为 Playing,实际 {other:?}"),
+        };
+        let paused = |title: &str, pos: f64, dur: f64| PlaybackReport {
+            status: "paused".into(),
+            title: Some(title.into()),
+            position: Some(pos),
+            duration: Some(dur),
+            ..Default::default()
+        };
+        // 有声书(单文件、所在文件夹只有它 → 不成队列):30 分钟长,听到 10 分钟处暂停
+        let d1 = std::env::temp_dir().join(format!("lw-audiobook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d1);
+        std::fs::create_dir_all(&d1).unwrap();
+        let book = touch(&d1, "评书.m4b").to_string_lossy().to_string();
+        let first = np(rt.play(1, &book, true, false, None).await.unwrap());
+        assert!(first.playlist.is_none() && first.resume_at.is_none());
+        rt.set_playback(paused(&first.title, 600.0, 1800.0));
+        assert_eq!(np(rt.play(1, &book, true, false, None).await.unwrap()).resume_at, Some(600.0), "长音频接着上次");
+        assert!(np(rt.play(1, &book, true, true, None).await.unwrap()).resume_at.is_none(), "「从头听」不续");
+        // 歌(3 分钟):听到一半停,再放照样从头
+        let d2 = std::env::temp_dir().join(format!("lw-song-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d2);
+        std::fs::create_dir_all(&d2).unwrap();
+        let song = touch(&d2, "歌.mp3").to_string_lossy().to_string();
+        let s = np(rt.play(1, &song, true, false, None).await.unwrap());
+        rt.set_playback(paused(&s.title, 100.0, 200.0));
+        assert!(np(rt.play(1, &song, true, false, None).await.unwrap()).resume_at.is_none(), "歌不续");
     }
 
     /// 集内续播(2026-09-07):前端心跳 / 暂停落「第几秒」,再放接着那一秒;播到片尾区 = 看完 →

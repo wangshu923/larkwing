@@ -173,8 +173,12 @@ pub struct AttachmentRef {
 pub struct InAttachment {
     pub name: String,
     pub mime: String,
-    /// 原始字节的 base64(无 data: 前缀)。
+    /// 原始字节的 base64(无 data: 前缀)。原生拖放进来的本地文件不走 base64:`path` 有值、这里空串,
+    /// core 自己按路径(有界)读。
     pub data: String,
+    /// 本地绝对路径(2026-09-16 ★ 原生拖放:用户亲手拖进来的文件,程序自己读,不经工具层不过授权圈)。
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 impl UserMeta {

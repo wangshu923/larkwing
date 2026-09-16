@@ -9,6 +9,11 @@
 - 规则变更:**§7.1** 新增「★影音体检第一批」一条(新点播复位只在放成时生效 / 切集指针可回滚 / 前端 advancing 闩 / relay 子进程弃读必杀 + 上游小请求各自超时 / zero_tfdt 按盒结构 / 兜底重放带位置 / 短集记 finished / 指纹不重跑 / 〔此刻〕带字幕清单 / EpisodeList 三变体 / submit_limited);§7.1 续播记忆那句「短于 10 分钟不记」改成「不记位置但记看完」。
 - 待确认常量三处进 PLAN §2;真机 watch 一节进 PLAN §1。叙事见 `docs/notes/media-playback.md`「影音体检第一批:播放 bug 七修(2026-09-16)」。
 
+同日第二批:五个 ★ 功能落地(嘴控全屏 / 睡眠定时 / 有声书进度 / 字幕字号跟大字 / 拖放直接播)。
+
+- 规则变更:**§7.1** 新增「★影音体检第二批」一条(五项各自的形态、默认与边界);§7.1 续播记忆那句「放歌不记」改成「短于 10 分钟的歌不记,单个长音频与电影同一条路」。附件 IPC 词汇 `InAttachment` 加 `path`(serde default,渠道零改);两份 tauri conf `dragDropEnabled` 改 true(Windows 上 HTML5 drop 随之不再给文件,前端在 Tauri 里让位)。
+- 待确认常量五处进 PLAN §2;真机 watch 一节进 PLAN §1。叙事见 `docs/notes/media-playback.md`「影音体检第二批:五个功能(2026-09-16)」。
+
 ## 2026-09-08·二批 拆巨型文件
 
 上一批把「拆巨型文件」记进了 `docs/notes/engineering.md` 的「明确没做」(理由 = 纯维护性、零行为收益,而 diff 巨大)。这次先给了切法(哪个文件拆成哪几个、为什么 Rust 侧能做成纯搬运、为什么 Vue 侧只抽 script),用户拍板「ABC 一起搞吧,也不是什么复杂的事儿」→ 三批一次做完。

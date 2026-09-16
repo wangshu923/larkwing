@@ -8,6 +8,7 @@ mod bilibili;
 pub mod capability;
 pub mod cookies;
 mod download;
+mod drop;
 mod edit;
 pub mod fingerprint;
 mod introdetect;
@@ -32,6 +33,7 @@ mod skipctl;
 pub use archive::{ExtractOutcome, ZipOutcome};
 pub use cookies::CookieRec;
 pub use download::{DownloadOutcome, DownloadedAudio, TrackMeta};
+pub use drop::{plan_drop, DropOutcome, DropPlan};
 pub use edit::{EditOutcome, EditRequest};
 /// 「回合内等多久再转后台」单源(§4.11):ffmpeg/解压/扫盘/delegate 子回合共用一个 30。
 pub(crate) use edit::IN_TURN_WAIT;
@@ -283,6 +285,9 @@ pub struct NowPlaying {
     /// 标记 / 检测结果变了由 `MediaEvent::Skip` 增量替换。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skip: Option<skip::SkipInfo>,
+    /// 睡眠定时镜像(core 是真相;中途改由 media 事件 `sleep` 对齐)。缺 = 没定时。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sleep: Option<SleepTimer>,
 }
 
 /// 剧集列表面板要的整份队列(按需取,不塞进每条 Play 事件 —— 合集上百集,标题一次拉够)。
@@ -411,6 +416,10 @@ struct Playback {
     duration_secs: Option<f64>,
     rate: Option<f64>,
     at: Option<std::time::Instant>,
+    /// 在放的是画面还是声音(起播时 seed;嘴控「全屏」只对视频有意义)。
+    kind: Option<MediaKind>,
+    /// 视频是否全屏(前端回报;None = 没报过 / 不是视频)。〔此刻〕据此告诉模型「全屏中 / 窗口态」。
+    fullscreen: Option<bool>,
 }
 
 /// 前端回报的播放器快照(`report_media_state` 命令载荷;新字段全可缺 —— 浏览器预览/旧路径兼容)。
@@ -431,7 +440,25 @@ pub struct PlaybackReport {
     /// 倍速(缺省当 1)。
     #[serde(default)]
     pub rate: Option<f64>,
+    /// 视频是否全屏(只在放视频时有值;〔此刻〕带「全屏中 / 窗口态」,嘴控「全屏 / 退出全屏」才有的放矢)。
+    #[serde(default)]
+    pub fullscreen: Option<bool>,
 }
+
+/// 睡眠定时(2026-09-16 ★ 用户拍板):「放半小时就停」「这首放完就停」。到点前端淡出后**暂停**
+/// (不清内容:第二天「接着放」直接续);跨集保留(是时间不是内容)、新点播复位;到点不说话、不进
+/// 聊天流。单曲循环下 `AtEnd` = 放完这一遍停。app 级瞬态(§6.4 派生可丢:丢了 = 没定时,不出错)。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SleepTimer {
+    /// 到这个墙钟时刻停(unix 毫秒;前端与 core 各按自己的墙钟算,同一台机器)。
+    At { ends_at_ms: i64 },
+    /// 当前这一首 / 这一集放完就停。
+    AtEnd,
+}
+
+/// 睡眠定时的分钟上限(**§4.11 待用户确认**;12 小时 = 「放一夜」也够)。
+const SLEEP_MAX_MIN: f64 = 720.0;
 
 /// 播放模式(2026-09-07 用户拍板「一个模式钮三档」:列表循环 / 单曲循环 / 随机,取代原
 /// 「循环三态 × 随机开关」两个正交状态)。app 级,**新 `play()` 请求复位**(同「倍速每次复位、
@@ -565,6 +592,8 @@ struct Inner {
     /// 教训:放完电影再放歌还是 2 倍),切集 / 自动续播沿用 —— 1.5 倍看剧不该每集掉回 1.0。
     /// 前端每条 Play 事件直接应用 `NowPlaying.rate`,零猜测(与 loop_mode 同款镜像)。
     rate: Mutex<f64>,
+    /// 睡眠定时(见 SleepTimer;新 `play()` 复位,切集沿用;到点由前端清)。
+    sleep: Mutex<Option<SleepTimer>>,
     /// 当前本地播放现场(切音轨用;None = 没在放本地内容)。
     current_local: Mutex<Option<CurrentLocal>>,
     /// 当前内容的续播身份 + 上次落盘时刻(节拍见 PROGRESS_PERSIST_EVERY)。None = 不记进度。
@@ -610,6 +639,7 @@ impl MediaRuntime {
                 audio_track: Mutex::new(0),
                 audio_track_lang: Mutex::new(None),
                 rate: Mutex::new(1.0),
+                sleep: Mutex::new(None),
                 current_local: Mutex::new(None),
                 progress: Mutex::new(None),
                 progress_at: Mutex::new(None),

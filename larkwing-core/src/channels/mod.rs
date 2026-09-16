@@ -755,7 +755,12 @@ mod tests {
 
     #[test]
     fn attach_buffer_debounces_and_merges() {
-        let att = |n: &str| InAttachment { name: n.into(), mime: "application/pdf".into(), data: String::new() };
+        let att = |n: &str| InAttachment {
+            name: n.into(),
+            mime: "application/pdf".into(),
+            data: String::new(),
+            path: None,
+        };
         let buf = AttachBuffer::default();
 
         // 连发 3 个文件:只第一个「本批第一个」= 要提示,后两个静默(防抖:不提示三次)

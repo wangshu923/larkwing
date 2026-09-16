@@ -209,7 +209,7 @@ fn digit_skeleton(s: &str) -> String {
 
 /// 自然排序:把数字段当数字比(`E2 < E10`、`第2集 < 第10集`),其余按字符比。
 /// 同骨架文件的数字/非数字段天然对齐,逐段比即可;大小写仅作末位 tiebreak(稳定)。
-fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+pub(super) fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let (mut x, mut y) = (a, b);
     loop {

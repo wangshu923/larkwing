@@ -27,6 +27,9 @@ const {
   toggleMute,
   stepRate,
   openRateMenu,
+  setFullscreen,
+  openSleepMenu,
+  sleepLabel,
   next,
   prev,
   cycleAudioTrack,
@@ -227,11 +230,9 @@ watch([hoverPct, thumbSrc], async () => {
   bubbleW.value = bubbleEl.value?.offsetWidth ?? 0
 })
 
-/** 原生窗口全屏(乐观置位,resize 兜底校准);视频默认全屏的进/退也走它。 */
-async function toggleFullscreen() {
-  const next = !state.fullscreen
-  state.fullscreen = next
-  await win.setFullscreen(next)
+/** 原生窗口全屏(乐观置位,resize 兜底校准);F 键 / ⛶ 钮 / Esc 与嘴控「全屏 / 退出全屏」汇到 useMedia 同一口。 */
+function toggleFullscreen() {
+  setFullscreen(!state.fullscreen)
 }
 
 /* —— 看片快捷键(§4.11 用户拍板 2026-09-07 键位表;键位表本体在 useMediaKeys,与音频播放条共用)——
@@ -831,6 +832,12 @@ onUnmounted(() => {
         :title="t('media.volume')"
         :style="{ '--pct': (state.muted ? 0 : state.volume * 100) + '%' }"
       />
+      <!-- 睡眠定时(哄睡「放半小时就停 / 这集放完就停」):点开档位菜单;定了就亮,tooltip 显还剩几分钟 -->
+      <button v-if="!compact" class="vbtn" :class="{ on: !!state.current?.sleep }" @click="openSleepMenu" :title="sleepLabel()">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z" />
+        </svg>
+      </button>
       <button v-if="!compact" class="vbtn" @click="helpOpen = !helpOpen" :title="kb(t('media.keys.title'), 'H')">?</button>
       <button class="vbtn" @click="toggleFullscreen" :title="kb(t('media.fullscreen'), 'F')">⛶</button>
     </footer>

@@ -293,6 +293,16 @@ export default {
     volume: '音量',
     speed: '倍速',
     speedPick: '倍速 {rate}x(点击选档,滚轮微调)',
+    // 睡眠定时(月亮钮菜单 + 状态提示):到点静静暂停、不出声
+    sleep: {
+      menu: '定时停止',
+      afterMin: '{m} 分钟后停',
+      atEndTrack: '这一首放完就停',
+      atEndEpisode: '这一集放完就停',
+      cancel: '取消定时',
+      leftMin: '还有 {m} 分钟自动停',
+      leftEnd: '放完就停',
+    },
     mute: '静音',
     unmute: '取消静音',
     // 播放快捷键(键位表在 useMediaKeys,视频浮层与音频播放条共用;帮助浮层 / tooltip 从同一张表生成)

@@ -442,6 +442,7 @@ pub fn run() {
       commands::media_log,
       commands::frontend_log,
       commands::media_replay_compat,
+      commands::drop_paths,
       commands::attachment_url,
       commands::remote_status,
       commands::http_creds_hosts,
