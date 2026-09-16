@@ -19,7 +19,7 @@
 - 规则变更:**§6.1** 新增「叶子文件拆成目录模块的变体」一条(`super::` 多一层不改行、mod.rs 借名字;子文件 `use super::*`;跨子文件 `pub(super)` 汇一次;对外 `pub use` 保路径;未被外部使用的别 re-export)。§4.11 / §7.1 里 `relay.rs` 的常量落点改写为 `relay/mod.rs`。
 - 验收 = 多重集只丢 20 条签名;PLAN §1 加一节「回归一眼」。叙事见 `docs/notes/engineering.md`「拆 relay.rs:目录模块的变体(2026-09-16)」。
 
-同日收尾:三批里新添的八处过程默认(`media_control` 30s / `UPSTREAM_HEAD_TIMEOUT` 10s / 短集 finished 闸 / `SLEEP_MAX_MIN` 720 / `SLEEP_FADE_MS` 20s / `SLEEP_PRESETS` 15·30·60 / 字幕大字 7.5vh / 拖放附件 12MB·64MB)用户拍板「都按现值确认」→ 进 **§4.11** 已确立清单,§7.1 两条 bullet 与代码注释里的「待确认」字样去掉,PLAN §2 两行删除。
+同日收尾:三批里新添的八处过程默认(`media_control` 30s / `UPSTREAM_HEAD_TIMEOUT` 10s / 短集 finished 闸 / `SLEEP_MAX_MIN` 720 / `SLEEP_FADE_MS` 20s / `SLEEP_PRESETS` 15·30·60 / 字幕大字 7.5vh / 拖放附件 12MB·64MB)用户拍板「都按现值确认」→ 进 **§4.11** 已确立清单,§7.1 两条 bullet 与代码注释里的「待确认」字样去掉,PLAN §2 两行删除。随后用户再拍「前 8 条按现值」把 PLAN §2 更早的八组常量一并清掉(续播三闸 / 片头片尾一组 / 下载嵌封面 / 雪碧图 / `CNY_PER_USD` / ftp 退避 / `speak_to_file` / `FIND_SCAN_MAX`):§4.11 清单里三处「待确认」改成已确认、新添五组;§7.1 / §7.2 / §7.8 六处标记改「已拍板」;代码注释九处对齐;PLAN §2 只剩五条非数值的决定(牌价待核 / 桌宠 B2 / 内嵌歌词标签 / 备份 last_error 口径 / lto thin)。
 
 ## 2026-09-08·二批 拆巨型文件
 

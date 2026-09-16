@@ -16,9 +16,9 @@ use super::{Tool, ToolCtx, ToolRisk, ToolSpec};
 use crate::files::{dedupe_path, default_download_dir, human_size, sanitize_filename};
 
 /// 单次文本上限(字符,不是字节):超了如实退回让模型拆段 / 精简,**绝不静默截断**(§6.5)。
-/// 几百字读出来已是几分钟,再长克隆音色在 CPU 上要等很久。§4.11 待用户确认。
+/// 几百字读出来已是几分钟,再长克隆音色在 CPU 上要等很久。§4.11 用户拍板 2026-09-16 按现值。
 const SPEAK_MAX_CHARS: usize = 1000;
-/// 模型没给 `name` 时的文件名主干。§4.11 待用户确认。
+/// 模型没给 `name` 时的文件名主干。§4.11 用户拍板 2026-09-16 按现值。
 const DEFAULT_NAME: &str = "留言";
 /// `name` 里若顺手带了这些音频扩展名就剥掉再拼真实扩展名 —— 真实格式由引擎定,不剥会
 /// 落成「xx.mp3.wav」。入参宽容,arg_bool 同族(§4.4)。

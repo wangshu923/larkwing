@@ -46,9 +46,9 @@ const CMD_TIMEOUT: Duration = Duration::from_secs(15);
 /// FTP 被动模式的数据连接被中间设备掐掉是常见死法,掐掉后往往一个字节都不再来、也不关连接。
 const STALL_TIMEOUT: Duration = Duration::from_secs(90);
 /// 断点续传:**同一次下载内**,传输中断(数据连接被掐 / 停滞 / 流提前结束 / 续传阶段重连失败)
-/// 最多重连续传几次。**§4.11 待用户确认** —— 先按「够救几次掐线、别对死服务器空转」定 5。
+/// 最多重连续传几次。§4.11 用户拍板 2026-09-16 按现值 —— 「够救几次掐线、别对死服务器空转」定 5。
 pub const RESUME_MAX_ATTEMPTS: u32 = 5;
-/// 两次续传之间的指数退避:2s → 4s → 8s → 封顶 15s。**§4.11 待用户确认**。
+/// 两次续传之间的指数退避:2s → 4s → 8s → 封顶 15s。§4.11 用户拍板 2026-09-16 按现值。
 /// (资源站常限「同 IP 连接数」,掐线后立刻重连多半 530,退避是给服务器时间回收旧连接。)
 const RESUME_BACKOFF_BASE: Duration = Duration::from_secs(2);
 const RESUME_BACKOFF_CAP: Duration = Duration::from_secs(15);
