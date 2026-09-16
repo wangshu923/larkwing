@@ -670,6 +670,17 @@ impl WebRender {
                         out.push_str(&format!("- {} → {}\n", l.text, l.url));
                     }
                 }
+                // 页内图片(2026-09-16):海报 / 封面 / 商品图挑一张交 web_download;行格式与
+                // web_fetch 同源(`PageImage::describe`)。渲染快照带的是实际显示尺寸。
+                if !page.images.is_empty() {
+                    out.push_str(
+                        "\n【页内图片】(要存哪张就把地址交给 web_download:图站防盗链就带 \
+                         referer=本页地址,想存成固定名字给 name)\n",
+                    );
+                    for im in &page.images {
+                        out.push_str(&im.describe());
+                    }
+                }
                 if page.click_ref_stale {
                     out.push_str("\n(那个编号已经失效——页面变过了,按上面新快照的编号再操作)");
                 }
@@ -1306,6 +1317,20 @@ mod tests {
                         ..Default::default()
                     },
                 ],
+                images: vec![
+                    crate::web::PageImage {
+                        url: "https://img.example.com/poster.jpg".into(),
+                        main: true,
+                        ..Default::default()
+                    },
+                    crate::web::PageImage {
+                        url: "https://img.example.com/still.jpg".into(),
+                        alt: "剧照".into(),
+                        width: 600,
+                        height: 338,
+                        main: false,
+                    },
+                ],
                 scroll_hint: "下面约 2 屏".into(),
                 ..Default::default()
             }),
@@ -1322,6 +1347,10 @@ mod tests {
         assert!(out.contains("[3] 下拉「城市」= 「北京」") && out.contains("可选:北京 / 上海"), "{out}");
         assert!(out.contains("[4] ☑ 勾选「同意」"), "{out}");
         assert!(out.contains("下面约 2 屏"), "{out}");
+        // 页内图片一栏:主图在前、带显示尺寸、指路 web_download 的 referer / name
+        assert!(out.contains("【页内图片】") && out.contains("referer=本页地址"), "{out}");
+        assert!(out.contains("- 主图 → https://img.example.com/poster.jpg"), "{out}");
+        assert!(out.contains("- 剧照 (600×338) → https://img.example.com/still.jpg"), "{out}");
     }
 
     #[tokio::test]

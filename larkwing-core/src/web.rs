@@ -162,7 +162,43 @@ pub struct PageLink {
     pub url: String,
 }
 
-/// 一次抓取的成品(缓存单元):标题 + 正文 + 页内链接。
+/// 页内图片(绝对地址 + alt + 尺寸):web_fetch / web_render 快照靠它让模型从页面里挑出
+/// 海报 / 封面 / 商品图,交给 web_download 落盘(2026-09-16;起因 = 抽音频嵌封面时上网找
+/// 海报,介绍页上明明有图、模型却看不到它的地址 —— 此前两条路都只抽 `a[href]`)。
+/// `main` = 页面自报的主图(og:image / twitter:image / link[rel=image_src]),海报页 / 商品页
+/// 的主图几乎总在这里,排最前。`width` / `height` 0 = 不知道:静态抓取只有属性上写了才
+/// 知道;渲染快照给的是实际显示尺寸。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct PageImage {
+    pub url: String,
+    pub alt: String,
+    pub width: u32,
+    pub height: u32,
+    pub main: bool,
+}
+
+impl PageImage {
+    /// 给模型看的一行(web_fetch 与 web_render 共用同一格式,单源):
+    /// `- 主图 → url` / `- 海报 (600×900) → url` / `- 图片 → url`。
+    pub fn describe(&self) -> String {
+        let label = if self.main {
+            "主图".to_string()
+        } else if self.alt.is_empty() {
+            "图片".to_string()
+        } else {
+            self.alt.clone()
+        };
+        let size = if self.width > 0 || self.height > 0 {
+            format!(" ({}×{})", self.width, self.height)
+        } else {
+            String::new()
+        };
+        format!("- {label}{size} → {}\n", self.url)
+    }
+}
+
+/// 一次抓取的成品(缓存单元):标题 + 正文 + 页内链接 + 页内图片。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Page {
     pub title: String,
@@ -174,10 +210,19 @@ pub struct Page {
     /// `serde(default)` 让改之前存下的缓存照样能读回来(读回来是 0 = 不知道,那就不报)。
     #[serde(default)]
     pub links_total: usize,
+    /// 页内图片(主图在前,再按文档序;至多 `IMAGES_MAX` 张)。`serde(default)` 同上,老缓存读回来是空。
+    #[serde(default)]
+    pub images: Vec<PageImage>,
 }
 
 /// 页内链接收集上限(给模型的预算闸,取文档序前 N 条)。
 const LINKS_MAX: usize = 25;
+/// 页内图片收集上限(§4.11 过程默认;主图 + 大图,再多是装饰 / 缩略图墙,模型也挑不动)。
+/// 壳层快照脚本按同一个数收(`format!` 插值),两条路一个源。
+pub const IMAGES_MAX: usize = 8;
+/// 图片短边低于此数(像素)不收:图标 / 表情 / 追踪像素。静态抓取只在 `width` / `height`
+/// 属性写了才判得出(没写就收 —— 宁多收一张小图,别漏了海报);渲染快照按实际显示尺寸判。
+pub const MIN_IMAGE_EDGE: u32 = 80;
 /// 单页字节上限(边收边判 —— 见 `fetch` 里的注释:先收完再判等于没闸)。
 const PAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
 
@@ -604,12 +649,13 @@ pub(crate) fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// 整页抽取(单次解析):正文 + 页内链接。
+/// 整页抽取(单次解析):正文 + 页内链接 + 页内图片。
 fn extract_page(html: &str, base_url: &str) -> Page {
     let doc = Html::parse_document(html);
     let (title, text) = extract_text_from(&doc);
     let (links, links_total) = extract_links(&doc, base_url);
-    Page { title, text, links, links_total }
+    let images = extract_images(&doc, base_url);
+    Page { title, text, links, links_total, images }
 }
 
 /// 正文抽取(readability 简化版):正文形元素的文本聚合;太少则退化为全文压平。
@@ -777,6 +823,100 @@ fn extract_links(doc: &Html, base_url: &str) -> (Vec<PageLink>, usize) {
         }
     }
     (out, total)
+}
+
+/// 页内图片(2026-09-16):页面自报的主图(og:image / og:image:secure_url / twitter:image /
+/// twitter:image:src / link[rel=image_src])在前,再按文档序收 `<img>`;相对转绝对、只留
+/// http(s)、同地址去重、`data:` 与 `.svg`(图标 / logo 的常态)丢弃;`width` / `height`
+/// 属性写了且短边 < `MIN_IMAGE_EDGE` 的丢(图标 / 追踪像素)。懒加载页的 `src` 常是占位图、
+/// 真图在 `data-src` / `data-original` / `data-lazy-src`,有就优先;`srcset` 取描述符最大的
+/// 候选。至多 `IMAGES_MAX` 张(主图也占额)。
+fn extract_images(doc: &Html, base_url: &str) -> Vec<PageImage> {
+    let base = url::Url::parse(base_url).ok();
+    let absolutize = |raw: &str| -> Option<String> {
+        let raw = raw.trim();
+        if raw.is_empty() || raw.starts_with("data:") {
+            return None;
+        }
+        let abs = match url::Url::parse(raw) {
+            Ok(u) => u,
+            Err(_) => base.as_ref()?.join(raw).ok()?,
+        };
+        if !matches!(abs.scheme(), "http" | "https") {
+            return None;
+        }
+        if abs.path().to_ascii_lowercase().ends_with(".svg") {
+            return None;
+        }
+        Some(abs.to_string())
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<PageImage> = Vec::new();
+    for m in doc.select(&sel(
+        "meta[property=\"og:image\"], meta[property=\"og:image:secure_url\"], \
+         meta[name=\"twitter:image\"], meta[name=\"twitter:image:src\"], link[rel=\"image_src\"]",
+    )) {
+        if out.len() >= IMAGES_MAX {
+            break;
+        }
+        let raw = m.value().attr("content").or_else(|| m.value().attr("href")).unwrap_or("");
+        let Some(url) = absolutize(raw) else { continue };
+        if !seen.insert(url.clone()) {
+            continue;
+        }
+        out.push(PageImage { url, main: true, ..Default::default() });
+    }
+    for im in doc.select(&sel("img")) {
+        if out.len() >= IMAGES_MAX {
+            break;
+        }
+        let v = im.value();
+        let dim = |k: &str| {
+            v.attr(k).and_then(|s| s.trim().trim_end_matches("px").parse::<u32>().ok())
+        };
+        let (w, h) = (dim("width").unwrap_or(0), dim("height").unwrap_or(0));
+        if (w > 0 && w < MIN_IMAGE_EDGE) || (h > 0 && h < MIN_IMAGE_EDGE) {
+            continue;
+        }
+        let lazy = ["data-src", "data-original", "data-lazy-src", "data-lazy"]
+            .iter()
+            .find_map(|k| v.attr(k))
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let raw = lazy
+            .or_else(|| v.attr("srcset").or_else(|| v.attr("data-srcset")).and_then(largest_srcset))
+            .or_else(|| v.attr("src"));
+        let Some(url) = raw.and_then(absolutize) else { continue };
+        if !seen.insert(url.clone()) {
+            continue;
+        }
+        let alt: String = v
+            .attr("alt")
+            .or_else(|| v.attr("title"))
+            .unwrap_or("")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push(PageImage { url, alt: clip(&alt, 60), width: w, height: h, main: false });
+    }
+    out
+}
+
+/// `srcset` 里描述符最大的候选(`600w` / `2x` 都按数值比;没描述符按 1 算)。空串 = None。
+fn largest_srcset(srcset: &str) -> Option<&str> {
+    srcset
+        .split(',')
+        .filter_map(|cand| {
+            let mut it = cand.split_whitespace();
+            let url = it.next()?;
+            let score = it
+                .next()
+                .and_then(|d| d.trim_end_matches(['w', 'x', 'h']).parse::<f64>().ok())
+                .unwrap_or(1.0);
+            Some((score, url))
+        })
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, url)| url)
 }
 
 /// 按字符数截断(给模型的预算闸)。算法在 `crate::text::clip` 单源(绝不按字节切),
@@ -1012,6 +1152,62 @@ mod tests {
         );
         assert_eq!(page.links[0].text, "下载附件");
         assert_eq!(page.links[2].text, "fa piao.pdf", "无文字锚用目标文件名(百分号解码)");
+    }
+
+    /// 页内图片:主图在前、图标 / data: / svg 被滤、懒加载取 data-src、srcset 取最大、同址去重;
+    /// 一行格式(`describe`)两条路共用,这里钉死。
+    #[test]
+    fn extract_images_puts_meta_main_first_and_filters_icons() {
+        let html = r##"<html><head>
+          <meta property="og:image" content="https://img.example.com/poster_l.jpg">
+          <meta name="twitter:image" content="/img/poster_l.jpg">
+        </head><body>
+          <img src="/icon.png" width="16" height="16" alt="小图标">
+          <img src="data:image/gif;base64,R0lGOD" alt="占位">
+          <img src="/logo.svg" alt="站标">
+          <img src="/placeholder.gif" data-src="/img/still1.jpg" alt="剧照  1" width="600" height="338">
+          <img srcset="/img/s-300.jpg 300w, /img/s-1200.jpg 1200w" alt="剧照 2">
+          <img src="https://img.example.com/poster_l.jpg" alt="重复的主图">
+          <img src="/img/plain.jpg">
+        </body></html>"##;
+        let page = extract_page(html, "https://movie.example.com/subject/1/");
+        let urls: Vec<&str> = page.images.iter().map(|i| i.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            [
+                "https://img.example.com/poster_l.jpg",
+                "https://movie.example.com/img/poster_l.jpg",
+                "https://movie.example.com/img/still1.jpg",
+                "https://movie.example.com/img/s-1200.jpg",
+                "https://movie.example.com/img/plain.jpg",
+            ],
+            "主图在前(og 绝对 / twitter 相对转绝对)、图标 / data: / svg 被滤、懒加载取 data-src、srcset 取最大、同址去重"
+        );
+        assert!(page.images[0].main && page.images[1].main && !page.images[2].main);
+        assert_eq!(page.images[2].alt, "剧照 1", "alt 空白归一");
+        assert_eq!((page.images[2].width, page.images[2].height), (600, 338));
+        assert_eq!(page.images[0].describe(), "- 主图 → https://img.example.com/poster_l.jpg\n");
+        assert_eq!(
+            page.images[2].describe(),
+            "- 剧照 1 (600×338) → https://movie.example.com/img/still1.jpg\n"
+        );
+        assert_eq!(page.images[4].describe(), "- 图片 → https://movie.example.com/img/plain.jpg\n");
+        // srcset 候选挑法
+        assert_eq!(largest_srcset("/a.jpg 1x, /b.jpg 2x"), Some("/b.jpg"));
+        assert_eq!(largest_srcset("/only.jpg"), Some("/only.jpg"));
+        assert_eq!(largest_srcset("  "), None);
+    }
+
+    #[test]
+    fn extract_images_caps_at_max_and_survives_old_cache_shape() {
+        let imgs: String = (0..20).map(|i| format!("<img src=\"/p{i}.jpg\">")).collect();
+        let page = extract_page(&format!("<html><body>{imgs}</body></html>"), "https://x.example.com/");
+        assert_eq!(page.images.len(), IMAGES_MAX, "封顶 IMAGES_MAX");
+        assert_eq!(page.images[0].url, "https://x.example.com/p0.jpg", "文档序");
+        // 改之前存下的缓存 JSON 没有 images 字段 → 读回来是空,不炸
+        let old: Page =
+            serde_json::from_str(r#"{"title":"t","text":"x","links":[],"links_total":0}"#).unwrap();
+        assert!(old.images.is_empty());
     }
 
     #[test]

@@ -225,6 +225,17 @@ impl Tool for WebFetch {
                 ));
             }
         }
+        // 页内图片同理只随首段给一次:海报 / 封面 / 商品图挑一张交 web_download(2026-09-16;
+        // 此前模型在这里看不到任何图的地址,介绍页上明明有海报也取不了)
+        if offset == 0 && !page.images.is_empty() {
+            out.push_str(
+                "\n\n【页内图片】(要存哪张就把地址交给 web_download:图站防盗链就带 referer=本页地址,\
+                 想存成固定名字给 name)\n",
+            );
+            for im in &page.images {
+                out.push_str(&im.describe());
+            }
+        }
         Ok(out.trim_end().to_string())
     }
 }
@@ -257,7 +268,9 @@ impl WebDownload {
                               需要账号的地址(WebDAV / 自家 NAS / 网盘挂载)由用户预先在\
                               「设置 · 系统 · 下载认证」里配好账号,这里会自动带上——\
                               **不要向用户索要密码、也不要把密码写进参数**;遇到 401 就\
-                              让用户去那里配。",
+                              让用户去那里配。网页里挑出来的图片(web_fetch / web_render 结果\
+                              的【页内图片】栏)也用它存:图站防盗链就带 referer=那一页的地址,\
+                              想直接存成 cover.jpg 这类固定名字就给 name。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -265,6 +278,14 @@ impl WebDownload {
                         "dir": {
                             "type": "string",
                             "description": "存到哪个文件夹(绝对路径);省略 = 系统「下载」文件夹"
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "存成这个文件名(只是名字不带目录;没写扩展名会按文件类型补上,如 cover → cover.jpg);省略 = 用服务器给的 / 链接末段的名字。同名仍不覆盖。只对 http(s) 直链有效"
+                        },
+                        "referer": {
+                            "type": "string",
+                            "description": "来源网页地址:图片站 / CDN 有防盗链时(直链单独打开是 403 或裂图)带上它,填这张图所在的那一页"
                         }
                     },
                     "required": ["url"]
@@ -332,10 +353,34 @@ impl Tool for WebDownload {
             url.starts_with("http://") || url.starts_with("https://"),
             "url 需要 http(s) 或 ftp:// 文件地址(或能拆出地址的 thunder:// 专用链),收到: {raw}"
         );
+        // 存成指定文件名(省一次改名;`sanitize_filename` 把 / \ 换掉,逃不出 dir)与来源页
+        // Referer(图 CDN 防盗链:海报 / 封面直链不带来源常被拒;它不是密码,过模型无妨)。
+        // 2026-09-16 随【页内图片】一起加,两条都是 http 档的事,ftp 分支在上面已经返回。
+        let wanted_name = args
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let referer = match args
+            .get("referer")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(r) => {
+                anyhow::ensure!(
+                    r.starts_with("http://") || r.starts_with("https://"),
+                    "referer 要是 http(s) 网页地址,收到: {r}"
+                );
+                Some(r.to_string())
+            }
+            None => None,
+        };
         // 认证按 host 现查(WebDAV / 带账号的直链)。**密码不经模型**(§7.7):它既不在
         // 工具参数里、也不出现在任何回给模型的文本里。
         let cred = crate::web::cred_for(&crate::web::load_http_creds(&ctx.store.settings), url);
-        let resp = self.get_with_cred(url, cred.as_ref()).await?;
+        let resp = self.get_with_cred(url, cred.as_ref(), referer.as_deref()).await?;
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
             anyhow::bail!(
@@ -357,13 +402,13 @@ impl Tool for WebDownload {
                 super::fs::human_size(DOWNLOAD_JOB_MAX_BYTES)
             );
             if n > DOWNLOAD_SYNC_MAX_BYTES {
-                let name = pick_filename(&resp);
+                let name = pick_filename(&resp, wanted_name.as_deref());
                 drop(resp); // 断掉这条连接,job 里重开(省得把 resp 搬进 spawn)
-                return self.spawn_job(ctx, url, &dir, name, n, cred);
+                return self.spawn_job(ctx, url, &dir, name, n, cred, referer);
             }
         }
 
-        let name = pick_filename(&resp);
+        let name = pick_filename(&resp, wanted_name.as_deref());
         // 先写临时件再改名:半截下载绝不顶着正式名躺在下载夹里
         let part = part_path(&dir);
         let total = match stream_to_file(resp, &part, DOWNLOAD_SYNC_MAX_BYTES, None).await {
@@ -516,17 +561,25 @@ impl WebDownload {
         &self,
         url: &str,
         cred: Option<&crate::web::HttpCred>,
+        referer: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
         self.net
-            .send(url, |c| match cred {
-                Some(cd) => c.get(url).basic_auth(&cd.user, Some(&cd.password)),
-                None => c.get(url),
+            .send(url, |c| {
+                let req = match cred {
+                    Some(cd) => c.get(url).basic_auth(&cd.user, Some(&cd.password)),
+                    None => c.get(url),
+                };
+                match referer {
+                    Some(r) => req.header(reqwest::header::REFERER, r),
+                    None => req,
+                }
             })
             .await
             .context("下载请求失败")
     }
 
     /// 大文件:登记进后台差事处,立即返回。
+    #[allow(clippy::too_many_arguments)]
     fn spawn_job(
         &self,
         ctx: &ToolCtx,
@@ -535,6 +588,7 @@ impl WebDownload {
         name: String,
         total: u64,
         cred: Option<crate::web::HttpCred>,
+        referer: Option<String>,
     ) -> anyhow::Result<String> {
         let size = super::fs::human_size(total);
         let ticket = ctx.media.bg().submit(
@@ -559,9 +613,15 @@ impl WebDownload {
             let mut part_guard = PartGuard::new(part.clone());
             let report = async {
                 let resp = net
-                    .send(&url_owned, |c| match cred.as_ref() {
-                        Some(cd) => c.get(&url_owned).basic_auth(&cd.user, Some(&cd.password)),
-                        None => c.get(&url_owned),
+                    .send(&url_owned, |c| {
+                        let req = match cred.as_ref() {
+                            Some(cd) => c.get(&url_owned).basic_auth(&cd.user, Some(&cd.password)),
+                            None => c.get(&url_owned),
+                        };
+                        match referer.as_deref() {
+                            Some(r) => req.header(reqwest::header::REFERER, r),
+                            None => req,
+                        }
                     })
                     .await
                     .context("下载请求失败")?;
@@ -657,9 +717,10 @@ impl Drop for PartGuard {
 
 use crate::files::{default_download_dir, sanitize_filename};
 
-/// 文件名:Content-Disposition(filename* 优先)→ 最终 URL 末段 → 兜底名;
-/// 非法字符替换、Windows 保留名规避(files::validate_name 口径),无扩展名按 MIME 补。
-fn pick_filename(resp: &reqwest::Response) -> String {
+/// 文件名:模型指定的 `name`(2026-09-16 加;存海报成 cover.jpg 这类固定名)→ Content-Disposition
+/// (filename* 优先)→ 最终 URL 末段 → 兜底名;非法字符替换、Windows 保留名规避
+/// (files::validate_name 口径),无扩展名按 MIME 补(`cover` + image/jpeg → `cover.jpg`)。
+fn pick_filename(resp: &reqwest::Response, wanted: Option<&str>) -> String {
     let cd_name = resp
         .headers()
         .get(reqwest::header::CONTENT_DISPOSITION)
@@ -672,7 +733,13 @@ fn pick_filename(resp: &reqwest::Response) -> String {
             .filter(|s| !s.is_empty())
             .map(crate::web::percent_decode)
     };
-    let raw = cd_name.or_else(url_name).unwrap_or_default();
+    let raw = wanted
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .or(cd_name)
+        .or_else(url_name)
+        .unwrap_or_default();
     let mut name = sanitize_filename(&raw);
     if !name.contains('.') {
         let mime = resp
@@ -840,6 +907,109 @@ mod tests {
             .unwrap();
         assert!(out.contains("【页内链接】"), "{out}");
         assert!(out.contains(&format!("下载附件 → http://127.0.0.1:{port}/dl/fp1.pdf")), "{out}");
+    }
+
+    /// 【页内图片】:主图在前、带尺寸、图标被滤、指路 referer / name;续读段不重复列。
+    #[tokio::test]
+    async fn web_fetch_lists_page_images_main_first() {
+        use axum::{routing::get, Router};
+        async fn page() -> axum::response::Html<&'static str> {
+            axum::response::Html(
+                "<html><head><title>影片页</title>\
+                 <meta property=\"og:image\" content=\"/img/poster.jpg\"></head>\
+                 <body><p>这一段是足够长的正文,用来验证抓取链路。</p>\
+                 <img src=\"/img/still.jpg\" alt=\"剧照\" width=\"600\" height=\"338\">\
+                 <img src=\"/icon.png\" width=\"16\" height=\"16\"></body></html>",
+            )
+        }
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/m", get(page))).await.ok();
+        });
+
+        let ctx = ctx("fetch-images");
+        let tool = WebFetch::new(Arc::new(WebClient::new()));
+        let url = format!("http://127.0.0.1:{port}/m");
+        let out = tool.run(serde_json::json!({"url": url}), &ctx).await.unwrap();
+        assert!(out.contains("【页内图片】") && out.contains("referer=本页地址"), "{out}");
+        assert!(out.contains(&format!("- 主图 → http://127.0.0.1:{port}/img/poster.jpg")), "{out}");
+        assert!(
+            out.contains(&format!("- 剧照 (600×338) → http://127.0.0.1:{port}/img/still.jpg")),
+            "{out}"
+        );
+        assert!(!out.contains("icon.png"), "16px 图标被滤:{out}");
+        let out2 = tool.run(serde_json::json!({"url": url, "offset": 5}), &ctx).await.unwrap();
+        assert!(!out2.contains("【页内图片】"), "续读段不重复列图:{out2}");
+    }
+
+    /// web_download 的 `name` / `referer`:防盗链图站不带来源页 403 如实报;带上就下得来,
+    /// `name` 无扩展名按 MIME 补 .jpg;非 http 的 referer 拒收;name 带路径分隔符逃不出 dir。
+    #[tokio::test]
+    async fn web_download_honours_name_and_referer() {
+        use axum::{
+            http::{header, HeaderMap, StatusCode},
+            routing::get,
+            Router,
+        };
+        const REF: &str = "https://movie.example.com/subject/1/";
+        async fn img(headers: HeaderMap) -> impl axum::response::IntoResponse {
+            let ok = headers.get(header::REFERER).and_then(|v| v.to_str().ok()) == Some(REF);
+            if !ok {
+                return (
+                    StatusCode::FORBIDDEN,
+                    [(header::CONTENT_TYPE, "text/plain")],
+                    &b"hotlink denied"[..],
+                );
+            }
+            (StatusCode::OK, [(header::CONTENT_TYPE, "image/jpeg")], &b"\xFF\xD8\xFF fake jpeg"[..])
+        }
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/p.jpg", get(img))).await.ok();
+        });
+
+        let ctx = ctx("download-ref");
+        let dir = std::env::temp_dir().join(format!("lw-dl-ref-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dir_s = dir.to_string_lossy().into_owned();
+        let tool = WebDownload::new();
+        let url = format!("http://127.0.0.1:{port}/p.jpg");
+
+        let err = tool
+            .run(serde_json::json!({"url": url, "dir": dir_s}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("403"), "不带来源页被拒要如实报:{err:#}");
+
+        let out = tool
+            .run(
+                serde_json::json!({"url": url, "dir": dir_s, "name": "cover", "referer": REF}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("cover.jpg"), "name 无扩展名按 MIME 补:{out}");
+        assert_eq!(std::fs::read(dir.join("cover.jpg")).unwrap(), b"\xFF\xD8\xFF fake jpeg");
+
+        assert!(
+            tool.run(serde_json::json!({"url": url, "dir": dir_s, "referer": "movie.example.com"}), &ctx)
+                .await
+                .is_err(),
+            "referer 不是 http(s) 地址要拒"
+        );
+
+        let out3 = tool
+            .run(
+                serde_json::json!({"url": url, "dir": dir_s, "name": "../evil", "referer": REF}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!dir.parent().unwrap().join("evil.jpg").exists(), "name 逃不出 dir:{out3}");
+        assert!(out3.contains(&dir_s), "落在 dir 里:{out3}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

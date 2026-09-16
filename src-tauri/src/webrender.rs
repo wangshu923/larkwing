@@ -1502,9 +1502,13 @@ async fn print_pdf_platform(_win: &tauri::WebviewWindow, _dest: &std::path::Path
 /// 点、也能 type_ref 填 / select_ref 选(壳层动作脚本按编号 querySelector 定位)。
 fn build_snapshot_script(collect_url: &str) -> String {
     let post = serde_json::to_string(collect_url).unwrap_or_else(|_| "\"\"".into());
+    // 页内图片的两道闸与 web_fetch 同一个源(§4.11 单源):张数上限 / 显示短边下限
+    let img_max = larkwing_core::web::IMAGES_MAX;
+    let img_min = larkwing_core::web::MIN_IMAGE_EDGE;
     format!(
         r#"(function() {{
   var POST = {post};
+  var IMG_MAX = {img_max}; var IMG_MIN = {img_min};
 {SCRUB_JS}
   function txt(el) {{ return ((el.innerText || '') + '').replace(/\s+/g, ' ').trim().slice(0, 40); }}
   function labelOf(el) {{
@@ -1559,6 +1563,33 @@ fn build_snapshot_script(collect_url: &str) -> String {
     if (!/^https?:/.test(h) || seen[h]) continue; seen[h] = 1;
     links.push({{ text: txt(anchors[i]) || h.split('/').pop().slice(0, 40), url: h }});
   }}
+  // 页内图片(2026-09-16):页面自报的主图(og:image / twitter:image / link[rel=image_src])在前,
+  // 再按**实际显示面积**排 <img>(短边 < IMG_MIN 的图标不收),至多 IMG_MAX 张;data: / svg 丢,
+  // 同址去重。形状 = core `web::PageImage`(与 web_fetch 一个口径),模型据此挑海报交 web_download。
+  var images = []; var iseen = {{}};
+  function absUrl(u) {{ try {{ return new URL(u, location.href).href; }} catch (e) {{ return ''; }} }}
+  function pushImg(u, alt, w, h, main) {{
+    if (!u || !/^https?:/.test(u) || /\.svg(\?|#|$)/i.test(u) || iseen[u] || images.length >= IMG_MAX) return;
+    iseen[u] = 1;
+    images.push({{ url: u, alt: (alt || '').replace(/\s+/g, ' ').trim().slice(0, 60), width: w | 0, height: h | 0, main: !!main }});
+  }}
+  try {{
+    var metas = document.querySelectorAll('meta[property="og:image"],meta[property="og:image:secure_url"],meta[name="twitter:image"],meta[name="twitter:image:src"],link[rel="image_src"]');
+    for (var mi = 0; mi < metas.length; mi++) {{
+      var mc = metas[mi].getAttribute('content') || metas[mi].getAttribute('href');
+      if (mc) pushImg(absUrl(mc), '', 0, 0, true);
+    }}
+    var scored = [];
+    for (var ii = 0; ii < document.images.length; ii++) {{
+      var im = document.images[ii]; var r = im.getBoundingClientRect();
+      var w = Math.round(r.width || 0), h = Math.round(r.height || 0);
+      if (w < IMG_MIN || h < IMG_MIN) continue;
+      var u = absUrl(im.currentSrc || im.src || im.getAttribute('data-src') || im.getAttribute('data-original') || '');
+      if (u) scored.push({{ u: u, alt: im.alt || im.title || '', w: w, h: h }});
+    }}
+    scored.sort(function (a, b) {{ return b.w * b.h - a.w * a.h; }});
+    for (var si = 0; si < scored.length; si++) pushImg(scored[si].u, scored[si].alt, scored[si].w, scored[si].h, false);
+  }} catch (e) {{}}
   var elements = [];
   // ⚠️ **先把上一张快照的编号全清掉**(2026-08-22 修):`data-lw-ref` 从来没人擦,而每张
   // 快照都从 1 重新编 —— 上一张的 7 号还挂着、这张的 7 号是另一个元素,`click_ref: 7` 用
@@ -1594,6 +1625,7 @@ fn build_snapshot_script(collect_url: &str) -> String {
     title: (document.title || '').slice(0, 200),
     text: (document.body ? document.body.innerText : '').slice(0, 8000),
     links: links,
+    images: images,
     elements: elements,
     scroll_hint: scroll_hint,
     clicked: !!click.clicked,
@@ -1643,6 +1675,12 @@ mod tests {
         assert!(!snap.contains("el.offsetParent === null && !isFile"), "别退回只看 offsetParent");
         assert!(snap.contains("removeAttribute('data-lw-ref')"), "编号前要清上一张快照的:{snap}");
         assert!(snap.contains("lwScrub(payload)"), "出站要清落单代理项:{snap}");
+        // 2026-09-16 页内图片:主图 meta + <img> 按显示面积,两道闸的数字从 core 单源插值
+        assert!(snap.contains("og:image") && snap.contains("images: images"), "页内图片要进快照:{snap}");
+        assert!(
+            snap.contains(&format!("var IMG_MAX = {}; var IMG_MIN = {};", larkwing_core::web::IMAGES_MAX, larkwing_core::web::MIN_IMAGE_EDGE)),
+            "图片闸要与 core 同源:{snap}"
+        );
         println!("__SCRIPT_SNAP__\n{snap}\n__END__");
     }
 

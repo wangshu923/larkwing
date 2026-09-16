@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::web::PageLink;
+use crate::web::{PageImage, PageLink};
 
 /// 单次上传的总字节上限(工具层验元数据、壳层读字节时再验)。取值沿用 web_download 的
 /// 50MB 闸口径(`tools/web.rs::DOWNLOAD_MAX_BYTES`)——网页世界一次进出的文件同一尺度,
@@ -23,6 +23,10 @@ pub struct RenderedPage {
     pub title: String,
     pub text: String,
     pub links: Vec<PageLink>,
+    /// 页内图片(与 web_fetch 同一口径 `crate::web::PageImage`;快照脚本给的是**实际显示尺寸**,
+    /// 主图在前、其余按显示面积排,至多 `web::IMAGES_MAX` 张,短边 < `web::MIN_IMAGE_EDGE` 不收)。
+    /// 2026-09-16 加;老壳层没这字段 = 空。
+    pub images: Vec<PageImage>,
     /// 渲染后 DOM 里「可点」元素的文字(button / [onclick] / role=button 这类无 href 的):
     /// 模型据此决定第二跳的 click_text。
     pub clickables: Vec<String>,
