@@ -88,7 +88,14 @@ impl MediaRuntime {
             rule.duration = duration.or(rule.duration);
         }
         match action {
-            "intro_start" => rule.intro_start = Some(at),
+            "intro_start" => {
+                rule.intro_start = Some(at);
+                if rule.intro_end.is_some_and(|e| e <= at) {
+                    // 终点落在新起点之前没意义 = 用户在重标片头:丢掉旧终点,回话会提示「标上终点才会跳」
+                    // (镜像下面 intro_end 那条;原先不查,起点 > 终点的段被 resolve 整个滤掉、回话却说标好了)
+                    rule.intro_end = None;
+                }
+            }
             "intro_end" => {
                 rule.intro_end = Some(at);
                 if rule.intro_start.is_some_and(|s| s >= at) {
@@ -146,5 +153,41 @@ impl MediaRuntime {
         let n = self.inner.store.media_skip.clear_manual(&key)?;
         self.refresh_skip();
         Ok(if n > 0 { "已清除这部剧的手动片头片尾标记".into() } else { "这部剧没有手动标记".into() })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::media::testkit::*;
+
+    /// 「片头从这里开始」说在已标的片头终点之后 = 重标片头:旧终点作废、等用户再说「到这里」;
+    /// 原先不查顺序,起点 > 终点的段被 resolve 整个滤掉、回话却说标好了(2026-09-16 体检修)。
+    #[tokio::test]
+    async fn intro_start_after_intro_end_drops_stale_end() {
+        let (rt, _rx) = runtime("skip-order");
+        let dir = std::env::temp_dir().join(format!("lw-skip-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let e1 = touch(&dir, "剧 第1集.mp4");
+        touch(&dir, "剧 第2集.mp4");
+        rt.play(1, &e1.to_string_lossy(), false, false, None).await.unwrap();
+        let key = rt.inner.playlist.lk().as_ref().unwrap().series_key.clone();
+        let manual = |rt: &MediaRuntime| {
+            let rows = rt.inner.store.media_skip.list(&key).unwrap();
+            let r = rows.iter().find(|r| r.source == "manual").expect("有手标行");
+            (r.intro_start, r.intro_end)
+        };
+        rt.mark_skip("intro_end", Some(60.0)).unwrap();
+        assert_eq!(manual(&rt), (None, Some(60.0)), "只标终点 = 起点从 0 算");
+        // 起点说在终点之后:旧终点作废,只剩起点(段不完整,不会跳)
+        rt.mark_skip("intro_start", Some(90.0)).unwrap();
+        assert_eq!(manual(&rt), (Some(90.0), None));
+        // 再说「到这里」:成段
+        rt.mark_skip("intro_end", Some(150.0)).unwrap();
+        assert_eq!(manual(&rt), (Some(90.0), Some(150.0)));
+        // 起点说在终点之前:两端都留
+        rt.mark_skip("intro_start", Some(100.0)).unwrap();
+        assert_eq!(manual(&rt), (Some(100.0), Some(150.0)));
     }
 }

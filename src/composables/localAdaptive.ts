@@ -77,7 +77,9 @@ export async function playAdaptive(
     }
   }
   const fail = (why: string) => {
-    if (dead) return
+    // stop() 之后残留的元素 error 监听仍可能进来:那是上一部片的尾声,闭包里的 onError 指着旧的
+    // 回落记忆(新 play() 已清)→ 会对**当前**正在放的内容发一次兜底重放。停了就不作数。
+    if (dead || stopped) return
     dead = true
     // 富化失败现场(t/readyState/两轨缓冲/video.error)→ onError → 写进 larkwing.log,真机可定位。
     const detail =

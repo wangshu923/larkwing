@@ -41,6 +41,10 @@ pub enum LyricsResult {
     /// 原先写盘失败也回 NotFound → 话术说成「没找到歌词」,模型和用户都以为是没词,
     /// 于是去做无用的重试/换源,真因(写不进)一个字都没说(§3.5)。
     WriteFailed,
+    /// **歌词库没连上**(5xx / 断网 / 超时)—— 与 NotFound 分开(2026-09-16 体检修,与上一条同族):
+    /// 原先折成 NotFound,下载话术说「歌名给得更准可能找得到」,模型就去改歌名白忙;真因是网络,
+    /// 该稍后用 lyrics_fetch 补。存量批量路早就分开报(`Unusable("歌词库没连上")`),下载路补齐。
+    LookupFailed,
 }
 
 /// 存量批量的单文件结论。
@@ -235,6 +239,10 @@ pub(crate) fn compose_batch_summary(results: &[(PathBuf, LyricsFileResult)]) -> 
             LyricsFileResult::Got(LyricsResult::Existed) => existed += 1,
             LyricsFileResult::Got(LyricsResult::NotFound) => not_found.push(stem(path)),
             LyricsFileResult::Got(LyricsResult::WriteFailed) => write_failed.push(stem(path)),
+            // 批量路的网络失败走的是 Unusable("歌词库没连上"),这一臂只为穷尽;万一有人喂进来,口径一致
+            LyricsFileResult::Got(LyricsResult::LookupFailed) => {
+                unusable.push(format!("{}(歌词库没连上)", stem(path)))
+            }
             LyricsFileResult::MissingTitle => missing.push(stem(path)),
             LyricsFileResult::Unusable(why) => unusable.push(format!("{}({why})", stem(path))),
         }
@@ -280,6 +288,22 @@ pub(super) async fn lyrics_for_download(
     duration: Option<f64>,
     audio_path: &Path,
 ) -> LyricsResult {
+    lyrics_for_download_at(LRCLIB_API, net, subs, sub_headers, title, artist, duration, audio_path)
+        .await
+}
+
+/// `lyrics_for_download` 的正身,歌词库地址可注入(测试喂假库;正式恒 LRCLIB_API)。
+#[allow(clippy::too_many_arguments)] // 只比外壳多一个注入口;调用面 = 上面那处 + 测试
+async fn lyrics_for_download_at(
+    api_base: &str,
+    net: &crate::net::Client,
+    subs: &[SubtitleRef],
+    sub_headers: &[(String, String)],
+    title: &str,
+    artist: Option<&str>,
+    duration: Option<f64>,
+    audio_path: &Path,
+) -> LyricsResult {
     if audio_path.with_extension("lrc").exists() {
         return LyricsResult::Existed;
     }
@@ -297,7 +321,7 @@ pub(super) async fn lyrics_for_download(
             Err(e) => tracing::info!("字幕拉取失败,转歌词库: {e:#}"),
         }
     }
-    match lrclib_lookup(net, LRCLIB_API, title, artist, duration).await {
+    match lrclib_lookup(net, api_base, title, artist, duration).await {
         Ok(Some((lrc, synced))) => match write_lrc_beside(audio_path, &lrc) {
             Ok(true) => {
                 if synced {
@@ -315,7 +339,7 @@ pub(super) async fn lyrics_for_download(
         Ok(None) => LyricsResult::NotFound,
         Err(e) => {
             tracing::warn!("歌词库查询失败: {e:#}");
-            LyricsResult::NotFound
+            LyricsResult::LookupFailed
         }
     }
 }
@@ -865,5 +889,36 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert!(synced && lrc.contains("对的版"), "时长 ±3s 挑对版本: {lrc}");
+    }
+
+    /// 歌词库**没连上**(5xx / 断网)与「没找到」是两回事(2026-09-16 体检修):原先下载路把它折成
+    /// NotFound,话术说「歌名给得更准可能找得到」,模型就去改歌名白忙;真因是网络,该稍后用 lyrics_fetch 补。
+    #[tokio::test]
+    async fn download_lyrics_reports_lookup_failure_distinctly() {
+        use axum::{routing::get, Router};
+        async fn boom() -> (axum::http::StatusCode, &'static str) {
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "down")
+        }
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/api/get", get(boom)).route("/api/search", get(boom)),
+            )
+            .await
+            .ok();
+        });
+        let net = lyrics_client();
+        let base = format!("http://127.0.0.1:{port}/api");
+        let dir = std::env::temp_dir().join(format!("lw-lyrics-lookupfail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audio = dir.join("某歌.m4a");
+        let _ = std::fs::remove_file(audio.with_extension("lrc"));
+        std::fs::write(&audio, b"x").unwrap();
+        let r = lyrics_for_download_at(&base, &net, &[], &[], "某歌", Some("某人"), Some(200.0), &audio)
+            .await;
+        assert_eq!(r, LyricsResult::LookupFailed);
+        assert!(!audio.with_extension("lrc").exists(), "失败不留空文件");
     }
 }

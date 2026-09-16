@@ -32,6 +32,8 @@ pub const TORRENT_MAX_BYTES: u64 = 50 * 1024 * 1024 * 1024; // 50 GB
 
 /// 同时下几个种子:再多带宽只是被分摊,还挤占 peer 连接数。
 pub const MAX_CONCURRENT: usize = 3;
+/// 登记处里种子任务的标题前缀:并发闸按它数同类任务(标题由本文件拼、也由本文件数,单源)。
+const TORRENT_TITLE_PREFIX: &str = "下载种子";
 
 /// 磁力链从 DHT 取 metadata(种子信息)的超时。
 /// **这是国内最容易卡死的一步** —— DHT 走 UDP,而运营商对 UDP 的限速正是冲着 P2P 来的;
@@ -267,18 +269,26 @@ impl super::MediaRuntime {
         only: Option<String>,
         origin: (i64, i64),
     ) -> Result<TorrentOutcome> {
-        // 并发闸:再多带宽只是被分摊。满了如实退回(bgtasks 满了也是这个口径,不排队)。
-        let running = self.inner.bg.running_count_of("下载种子");
-        anyhow::ensure!(
-            running < MAX_CONCURRENT,
-            "已经有 {running} 个种子在下了(一次最多 {MAX_CONCURRENT} 个,再多只是分摊带宽)。\
-             等一个下完,或者用 task_cancel 停掉一个再来。"
-        );
         // 引擎在这里就建好 —— 起不来要让模型当场知道,别等到后台 job 里才炸。
         self.torrent_engine().await?;
 
         let label = link.label();
-        let ticket = self.inner.bg.submit(format!("下载种子({label})"), origin, 100)?;
+        // 并发闸:再多带宽只是被分摊。满了如实退回(bgtasks 满了也是这个口径,不排队)。数与登记在
+        // 登记处同一把锁里完成 —— 原先先数再提交分两步,轮内 join_all 并发的四个种子能全放进去。
+        let Some(ticket) = self.inner.bg.submit_limited(
+            format!("{TORRENT_TITLE_PREFIX}({label})"),
+            origin,
+            100,
+            TORRENT_TITLE_PREFIX,
+            MAX_CONCURRENT,
+        )?
+        else {
+            let running = self.inner.bg.running_count_of(TORRENT_TITLE_PREFIX);
+            anyhow::bail!(
+                "已经有 {running} 个种子在下了(一次最多 {MAX_CONCURRENT} 个,再多只是分摊带宽)。\
+                 等一个下完,或者用 task_cancel 停掉一个再来。"
+            );
+        };
         let ticket_id = ticket.id();
         let this = self.clone();
         let dir_owned = dir.to_path_buf();

@@ -374,7 +374,7 @@ onUnmounted(() => {
     <Transition name="osd">
       <div v-if="osd" class="osd" aria-live="polite">{{ osd }}</div>
     </Transition>
-    <EpisodeList v-model:open="listOpen" variant="drop" />
+    <EpisodeList v-model:open="listOpen" variant="bar" />
     <div v-if="helpOpen" class="help-drop" @pointerdown.stop @click.stop>
       <KeyHelpCard :rows="keys.help.value" variant="drop" />
     </div>
@@ -457,7 +457,7 @@ onUnmounted(() => {
 .cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .cover:hover, .cover.on { border-color: var(--accent); box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.3); }
 /* 曲目列表:从播放条上方展开(组件自身 right/width 定位,这里只定纵向锚) */
-.eplist.drop { bottom: calc(100% + 8px); left: 8px; right: auto; }
+.eplist.bar { bottom: calc(100% + 8px); left: 8px; right: auto; }
 .help-drop { position: absolute; z-index: 6; bottom: calc(100% + 8px); right: 8px; display: flex; }
 .pbtn.stop { color: var(--attn); border-color: rgba(var(--attn-rgb), 0.35); }
 .pbtn.stop:hover { border-color: var(--attn); box-shadow: 0 0 12px rgba(var(--attn-rgb), 0.3); }

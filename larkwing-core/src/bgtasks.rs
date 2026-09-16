@@ -124,6 +124,30 @@ impl BgTasks {
     /// 提交一个后台任务(cap 满 = 如实退回,不排队):返回票据,任务循环拿着它
     /// 打点(beat)/查取消/收尾(finish)。spawn 之后记得 `attach_abort`(看门狗要用)。
     pub fn submit(&self, title: String, origin: (i64, i64), total: usize) -> Result<BgTicket> {
+        Ok(self.submit_with(title, origin, total, None)?.expect("无类别闸时必有票据"))
+    }
+
+    /// `submit` 的带**类别闸**版本:同一把锁里数「运行中且标题以 `prefix` 打头」的任务,满 `max`
+    /// 回 `Ok(None)`(调用方用自己的话术退回模型),否则登记。数与登记不分两步 —— 原先调用方先
+    /// `running_count_of` 再 `submit`,轮内 `join_all` 并发提交能全放进去越过闸(2026-09-16 体检修)。
+    pub fn submit_limited(
+        &self,
+        title: String,
+        origin: (i64, i64),
+        total: usize,
+        prefix: &str,
+        max: usize,
+    ) -> Result<Option<BgTicket>> {
+        self.submit_with(title, origin, total, Some((prefix, max)))
+    }
+
+    fn submit_with(
+        &self,
+        title: String,
+        origin: (i64, i64),
+        total: usize,
+        gate: Option<(&str, usize)>,
+    ) -> Result<Option<BgTicket>> {
         self.ensure_sweeper();
         let now = now_ms();
         let entry = {
@@ -133,6 +157,12 @@ impl BgTasks {
                 running < BG_MAX_CONCURRENT,
                 "后台已有 {running} 个任务在跑(上限 {BG_MAX_CONCURRENT}),等几个跑完再提交"
             );
+            if let Some((prefix, max)) = gate {
+                let same = entries.iter().filter(|e| e.running() && e.title.starts_with(prefix)).count();
+                if same >= max {
+                    return Ok(None);
+                }
+            }
             let entry = Arc::new(BgEntry {
                 id: self.inner.next_id.fetch_add(1, Ordering::Relaxed),
                 title,
@@ -165,7 +195,7 @@ impl BgTasks {
             }
             entry
         };
-        Ok(BgTicket { reg: self.clone(), entry })
+        Ok(Some(BgTicket { reg: self.clone(), entry }))
     }
 
     /// 运行中、且标题以 `prefix` 打头的任务数。给「某一类活自己还有并发闸」用

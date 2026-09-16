@@ -171,6 +171,10 @@ impl Tool for MediaDownload {
                     crate::media::LyricsResult::WriteFailed => {
                         ";歌词找到了但写不进去(那个文件夹可能没有写权限或磁盘满了),歌本身已存好"
                     }
+                    // 歌词库没连上 ≠ 没这首:别让模型去改歌名重试,过会儿用 lyrics_fetch 补就行
+                    crate::media::LyricsResult::LookupFailed => {
+                        ";歌词库这次没连上,没配上歌词(不是没有这首;歌本身已存好,之后可以用 lyrics_fetch 补)"
+                    }
                 });
                 out
             }

@@ -26,6 +26,8 @@ impl MediaControl {
                               回到默认(歌单 = 列表循环;单曲或视频 = 放完就停)/ audio_track 切音轨\
                               (value=第几条,从 1 数;〔此刻〕背景列着可选音轨和语言,用户说\
                               「换英文原声/换国语」就挑对应语言那条的轨号;单音轨内容没得切,会如实说)/ \
+                              subtitle 开关字幕(value=第几条,从 1 数,0=关;〔此刻〕背景列着可选字幕和语言,\
+                              「开中文字幕」就挑 chi/zh 那条)/ \
                               **片头片尾**(只对多集剧集):skip_intro 跳过本集片头 / intro_start、intro_end、\
                               outro_start 标记「片头从这里开始 / 片头到这里为止 / 片尾从这里开始」(value=秒;\
                               用户说「到这里」就不传 value = 取此刻播放位;标记从当前这一集起生效,以后自动跳)/ \
@@ -50,7 +52,10 @@ impl MediaControl {
                     },
                     "required": ["action"]
                 }),
-                timeout: std::time::Duration::from_secs(5),
+                // 切集 / 切音轨走整条 play_entry(B 站 yt-dlp 解析几秒、mkv 切集要 probe + 关键帧扫描),
+                // 5s 常常不够 —— 超时 = future 被 drop,模型只拿到「超时」、切集半途而废(2026-09-16 体检修;
+                // 30s 与回合内等后台活的 IN_TURN_WAIT 同档,**§4.11 待用户确认**)。纯指令类动作本就秒回。
+                timeout: std::time::Duration::from_secs(30),
                 ui_key: "tool.media_control",
             },
         }

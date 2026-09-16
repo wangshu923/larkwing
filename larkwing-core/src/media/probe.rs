@@ -1129,21 +1129,44 @@ pub fn plan_copy_segments(keyframes: &[f64], duration: f64, target: f64) -> Vec<
 /// 段被 append 但样本全落在 appendWindow 外被静默裁光 → 无声)——归零 = 按构造满足契约,
 /// 对本就为 0 的段是 no-op。找不到 tfdt(不是分片 mp4)= 0,不动。
 pub fn zero_tfdt(seg: &mut [u8]) -> u64 {
+    // 只认 moof → traf → tfdt 的盒结构,**不做全段子串扫描**(2026-09-16 体检修):段里跟着 mdat
+    // (压缩音频),四个字节撞上 "tfdt" 的概率按段长算不小(200KB 段 ≈ 5e-5,两小时片上千段累计到
+    // 百分位),撞上就把随后 4/8 字节清零 = 悄悄坏掉一个音频帧。视频侧的 `patch_segment_tfdt` 本来就
+    // 按结构走,两处口径至此一致。先收集偏移再改写:遍历借的是只读视图。
+    let mut targets: Vec<(usize, u8)> = Vec::new(); // (baseMediaDecodeTime 起点, version)
+    {
+        let view: &[u8] = seg;
+        for_each_box(view, 0, view.len(), |typ, hdr, bs, be| {
+            if typ != b"moof" {
+                return;
+            }
+            for_each_box(view, bs + hdr, be, |t2, h2, s2, e2| {
+                if t2 != b"traf" {
+                    return;
+                }
+                for_each_box(view, s2 + h2, e2, |t3, h3, s3, e3| {
+                    if t3 != b"tfdt" {
+                        return;
+                    }
+                    let p = s3 + h3; // version(1)+flags(3) 之后是 baseMediaDecodeTime
+                    if let Some(&version) = view.get(p) {
+                        let need = if version == 1 { 8 } else { 4 };
+                        if p + 4 + need <= e3 {
+                            targets.push((p + 4, version));
+                        }
+                    }
+                });
+            });
+        });
+    }
     let mut max_was: u64 = 0;
-    let mut from = 0usize;
-    while let Some(rel) = find_subslice(&seg[from..], b"tfdt") {
-        let tag = from + rel;
-        from = tag + 4;
-        let Some(&version) = seg.get(tag + 4) else { break };
-        let off = tag + 8; // version(1)+flags(3) 之后是 baseMediaDecodeTime
+    for (off, version) in targets {
         if version == 1 {
-            let Some(b8) = seg.get(off..off + 8) else { continue };
-            let was = u64::from_be_bytes(b8.try_into().unwrap());
+            let was = u64::from_be_bytes(seg[off..off + 8].try_into().unwrap());
             max_was = max_was.max(was);
             seg[off..off + 8].fill(0);
         } else {
-            let Some(b4) = seg.get(off..off + 4) else { continue };
-            let was = u32::from_be_bytes(b4.try_into().unwrap()) as u64;
+            let was = u32::from_be_bytes(seg[off..off + 4].try_into().unwrap()) as u64;
             max_was = max_was.max(was);
             seg[off..off + 4].fill(0);
         }
@@ -1766,12 +1789,27 @@ mod tests {
             p.extend_from_slice(&17_580_000u64.to_be_bytes());
             mp4_box(b"tfdt", &p)
         };
-        let mut seg = mp4_box(b"moof", &[v0, v1].concat());
+        // 两条 traf(音视频各一)各带一个 tfdt,都得归零
+        let mut seg = mp4_box(b"moof", &[mp4_box(b"traf", &v0), mp4_box(b"traf", &v1)].concat());
         assert_eq!(zero_tfdt(&mut seg), 17_580_000, "报告改前最大原值");
         assert_eq!(zero_tfdt(&mut seg), 0, "二次归零 = no-op(已全 0)");
         // 没有 tfdt 的数据:不动、报 0
         let mut plain = mp4_box(b"ftyp", b"isom");
         assert_eq!(zero_tfdt(&mut plain), 0);
+
+        // mdat 里的压缩字节恰好凑出 "tfdt" 四个字(真实音频段里按段长算概率不低):**不是盒,绝不能改**。
+        // 老实现是全段子串扫描,会把它后面 4 字节清零 = 悄悄坏一个音频帧(2026-09-16 体检修)。
+        let tfdt = {
+            let mut p = vec![0u8, 0, 0, 0];
+            p.extend_from_slice(&777u32.to_be_bytes());
+            mp4_box(b"tfdt", &p)
+        };
+        let moof = mp4_box(b"moof", &mp4_box(b"traf", &tfdt));
+        let mdat = mp4_box(b"mdat", b"\x21\x0a\x00tfdt\xde\xad\xbe\xef\x01\x00\x00\x00tfdt\x55");
+        let mut seg = [moof.clone(), mdat.clone()].concat();
+        assert_eq!(zero_tfdt(&mut seg), 777, "真 tfdt 照样归零并报原值");
+        assert_eq!(&seg[moof.len()..], &mdat[..], "mdat 里的诱饵一个字节都不许动");
+        assert_eq!(&seg[moof.len() - 4..moof.len()], &[0, 0, 0, 0], "真 tfdt 的值已清零");
     }
 
     #[test]

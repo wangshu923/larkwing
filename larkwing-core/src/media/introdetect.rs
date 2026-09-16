@@ -74,13 +74,23 @@ impl MediaRuntime {
         if has_row {
             return;
         }
+        // 测过但没测出(没 OP 的剧 / 两侧邻居不合)也别每次开播重跑:一趟 = 3 次 probe + 6 次解码,
+        // 与正在跑的转码抢 CPU(2026-09-16 体检修)。进程内记「试过」(§6.4 派生可丢:重启后再试一次,
+        // 正好兜「邻居刚下载好」那种情况);没跑成(ffmpeg 挂了之类)不记,下次照旧再来。
+        let tried_key = (key.clone(), entries[index].id.clone());
+        if self.inner.detect_tried.lk().contains(&tried_key) {
+            return;
+        }
         if self.inner.detect_busy.swap(true, Ordering::SeqCst) {
             return; // 上一趟还在跑,这集下次开播再来
         }
         let rt = self.clone();
         tokio::spawn(async move {
             match rt.detect_series(&key, &entries, index).await {
-                Ok(found) => tracing::info!(key = %key, ep = index + 1, found, "片头片尾指纹检测完成"),
+                Ok(found) => {
+                    tracing::info!(key = %key, ep = index + 1, found, "片头片尾指纹检测完成");
+                    rt.inner.detect_tried.lk().insert(tried_key);
+                }
                 Err(e) => tracing::info!(key = %key, ep = index + 1, "片头片尾指纹检测没跑成: {e:#}"),
             }
             rt.inner.detect_busy.store(false, Ordering::SeqCst);

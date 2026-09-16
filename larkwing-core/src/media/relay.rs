@@ -268,6 +268,10 @@ const AUDIO_FINE_SEEK: f64 = 0.1;
 /// ffmpeg stderr 的有界收集上限(只为拿错误尾巴记日志)。有界是因为 stderr 现在**并发排空**:
 /// 排空是为了防挂死,但不能反过来让一个疯狂刷 stderr 的进程把内存吃掉。
 const STDERR_TAIL_CAP: usize = 8 * 1024;
+/// 上游流头(探 sidx 的前 96KB)的取回超时。relay 的 `net::Client` 刻意只设建连超时(它同时服务
+/// 整片的 `/s/` 流,不能加总超时),所以这两趟小请求各自套一把 —— 不然 CDN 建连后不吐字节,
+/// `register_dash` 永挂、`play()` 整个不返回(2026-09-16 体检修;**§4.11 待用户确认**)。
+const UPSTREAM_HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// HLS 播放列表的段数上限(≈ 33 小时 @6s)。存在的理由不是「片子不会更长」,而是 duration
 /// 来自**文件自报**的元数据:坏文件能报出天文数字,而列表是照着它逐段拼字符串的。
 const HLS_MAX_SEGMENTS: u64 = 20_000;
@@ -595,8 +599,14 @@ impl Relay {
     ) -> Result<String> {
         // sidx 在 ftyp+moov 之后;DASH 单表示流的 moov 很小,96KB 头足够覆盖。
         const HEAD: u64 = 96 * 1024;
-        let vhead = fetch_head(&self.inner.net, &video, HEAD).await.context("取视频流头失败")?;
-        let ahead = fetch_head(&self.inner.net, &audio, HEAD).await.context("取音频流头失败")?;
+        // 两条流头**并行**取、各带超时:串行白等一趟 RTT;不带超时则 CDN 建连后不吐字节时
+        // `play()` 整个不返回(relay 的 net::Client 刻意只设建连超时,见 UPSTREAM_HEAD_TIMEOUT)。
+        let (vhead, ahead) = tokio::join!(
+            tokio::time::timeout(UPSTREAM_HEAD_TIMEOUT, fetch_head(&self.inner.net, &video, HEAD)),
+            tokio::time::timeout(UPSTREAM_HEAD_TIMEOUT, fetch_head(&self.inner.net, &audio, HEAD)),
+        );
+        let vhead = vhead.ok().flatten().context("取视频流头失败或超时")?;
+        let ahead = ahead.ok().flatten().context("取音频流头失败或超时")?;
         let vsidx = super::probe::probe_sidx(&vhead)
             .context("视频流头里没有 sidx(非 SegmentBase 单文件 DASH)")?;
         let asidx = super::probe::probe_sidx(&ahead).context("音频流头里没有 sidx")?;
@@ -1685,7 +1695,21 @@ async fn cover(State(state): State<Arc<Inner>>, AxPath(token): AxPath<String>) -
             tokio::task::spawn_blocking(move || read_capped(&p, COVER_SRC_MAX_BYTES)).await.ok().flatten()
         }
         CoverSrc::Remote { url, headers } => {
-            fetch_image_bytes(&state, url, headers, COVER_SRC_MAX_BYTES).await
+            // 与内嵌 / 雪碧图两路同一把超时:relay 的 net::Client 只设了建连超时(它同时服务整片的
+            // /s/ 流,不能加总超时),CDN 建连后不吐字节就会在这儿永挂 —— 而此刻正握着 `thumb_gate`
+            // 那把串行闸,后面所有缩略图 / 封面都得排队等它(2026-09-16 体检修)。
+            match tokio::time::timeout(
+                THUMB_TIMEOUT,
+                fetch_image_bytes(&state, url, headers, COVER_SRC_MAX_BYTES),
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(_) => {
+                    tracing::warn!(url = %url, "取远端封面超时,放弃");
+                    None
+                }
+            }
         }
     };
     let out = match raw {
@@ -1872,7 +1896,7 @@ async fn remux(
         }
         _ => return bad(StatusCode::NOT_FOUND),
     };
-    // 两条路都吐流式 fMP4(渐进播);HLS 段走另一条(mpegts,见 hls_segment)。
+    // 两条路都吐流式 fMP4(渐进播);HLS / 自适应的段走 `run_ffmpeg_collect` 整段收(也是 fMP4)。
     cmd.arg("-movflags")
         .arg("frag_keyframe+empty_moov+default_base_moof")
         .arg("-f")
@@ -1883,10 +1907,28 @@ async fn remux(
 }
 
 /// 给一个**已配好程序+参数+输出格式(`-f … pipe:1`)**的 ffmpeg 命令收口 stdio、起进程、把
-/// stdout 搬成 HTTP 流。三条路共用:网络 DASH 混流 / 本地 fMP4 混流(content_type=video/mp4)、
-/// 本地 HLS 按需切片(content_type=video/mp2t,cors=true 给 shaka fetch)。child 生死跟搬运任务走
-/// (响应体被 drop → send 失败 → 任务退出 → kill_on_drop 收尸)。
-fn stream_ffmpeg(mut cmd: tokio::process::Command, content_type: &'static str, cors: bool) -> Response {
+/// stdout 搬成 HTTP 流(唯一调用方 = `/m/` 渐进混流;段类走 `run_ffmpeg_collect`)。
+/// child 生死跟搬运任务走:响应体被 drop → send 失败 → **当场 `start_kill`** → 收尸 → 任务退出。
+fn stream_ffmpeg(cmd: tokio::process::Command, content_type: &'static str, cors: bool) -> Response {
+    spawn_stream(cmd, content_type, cors)
+        .map(|(resp, _task)| resp)
+        .unwrap_or_else(|| bad(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
+/// `stream_ffmpeg` 的本体,把搬运任务的句柄一并交出来(测试据此断言「弃读后任务真结束 = child 真被杀」)。
+///
+/// **两条纪律(2026-09-16 体检修,与 `run_ffmpeg_collect` 2026-08-22 那条互为镜像)**:
+/// ① 客户端弃读(`?t=` 重启式 seek / 切集 / 关窗)后**必须主动杀 child**:原先只 `break` 然后去等
+///    stderr 的 EOF,可 stdout 管道的读端还握在本任务手里、ffmpeg 一写满 64KB 就阻塞、永不退出,
+///    stderr 也就永无 EOF → 任务永挂、child 永不 drop、`kill_on_drop` 永远轮不到 —— 每拖一次进度条
+///    漏一个卡死的 ffmpeg + 一个 tokio task。
+/// ② stderr **并发排空且有界**(`STDERR_TAIL_CAP`):串在 stdout 之后读的话,ffmpeg 刷满 stderr 管道
+///    就整条挂死(坏文件 / 坏参数能刷满)。
+fn spawn_stream(
+    mut cmd: tokio::process::Command,
+    content_type: &'static str,
+    cors: bool,
+) -> Option<(Response, tokio::task::JoinHandle<()>)> {
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .stdin(std::process::Stdio::null())
@@ -1897,42 +1939,54 @@ fn stream_ffmpeg(mut cmd: tokio::process::Command, content_type: &'static str, c
         Ok(c) => c,
         Err(e) => {
             tracing::error!("ffmpeg 起不来: {e}");
-            return bad(StatusCode::INTERNAL_SERVER_ERROR);
+            return None; // 调用方回 500
         }
     };
     let mut stdout = child.stdout.take().expect("piped stdout");
-    let mut stderr = child.stderr.take().expect("piped stderr");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let err_task = tokio::spawn(async move {
+        let mut s = String::new();
+        let _ = stderr.take(STDERR_TAIL_CAP as u64).read_to_string(&mut s).await;
+        s
+    });
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(8);
-    tokio::spawn(async move {
-        let _child = &mut child; // 搬运任务持有 child:任务退出才轮到 kill_on_drop
+    let task = tokio::spawn(async move {
         let mut buf = vec![0u8; 64 * 1024];
+        let mut abandoned = false;
         loop {
             match stdout.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     if tx.send(Ok(bytes::Bytes::copy_from_slice(&buf[..n]))).await.is_err() {
-                        break; // 客户端不要了(暂停换台/关窗):停止搬运,child 随后被杀
+                        abandoned = true; // 客户端不要了(暂停换台 / seek 重启 / 关窗)
+                        break;
                     }
                 }
             }
         }
-        // 正常收尾或被弃读:收掉 stderr 留诊断,然后让 child drop
-        let mut err = String::new();
-        let _ = stderr.read_to_string(&mut err).await;
-        if !err.trim().is_empty() {
-            tracing::warn!("ffmpeg stderr: {}", err.trim());
+        if abandoned {
+            let _ = child.start_kill(); // 别等它自己退:它正卡在写我们不再读的那根管道上
+        }
+        drop(stdout); // 关掉读端:万一 kill 没到位(已退出 / 平台差异),它写下一块也拿 EPIPE 走人
+        let _ = child.wait().await; // 收尸(kill_on_drop 只是兜底)
+        if let Ok(err) = err_task.await {
+            let err = err.trim();
+            if !err.is_empty() && !abandoned {
+                tracing::warn!("ffmpeg stderr: {err}");
+            }
         }
     });
 
     let mut builder = Response::builder().status(StatusCode::OK).header("content-type", content_type);
     if cors {
-        // HLS 段被 shaka 用 fetch 拉(跨源:app 源 ≠ relay 回环口)→ 必须放行。
+        // 被 fetch 拉(跨源:app 源 ≠ relay 回环口)→ 必须放行。
         builder = builder.header("access-control-allow-origin", "*");
     }
     builder
         .body(Body::from_stream(tokio_stream_from(rx)))
-        .unwrap_or_else(|_| bad(StatusCode::INTERNAL_SERVER_ERROR))
+        .ok()
+        .map(|resp| (resp, task))
 }
 
 fn tokio_stream_from(
@@ -2802,6 +2856,79 @@ mod tests {
         .await
         .expect("超上限后没杀子进程 → wait() 永远等不到退出");
         assert!(got.is_some_and(|b| b.len() > 64 * 1024), "截断处收到的那截照样返回");
+    }
+
+    /// **弃读必须杀 child(2026-09-16 体检修)**:`/m/` 每次 `?t=` 重启式 seek 都是「客户端掐断上一条响应」。
+    /// 原先任务 break 后去等 stderr 的 EOF,可 stdout 读端还在本任务手里、子进程一写满管道就卡住、永不
+    /// 退出 → 任务永挂、child 永不 drop、`kill_on_drop` 永远轮不到。这里用 `yes`(无限吐)当替身:读一块
+    /// 就把响应体丢掉,搬运任务必须在几秒内自己结束(= child 已被杀并收尸)。修前这条卡到 timeout 而红。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stream_kills_child_when_client_drops_body() {
+        use futures_util::StreamExt;
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg("yes X");
+        let (resp, task) = spawn_stream(cmd, "video/mp4", false).expect("起得来");
+        let mut body = resp.into_body().into_data_stream();
+        let first = body.next().await.expect("至少吐一块").expect("不是错误");
+        assert!(!first.is_empty());
+        drop(body); // 客户端不要了
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("弃读后搬运任务没结束 = child 没被杀、永挂")
+            .expect("任务不该 panic");
+    }
+
+    /// 同族:stderr 猛刷时 stdout 照样吐得出来(`run_ffmpeg_collect` 2026-08-22 修过的病,`stream_ffmpeg`
+    /// 原先原样还在 —— stderr 串在 stdout 之后读,子进程写满 stderr 管道就整条挂死)。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stream_drains_stderr_concurrently() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg("head -c 200000 /dev/zero | tr '\\0' 'E' >&2; printf OK");
+        let (resp, task) = spawn_stream(cmd, "video/mp4", true).expect("起得来");
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").and_then(|v| v.to_str().ok()),
+            Some("*"),
+            "cors=true 要带放行头"
+        );
+        let bytes = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            axum::body::to_bytes(resp.into_body(), 1 << 20),
+        )
+        .await
+        .expect("stderr 没并发排空 → 卡在写管道上")
+        .expect("body 读得出");
+        assert_eq!(&bytes[..], b"OK");
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("正常收尾任务要结束")
+            .unwrap();
+    }
+
+    /// `parse_range` 只认媒体元素会发的 `bytes=a-` / `bytes=a-b`;其余歪形一律当没有(回 200 全量),
+    /// 越界 416,**绝不 panic**(header 是客户端给的)。此前只经 e2e 三形覆盖。
+    #[test]
+    fn parse_range_edge_forms_never_panic() {
+        let hv = |s: &str| axum::http::HeaderValue::from_str(s).unwrap();
+        let none = |s: &str| matches!(parse_range(Some(&hv(s)), 100), RangeSpec::None);
+        assert!(none("bytes=-5"), "后缀形不认 → 200 全量");
+        assert!(none("bytes=5-2"), "倒置 → 当没有");
+        assert!(none("bytes=abc"));
+        assert!(none("bytes=0-10,20-30"), "多段不认");
+        assert!(none("items=0-1"), "非 bytes 单位");
+        assert!(none(""), "空串");
+        assert!(matches!(parse_range(Some(&hv("bytes=100-")), 100), RangeSpec::Unsatisfiable));
+        assert!(
+            matches!(parse_range(Some(&hv("bytes=0-")), 0), RangeSpec::Unsatisfiable),
+            "0 字节文件任何 Range 都越界"
+        );
+        assert!(
+            matches!(parse_range(Some(&hv("bytes=10-999")), 100), RangeSpec::Span(10, 99)),
+            "end 夹到 len-1"
+        );
+        assert!(matches!(parse_range(Some(&hv("bytes=0-")), 100), RangeSpec::Span(0, 99)));
+        assert!(matches!(parse_range(None, 100), RangeSpec::None));
     }
 
     /// **契约③的音频半边(2026-08-22 真机实锤后补)**:copy 音频段必须**恰好**是计划的长度。

@@ -120,7 +120,9 @@ impl Tool for MediaPlay {
                     None => format!("已开始播放《{}》", np.title),
                 };
                 if let Some(author) = &np.author {
-                    out.push_str(&format!("(UP主: {author})"));
+                    // 本地文件的 author 来自标签(歌手 / 艺人),网络页面的才是 UP 主 —— 别把歌手叫 UP主
+                    let who = if crate::media::is_local_path(&np.page_url) { "歌手" } else { "UP主" };
+                    out.push_str(&format!("({who}: {author})"));
                 }
                 if let Some(d) = np.duration_seconds {
                     let (m, s) = ((d as i64) / 60, (d as i64) % 60);

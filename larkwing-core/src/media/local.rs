@@ -377,9 +377,20 @@ impl MediaRuntime {
 
     /// 兜底重放(前端手写 MSE〔本地自适应〕播放失败时调):对同一本地文件**强制走 muxed HLS**
     /// (能放的老路,会漂但不黑屏,§3.5 不静默失败)。`play_local` 内部已发 Play 事件替换当前播放。
-    /// pos=None:兜底不重建剧集队列(先保能放;切集另说)。仅本地文件有意义(网络路本就 shaka)。
+    /// 仅本地文件有意义(网络路本就 shaka)。
+    ///
+    /// 兜底**不是新点播**:队列位置与「放到哪了」都带上 —— 原先传 None/None,回落那一刻剧集变单集
+    /// (集数 / 上下集钮 / 片尾预告 / 标记菜单全消失)、从 0 重放、放完 `onEnded` 直接 stop 不续下一集,
+    /// 而 core 手里的队列其实还在(2026-09-16 体检修;写法同 `set_audio_track`)。
     pub async fn replay_local_compat(&self, page_url: &str, audio_only: bool) -> Result<()> {
-        self.play_local(page_url, audio_only, None, false, None).await?;
+        let pos = self.inner.playlist.lk().as_ref().map(|pl| PlaylistPos {
+            index: pl.index,
+            total: pl.entries.len(),
+            resumed: false,
+        });
+        // 刚起播就失败时前端还没报过位置(或报的是 0),那就从头;真播了一会儿才炸的接着放。
+        let resume = self.current_position().filter(|p| *p > 1.0);
+        self.play_local(page_url, audio_only, pos, false, resume).await?;
         Ok(())
     }
 
@@ -652,6 +663,7 @@ impl MediaRuntime {
             page_url: path_str.to_string(),
             audio_only,
             tracks: tracks.clone(),
+            subtitles: subtitle_refs.clone(),
         });
         // 片头 / 片尾:章节里名为 OP/ED 的段 + 库里的手标 / 检测结果汇成本集怎么跳(放歌不跳)
         let skip_info = if audio_only {

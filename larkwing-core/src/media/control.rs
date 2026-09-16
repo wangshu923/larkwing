@@ -324,14 +324,44 @@ impl MediaRuntime {
                 })
                 .unwrap_or_default()
         };
+        // 字幕清单:模型据此把「开中文字幕」对到序号(media_control 的 subtitle,0=关)。开没开、开的
+        // 哪条是前端显示层的事,core 不知道也不装知道(原先只列音轨不列字幕,模型对不上号)。
+        let subs = self
+            .inner
+            .current_local
+            .lk()
+            .as_ref()
+            .filter(|c| !c.subtitles.is_empty())
+            .map(|c| format!(",字幕可选: {}(0=关)", subtitle_menu(&c.subtitles)))
+            .unwrap_or_default();
         // 播放模式:模型据此答「现在是循环吗」、对「别循环了/换随机」给对动作。
         let mode = self.inner.mode.lk().ambient();
         Some(match (pb.title, pb.paused) {
             (None, _) => "播放器现在空闲,没有在播放任何内容".to_string(),
-            (Some(t), false) => format!("播放器正在播放《{t}》{ep}{progress}{vol}{rate}{mode}{audio}"),
-            (Some(t), true) => format!("播放器已暂停,停在《{t}》{ep}{progress}{vol}{rate}{mode}{audio}"),
+            (Some(t), false) => {
+                format!("播放器正在播放《{t}》{ep}{progress}{vol}{rate}{mode}{audio}{subs}")
+            }
+            (Some(t), true) => {
+                format!("播放器已暂停,停在《{t}》{ep}{progress}{vol}{rate}{mode}{audio}{subs}")
+            }
         })
     }
+}
+
+/// 字幕清单一行:「1=chi 2=eng·外挂」(语言码原样,§6.6 友好名归前端字典;没标语言 = 「字幕N」)。
+fn subtitle_menu(subs: &[SubtitleRef]) -> String {
+    subs.iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let lang = s.lang.clone().unwrap_or_else(|| format!("字幕{}", i + 1));
+            if s.sidecar {
+                format!("{}={lang}·外挂", i + 1)
+            } else {
+                format!("{}={lang}", i + 1)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -363,16 +393,23 @@ mod tests {
         }
     }
 
-    /// 倍速是队列级粘住:切集不经 `play()` 所以沿用;**新点播**(`play()`)一进门就复位 1 ——
-    /// 这里拿一个空文件夹当点播入参(会如实退回,但复位发生在退回之前)。
+    /// 倍速是队列级粘住:切集不经 `play()` 所以沿用;**新点播**(`play()`)放出来就复位 1。
+    /// 没放成(如实退回)则**不**复位 —— 老内容还在放,它的倍速不该被一次失败的点播打掉
+    /// (2026-09-16 体检修;此前这条测试正好钉着相反的次序「复位发生在退回之前」)。
     #[tokio::test]
     async fn speed_resets_on_new_play_request() {
         let (rt, _rx) = runtime("speed-reset");
         rt.control("speed", Some(2.0)).unwrap();
         assert_eq!(rt.rate(), 2.0);
+        // 空文件夹当点播入参 → 如实退回 → 倍速原样
         let empty = std::env::temp_dir().join(format!("lw-speed-reset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&empty);
         std::fs::create_dir_all(&empty).unwrap();
         assert!(rt.play(1, &empty.to_string_lossy(), false, false, None).await.is_err());
+        assert_eq!(rt.rate(), 2.0, "失败的点播不复位倍速");
+        // 真放出来一首 → 复位
+        let one = touch(&empty, "独一首.mp3");
+        assert!(rt.play(1, &one.to_string_lossy(), true, false, None).await.is_ok());
         assert_eq!(rt.rate(), 1.0, "新点播复位倍速");
         let _ = std::fs::remove_dir_all(&empty);
     }
@@ -451,6 +488,7 @@ mod tests {
                 probe::AudioTrack { codec: "ac-3".into(), lang: Some("chi".into()), title: None, channels: Some(6) },
                 probe::AudioTrack { codec: "ac-3".into(), lang: Some("eng".into()), title: None, channels: Some(2) },
             ],
+            subtitles: Vec::new(),
         });
         assert!(rt.set_audio_track(2).await.is_err(), "没在播放(playback 空闲)也退回");
         rt.set_playback(PlaybackReport {

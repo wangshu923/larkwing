@@ -15,7 +15,8 @@ const { t } = useI18n()
   <div class="help-card" :class="variant" @click.stop @pointerdown.stop>
     <h3>{{ t('media.keys.title') }}</h3>
     <ul>
-      <li v-for="row in rows" :key="row.label">
+      <!-- key 用键位不用 label:视频面 PageUp/Down 与 N/P 两行同为「上一集 / 下一集」,label 撞车 -->
+      <li v-for="row in rows" :key="row.keys.join('+')">
         <span class="kbs"><kbd v-for="k in row.keys" :key="k">{{ k }}</kbd></span>
         <span class="lbl">{{ row.label }}</span>
       </li>

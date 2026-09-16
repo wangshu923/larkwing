@@ -291,8 +291,16 @@ async function loadVideoInto(el: HTMLVideoElement) {
     //(本地 fMP4-HLS 黑屏就是靠它定位到 MSE append 失败,见 relay::build_frag_cmd)。
     player.addEventListener('error', (e: any) => {
       const err = e?.detail ?? e
-      console.error('[lw][shaka] error', { code: err?.code, category: err?.category, data: err?.data, mediaError: el.error?.message })
+      // 写进 larkwing.log(正式版无 console):shaka 自己的网络 / manifest / MSE append 错多数**不**触发
+      // <video> 的 error 事件,原先只 console.error = 用户对着黑屏 + 一个不响应的播放键(§3.5)。
+      const line =
+        `[shaka] error code=${err?.code} category=${err?.category} severity=${err?.severity}` +
+        ` data=${safeJson(err?.data)} mediaError=${el.error?.message || '(无)'} route=${cur.route}`
+      console.error('[lw]' + line)
+      if (isTauri()) void api.mediaLog(line)
       if (state.current?.kind === 'video') state.status = 'paused'
+      // severity 2 = CRITICAL(shaka 放弃了);1 = RECOVERABLE 它会自己重试,不吵
+      if (err?.severity === 2 && state.current === cur) notifyMediaFailed(cur)
     })
     await player.load(cur.manifest_url)
     if (state.current !== cur) {
@@ -301,8 +309,22 @@ async function loadVideoInto(el: HTMLVideoElement) {
     }
     el.play().catch(() => (state.status = 'paused'))
   } catch (e) {
-    console.error('[lw][shaka] load failed', e, 'mediaError=', el.error?.message)
-    if (state.current === cur) state.status = 'paused'
+    const line = `[shaka] load failed: ${e} mediaError=${el.error?.message || '(无)'} src=${cur.manifest_url}`
+    console.error('[lw]' + line)
+    if (isTauri()) void api.mediaLog(line)
+    if (state.current === cur) {
+      state.status = 'paused'
+      notifyMediaFailed(cur)
+    }
+  }
+}
+
+/** 日志里塞对象:JSON 不了(循环引用 / undefined)就 String。 */
+function safeJson(v: unknown): string {
+  try {
+    return JSON.stringify(v) ?? String(v)
+  } catch {
+    return String(v)
   }
 }
 
@@ -451,6 +473,7 @@ function play(np: NowPlaying) {
   const continuation = state.current?.kind === 'video' && np.kind === 'video'
   updateMediaMetadata(np)
   stopElements()
+  advancing = false // 新一条 Play 到了:在飞的切集已落地(或是别的新点播),闩子放开
   adaptiveFellBackFor = null // 新播放:清兜底记忆(muxed 回落走 /hls/ 不再进自适应,不会循环)
   failToastedFor = null // 同上:兜底重放也从这过,那一次再失败就该说话了
   state.current = np
@@ -648,6 +671,13 @@ function stopElements() {
   if (audio) {
     audio.pause()
     audio.removeAttribute('src')
+    try {
+      // 同下面的 video:跑一遍加载算法把排队的 pause 等任务清掉 —— 否则音频切视频时,迟到的 pause
+      // 事件在 play() 置 loading 之后落地,把新内容闪报成 paused(悬浮窗与 core 都收到一条假的)
+      audio.load()
+    } catch {
+      /**/
+    }
   }
   destroyAdaptive() // 手写 MSE(本地自适应)先拆:停泵/停音频流/收 MediaSource
   void destroyShaka() // 自适应流:先拆 shaka(它经 MSE 接管了 <video>),再清原生 src
@@ -665,6 +695,7 @@ function stopElements() {
 function stop() {
   if (isFloat) return emitMediaControl('stop') // 悬浮窗转发,真停在主窗(它清完会广播 null 回来)
   stopElements()
+  advancing = false
   // 退出视频的窗口态:退全屏 + 撤置顶(✕/ended/模型 stop 都汇到这里)。float 不碰自身窗口
   // ——它的"播放"只是镜像,对悬浮窗做 setFullscreen/setAlwaysOnTop 会误伤它(它常驻置顶)。
   if (windowLabel() !== 'float') {
@@ -689,7 +720,13 @@ function stop() {
 /** 一集放完:「接下来放什么」归 core(auto_next:顺序下一集 / 列表循环回卷 / 随机挑;
  *  true=已接管,core 现取现播 publishes Play 接力、保持全屏;false=没有下一首 → 正常停)。
  *  单曲循环由 el.loop 原生循环,ended 压根不触发。只在主窗触发(悬浮窗不实际播放、不会冒 ended)。 */
+/** 「接下来放什么」已交给 core、正在切(autoNext 在飞):下一条 Play / stop 清。期间旧元素还在播,
+ *  它播到头冒出的 `ended` 不许再触发一次 autoNext —— 否则 core 对已推进的指针再推一格 = 跳过一集
+ *  (片尾预告到点切 + 下一集解析慢于剩余片尾时必现;2026-09-16 体检修)。 */
+let advancing = false
+
 function onEnded() {
+  if (advancing) return // 切集在飞:这是旧一集播到头的尾声,不是又一次「放完了」
   if (state.current?.playlist && isTauri()) {
     autoNext()
     return
@@ -697,17 +734,24 @@ function onEnded() {
   stop() // 单集(el.loop 没开才会走到 ended)/ 浏览器预览:正常收尾
 }
 
-/** 「接下来放什么」交 core(顺序下一集 / 列表循环回卷 / 随机挑):自然播完与片尾倒计时到点共用。
+/** 「接下来放什么」交 core(顺序下一集 / 列表循环回卷 / 随机挑):自然播完与片尾预告到点共用。
  *  没有下一首 → 正常收尾。 */
 function autoNext() {
-  if (!isTauri()) return
+  if (!isTauri() || advancing) return
+  advancing = true
   state.status = 'loading' // 续播解析的空档显 spinner(别看着像卡死)
   api
     .mediaAutoNext()
     .then((took) => {
-      if (!took) stop() // 放完了(末集且不循环 / 随机放完一轮):正常收尾
+      if (!took) {
+        advancing = false
+        stop() // 放完了(末集且不循环 / 随机放完一轮):正常收尾
+      }
     })
-    .catch(() => stop()) // 切集失败兜底停
+    .catch(() => {
+      advancing = false
+      stop() // 切集失败兜底停
+    })
 }
 
 /** 上/下一集(+1/-1):播放器按钮 + 嘴控都最终汇到 core 的 advance(全局队列);任意窗口可调
@@ -736,13 +780,13 @@ async function fetchPlaylist(): Promise<PlaylistView | null> {
 type SkipMark = 'intro_start' | 'intro_end' | 'outro_start' | 'skip_clear'
 function markSkip(action: SkipMark, secs?: number) {
   if (!isTauri()) return
-  void api.mediaMode(action, secs).catch(() => useToast().error(i18n.global.t('toast.mediaFailed', { title: '' })))
+  void api.mediaMode(action, secs).catch(() => useToast().error(i18n.global.t('toast.markFailed')))
 }
 
 /** 列表里点第 N 集(1 起):与嘴控「看第五集」同一 core 入口;越界 toast,不 panic。 */
 function jumpTo(episode: number) {
   if (!isTauri()) return
-  void api.mediaJump(episode).catch(() => useToast().error(i18n.global.t('toast.mediaFailed', { title: '' })))
+  void api.mediaJump(episode).catch(() => useToast().error(i18n.global.t('toast.jumpFailed')))
 }
 
 /** seek:自适应流(shaka)/ 音频 / 直转单文件走**原生** currentTime(播放器管时间轴,精确 + 同步);

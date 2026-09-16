@@ -361,6 +361,10 @@ struct PendingPlay {
     user_id: i64,
     page_url: String,
     audio_only: bool,
+    /// 原话里的「从头看」/「看第五集」:解析层只知道 url,由 `play()` 撞墙后补记(`amend_pending`),
+    /// 登录后重放才照原意图来(2026-09-16 体检修;原先重放一律按续播规则)。
+    restart: bool,
+    episode: Option<usize>,
     at: Instant,
 }
 
@@ -525,6 +529,8 @@ struct CurrentLocal {
     audio_only: bool,
     /// 探测出的音轨清单(顺序 = -map 轨号)。
     tracks: Vec<probe::AudioTrack>,
+    /// 可选字幕清单(与 `NowPlaying.subtitles` 同一份;〔此刻〕据此列给模型对号,选没选是前端显示层的事)。
+    subtitles: Vec<SubtitleRef>,
 }
 
 // ---------- 运行时 ----------
@@ -568,6 +574,9 @@ struct Inner {
     skip_ctx: Mutex<Option<SkipCtx>>,
     /// 指纹检测任务在跑(一次只跑一个;新一集开播时上一个还没完就先不起,下次开播再来)。
     detect_busy: AtomicBool,
+    /// 本进程里已经跑过检测却没测出结果的集((series_key, episode_id)):不再每次开播重跑
+    /// (§6.4 派生可丢;重启后清零 = 再试一次,兜「邻居刚下载好」)。
+    detect_tried: Mutex<std::collections::HashSet<(String, String)>>,
     /// BT 下载引擎(懒建,同 relay):不用 BT 的用户零成本,且**不会平白发 DHT 包**。
     torrent: tokio::sync::OnceCell<torrent::TorrentEngine>,
 }
@@ -606,6 +615,7 @@ impl MediaRuntime {
                 progress_at: Mutex::new(None),
                 skip_ctx: Mutex::new(None),
                 detect_busy: AtomicBool::new(false),
+                detect_tried: Mutex::new(std::collections::HashSet::new()),
                 torrent: tokio::sync::OnceCell::new(),
             }),
         }
@@ -707,8 +717,10 @@ impl MediaRuntime {
                 tracing::info!(source = source_id, url = %p.page_url, "登录成功,自动重放待播内容");
                 let this = self.clone();
                 handle.spawn(async move {
-                    // 重放走完整 play(会重建队列):带新 cookie 重新发现合集/分P,resume 规则照常生效。
-                    if let Err(e) = this.play(p.user_id, &p.page_url, p.audio_only, false, None).await {
+                    // 重放走完整 play(会重建队列):带新 cookie 重新发现合集/分P,原话的「从头 / 第几集」照带。
+                    if let Err(e) =
+                        this.play(p.user_id, &p.page_url, p.audio_only, p.restart, p.episode).await
+                    {
                         tracing::warn!("登录后自动重放失败: {e:#}");
                     }
                 });
@@ -725,9 +737,21 @@ impl MediaRuntime {
                 user_id,
                 page_url: page_url.to_string(),
                 audio_only,
+                restart: false,
+                episode: None,
                 at: Instant::now(),
             },
         );
+    }
+
+    /// `play()` 撞上登录墙后补记原意图:record_pending 在解析层只知道 url,「看第五集」「从头看」在这里补上。
+    fn amend_pending(&self, page_url: &str, restart: bool, episode: Option<usize>) {
+        for p in self.inner.pending_play.lk().values_mut() {
+            if p.page_url == page_url {
+                p.restart = restart;
+                p.episode = episode;
+            }
+        }
     }
 
     /// 取走某源的待重放(取即消费,不重复);超过 TTL 的丢弃、返回 None。
@@ -955,6 +979,8 @@ mod tests {
                     user_id: 1,
                     page_url: "https://www.bilibili.com/video/BVold".into(),
                     audio_only: false,
+                    restart: false,
+                    episode: None,
                     at: stale,
                 },
             );

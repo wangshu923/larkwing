@@ -359,6 +359,7 @@ export default {
       skipped: 'Intro skipped',
       undo: 'Watch it',
       nextIn: 'Up next in {s}s',
+      replayIn: 'Replaying in {s}s',
       cancel: 'Cancel',
     },
     fullscreen: 'Fullscreen',
@@ -516,6 +517,9 @@ export default {
     restoreFailed: 'The restore didn’t finish — your data is unchanged',
     // don't just sit there black (§3.5): this used to only flip the status to paused
     mediaFailed: 'Can’t play “{title}” — the file may be damaged or in a format we can’t handle',
+    // marks / episode jumps get their own lines instead of borrowing the "damaged file" one
+    markFailed: 'That mark didn’t save — try again?',
+    jumpFailed: 'Couldn’t switch to that one — try again?',
     // don't silently drop oversized attachments either (§3.5)
     attTooBig: '“{name}” is over {limit} — it wasn’t attached',
     autoBackupStale: 'Auto backup hasn’t succeeded in a while — check that the backup drive is still there',

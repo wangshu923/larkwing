@@ -84,18 +84,18 @@ impl MediaRuntime {
             }
             *at = Some(std::time::Instant::now());
         }
-        // 短内容(歌 / 短片)不记集内位置:重听从头是常识,记了反而怪
-        if dur > 0.0 && dur < RESUME_MIN_DURATION_S {
-            if idle {
-                *self.inner.progress.lk() = None;
-            }
-            return;
-        }
-        let finished = dur > 0.0 && pos >= dur - RESUME_TAIL_S;
+        // 短内容(歌 / 短片)不记集内位置:重听从头是常识,记了反而怪 —— 但「看完了」照记:
+        // 5–12 分钟一集的儿童动画正是这类,原先整段早退连 `finished` 也不写,末集看完再「接着看」
+        // 回的还是末集、走不到「整部从头」(2026-09-16 体检修)。位置写 0 = 不续播;片尾判定照
+        // RESUME_TAIL_S、但不超过一半时长(两分钟的短片别刚开头就算看完)。
+        let short = dur > 0.0 && dur < RESUME_MIN_DURATION_S;
+        let tail = if short { RESUME_TAIL_S.min(dur / 2.0) } else { RESUME_TAIL_S };
+        let finished = dur > 0.0 && pos >= dur - tail;
+        let stored_pos = if short { 0.0 } else { pos };
         if let Err(e) = self.inner.store.media_progress.set_position(
             &target.key,
             &target.episode_id,
-            pos,
+            stored_pos,
             dur,
             finished,
         ) {
@@ -111,6 +111,45 @@ impl MediaRuntime {
 mod tests {
     use super::*;
     use crate::media::testkit::*;
+
+    /// 短于 10 分钟的集:位置不记(重看从头是常识)、但**看完了要记**(2026-09-16 体检修):原先整段早退,
+    /// 末集看完再「接着看」回的还是末集;片尾判定按 RESUME_TAIL_S 但不超过一半时长。
+    #[tokio::test]
+    async fn short_episode_records_finished_but_not_position() {
+        let (rt, _rx) = runtime("short-finished");
+        let mp = &rt.inner.store.media_progress;
+        let arm = |ep: &str| {
+            mp.set_episode("local:short", ep, ep, "短剧", 0.0, Some(1)).unwrap();
+            *rt.inner.progress.lk() = Some(ProgressTarget {
+                key: "local:short".into(),
+                episode_id: ep.into(),
+                title: ep.into(),
+            });
+            *rt.inner.progress_at.lk() = None;
+        };
+        let report = |pos: f64, dur: f64, ep: &str| PlaybackReport {
+            status: "paused".into(),
+            title: Some(ep.into()),
+            position: Some(pos),
+            duration: Some(dur),
+            ..Default::default()
+        };
+        // 5 分钟一集,播到 2:00 暂停:位置不记(0)、没看完
+        arm("ep1");
+        rt.persist_progress(&report(120.0, 300.0, "ep1"));
+        let p = mp.get("local:short").unwrap().unwrap();
+        assert_eq!((p.position_seconds, p.finished), (0.0, false));
+        // 播到 4:40(距结尾 20s):看完了,位置仍不记
+        rt.persist_progress(&report(280.0, 300.0, "ep1"));
+        let p = mp.get("local:short").unwrap().unwrap();
+        assert_eq!((p.position_seconds, p.finished), (0.0, true), "短集看完要记 finished");
+        // 2 分钟短片播到 0:40:片尾闸夹到一半时长(60s),还不算看完;1:10 才算
+        arm("ep2");
+        rt.persist_progress(&report(40.0, 120.0, "ep2"));
+        assert!(!mp.get("local:short").unwrap().unwrap().finished, "刚开头不能算看完");
+        rt.persist_progress(&report(70.0, 120.0, "ep2"));
+        assert!(mp.get("local:short").unwrap().unwrap().finished);
+    }
 
     /// 集内续播(2026-09-07):前端心跳 / 暂停落「第几秒」,再放接着那一秒;播到片尾区 = 看完 →
     /// 下次从下一集开头;末集看完 = 整部从头;别的内容的迟到心跳写不进;电影按文件身份同样续。

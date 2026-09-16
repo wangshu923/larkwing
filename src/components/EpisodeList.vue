@@ -2,16 +2,16 @@
 // 剧集 / 曲目列表:多集内容的「选集」面板。开着时向 core 按需取整份队列(不塞进每条 Play 事件),
 // 当前集高亮并滚到可见;点一行 = 跳到那一集(与嘴控「看第五集」同一 core 入口)。
 // 键盘:↑↓ 挑、Enter 跳、Esc 关(事件在面板内截住,不冒泡给视频浮层的快捷键表)。
-// 视频浮层与音频条共用;观感由 `variant` 定(全屏侧栏 / 窗口态下拉),颜色只用语义 token(§6.7),
-// 视频上盖的那份走「覆盖媒体豁免」恒亮浅字(同控制条)。
+// 视频浮层与音频条共用;观感由 `variant` 定:side / drop 盖在视频画面上,走「覆盖媒体豁免」恒黑底浅字
+// (同控制条);bar 是音频播放条上方的下拉,底下不是画面,颜色只用语义 token 随皮肤(§6.7)。
 import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useMedia } from '../composables/useMedia'
 import type { PlaylistView } from '../lib/backend'
 
 const props = defineProps<{
-  /** side = 全屏影院右侧滑出;drop = 窗口态 / 音频条上方的下拉卡。 */
-  variant: 'side' | 'drop'
+  /** side = 全屏影院右侧滑出;drop = 视频窗口态的下拉卡;bar = 音频播放条上方的曲目下拉(随皮肤)。 */
+  variant: 'side' | 'drop' | 'bar'
 }>()
 const open = defineModel<boolean>('open', { default: false })
 
@@ -36,7 +36,7 @@ async function refresh() {
 }
 function scrollActiveIntoView() {
   const li = listEl.value?.querySelector<HTMLElement>('li.cur') ?? listEl.value?.querySelector<HTMLElement>('li.act')
-  li?.scrollIntoView({ block: 'nearest' })
+  li?.scrollIntoView({ block: 'center' }) // 上百集时 nearest 会把当前集贴在可视区边缘,居中一眼看到前后
 }
 // 打开时取一次;开着时切了集(Play 事件换了 current)再取一次对齐高亮
 watch(open, (o) => {
@@ -106,16 +106,19 @@ onUnmounted(() => window.removeEventListener('keydown', onKey, true))
 .eplist {
   position: absolute; z-index: 6;
   display: flex; flex-direction: column;
-  color: #eaf2fb; /* 覆盖在视频 / 深色播放条上:恒亮浅字(同控制条的媒体豁免) */
-  background: rgba(0, 0, 0, 0.82);
   border: 1px solid rgba(var(--accent-rgb), 0.3);
   box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55);
   backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
 }
+/* 盖在视频画面上的两种(全屏侧栏 / 窗口态下拉):覆盖媒体豁免,恒黑底浅字不随皮肤(同控制条) */
+.eplist.side, .eplist.drop { color: #eaf2fb; background: rgba(0, 0, 0, 0.82); }
+/* 音频播放条上方的曲目下拉:底下不是画面,走语义 token 随皮肤(2026-09-16 修:原与视频共用黑底,
+   暖萌皮上是一张黑卡压在奶油色的播放条上) */
+.eplist.bar { color: var(--text); background: var(--surface); }
 /* 全屏影院:右侧滑出的侧栏,上下留空不压住两条控制条 */
 .eplist.side { top: 56px; right: 16px; bottom: 76px; width: min(340px, 40%); border-radius: 14px; }
 /* 窗口态 / 音频条:锚在触发钮附近的下拉卡(由父组件定位 top/bottom) */
-.eplist.drop { right: 8px; width: min(320px, 92%); max-height: 320px; border-radius: 12px; }
+.eplist.drop, .eplist.bar { right: 8px; width: min(320px, 92%); max-height: 320px; border-radius: 12px; }
 header {
   display: flex; align-items: center; gap: 8px; flex: none;
   padding: 10px 12px 8px; font-size: 12.5px; letter-spacing: 0.4px;
@@ -123,6 +126,7 @@ header {
 }
 .hd { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--accent); }
 .cnt { flex: none; font: 11px/1 ui-monospace, "SF Mono", monospace; color: rgba(234, 242, 251, 0.7); }
+.bar .cnt { color: var(--text-dim); }
 .x {
   flex: none; width: 24px; height: 24px; border-radius: 7px; cursor: pointer;
   border: 1px solid rgba(var(--accent-rgb), 0.18); background: rgba(var(--accent-rgb), 0.08); color: var(--accent);
@@ -134,6 +138,7 @@ li {
   font-size: 12.5px; line-height: 1.3;
 }
 li .no { flex: none; min-width: 26px; text-align: right; font: 11px/1 ui-monospace, "SF Mono", monospace; color: rgba(234, 242, 251, 0.6); }
+.bar li .no { color: var(--text-dim); }
 li .tt { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 li.act { background: rgba(var(--accent-rgb), 0.12); }
 li.cur { color: var(--accent); }

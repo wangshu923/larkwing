@@ -32,10 +32,39 @@ impl MediaRuntime {
         // 新播放请求 = 新内容意图:播放模式/音轨/倍速都复位;切集不经这里 —— 三者跨集粘住
         // (2026-09-07 用户实锤「1.5 倍看剧下一集变 1.0」:复位口径是「新点播」,不是「新一集」)。
         // 模式先归零,队列建好后再按内容定默认(歌单 = 列表循环,见 PlayMode::default_for)。
+        //
+        // **复位只在新内容真放出来时算数(2026-09-16 体检修)**:解析失败 / 文件不在 / 撞登录墙时老内容
+        // 还在放 —— 原先复位与清队列都落在 bail 之前:歌单列表循环放着、模型点播一个坏链接失败,老歌照放、
+        // 放完 `auto_next` 摸不到队列就**静默停**,模式钮却还亮着。现在先拍快照,没放成就整份还回去
+        // (队列 / 模式 / 音轨 / 倍速),像什么都没发生。
+        let snap = self.intent_snapshot();
         *self.inner.mode.lk() = PlayMode::Once;
         *self.inner.audio_track.lk() = 0;
         *self.inner.audio_track_lang.lk() = None;
         *self.inner.rate.lk() = 1.0;
+        let outcome = self.play_fresh(user_id, page_url, audio_only, restart, episode).await;
+        match &outcome {
+            Ok(PlayOutcome::Playing(_)) => {}
+            Ok(PlayOutcome::AwaitingLogin { .. }) => {
+                // 登录后重放要照原话来(「看第五集」「从头看」不能丢);老内容接着放,意图先还回去
+                self.amend_pending(page_url, restart, episode);
+                self.restore_intent(snap);
+            }
+            Err(_) => self.restore_intent(snap),
+        }
+        outcome
+    }
+
+    /// `play()` 的正身:目录入参归一 → 建队列 → 按内容定默认模式 → 放起播集。任何一步 `?` 退出都由
+    /// `play()` 兜着把播放意图还原(见那里的注释)。
+    async fn play_fresh(
+        &self,
+        user_id: i64,
+        page_url: &str,
+        audio_only: bool,
+        restart: bool,
+        episode: Option<usize>,
+    ) -> Result<PlayOutcome> {
         // 目录入参 = 音频文件夹:强制只出声;≥2 首由 build_queue 组队连播,恰 1 首退化成放
         // 那一首,一首没有如实退回(播放链吃不了目录,绝不喂它;§3.5 不静默)。
         let single_fallback;
@@ -194,12 +223,13 @@ impl MediaRuntime {
     /// 那一集现取现播(不重建队列、流地址永不过期)。
     async fn switch_episode(&self, user_id: i64, target: EpisodeTarget) -> Result<PlayOutcome> {
         let mode = *self.inner.mode.lk();
-        let (target_url, audio_only, pos) = {
+        let (target_url, audio_only, pos, prev) = {
             let mut guard = self.inner.playlist.lk();
             let pl = guard
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("现在没有在播放剧集,没有可切换的集"))?;
             let total = pl.entries.len();
+            let prev = (pl.series_key.clone(), pl.index, pl.played.clone());
             let new = match target {
                 // 随机播放中的「下一首」= 这轮没放过的里随机挑(用户点名要,放完一轮也接着挑,
                 // 恒有下一首);「上一首」= 沿履历回退(现场心智 = 回到刚才那首)。
@@ -242,9 +272,18 @@ impl MediaRuntime {
                 e.url.clone(),
                 pl.audio_only,
                 PlaylistPos { index: pl.index, total, resumed: false },
+                prev,
             )
         };
-        self.play_entry(user_id, &target_url, audio_only, Some(pos), None).await
+        // 指针先写(起播路上 compute_skip / maybe_spawn_detect 要读「当前集」),但**没放成就回滚**:起播
+        // 失败(文件不在 / 解析挂)或调用方半路放弃(工具超时 = future 被 drop)都不能留下「指针指着一集
+        // 没放出来的集」—— 那会让下一次 ended / 「下一集」跳过一集(2026-09-16 体检修)。守卫见 IndexRollback。
+        let rollback = IndexRollback { rt: self.clone(), prev: Some(prev) };
+        let outcome = self.play_entry(user_id, &target_url, audio_only, Some(pos), None).await;
+        if matches!(&outcome, Ok(PlayOutcome::Playing(_))) {
+            rollback.disarm();
+        }
+        outcome
     }
 
     /// 一集自然放完(前端 `ended` 的唯一 core 入口):按播放模式决定接下来放什么。
@@ -511,12 +550,142 @@ impl MediaRuntime {
         }
         Ok(PlayOutcome::Playing(np))
     }
+
+    /// 「播放意图」快照:队列 + 模式 + 音轨 + 倍速。`play()` 没放成时整份还回去。
+    fn intent_snapshot(&self) -> IntentSnapshot {
+        IntentSnapshot {
+            playlist: self.inner.playlist.lk().clone(),
+            mode: *self.inner.mode.lk(),
+            audio_track: *self.inner.audio_track.lk(),
+            audio_track_lang: self.inner.audio_track_lang.lk().clone(),
+            rate: *self.inner.rate.lk(),
+        }
+    }
+
+    fn restore_intent(&self, s: IntentSnapshot) {
+        *self.inner.playlist.lk() = s.playlist;
+        *self.inner.mode.lk() = s.mode;
+        *self.inner.audio_track.lk() = s.audio_track;
+        *self.inner.audio_track_lang.lk() = s.audio_track_lang;
+        *self.inner.rate.lk() = s.rate;
+    }
+}
+
+/// `play()` 进门时拍下的播放意图(见 `MediaRuntime::play` 的注释)。
+struct IntentSnapshot {
+    playlist: Option<Playlist>,
+    mode: PlayMode,
+    audio_track: usize,
+    audio_track_lang: Option<String>,
+    rate: f64,
+}
+
+/// 切集的指针回滚守卫:起播成功 `disarm`;失败或**半路被 drop**(工具超时 = future 被丢)则析构时把
+/// index / 随机履历还回去 —— 超时那条路上没有代码能跑,只有析构能跑。期间队列被换掉(来了新点播,
+/// series_key 不同)就不动:只还「还是那一份队列」的指针。
+struct IndexRollback {
+    rt: MediaRuntime,
+    prev: Option<(String, usize, Vec<usize>)>,
+}
+
+impl IndexRollback {
+    fn disarm(mut self) {
+        self.prev = None;
+    }
+}
+
+impl Drop for IndexRollback {
+    fn drop(&mut self) {
+        let Some((key, index, played)) = self.prev.take() else { return };
+        if let Some(pl) = self.rt.inner.playlist.lk().as_mut() {
+            if pl.series_key == key && index < pl.entries.len() {
+                pl.index = index;
+                pl.played = played;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::media::testkit::*;
+
+    /// **点播失败不许毁掉正在放的东西(2026-09-16 体检修)**:歌单列表循环放着,模型点播一个不存在的
+    /// 文件 → 原先 `play()` 一进门就复位模式 / 清队列,bail 之后老歌照放、放完 `auto_next` 摸不到队列
+    /// 就静默停。现在失败 = 队列 / 模式 / 倍速整份还回去,放完照常接下一首。
+    #[tokio::test]
+    async fn failed_play_keeps_current_queue_and_mode() {
+        let (rt, _rx) = runtime("play-fail-keeps");
+        let dir = std::env::temp_dir().join(format!("lw-play-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in ["a.mp3", "b.mp3", "c.mp3"] {
+            touch(&dir, n);
+        }
+        rt.play(1, &dir.to_string_lossy(), false, false, None).await.unwrap();
+        rt.control("loop_one", None).unwrap();
+        rt.control("speed", Some(1.5)).unwrap();
+        let before = rt.intent_snapshot();
+        assert!(before.playlist.is_some());
+        assert_eq!(before.mode, PlayMode::LoopOne);
+
+        // 一个既不存在、所在文件夹也不存在的文件:发现不了剧集、起播读不到 → 失败
+        let missing = std::env::temp_dir()
+            .join(format!("lw-nowhere-{}", std::process::id()))
+            .join("不存在.mp3");
+        assert!(rt.play(1, &missing.to_string_lossy(), true, false, None).await.is_err());
+        let after = rt.intent_snapshot();
+        assert_eq!(after.mode, PlayMode::LoopOne, "模式不该被失败的点播复位");
+        assert_eq!(after.rate, 1.5, "倍速不该被失败的点播复位");
+        assert_eq!(
+            after.playlist.as_ref().map(|p| (p.index, p.entries.len())),
+            before.playlist.as_ref().map(|p| (p.index, p.entries.len())),
+            "队列原样保留"
+        );
+        assert!(rt.auto_next(1).await.unwrap().is_some(), "老歌单放完仍能接上");
+    }
+
+    /// 切集失败 / 半路被放弃不许留下「指针指着没放出来的集」(2026-09-16 体检修):原先先写 index 再
+    /// 起播,失败后 ended / 再说「下一集」会跳过一集;工具超时 = future 被 drop,同一条路。
+    #[tokio::test]
+    async fn failed_or_abandoned_switch_keeps_index() {
+        let (rt, _rx) = runtime("switch-fail-keeps");
+        let dir = std::env::temp_dir().join(format!("lw-switch-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |n: &str| dir.join(n).to_string_lossy().to_string();
+        let e1 = mk("剧 第1集.mp4");
+        let e2 = mk("剧 第2集.mp4");
+        let e3 = mk("剧 第3集.mp4");
+        for p in [&e1, &e2, &e3] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        rt.play(1, &e1, false, false, None).await.unwrap();
+        let index = || rt.inner.playlist.lk().as_ref().unwrap().index;
+        let key = rt.inner.playlist.lk().as_ref().unwrap().series_key.clone();
+
+        // 半路被放弃(工具超时 = future 被 drop)走的是同一个守卫:没 disarm 就析构 → 指针还回去;
+        // disarm 过的析构什么都不动;队列已被换掉(key 不同)也不动
+        rt.inner.playlist.lk().as_mut().unwrap().index = 2; // 模拟 switch_episode 已写新指针
+        drop(IndexRollback { rt: rt.clone(), prev: Some((key.clone(), 0, vec![0])) });
+        assert_eq!(index(), 0, "被放弃的切集不留指针");
+        rt.inner.playlist.lk().as_mut().unwrap().index = 2;
+        IndexRollback { rt: rt.clone(), prev: Some((key.clone(), 0, vec![0])) }.disarm();
+        assert_eq!(index(), 2, "放成了的切集不回滚");
+        drop(IndexRollback { rt: rt.clone(), prev: Some(("别的剧".into(), 0, vec![0])) });
+        assert_eq!(index(), 2, "队列已换掉就不动别人的指针");
+        rt.inner.playlist.lk().as_mut().unwrap().index = 0;
+
+        // 起播失败(第 2 集文件没了):指针仍在第 1 集
+        std::fs::remove_file(&e2).unwrap();
+        assert!(rt.advance(1, 1).await.is_err(), "第 2 集文件不在 → 起播失败");
+        assert_eq!(index(), 0, "失败后指针仍在第 1 集");
+        // 第 2 集回来了 → 正常切过去
+        std::fs::write(&e2, b"x").unwrap();
+        rt.advance(1, 1).await.unwrap();
+        assert_eq!(index(), 1);
+    }
 
     #[tokio::test]
     async fn auto_next_follows_play_mode() {

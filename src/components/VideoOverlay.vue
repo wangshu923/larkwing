@@ -675,7 +675,8 @@ onUnmounted(() => {
       {{ skipOsd.text }} · {{ t('media.skip.undo') }}
     </button>
     <div v-if="outroNotice != null" class="countdown" @pointerdown.stop>
-      <span>{{ t('media.skip.nextIn', { s: outroNotice }) }}</span>
+      <!-- 单曲循环下 core 的 auto_next 是重放本集,别说成「下一集」 -->
+      <span>{{ t(state.playMode === 'loop_one' ? 'media.skip.replayIn' : 'media.skip.nextIn', { s: outroNotice }) }}</span>
       <button class="vbtn small" @click.stop="dismissOutro">{{ t('media.skip.cancel') }}</button>
     </div>
     <!-- 快捷键速查(H):从同一张键位表生成;点外 / Esc / H 关 -->
