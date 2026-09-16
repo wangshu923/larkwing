@@ -163,3 +163,15 @@
 - **`parking_lot` 换掉约 130 处 `lock().unwrap()`**:任一任务在持锁段 panic 就毒锁,之后 `MediaRuntime.inner` / `Engine.sessions` 这类进程级状态整体失效。是设计取舍(新依赖 + 130 处触点),记档不做。
 - **聊天历史「加载更早」**:`load_conversation` 只回最近 200 行,而 `search_messages` 跨全表 —— 命中 200 行之前的消息,点开后看不到那条。修它要改命令签名 + UI 分页 + 命中定位 = **新功能**,不在「优化」范围内。
 - **前端单元测试**:全仓零 vitest;`useLyrics` 解析 / `useScrubHover` 算位 / `useMediaKeys` 键表 / `streamGroups` 分组这类纯函数正是前端出过 bug 的地方,值得补。本批只补了 Rust 侧 14 条。
+
+## 拆 relay.rs:目录模块的变体(2026-09-16)
+
+> 来源:2026-09-16 影音体检第三批。第一路审查点名 `media/relay.rs` 2868 行(修完 bug 后 2995 行)该按 §6.1 拆;因为搬运批不能掺真改动,排在两批修改之后单独走。
+
+**和上一次拆的不同处**:engine / media 那两次拆的是 `mod.rs`,新文件是同一目录下的兄弟;这次拆的是**叶子文件**,新文件成了它的**子**模块(`relay/mod.rs` + `relay/*.rs`)。两条推论:① 搬过去的代码里 `super::probe::first_moof_offset`、`super::no_console` 原先指的是 media 的兄弟,现在 `super` 是 relay —— **不改这些行**(改了多重集验收就对不上),在 `relay/mod.rs` 里 `use super::{no_console, probe};` 把 media 的两个名字借进 relay,子文件的 `super::` 就照旧解得出;② 对外可见性不能只靠 `pub(super)`:`pub(super)` 在子文件里只到 relay,给 media 用的项要保留原 `pub` / `pub(crate)` 并在 mod.rs `pub use child::X;`(`gen_video_init` / `gen_video_segment` / `VideoEncoder` / `video_encode_args` / `cover_jpeg` / `AUDIO_LOUDNESS_AF`)。子文件一律 `use super::*;` —— 能拿到 mod.rs 的私有项与私有 `use` 绑定(`Arc` / `Response` / `UpStream` 这些顶部 import 也在内),测试模块再 `use super::*;` 一层层链上去。
+
+**切法**:先 `git mv relay.rs relay/mod.rs`(git 认成改名,历史不断),再跑一个按**原行号段**搬运的脚本:每段都从上一项的收尾空行起、到本项的顶层 `}` / `;` 止,所以文档注释天然跟着项走;测试按主题分配(每个 test fn 的边界 = 4 空格缩进的 `}`),各文件自带 `#[cfg(test)] mod tests { use super::*;` 壳;脚本自带覆盖检查(1..2995 每行恰进一个文件,漏切的只能是 1999 空行与 2000–2002 的老 `mod tests` 头)和 17 处签名替换(跨子文件调用的 `fn` 加 `pub(super)`),编译再补 3 处(`build_mpd`、`RemuxQuery`、`ThumbQuery`:handler 是 `pub(super)` 了,它签名里的 Query 类型不能更私)。**§4.11 常量全留在 mod.rs 顶部**,单源落点不漂(AGENT 里 `relay.rs` 的三处路径改写为 `relay/mod.rs`)。
+
+**验收**:`git show HEAD:relay.rs` 与 `cat relay/*.rs` 各去空行排序比多重集 —— 丢 20 行、每行都是加了 `pub(super)` 的签名;多 108 行全是文件头 / `mod` / `use` / 九份 `mod tests` 壳。lib 839 / engine 20 / clippy 两 crate 零。一条小坑:`pub(crate) use preview::{cover_jpeg, crop_sprite_cell};` 里 `crop_sprite_cell` 没人在 relay 外用,unused import 在 `-D warnings` 下是红 —— **re-export 只给真被外面用的**。
+
+**落点**:`mod.rs`(Entry / Relay / Inner / 注册表 / FifoCache / 常量 / register_* / `lookup` `bad` `bytes_response`)· `encoder.rs` · `upstream.rs`(/s/ /dash/ + fetch_head + build_mpd)· `file.rs` · `hls.rs` · `adaptive.rs` · `ffmpeg.rs`(gen_video_* / build_*_frag_cmd / run_ffmpeg_collect)· `progressive.rs`(/m/ + spawn_stream)· `preview.rs`(thumb / sprites / cover)· `collect.rs`。**没顺手改的**:`preview.rs` 816 行仍是最大的一个(三条预览路本就同一把串行闸与两级缓存,再切会把闸切散);`stream_ffmpeg` 与 `run_ffmpeg_collect` 的两条「子进程纪律」注释各在一处,没合并成一段。
