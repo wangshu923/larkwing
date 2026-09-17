@@ -132,6 +132,41 @@ const SELF_CHECK_EVERY: usize = 10;
 /// 连续多少轮"全重复调用 / 全报错"(无新进展)即判空转、强制收尾;
 /// 接住"模型自欺、自检答继续"的洞 —— 真在干活每轮有新结果则清零,碰不到。
 const MAX_STALL_ROUNDS: usize = 5;
+/// 计划槽几轮没更新就点一句(§4.11 过程默认,PLAN §2 待确认;2026-09-17 用户「除了进度是不是
+/// 该再给个提示」)。只在计划还有未完项时说;plan_set 一调就归零。
+const PLAN_NUDGE_EVERY: usize = 5;
+
+/// 「计划已 N 轮没更新」提示句(不落库、挂 request 尾,与自检句同形):到点、且计划里还有
+/// 未完项才有;没计划 / 全完成 / 没到点 = None。
+fn plan_nudge_line(since: usize, plan: &crate::tools::plan::Plan) -> Option<String> {
+    if since == 0 || !since.is_multiple_of(PLAN_NUDGE_EVERY) {
+        return None;
+    }
+    let rest = plan.remaining_brief()?;
+    Some(format!(
+        "[system] 计划已 {since} 轮没更新(未完成:{rest})。做完的项用 plan_set 传 done=[序号] 标完成\
+         再接着干;还没做完就继续,别停下来问。"
+    ))
+}
+
+#[cfg(test)]
+mod plan_nudge_tests {
+    use crate::tools::plan::{parse_args, Plan};
+    use serde_json::json;
+
+    #[test]
+    fn nudge_only_on_cadence_with_undone_items() {
+        let plan = parse_args(&json!({ "items": [{ "text": "扫文件夹", "done": true }, { "text": "补歌词" }] })).unwrap();
+        assert!(super::plan_nudge_line(0, &plan).is_none(), "刚更新过不点");
+        assert!(super::plan_nudge_line(3, &plan).is_none(), "没到点不点");
+        let line = super::plan_nudge_line(super::PLAN_NUDGE_EVERY, &plan).unwrap();
+        assert!(line.starts_with("[system]") && line.contains("补歌词") && !line.contains("扫文件夹"), "{line}");
+        assert!(line.contains("done=[序号]"), "教它怎么更新:{line}");
+        let all_done = parse_args(&json!({ "items": [{ "text": "a", "done": true }] })).unwrap();
+        assert!(super::plan_nudge_line(super::PLAN_NUDGE_EVERY, &all_done).is_none(), "全完成不点");
+        assert!(super::plan_nudge_line(super::PLAN_NUDGE_EVERY, &Plan::default()).is_none(), "没计划不点");
+    }
+}
 
 /// 回合任一出口都把 mood 收回 Idle(悬浮窗 mood 灯熄):Drop 兜底覆盖所有 return 分支。
 struct MoodGuard(crate::bus::Bus);
@@ -311,6 +346,8 @@ impl Turn {
             .unwrap_or_default();
 
         let mut round: usize = 0;
+        // 距上次 plan_set 过了几轮(计划槽的「几轮没更新就点一句」用;plan_set ok 即归零)
+        let mut rounds_since_plan: usize = 0;
         let mut stall: usize = 0; // 连续无进展(全重复 / 全失败)轮数
         let mut seen_calls: HashSet<String> = HashSet::new(); // 本回合已发过的工具调用指纹
         // 本回合是否调过 end_conversation(§7.5 会话收尾):随收尾的 Done 递给前端 → 唤醒回合
@@ -390,6 +427,25 @@ impl Turn {
                 // 收尾前看插队(原子):空 → 置 finishing 收尾;非空 → 取出注入(先落本段回复再 apply)
                 let pending = take_or_finish(&inject);
                 if pending.is_empty() {
+                    // 全部完成的计划在回合收尾自动清(2026-09-17):模型基本不主动传空 items,卡就一直挂着;
+                    // 有未完项的不动 —— 下回合〔此刻〕还要靠它接上。子回合没有计划槽。
+                    if !ephemeral {
+                        let cleared = {
+                            let mut p = plan.lk();
+                            if !p.is_empty() && p.done_count() == p.items.len() {
+                                *p = Default::default();
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if cleared {
+                            bus.publish(AppEvent::Plan(crate::bus::PlanCard::of(
+                                conv_id,
+                                &crate::tools::plan::Plan::default(),
+                            )));
+                        }
+                    }
                     // 真收尾(take_or_finish 内已原子置 finishing,此后 inject 拒绝)
                     match persist_row_if(persist, &store, conv_id, "assistant", &text, None).await {
                         Some(message_id) => {
@@ -530,9 +586,13 @@ impl Turn {
                 // !ephemeral = 纵深防御:子回合白名单本就排除 plan_set(golden 钉着),这道门
                 // 防未来放行时子回合拿父 conv_id 发幽灵计划卡、写进无人认领的私有槽。
                 if call.name == "plan_set" && status == "ok" && !ephemeral {
-                    if let Ok(p) = crate::tools::plan::parse_args(&call.args) {
-                        bus.publish(AppEvent::Plan(crate::bus::PlanCard::of(conv_id, &p)));
-                        *plan.lk() = p;
+                    // parse_op 单源:items = 全量替换;只给 done = 增量标完成(2026-09-17)。
+                    // 先算好 next 再重锁写回(同一把锁,别跨语句持着守卫)。
+                    if let Ok(op) = crate::tools::plan::parse_op(&call.args) {
+                        let next = crate::tools::plan::apply(&plan.lk(), op);
+                        bus.publish(AppEvent::Plan(crate::bus::PlanCard::of(conv_id, &next)));
+                        *plan.lk() = next;
+                        rounds_since_plan = 0;
                     }
                 }
                 // show_image 亮的图:refs 随 tool 行 payload 落库(重开会话派生图卡)+
@@ -582,6 +642,7 @@ impl Turn {
             // 插队(PLAN §9 B):轮间排空注入队列,append 进 request,下一轮 LLM 就带上
             drain_injections(&store, conv_id, &tx, &inject, &mut request, persist).await;
             round += 1;
+            rounds_since_plan += 1;
             // 收尾闸:① 硬上限到顶(纯失控 backstop)② 连续空转到顶(自检失灵的兜底网)。
             // 命中就禁用工具,下一次开流模型只能用嘴收尾;否则按周期插一句自检让模型自决。
             if round >= max_rounds || stall >= MAX_STALL_ROUNDS {
@@ -598,6 +659,10 @@ impl Turn {
                     &task_quote,
                     &plan.lk(),
                 );
+                request.messages.push(ChatMessage::user(line));
+            } else if let Some(line) = plan_nudge_line(rounds_since_plan, &plan.lk()) {
+                // 计划几轮没更新就点一句(2026-09-17 用户「除了进度是不是该再给个提示」):
+                // 与自检句同形 —— 不落库、挂 request 尾、前缀缓存零损伤;自检轮让位。
                 request.messages.push(ChatMessage::user(line));
             }
 

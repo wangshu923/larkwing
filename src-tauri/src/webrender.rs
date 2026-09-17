@@ -1,6 +1,7 @@
 //! core「网页渲染器」接缝(webrender.rs)的壳层实现:**app 自己就是浏览器** ——
 //! 隐藏 WebView 窗(WebView2/WKWebView,同 B 站扫码登录窗先例)真渲染 JS 页面。
-//! L2 会话式浏览(2026-07-10):窗口跨调用存活(TTL 180s / 最多 2 个,清扫任务收摊),
+//! L2 会话式浏览(2026-07-10):窗口跨调用存活(TTL 600s / 最多 10 个,清扫任务收摊;2026-09-17
+//! 由 180s / 2 放开 —— 会话表是全程序一张,主 agent 与四路子 agent 共用,2 个窗互相挤掉),
 //! 每步 = 可选动作(导航 / back / 点编号 / 点文字)→ **编号快照**(给交互元素打
 //! `data-lw-ref`,文本版 Set-of-Marks)经 relay `/collect/{token}` POST 回 core。
 //! 下载由 `on_download` 接管(Requested 时定落点 sanitize+dedupe;**mac 的 Finished.path
@@ -29,10 +30,13 @@ use larkwing_core::webrender::{
     PendingConfirm, RenderOutcome, RenderRequest, RenderedPage, WebRenderer,
 };
 
-/// 会话窗空闲多久收摊(模型隔几步回来续用足够;不无限占内存/进程)。
-const SESSION_TTL: Duration = Duration::from_secs(180);
-/// 同时最多几个会话窗(第三个进来挤掉最旧的)。
-const SESSION_MAX: usize = 2;
+/// 会话窗空闲多久收摊(§4.11:2026-09-17 由 180s 放到 600s —— 用户一步步教它办事时中间会隔
+/// 几分钟,3 分钟一过就得重开、登录态 / 页面状态全丢;不无限占内存/进程)。
+const SESSION_TTL: Duration = Duration::from_secs(600);
+/// 同时最多几个会话窗(第 N+1 个进来挤掉最旧的)。§4.11 用户拍板 2026-09-17:2 → 10 ——
+/// 这张会话表是全程序一张(主 agent + 四路子 agent 共用),2 个窗互相挤掉;代价只有真开到
+/// 10 个时的内存(每窗一个 WebView 进程),TTL 会收。
+const SESSION_MAX: usize = 10;
 /// 可见缩略窗:逻辑尺寸(右下角小窗,set_zoom 联动出「桌面版页面的缩略直播」;
 /// 用户拖大窗口 = 自然放大——Resized 事件按宽度重算 zoom)。做了啥摆在明面上让人放心,
 /// 顺手解锁登录墙人机接力:它搞不定的登录/验证码,用户直接在这个窗里点,它接着干。
@@ -135,7 +139,29 @@ impl WebRenderer for ShellWebRenderer {
     }
 }
 
-/// 一步会话式浏览(带 HUD 任务卡:干了啥全程可见,与缩略窗一体两面)。
+/// 步骤汇报口:安静模式(子回合的请求)没有 HUD 卡,`step` 就是空操作 —— 内部十几处
+/// `task.step(...)` 一行不改。有卡时原样转发,收尾 done / fail 同理。
+struct StepSink(Option<larkwing_core::tasks::TaskHandle>);
+
+impl StepSink {
+    fn step(&self, key: &str, params: serde_json::Value) {
+        if let Some(t) = &self.0 {
+            t.step(key, params);
+        }
+    }
+    fn done(self) {
+        if let Some(t) = self.0 {
+            t.done();
+        }
+    }
+    fn fail(self, key: &str, params: serde_json::Value) {
+        if let Some(t) = self.0 {
+            t.fail(key, params);
+        }
+    }
+}
+
+/// 一步会话式浏览(带 HUD 任务卡:干了啥全程可见,与缩略窗一体两面;子回合安静模式不起卡)。
 /// 句柄 drop 未收尾 = 自动 fail(进度总线纪律 §7.1)兜住 panic 路。
 async fn browse_step(
     app: tauri::AppHandle,
@@ -143,7 +169,12 @@ async fn browse_step(
     sessions: Arc<Mutex<HashMap<String, Arc<SessionEntry>>>>,
     req: RenderRequest,
 ) -> Result<RenderOutcome> {
-    let task = media.tasks().start("webrender", larkwing_core::bus::Text::new("task.webrender"));
+    // 安静模式(子回合的请求,2026-09-17):不起这张随每一步冒出又消失的「替你看网页」卡 ——
+    // 几路子 agent 一起上网时它没完没了地闪;进度落在分头办事那张卡的步骤行里。
+    let task = StepSink(
+        (!req.quiet)
+            .then(|| media.tasks().start("webrender", larkwing_core::bus::Text::new("task.webrender"))),
+    );
     match browse_step_inner(app, media, sessions, req, &task).await {
         Ok(o) => {
             task.done();
@@ -162,7 +193,7 @@ async fn browse_step_inner(
     media: larkwing_core::media::MediaRuntime,
     sessions: Arc<Mutex<HashMap<String, Arc<SessionEntry>>>>,
     req: RenderRequest,
-    task: &larkwing_core::tasks::TaskHandle,
+    task: &StepSink,
 ) -> Result<RenderOutcome> {
     let deadline = tokio::time::Instant::now() + req.timeout;
 
@@ -552,7 +583,7 @@ fn open_session(
             }
             tauri::WindowEvent::Destroyed => {
                 // 用户手动关窗 / 被销毁:注册表同步摘除(幂等——清扫/挤位路径已先摘)。
-                // 必须真摘掉:漏一次就永久占着一个会话槽(SESSION_MAX=2),之后开不出窗。
+                // 必须真摘掉:漏一次就永久占着一个会话槽(SESSION_MAX 个),攒满就开不出窗。
                 sessions_evt.lk().remove(&sid_evt);
             }
             _ => {}
@@ -1556,12 +1587,25 @@ fn build_snapshot_script(collect_url: &str) -> String {
     }} catch (e) {{}}
     return false;
   }}
+  // 下载类协议一并收(2026-09-17 电影天堂实锤:影片页的下载链接全是 magnet: 的 <a>,原先只留
+  // http(s) → 模型看到的页面一个下载地址都没有);协议表与 core web.rs::is_link_scheme 同口径。
+  var LINK_SCHEME = /^(https?|magnet|ftp|ed2k|thunder|flashget|qqdl):/i;
+  function linkName(h) {{
+    if (/^magnet:/i.test(h)) {{
+      var m = /[?&]dn=([^&]*)/i.exec(h);
+      try {{ if (m && m[1]) return decodeURIComponent(m[1].replace(/\+/g, ' ')).slice(0, 40); }} catch (e) {{}}
+      return '磁力链接';
+    }}
+    if (/^ed2k:/i.test(h)) return '电驴 ed2k 链接';
+    if (/^(thunder|flashget|qqdl):/i.test(h)) return '下载器专用链';
+    return h.split('/').pop().slice(0, 40);
+  }}
   var links = []; var seen = {{}};
   var anchors = document.querySelectorAll('a[href]');
   for (var i = 0; i < anchors.length && links.length < 25; i++) {{
-    var h = anchors[i].href || '';
-    if (!/^https?:/.test(h) || seen[h]) continue; seen[h] = 1;
-    links.push({{ text: txt(anchors[i]) || h.split('/').pop().slice(0, 40), url: h }});
+    var h = anchors[i].href || anchors[i].getAttribute('href') || '';
+    if (!LINK_SCHEME.test(h) || seen[h]) continue; seen[h] = 1;
+    links.push({{ text: txt(anchors[i]) || linkName(h), url: h }});
   }}
   // 页内图片(2026-09-16):页面自报的主图(og:image / twitter:image / link[rel=image_src])在前,
   // 再按**实际显示面积**排 <img>(短边 < IMG_MIN 的图标不收),至多 IMG_MAX 张;data: / svg 丢,
@@ -1607,7 +1651,7 @@ fn build_snapshot_script(collect_url: &str) -> String {
     var d = describe(el);
     if (!d) continue;
     el.setAttribute('data-lw-ref', String(no));
-    var h = (el.tagName === 'A' && el.href && /^https?:/.test(el.href)) ? el.href : null;
+    var h = (el.tagName === 'A' && el.href && LINK_SCHEME.test(el.href)) ? el.href : null;
     elements.push({{ ref: no, role: d.role, text: d.text, href: h, value: d.value || '', checked: (d.checked === undefined ? null : d.checked), options: d.options || [], secret: !!d.secret, accept: d.accept || '', multiple: !!d.multiple }});
     no++;
   }}

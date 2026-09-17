@@ -44,6 +44,13 @@ impl Engine {
         self.media.bg().cancel(id)
     }
 
+    /// HUD 任务卡「停止」的另一半(2026-09-17):回合内可取消的长活(影音解析 / 分头办事同步段)
+    /// 挂的是任务卡自己的取消令牌(`TaskHandle::bind_cancel`),这里直连 `Tasks::cancel`。
+    /// true = 令牌已掐;false = 卡已收尾 / 没挂令牌。
+    pub fn task_stop(&self, task_id: u64) -> bool {
+        self.media.tasks().cancel(task_id)
+    }
+
     /// 跑一路子回合(delegate 的 engine 半边,§6.5「分头办事」):新鲜上下文(wake_turn
     /// 同款原料、历史为空、简报物化成唯一 user 消息)+ 工具面 = 场景白名单 − 排除表 +
     /// ephemeral Turn(不落会话行/不点灯;usage 流水锚父回合)。`IN_TURN_WAIT`(30s 单源)
@@ -154,7 +161,11 @@ impl Engine {
                 request,
                 tools: sub_tools,
                 media: self.media.clone(),
-                web: self.web_renderer(),
+                // 安静包装:子回合的 web_render 不起「替你看网页」HUD 卡(几路子 agent 一起
+                // 上网时那张卡没完没了地闪,2026-09-17 用户实锤),进度落在分头办事卡的步骤行
+                web: self
+                    .web_renderer()
+                    .map(|r| Arc::new(crate::webrender::Quiet(r)) as Arc<dyn crate::webrender::WebRenderer>),
                 voice: self.voice(),
                 confirm: Some(self.confirmer.clone()),
                 rx: rx_llm,
@@ -175,6 +186,11 @@ impl Engine {
             "delegate",
             crate::bus::Text::with("task.delegate", serde_json::json!({ "t": brief })),
         );
+        // HUD 卡从第一秒起就能停(2026-09-17 用户实锤:同步段的卡没有停止钮,转后台前这路活
+        // 只有父回合的聊天停止键能连带掐):挂子回合自己的取消令牌,点停 = Cancelled 收尾。
+        handle.bind_cancel(sub_token.clone());
+        // 卡上的极简统计(用户拍板「toolcall 数 + token 就行」):工具调用次数 + 子回合累计 token
+        let mut tokens: i64 = 0;
 
         // —— 同步段:IN_TURN_WAIT 内跑完当场回汇报(读类结果要回到推理手里才接得上) ——
         // 汇报 = 最后一段收尾文本:每见 ToolUse 即清缓冲(之前攒的是过程叙述,不是汇报)。
@@ -192,6 +208,11 @@ impl Engine {
                     digest.clear();
                     units += 1;
                     handle.step(&label, serde_json::Value::Null);
+                    handle.meta("step.delegate_stats", serde_json::json!({ "calls": units, "tokens": tokens }));
+                }
+                Some(TurnEvent::Usage { round, .. }) => {
+                    tokens += round.input_tokens + round.output_tokens;
+                    handle.meta("step.delegate_stats", serde_json::json!({ "calls": units, "tokens": tokens }));
                 }
                 Some(TurnEvent::Done { .. }) => {
                     let report = digest.trim().to_string();
@@ -212,9 +233,9 @@ impl Engine {
                 }
                 Some(TurnEvent::Cancelled) => {
                     handle.fail("task.err.cancelled", serde_json::Value::Null);
-                    anyhow::bail!("这路活被取消了");
+                    anyhow::bail!("这路活按要求停下了(用户在任务卡上点了停止),别重派。");
                 }
-                Some(_) => {} // Thinking / Usage 等,与汇报无关
+                Some(_) => {} // Thinking 等,与汇报无关
                 None => {
                     handle.fail("task.err.delegate", serde_json::Value::Null);
                     anyhow::bail!("子回合的事件流断了(内部错误)");
@@ -247,6 +268,11 @@ impl Engine {
             let _kill = token_bg.clone().drop_guard();
             let mut digest = digest;
             let mut units = units;
+            let mut tokens = tokens;
+            // 取消旗标的巡查节拍:interval 不随事件重置(原先 select! 里每收一条事件就重建
+            // 一个 2 秒 sleep,子回合流式吐字时永远攒不满 —— HUD 点了停止要等它说完才停)
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     ev = rx.recv() => match ev {
@@ -256,6 +282,11 @@ impl Engine {
                             units += 1;
                             ticket.beat(units, format!("调用 {name}"));
                             handle.step(&label, serde_json::Value::Null);
+                            handle.meta("step.delegate_stats", serde_json::json!({ "calls": units, "tokens": tokens }));
+                        }
+                        Some(TurnEvent::Usage { round, .. }) => {
+                            tokens += round.input_tokens + round.output_tokens;
+                            handle.meta("step.delegate_stats", serde_json::json!({ "calls": units, "tokens": tokens }));
                         }
                         Some(TurnEvent::Done { .. }) => {
                             let report = digest.trim();
@@ -294,11 +325,12 @@ impl Engine {
                             break;
                         }
                     },
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
-                        if ticket.is_cancelled() {
-                            token_bg.cancel(); // 协作式:子回合走 Cancelled 收尾,上面接住
-                        }
-                    }
+                    _ = tick.tick() => {}
+                }
+                // 每次醒来都查旗标(事件臂与定时臂都算):HUD 停止钮 / task_cancel 拨的是
+                // bgtasks 协作旗标,这里把它翻译成子回合的取消令牌 → 走 Cancelled 收尾,上面接住
+                if ticket.is_cancelled() {
+                    token_bg.cancel();
                 }
             }
         });

@@ -82,7 +82,8 @@ export default {
   task: {
     progress: '{n} 项进行中',
     retry: '重试', // 失败任务的重试按钮(目前仅影音解析/组件下载)
-    stop: '停止', // 运行中后台任务的停止按钮(带 bg 编号的卡才显;直连协作旗标,不绕模型)
+    stop: '停止', // 运行中任务的停止按钮(带 bg 编号或挂了取消令牌的卡才显;直连旗标 / 令牌,不绕模型)
+    stopping: '正在停…', // 点了停止到卡收尾之间的即时反馈
     unknown: '后台小任务',
     resolve: '解析播放地址',
     media_download: '下载音频',
@@ -169,6 +170,7 @@ export default {
     speak: '要{action},可以吗?',
   },
   step: {
+    delegate_stats: '工具 {calls} 次 · {tokens} tokens', // 分头办事卡的附注行(子回合累计)
     connect: '连接 {host}…',
     download: '下载中 {done}/{total} MB',
     downloading: '下载中 {done} MB',

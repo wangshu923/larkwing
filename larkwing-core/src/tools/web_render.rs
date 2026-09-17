@@ -158,7 +158,7 @@ impl WebRender {
                         },
                         "session": {
                             "type": "string",
-                            "description": "继续上次结果里的会话号(3 分钟内有效);过期就带 url 重开"
+                            "description": "继续上次结果里的会话号(10 分钟内有效);过期就带 url 重开"
                         },
                         "click_ref": {
                             "type": "integer",
@@ -468,6 +468,7 @@ impl WebRender {
             save_pdf: want_pdf.then(|| download_dir.clone()),
             download_dir,
             timeout: RENDER_TIMEOUT,
+            quiet: false, // 主回合的请求;子回合经 webrender::Quiet 包装置 true
         };
         let mut outcome = renderer.render(req.clone()).await?;
 
@@ -665,7 +666,10 @@ impl WebRender {
                     }
                 }
                 if !page.links.is_empty() {
-                    out.push_str("\n【页内链接】(直链交给 web_download)\n");
+                    out.push_str(
+                        "\n【页内链接】(直链交给 web_download;magnet: 磁力链交给 torrent_download;\
+                         ftp:// 与 thunder:// 专用链也交 web_download)\n",
+                    );
                     for l in &page.links {
                         out.push_str(&format!("- {} → {}\n", l.text, l.url));
                     }

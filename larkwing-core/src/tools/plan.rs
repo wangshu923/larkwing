@@ -51,7 +51,13 @@ impl Plan {
         if done == total {
             return Some(format!("计划{name}:{done}/{total} 全部完成(该向用户收尾汇报,或用 plan_set 清空)"));
         }
-        Some(format!("计划{name}:完成 {done}/{total},接下来:{}", self.undone_texts().join("、")))
+        // 末尾那句提示(2026-09-17 用户「除了进度是不是该再给个提示」):进度本就每回合在这儿,
+        // 模型不动手的是「更新」这一步 —— 把怎么更新、什么时候清空一并摆在眼前。
+        Some(format!(
+            "计划{name}:完成 {done}/{total},接下来:{}(做完一批就 plan_set 传 done=[序号] 标完成,\
+             用户换了别的事就传空 items 清空)",
+            self.undone_texts().join("、")
+        ))
     }
 
     /// 自检句用的未完项一串(「a、b、c」);没有未完项 = None。
@@ -112,6 +118,91 @@ pub fn parse_args(args: &serde_json::Value) -> anyhow::Result<Plan> {
     Ok(Plan { title, items })
 }
 
+/// plan_set 的两种形(2026-09-17):`items` = 全量替换(老形);只给 `done` = **增量标完成** ——
+/// 把已有清单里第 N 项(1 起)或原文对得上的项标 done,不用重发整张清单。缘由 = 用户实锤
+/// 「创建了基本不咋更新」:进度每回合都在〔此刻〕里给模型了,它不动手的原因之一是全量重发
+/// 整张清单对它是负担;把更新降到一句话。两者都给按 items 全量算。
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlanOp {
+    Replace(Plan),
+    MarkDone(Vec<DoneSel>),
+}
+
+/// `done` 里的一个选择器:序号(1 起)或那一项的原文(大小写不敏感、子串双向对得上就算)。
+#[derive(Debug, Clone, PartialEq)]
+pub enum DoneSel {
+    Index(usize),
+    Text(String),
+}
+
+/// 解析一次调用(单源:工具 run 与回合循环嗅探共用)。`items` 在 → Replace;否则 `done` 在 → MarkDone;
+/// 都没有 / done 空 / 序号不是正整数 → bail,话术引导两种形。
+pub fn parse_op(args: &serde_json::Value) -> anyhow::Result<PlanOp> {
+    if args.get("items").is_some() {
+        return parse_args(args).map(PlanOp::Replace);
+    }
+    let Some(done) = args.get("done").and_then(|v| v.as_array()) else {
+        anyhow::bail!(
+            "缺少 items 或 done:改清单发完整 items(全量替换,清空传空数组);\
+             只标完成传 done=[序号(1 起)或那一项的原文]。"
+        );
+    };
+    anyhow::ensure!(!done.is_empty(), "done 是空的:填要标完成的序号(1 起)或那一项的原文。");
+    let mut sels = Vec::with_capacity(done.len());
+    for d in done {
+        match d {
+            serde_json::Value::Number(n) => {
+                let i = n
+                    .as_u64()
+                    .filter(|i| *i >= 1)
+                    .ok_or_else(|| anyhow::anyhow!("done 里的序号要是 1 起的正整数,收到 {n}"))?;
+                sels.push(DoneSel::Index(i as usize));
+            }
+            serde_json::Value::String(s) => {
+                let s = s.trim();
+                anyhow::ensure!(!s.is_empty(), "done 里有空项:填序号或那一项的原文。");
+                match s.parse::<usize>() {
+                    Ok(i) if i >= 1 => sels.push(DoneSel::Index(i)),
+                    Ok(_) => anyhow::bail!("done 里的序号要是 1 起的正整数,收到 {s}"),
+                    Err(_) => sels.push(DoneSel::Text(s.to_string())),
+                }
+            }
+            other => anyhow::bail!("done 每项要是序号或原文,收到 {other}"),
+        }
+    }
+    Ok(PlanOp::MarkDone(sels))
+}
+
+/// 把一步操作落到当前计划上(纯函数;回合循环嗅探时调)。MarkDone 对不上号的选择器忽略 ——
+/// 工具本体无状态、校验不了序号越界,下一条〔此刻〕会把真实清单摆出来。
+pub fn apply(current: &Plan, op: PlanOp) -> Plan {
+    match op {
+        PlanOp::Replace(p) => p,
+        PlanOp::MarkDone(sels) => {
+            let mut next = current.clone();
+            for sel in sels {
+                match sel {
+                    DoneSel::Index(i) => {
+                        if let Some(it) = next.items.get_mut(i - 1) {
+                            it.done = true;
+                        }
+                    }
+                    DoneSel::Text(t) => {
+                        let tl = t.to_lowercase();
+                        if let Some(it) = next.items.iter_mut().find(|it| {
+                            let x = it.text.to_lowercase();
+                            x == tl || x.contains(&tl) || tl.contains(&x)
+                        }) {
+                            it.done = true;
+                        }
+                    }
+                }
+            }
+            next
+        }
+    }
+}
+
 /// 工具结果回显(喂回模型的观察):清单全貌 + 下一步引导;清空态说清已清空。
 fn render_echo(plan: &Plan) -> String {
     if plan.is_empty() {
@@ -128,7 +219,7 @@ fn render_echo(plan: &Plan) -> String {
     if done == total {
         out.push_str("全部完成:向用户收尾汇报;这份计划可用空 items 清空。");
     } else {
-        out.push_str("接着干下一项;每完成一批就再调 plan_set 更新(发完整清单,全量替换)。");
+        out.push_str("接着干下一项;每做完一批就再调 plan_set:只标完成传 done=[序号],改清单才发完整 items。");
     }
     out
 }
@@ -144,9 +235,9 @@ impl PlanSet {
                 name: "plan_set",
                 description: "给正在干的多步骤长活记一份工作计划(只在当前会话内有效,不是给用户的提醒)。\
                               一件事要分好几步、好几批才能干完(批量处理一堆文件、多步网页操作、下载完接着加工),\
-                              先把步骤列出来再动手;之后每完成一批就再调一次,把干完的项标 done——每次都发完整清单\
-                              (全量替换,不是追加)。全部干完或者用户不要了,items 传空数组清空。\
-                              三两步能办完的小事别用。",
+                              先把步骤列出来再动手;之后**每做完一批就再调一次:只标完成传 done=[序号]**\
+                              (1 起,也可以传那一项的原文),不用重发清单;要改清单才发完整 items(全量替换,\
+                              不是追加)。全部干完或者用户不要了,items 传空数组清空。三两步能办完的小事别用。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -164,10 +255,14 @@ impl PlanSet {
                                 },
                                 "required": ["text"]
                             },
-                            "description": "完整步骤清单(全量替换,最多 30 条);空数组 = 清空计划"
+                            "description": "完整步骤清单(全量替换,最多 30 条);空数组 = 清空计划。只标完成不用传它,传 done 就行"
+                        },
+                        "done": {
+                            "type": "array",
+                            "items": { "type": ["integer", "string"] },
+                            "description": "把已有清单里这些项标为完成:序号(1 起)或那一项的原文;不传 items 时用它,清单其余不动"
                         }
-                    },
-                    "required": ["items"]
+                    }
                 }),
                 timeout: std::time::Duration::from_secs(5),
                 ui_key: "tool.plan_set",
@@ -183,9 +278,16 @@ impl Tool for PlanSet {
     }
 
     async fn run(&self, args: serde_json::Value, _ctx: &ToolCtx) -> anyhow::Result<String> {
-        // 纯校验 + 回显:写槽/发事件由回合循环按同一 parse_args 嗅探完成(status=ok 才写)。
-        let plan = parse_args(&args)?;
-        Ok(render_echo(&plan))
+        // 纯校验 + 回显:写槽/发事件由回合循环按同一 parse_op 嗅探完成(status=ok 才写)。
+        match parse_op(&args)? {
+            PlanOp::Replace(plan) => Ok(render_echo(&plan)),
+            // 工具本体无状态,看不到当前清单:只确认收到,真实进度下一条〔此刻〕会带
+            PlanOp::MarkDone(sels) => Ok(format!(
+                "已把 {} 项标为完成(以当前清单为准,〔此刻〕会带最新进度)。接着干下一项;\
+                 全部干完向用户收尾,再传空 items 清空。",
+                sels.len()
+            )),
+        }
     }
 }
 
@@ -193,6 +295,25 @@ impl Tool for PlanSet {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 增量标完成:序号 / 原文都认,其余项与标题不动;越界忽略;items 在就是全量替换;
+    /// 都没给 / done 空 / 序号 0 报错;〔此刻〕行带更新与清空提示。
+    #[test]
+    fn parse_op_marks_done_by_index_or_text_and_apply_keeps_rest() {
+        let cur = parse_args(&json!({ "title": "补词", "items": ["扫文件夹", "补第一批", "发手机"] })).unwrap();
+        let next = apply(&cur, parse_op(&json!({ "done": [1, "第一批"] })).unwrap());
+        assert_eq!(next.done_count(), 2);
+        assert!(next.items[0].done && next.items[1].done && !next.items[2].done);
+        assert_eq!(next.title.as_deref(), Some("补词"), "标完成不动标题");
+        let next2 = apply(&cur, parse_op(&json!({ "done": ["3", 9] })).unwrap());
+        assert!(next2.items[2].done && !next2.items[0].done, "字符串序号也认,越界忽略");
+        assert!(matches!(parse_op(&json!({ "items": [] })).unwrap(), PlanOp::Replace(p) if p.is_empty()));
+        assert!(parse_op(&json!({})).is_err());
+        assert!(parse_op(&json!({ "done": [] })).is_err());
+        assert!(parse_op(&json!({ "done": [0] })).is_err());
+        let line = cur.ambient_line().unwrap();
+        assert!(line.contains("done=[序号]") && line.contains("清空"), "{line}");
+    }
 
     #[test]
     fn parse_accepts_objects_bare_strings_and_stringified_done() {

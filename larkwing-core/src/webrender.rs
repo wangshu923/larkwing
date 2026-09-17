@@ -146,6 +146,10 @@ pub struct RenderRequest {
     pub download_dir: PathBuf,
     /// 单步预算(壳层超时即收手回快照;会话窗本身由 TTL 管生死)。
     pub timeout: Duration,
+    /// 安静模式(2026-09-17):子回合(delegate)发出的渲染请求。壳层**不起**那张随每一步
+    /// 冒出又消失的「替你看网页」HUD 卡 —— 几路子 agent 一起上网时它没完没了地闪(用户实锤),
+    /// 进度只落在分头办事那张卡的步骤行里;浏览窗本身照旧。主回合的请求恒 false。
+    pub quiet: bool,
 }
 
 /// 批量填表的一个字段(`fill` 数组元素)。
@@ -208,4 +212,16 @@ pub struct RenderOutcome {
 #[async_trait::async_trait]
 pub trait WebRenderer: Send + Sync {
     async fn render(&self, req: RenderRequest) -> anyhow::Result<RenderOutcome>;
+}
+
+/// 安静包装(engine 给子回合注入用,2026-09-17):每个请求打上 `quiet` 再转交真渲染器。
+/// 子回合的 ToolCtx 拿到的就是它 —— 工具面零改、ToolCtx 零加字段。
+pub struct Quiet(pub std::sync::Arc<dyn WebRenderer>);
+
+#[async_trait::async_trait]
+impl WebRenderer for Quiet {
+    async fn render(&self, mut req: RenderRequest) -> anyhow::Result<RenderOutcome> {
+        req.quiet = true;
+        self.0.render(req).await
+    }
 }

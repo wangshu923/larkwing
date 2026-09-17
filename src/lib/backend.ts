@@ -455,6 +455,11 @@ export interface TaskView {
   /** 后台差事编号(批量下载/配词/BT/加工/delegate 等长活带上)→ 运行中显「停止」钮,
    *  点击直连 bgCancel(与嘴上说「停下」拨的是同一个协作旗标,不绕 LLM)。 */
   bg?: number
+  /** 可取消的回合内长活(影音解析 / 分头办事同步段…,2026-09-17):卡挂了自己的取消令牌 →
+   *  运行中也显「停止」钮,点击直连 taskStop(task_id)。与 bg 可同时为真(两把钥匙都拧)。 */
+  cancellable?: boolean
+  /** 附注行(小字放步骤行下):统计 / 备注,如分头办事的「工具 N 次 · token M」。 */
+  meta?: TextRef
 }
 
 /** 多集续播位置(有值 = 当前是 ≥2 集的剧集:B 站合集/分P、本地剧集文件夹)。 */
@@ -1254,6 +1259,9 @@ export const api = {
   /** HUD 任务卡「停止」:直连 bgtasks 协作旗标(做错了不用跟模型说「停下」再烧一轮)。
    *  false = 已收尾/查无此号,无需报错(终态快照马上到)。 */
   bgCancel: (id: number) => invoke<boolean>('bg_cancel', { id }),
+  /** HUD 任务卡「停止」的另一半:回合内可取消的长活(解析 / 分头办事同步段)挂的是任务卡自己的
+   *  取消令牌,按 task_id 掐。false = 卡已收尾 / 没挂令牌。 */
+  taskStop: (id: number) => invoke<boolean>('task_stop', { id }),
   /** 多集续播切集(+1 下一集 / -1 上一集):ended 自动续播、播放器上/下一集按钮直连这里(不绕 LLM)。
    *  越界(到头/到顶)在 core 内静默(只记日志)。fire-and-forget。 */
   mediaAdvance: (delta: number) => invoke<void>('media_advance', { delta }),

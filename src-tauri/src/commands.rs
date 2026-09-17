@@ -1076,6 +1076,14 @@ pub fn bg_cancel(state: State<'_, AppState>, id: u64) -> Result<bool, AppError> 
     Ok(state.engine.bg_cancel(id).is_some())
 }
 
+/// HUD 任务卡「停止」的另一半(2026-09-17):回合内可取消的长活(影音解析 / 分头办事同步段…)
+/// 挂的是任务卡自己的取消令牌,这里直连 `Tasks::cancel` 掐它 —— 与 bg_cancel 同哲学,按钮不绕 LLM。
+/// false = 卡已收尾 / 没挂令牌。
+#[tauri::command]
+pub fn task_stop(state: State<'_, AppState>, id: u64) -> Result<bool, AppError> {
+    Ok(state.engine.task_stop(id))
+}
+
 /// 多集续播切集(PLAN §9 多集续播):前端 `ended` 自动下一集、播放器上/下一集按钮直连这里
 /// (不绕 LLM,同 media_retry / 嘴控按钮哲学 §7.1)。delta = +1 下一集 / -1 上一集。
 /// 越界(到头/到顶)在 advance 内报错,这里只记日志 —— 按钮路径没有模型可叙述。

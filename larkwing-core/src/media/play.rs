@@ -410,9 +410,21 @@ impl MediaRuntime {
         };
 
         let task = self.inner.tasks.start("resolve", Text::new("task.resolve"));
+        // HUD 卡可停(2026-09-17 用户实锤「视频操作」的卡点了没反应 —— 它从来没有停止钮):
+        // 挂一枚取消令牌,点停 = 丢掉 resolve future → yt-dlp 子进程 kill_on_drop 跟着死,
+        // 工具回「按要求停下了」当观察;意图快照由 play() 的 Err 路统一还原。
+        let stop = tokio_util::sync::CancellationToken::new();
+        task.bind_cancel(stop.clone());
         task.step("step.resolve", serde_json::Value::Null);
+        let attempt = tokio::select! {
+            r = resolver::resolve(&ytdlp, page_url, cookies_file.as_deref(), audio_only) => r,
+            _ = stop.cancelled() => {
+                task.fail("task.err.cancelled", serde_json::Value::Null);
+                anyhow::bail!("解析按要求停下了(用户在任务卡上点了停止),别重试。");
+            }
+        };
         let resolved =
-            match resolver::resolve(&ytdlp, page_url, cookies_file.as_deref(), audio_only).await {
+            match attempt {
                 Ok(r) => r,
                 Err(resolver::ResolveError::AuthRequired(detail)) => {
                     // 需要登录 ≠ 失败:记下待重放 + 弹扫码气泡,登录成功后自动续上(见 set_cookies)。

@@ -432,6 +432,7 @@ pub fn run() {
       commands::retry_download,
       commands::retry_voice_model,
       commands::bg_cancel,
+      commands::task_stop,
       commands::media_advance,
       commands::media_auto_next,
       commands::media_mode,

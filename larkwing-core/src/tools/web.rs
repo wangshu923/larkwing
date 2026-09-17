@@ -210,7 +210,10 @@ impl Tool for WebFetch {
         }
         // 页内链接整页相同,只随首段给一次(续读段重复列出白吃 token)
         if offset == 0 && !page.links.is_empty() {
-            out.push_str("\n\n【页内链接】(要下载哪个就把链接交给 web_download)\n");
+            out.push_str(
+                "\n\n【页内链接】(要下载哪个就把链接交给 web_download;magnet: 磁力链交给 \
+                 torrent_download;ftp:// 与 thunder:// 专用链也交 web_download)\n",
+            );
             for l in &page.links {
                 out.push_str(&format!("- {} → {}\n", l.text, l.url));
             }

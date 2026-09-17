@@ -74,6 +74,14 @@ pub struct TaskView {
     /// None = 回合内小任务(跟着回合走,聊天停止键管)。serde 增量,旧前端忽略(§6.8)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bg: Option<u64>,
+    /// 可取消(2026-09-17):回合内的长活挂了自己的取消令牌(`TaskHandle::bind_cancel`:影音解析 /
+    /// 分头办事同步段…)。UI 据此显「停止」钮,点击直连 `task_stop(task_id)` 掐令牌(不绕 LLM;
+    /// 与 `bg` 是两把钥匙,可同时有)。此前这些卡从来没有停止钮,只有聊天停止键能连带掐。
+    pub cancellable: bool,
+    /// 附注行(小字,步骤行之下):统计 / 备注类,如分头办事的「工具 N 次 · token M」。
+    /// core 只给 key + params,句子在前端字典(§6.6)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Text>,
 }
 
 /// 播放器车道。Play/Control 是 core → UI 的指令;UI 本地按钮直接操作播放元素,不绕这里。
@@ -352,6 +360,8 @@ mod tests {
             error: None,
             retry: None,
             bg: None,
+            cancellable: false,
+            meta: None,
         }));
         let ev = rx.recv().await.unwrap();
         let v = serde_json::to_value(&ev).unwrap();

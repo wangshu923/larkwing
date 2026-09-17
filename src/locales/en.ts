@@ -83,7 +83,8 @@ export default {
   task: {
     progress: '{n} in progress',
     retry: 'Retry', // retry button on a failed task (currently media resolve / component download)
-    stop: 'Stop', // stop button on a running background task (cards with a bg id; direct flag, no model round-trip)
+    stop: 'Stop', // stop button on a running task (cards with a bg id or a cancel token; direct flag / token, no model round-trip)
+    stopping: 'Stopping…', // instant feedback between the click and the card settling
     unknown: 'Background task',
     resolve: 'Resolving the stream',
     media_download: 'Audio download',
@@ -168,6 +169,7 @@ export default {
     speak: 'It wants to {action} — is that OK?',
   },
   step: {
+    delegate_stats: '{calls} tool calls · {tokens} tokens', // side-errand card footnote (sub-turn totals)
     connect: 'Connecting to {host}…',
     download: 'Downloading {done}/{total} MB',
     downloading: 'Downloading {done} MB',

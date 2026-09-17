@@ -362,21 +362,50 @@ impl WebClient {
                 return Ok(page);
             }
         }
+        // 跳板页(2026-09-17 电影天堂实锤:dy2018 给普通请求的是 82 字节的
+        // `<script>window.location.href='…'</script>`):正文几乎为空、又只有一个跳转目标 →
+        // 跟过去再抓,至多 STUB_HOPS 跳;真正的文章页也可能内嵌这类脚本,所以正文非空绝不跳。
+        let mut target = url.to_string();
+        let mut hops = 0usize;
+        loop {
+            let (final_url, ctype_full, bytes) = self.fetch_once(&target).await?;
+            let mime = ctype_full.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+            // 搜索结果/页内链接常直指 PDF 等文件:当 HTML 解析只会出乱码,如实拦下指路
+            if let Some(hint) = non_page_hint(&mime, &bytes) {
+                bail!("{hint}");
+            }
+            // 按声明的字符集解码(gb2312 老站原先整页乱码,模型只能说「读不到」)
+            let html = decode_html(&bytes, &ctype_full);
+            let page = extract_page(&html, &final_url);
+            if page.text.trim().chars().count() < STUB_TEXT_MAX_CHARS {
+                if let Some(next) = stub_redirect(&html, &final_url) {
+                    if hops < STUB_HOPS && next != final_url {
+                        hops += 1;
+                        tracing::info!(from = %final_url, to = %next, "跟随跳板页");
+                        target = next;
+                        continue;
+                    }
+                }
+            }
+            anyhow::ensure!(!page.text.trim().is_empty(), "页面没有可读正文(可能是纯脚本应用)");
+            self.cache_put(url, &page);
+            return Ok(page);
+        }
+    }
+
+    /// 单次 GET:成功状态 → (最终地址, 完整 Content-Type 头, 有界字节)。
+    /// 重定向后以最终地址为基准解析相对链接(下载类站点常见跳转)。
+    async fn fetch_once(&self, url: &str) -> Result<(String, String, Vec<u8>)> {
         let resp = self.net.send(url, |c| c.get(url)).await.context("页面请求失败")?;
         let status = resp.status();
         anyhow::ensure!(status.is_success(), "页面 HTTP {status}");
-        // 重定向后以最终地址为基准解析相对链接(下载类站点常见跳转);bytes() 前先取
         let final_url = resp.url().to_string();
-        let ctype = resp
+        let ctype_full = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
+            .to_string();
         // 体积闸:10MB 封顶,防超大页面拖死。**必须边收边判**(2026-08-22 审计):
         // 原先是 `resp.bytes().await?` 先把整个 body 收进内存、再看长度 —— 闸形同虚设,
         // 一个几 GB 的响应(或谎报 Content-Type 的大文件)先把进程撑爆才轮到这句。
@@ -391,16 +420,7 @@ impl WebClient {
             );
             buf.extend_from_slice(&chunk);
         }
-        let bytes = buf;
-        // 搜索结果/页内链接常直指 PDF 等文件:当 HTML 解析只会出乱码,如实拦下指路
-        if let Some(hint) = non_page_hint(&ctype, &bytes) {
-            bail!("{hint}");
-        }
-        let html = String::from_utf8_lossy(&bytes);
-        let page = extract_page(&html, &final_url);
-        anyhow::ensure!(!page.text.trim().is_empty(), "页面没有可读正文(可能是纯脚本应用)");
-        self.cache_put(url, &page);
-        Ok(page)
+        Ok((final_url, ctype_full, buf))
     }
 
     fn cache_get(&self, url: &str) -> Option<String> {
@@ -799,7 +819,11 @@ fn extract_links(doc: &Html, base_url: &str) -> (Vec<PageLink>, usize) {
                 None => continue,
             },
         };
-        if !matches!(abs.scheme(), "http" | "https") {
+        // http(s) 之外也收下载类协议(2026-09-17 电影天堂实锤:影片页的下载链接全是
+        // `magnet:` 的 <a>,原先只留 http(s) → 模型看到的页面一个下载地址都没有):磁力交
+        // torrent_download,ftp / 迅雷 / 快车 / 旋风交 web_download(它会拆专用链),ed2k 收下
+        // 让模型如实说下不了。其余(javascript / mailto / tel…)照旧丢。
+        if !is_link_scheme(abs.scheme()) {
             continue;
         }
         let abs_s = abs.to_string();
@@ -809,11 +833,7 @@ fn extract_links(doc: &Html, base_url: &str) -> (Vec<PageLink>, usize) {
         let mut text: String =
             a.text().collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
         if text.is_empty() {
-            text = abs
-                .path_segments()
-                .and_then(|mut s| s.next_back())
-                .map(percent_decode)
-                .unwrap_or_default();
+            text = link_fallback_text(&abs);
         }
         total += 1;
         // 超了上限就只数不收 —— 数目要报给模型(截断不说 = 模型以为链接就这些,
@@ -917,6 +937,170 @@ fn largest_srcset(srcset: &str) -> Option<&str> {
         })
         .max_by(|a, b| a.0.total_cmp(&b.0))
         .map(|(_, url)| url)
+}
+
+/// 页内链接收哪些协议:网页 + 我们有工具能接的下载类专用链(见 `extract_links` 注)。
+/// 壳层快照脚本按同一张表收(`LINK_SCHEME` 正则),两条路一个口径。
+pub fn is_link_scheme(scheme: &str) -> bool {
+    matches!(scheme, "http" | "https" | "magnet" | "ftp" | "ed2k" | "thunder" | "flashget" | "qqdl")
+}
+
+/// 无文字锚的名字:磁力用 dn=(种子名);ftp / http 用目标文件名(百分号解码);其余按协议给类别名。
+fn link_fallback_text(abs: &url::Url) -> String {
+    let file_name = || {
+        abs.path_segments()
+            .and_then(|mut s| s.next_back())
+            .filter(|s| !s.is_empty())
+            .map(percent_decode)
+    };
+    match abs.scheme() {
+        "magnet" => abs
+            .query_pairs()
+            .find(|(k, _)| k == "dn")
+            .map(|(_, v)| v.into_owned())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "磁力链接".into()),
+        "ftp" => file_name().unwrap_or_else(|| "FTP 直链".into()),
+        "ed2k" => "电驴 ed2k 链接".into(),
+        "thunder" | "flashget" | "qqdl" => "下载器专用链".into(),
+        _ => file_name().unwrap_or_default(),
+    }
+}
+
+/// META 字符集预扫的字节数(HTML 规范的 1024 太紧,老站 META 前常堆一屏注释 / 脚本)。
+const META_PRESCAN_BYTES: usize = 4096;
+/// 跳板页:正文少于这么多字才考虑跟跳转(真文章页也可能内嵌 location.href,不能见了就跳)。
+const STUB_TEXT_MAX_CHARS: usize = 80;
+/// 跳板页最多跟几跳(dy2018 → dytt8899 一跳;链式跳板极少,3 是失控 backstop)。
+const STUB_HOPS: usize = 3;
+/// 跳板页扫描前多少字节(跳转脚本都在头部)。
+const STUB_SCAN_BYTES: usize = 8192;
+
+/// 按声明的字符集把页面字节解成文本(2026-09-17):响应头 `charset=` 优先,没有就在前
+/// `META_PRESCAN_BYTES` 里找 `<meta charset=…>` / `<meta http-equiv=Content-Type content="…; charset=…">`,
+/// 都没有按 UTF-8。电影天堂这类老站全是 gb2312 且只在 META 里声明 —— 原先一律
+/// `from_utf8_lossy`,整页乱码。标签交 `encoding_rs`(gb2312 / gbk / gb18030 / big5 / shift_jis…
+/// 都认),认不出的标签按 UTF-8。
+pub fn decode_html(bytes: &[u8], content_type: &str) -> String {
+    let label = charset_of(content_type).or_else(|| meta_charset(bytes));
+    let enc = label
+        .and_then(|l| encoding_rs::Encoding::for_label(l.trim().as_bytes()))
+        .unwrap_or(encoding_rs::UTF_8);
+    enc.decode(bytes).0.into_owned()
+}
+
+/// `text/html; charset=gb2312` / `content="…; charset='gbk'"` → Some("gb2312" / "gbk")。
+fn charset_of(content_type: &str) -> Option<String> {
+    let lower = content_type.to_ascii_lowercase();
+    let i = lower.find("charset=")?;
+    let rest = lower[i + "charset=".len()..].trim_start_matches(['"', '\'', ' ']);
+    let v: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+        .collect();
+    (!v.is_empty()).then_some(v)
+}
+
+/// 前 `META_PRESCAN_BYTES` 里的 META 字符集声明(两种写法都认);只看 ASCII,大小写不敏感。
+fn meta_charset(bytes: &[u8]) -> Option<String> {
+    let head = &bytes[..bytes.len().min(META_PRESCAN_BYTES)];
+    let text = String::from_utf8_lossy(head).to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(i) = text[from..].find("<meta") {
+        let start = from + i;
+        let end = text[start..].find('>').map(|e| start + e).unwrap_or(text.len());
+        if let Some(c) = charset_of(&text[start..end]) {
+            return Some(c);
+        }
+        from = end.max(start + "<meta".len());
+        if from >= text.len() {
+            break;
+        }
+    }
+    None
+}
+
+/// 跳板页的跳转目标(纯函数):`location.href = '…'` / `location.replace('…')` / `location = '…'` /
+/// `<meta http-equiv="refresh" content="0;url=…">`。只在正文几乎为空时由 `fetch_page` 调用
+/// (文章页也可能内嵌这类脚本,不能见了就跳);相对地址按 base 解析;非 http(s) 目标不跟。
+pub fn stub_redirect(html: &str, base: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase(); // 只动 ASCII,字节偏移与 html 一致
+    let mut n = lower.len().min(STUB_SCAN_BYTES);
+    while !lower.is_char_boundary(n) {
+        n -= 1;
+    }
+    let head = &lower[..n];
+    let (s, e) = find_js_target(head).or_else(|| find_meta_refresh(head))?;
+    let raw = html[s..e].trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let abs = url::Url::parse(base).ok()?.join(raw).ok()?;
+    matches!(abs.scheme(), "http" | "https").then(|| abs.to_string())
+}
+
+/// `location[.href] = '…'` / `location.replace('…')` / `location.assign('…')` 里引号内的字节区间。
+fn find_js_target(lower: &str) -> Option<(usize, usize)> {
+    let b = lower.as_bytes();
+    let skip_ws = |mut q: usize| {
+        while q < b.len() && b[q].is_ascii_whitespace() {
+            q += 1;
+        }
+        q
+    };
+    let mut from = 0;
+    while let Some(i) = lower[from..].find("location") {
+        let word = from + i;
+        let mut p = skip_ws(word + "location".len());
+        let mut quoted_at: Option<usize> = None;
+        if lower[p..].starts_with(".href") {
+            p = skip_ws(p + ".href".len());
+        }
+        for call in [".replace", ".assign"] {
+            if lower[p..].starts_with(call) {
+                let q = skip_ws(p + call.len());
+                if q < b.len() && b[q] == b'(' {
+                    quoted_at = Some(skip_ws(q + 1));
+                }
+            }
+        }
+        if quoted_at.is_none() && p < b.len() && b[p] == b'=' && b.get(p + 1) != Some(&b'=') {
+            quoted_at = Some(skip_ws(p + 1));
+        }
+        if let Some(q) = quoted_at {
+            if q < b.len() && (b[q] == b'\'' || b[q] == b'"') {
+                let s = q + 1;
+                if let Some(e) = lower[s..].find(b[q] as char) {
+                    return Some((s, s + e));
+                }
+            }
+        }
+        from = word + "location".len();
+    }
+    None
+}
+
+/// `<meta http-equiv="refresh" content="0;url=…">` 里 url= 之后到引号 / 分号的字节区间。
+fn find_meta_refresh(lower: &str) -> Option<(usize, usize)> {
+    let mut from = 0;
+    while let Some(i) = lower[from..].find("<meta") {
+        let start = from + i;
+        let end = lower[start..].find('>').map(|e| start + e).unwrap_or(lower.len());
+        let tag = &lower[start..end];
+        if tag.contains("refresh") {
+            if let Some(u) = tag.find("url=") {
+                let s = start + u + "url=".len();
+                let rest = &lower[s..end];
+                let e = rest.find(['"', '\'', ';']).unwrap_or(rest.len());
+                return Some((s, s + e));
+            }
+        }
+        from = end.max(start + "<meta".len());
+        if from >= lower.len() {
+            break;
+        }
+    }
+    None
 }
 
 /// 按字符数截断(给模型的预算闸)。算法在 `crate::text::clip` 单源(绝不按字节切),
@@ -1208,6 +1392,69 @@ mod tests {
         let old: Page =
             serde_json::from_str(r#"{"title":"t","text":"x","links":[],"links_total":0}"#).unwrap();
         assert!(old.images.is_empty());
+    }
+
+    /// 字符集:响应头优先 → META 两种写法 → 都没有按 UTF-8(2026-09-17 电影天堂 gb2312 实锤)。
+    #[test]
+    fn decode_html_honours_header_then_meta_charset() {
+        let (gbk, _, _) = encoding_rs::GBK.encode(
+            "<html><head><META http-equiv=Content-Type content=\"text/html; charset=gb2312\"></head>\
+             <body><p>电影天堂</p></body></html>",
+        );
+        assert!(decode_html(&gbk, "text/html").contains("电影天堂"), "META 声明的 gb2312 要认");
+        assert!(decode_html(&gbk, "text/html; charset=GBK").contains("电影天堂"), "响应头声明优先");
+        let (gbk2, _, _) = encoding_rs::GBK.encode("<meta charset=\"gbk\"><p>海报</p>");
+        assert!(decode_html(&gbk2, "").contains("海报"), "<meta charset=…> 写法也认");
+        assert!(decode_html("<p>正文</p>".as_bytes(), "text/html").contains("正文"), "没声明按 UTF-8");
+        assert_eq!(charset_of("text/html; charset=gb2312").as_deref(), Some("gb2312"));
+        assert_eq!(charset_of("text/html").as_deref(), None);
+    }
+
+    /// 跳板页:JS 三种写法 + meta refresh 都跟;相对地址按 base;比较 / 非 http 目标不跟。
+    #[test]
+    fn stub_redirect_follows_js_and_meta_but_not_non_http() {
+        let base = "https://www.dy2018.com/";
+        assert_eq!(
+            stub_redirect("<script>\n  window.location.href = 'https://www.dytt8899.com';\n</script>", base)
+                .as_deref(),
+            Some("https://www.dytt8899.com/")
+        );
+        assert_eq!(
+            stub_redirect("<script>location.replace(\"/new/index.html\")</script>", base).as_deref(),
+            Some("https://www.dy2018.com/new/index.html")
+        );
+        assert_eq!(
+            stub_redirect("<script>top.location = 'https://b.example.com/'</script>", base).as_deref(),
+            Some("https://b.example.com/")
+        );
+        assert_eq!(
+            stub_redirect("<META HTTP-EQUIV=\"refresh\" CONTENT=\"0;url=https://a.example.com/x\">", base)
+                .as_deref(),
+            Some("https://a.example.com/x")
+        );
+        assert_eq!(stub_redirect("<script>if (location.href == 'x') { go(); }</script>", base), None, "比较不是赋值");
+        assert_eq!(stub_redirect("<script>location.href='javascript:void(0)'</script>", base), None, "非 http 目标不跟");
+        assert_eq!(stub_redirect("<p>普通正文,没有跳转</p>", base), None);
+    }
+
+    /// 页内链接收下载类协议并给名字:磁力用 dn=、ftp 用文件名、专用链给类别名;mailto / js 照旧丢。
+    #[test]
+    fn extract_links_keeps_download_schemes_with_labels() {
+        let html = r##"<html><body>
+          <a href="magnet:?xt=urn:btih:abc&amp;dn=%5B%E7%94%B5%E5%BD%B1%E5%A4%A9%E5%A0%82%5D%E8%94%B7%E8%8A%B1.mp4&amp;tr=http://t/announce"></a>
+          <a href="ftp://dy:dy@ftp.example.com/movie.mkv"></a>
+          <a href="thunder://QUFodHRwOi8vZXhhbXBsZS5jb20vYS5tcDRaWg=="></a>
+          <a href="mailto:x@y.z">写信</a>
+          <a href="javascript:void(0)">JS</a>
+        </body></html>"##;
+        let page = extract_page(html, "https://www.dytt8899.com/i/1.html");
+        let urls: Vec<&str> = page.links.iter().map(|l| l.url.as_str()).collect();
+        assert_eq!(urls.len(), 3, "磁力 / ftp / 迅雷收下,mailto / js 丢:{urls:?}");
+        assert!(urls[0].starts_with("magnet:?xt=urn:btih:abc"), "{}", urls[0]);
+        assert_eq!(page.links[0].text, "[电影天堂]蔷花.mp4", "磁力无锚文字用 dn= 种子名");
+        assert_eq!(page.links[1].text, "movie.mkv", "ftp 用文件名");
+        assert_eq!(page.links[2].text, "下载器专用链");
+        assert_eq!(page.links_total, 3);
     }
 
     #[test]

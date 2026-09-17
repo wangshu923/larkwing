@@ -89,6 +89,16 @@ function wire() {
       error: { key: 'task.err.resolve' },
       retry: { type: 'media_play', data: { page_url: 'https://www.bilibili.com/video/BV1xx', audio_only: false } },
     })
+    // 可取消的回合内长活 + 附注行(2026-09-17):分头办事卡的形
+    upsert({
+      task_id: 4,
+      kind: 'delegate',
+      label: { key: 'task.delegate', params: { t: '查三家云盘的价格' } },
+      state: 'running',
+      step: { key: 'tool.web_fetch' },
+      meta: { key: 'step.delegate_stats', params: { calls: 7, tokens: 18420 } },
+      cancellable: true,
+    })
     let p = 0.34
     const timer = setInterval(() => {
       p = Math.min(1, p + 0.02)

@@ -2,10 +2,11 @@
 // 任务 HUD:窗口右缘垂直堆叠的进度卡(标题 + 当前步骤 + 进度条)。
 // 超过 4 条折叠成汇总胶囊;视频全屏时缩成右上角迷你胶囊,不挡画面。
 // 确认卡(§7.8 确认闸)与任务卡同族同区:置顶、不随折叠收起(它在等人点头,必须可见)。
-import { computed } from 'vue'
+import { computed, reactive } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useTasks } from '../composables/useTasks'
 import { useMedia } from '../composables/useMedia'
+import { useChat } from '../composables/useChat'
 import { confirmActionPhrase, isScopeCard, useConfirm } from '../composables/useConfirm'
 import { planProgress, usePlan } from '../composables/usePlan'
 import { api, type ConfirmCard, type PlanCard, type TaskView, type TextRef } from '../lib/backend'
@@ -13,8 +14,14 @@ import { api, type ConfirmCard, type PlanCard, type TaskView, type TextRef } fro
 const { t, te } = useI18n()
 const { state, dismiss } = useTasks()
 const { state: media } = useMedia()
+const { state: chat } = useChat()
 const confirm = useConfirm()
 const plan = usePlan()
+// 点了「停止」到卡收尾之间的即时反馈(协作式取消要等正在做的这一步做完;没反馈会被当成没按到)
+const stopping = reactive<Record<number, boolean>>({})
+// 计划卡随活动(2026-09-17 用户「任务结束了还挂在那儿」):回合在飞、或有任务在跑时才显;
+// 都停了就淡出。槽仍留给模型(〔此刻〕照带),它再调 plan_set 或回合再起时卡就回来。
+const planLive = computed(() => chat.usage.turnStartedAt != null || running.value > 0)
 
 // 计划卡进度条宽度(done/total;total 恒 >0,空快照到不了渲染层)
 function planPct(p: PlanCard): string {
@@ -48,7 +55,10 @@ function retry(task: TaskView) {
 // 停止运行中的后台任务(带 bg 编号的卡才有钮):直连 bgtasks 协作旗标 —— 做错了
 // 不用跟模型说「停下」再烧一轮 token。协作式:正在做的这项做完就停,卡片随终态快照收尾。
 function stop(task: TaskView) {
+  stopping[task.task_id] = true
   if (task.bg != null) void api.bgCancel(task.bg)
+  // 回合内长活(解析 / 分头办事同步段)挂的是任务卡自己的取消令牌:两把钥匙都拧(可同时有)
+  if (task.cancellable) void api.taskStop(task.task_id)
 }
 
 const running = computed(() => state.tasks.filter(x => x.state === 'running').length)
@@ -68,7 +78,7 @@ function txt(ref?: TextRef, fallback = 'task.unknown'): string {
   <div
     class="tasks"
     :class="{ mini: media.fullscreen }"
-    v-if="state.tasks.length || confirm.state.cards.length || plan.cards.value.length"
+    v-if="state.tasks.length || confirm.state.cards.length || (plan.cards.value.length && planLive)"
   >
     <!-- 确认卡(§7.8):等人点头的动作,置顶、永不折叠;终态短暂停留后自动淡出 -->
     <TransitionGroup name="card" tag="div" class="stack" v-if="confirm.state.cards.length">
@@ -94,7 +104,7 @@ function txt(ref?: TextRef, fallback = 'task.unknown'): string {
     </TransitionGroup>
 
     <!-- 计划卡(§6.5):BT 干长活的步骤清单进度;纯展示无按钮,空快照即收卡 -->
-    <TransitionGroup name="card" tag="div" class="stack" v-if="plan.cards.value.length">
+    <TransitionGroup name="card" tag="div" class="stack" v-if="plan.cards.value.length && planLive">
       <div v-for="p in plan.cards.value" :key="'plan-' + p.conv_id" class="card">
         <div class="row">
           <span class="label">📋 {{ p.title || t('plan.title') }}</span>
@@ -118,10 +128,11 @@ function txt(ref?: TextRef, fallback = 'task.unknown'): string {
         <div class="row">
           <span class="label">{{ txt(task.label) }}</span>
           <button
-            v-if="task.state === 'running' && task.bg != null"
+            v-if="task.state === 'running' && (task.bg != null || task.cancellable)"
             class="stop"
+            :disabled="stopping[task.task_id]"
             @click="stop(task)"
-          >{{ t('task.stop') }}</button>
+          >{{ stopping[task.task_id] ? t('task.stopping') : t('task.stop') }}</button>
           <button
             v-if="task.state === 'failed' && task.retry"
             class="retry"
@@ -137,6 +148,8 @@ function txt(ref?: TextRef, fallback = 'task.unknown'): string {
         </div>
         <div v-if="task.state === 'failed'" class="step err">{{ txt(task.error) }}</div>
         <div v-else-if="task.step" class="step">{{ txt(task.step) }}</div>
+        <!-- 附注行(分头办事的「工具 N 次 · token M」这类统计;core 只给 key+params) -->
+        <div v-if="task.meta && task.state === 'running'" class="step meta">{{ txt(task.meta) }}</div>
         <div class="bar" v-if="task.state === 'running'">
           <div
             v-if="task.progress != null"
@@ -235,6 +248,7 @@ function txt(ref?: TextRef, fallback = 'task.unknown'): string {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .step.err { color: var(--attn); }
+.step.meta { font-size: 10.5px; color: var(--text-dim); margin-top: 1px; }
 
 .bar {
   margin-top: 7px; height: 3px; border-radius: 2px; overflow: hidden;
