@@ -73,7 +73,12 @@ struct SessionEntry {
     /// 通读(read)定格:同一导航代次内全文只抽一次,offset 从这份定格切 → 语义稳定
     /// (滚动不换代;换页/重导航 = load_seq 变 = 自动重抽)。
     read_cache: Mutex<Option<ReadCache>>,
-    last_used: Mutex<Instant>,
+    /// 最近一次「在用」:agent 调一步 / 用户点了窗(Focused)/ 窗里发生导航都算(2026-09-17 后两条
+    /// 是新加的 —— 原先只有 agent 调步才算,用户在窗里接手登录时窗会在手底下过期消失)。
+    /// Arc:窗口回调闭包在 entry 建成之前就要拿到它。
+    last_used: Arc<Mutex<Instant>>,
+    /// 窗题的「本体」(站名 → 快照后换成页标题):倒计时拼在它后面显示,别把倒计时当本体存回去。
+    title: Mutex<String>,
 }
 
 /// 通读定格(见 `SessionEntry::read_cache`)。
@@ -89,6 +94,24 @@ impl SessionEntry {
     fn touch(&self) {
         *self.last_used.lk() = Instant::now();
     }
+
+    /// 距 TTL 收摊还剩多久(0 = 该收了)。
+    fn remaining(&self) -> Duration {
+        SESSION_TTL.saturating_sub(self.last_used.lk().elapsed())
+    }
+
+    /// 窗题 = 本体 · ⏱ mm:ss(2026-09-17 用户「TTL 有没有办法让人看见」,原先到点静默 destroy):
+    /// 清扫每 30s 一拍刷一次,agent 调步 / 快照后也刷。计时格式语言中立,壳层不产句子(§6.6)。
+    fn refresh_title(&self) {
+        let base = self.title.lk().clone();
+        let _ = self.win.set_title(&ttl_title(&base, self.remaining()));
+    }
+}
+
+/// `本体 · ⏱ 07:30`(纯函数,可测)。
+fn ttl_title(base: &str, remaining: Duration) -> String {
+    let s = remaining.as_secs();
+    format!("{base} · ⏱ {:02}:{:02}", s / 60, s % 60)
 }
 
 pub struct ShellWebRenderer {
@@ -106,6 +129,11 @@ impl ShellWebRenderer {
         tauri::async_runtime::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
+                // 倒计时上窗题(2026-09-17):锁内取快照、锁外改题(set_title 走事件循环,别持锁调)
+                let live: Vec<Arc<SessionEntry>> = sweep.lk().values().cloned().collect();
+                for e in &live {
+                    e.refresh_title();
+                }
                 let expired: Vec<(String, Arc<SessionEntry>)> = {
                     let map = sweep.lk();
                     map.iter()
@@ -436,13 +464,14 @@ async fn browse_step_inner(
     if let Some(p) = &page {
         let t: String = p.title.trim().chars().take(40).collect();
         if !t.is_empty() {
-            let _ = entry.win.set_title(&t);
+            *entry.title.lk() = t; // 只换本体;带倒计时的窗题由下面 refresh_title 拼
         }
     }
     // 截图(模型自行决定要不要;没打开窗就没得截 —— 到这步窗必在,截不到只因平台/组件不支持)。
     // 工具结果多媒体第一个消费者:图随 ToolOutput 图片 part 回给模型,非视觉模型出向层降级。
     let screenshot = if req.screenshot { capture_screenshot(&entry.win).await } else { None };
     entry.touch();
+    entry.refresh_title(); // 刚用过 = 倒计时回满,窗题立刻跟上(不等下一拍清扫)
     Ok(RenderOutcome {
         page,
         download,
@@ -516,6 +545,10 @@ fn open_session(
 
     // 右下角缩略位(定位失败回落一个无害默认;margin 给任务栏/dock 留身位)
     let (px, py) = thumb_position(app).unwrap_or((80.0, 80.0));
+    // 「在用」时刻先于窗建好:导航 / 聚焦两个回调闭包要拿着它续 TTL(2026-09-17)
+    let last_used = Arc::new(Mutex::new(Instant::now()));
+    let last_used_nav = last_used.clone();
+    let last_used_evt = last_used.clone();
     let win = tauri::WebviewWindowBuilder::new(app, &sid, tauri::WebviewUrl::External(url))
         .title(&host)
         .inner_size(THUMB_W, THUMB_H)
@@ -535,6 +568,7 @@ fn open_session(
         .initialization_script(POPUP_TAME_JS)
         .on_navigation(move |u| {
             nav_slot.lk().push((Instant::now(), u.to_string()));
+            *last_used_nav.lk() = Instant::now(); // 窗里发生导航 = 在用(用户点链接 / 登录跳转都算)
             true // 只观察不拦
         })
         .on_download(move |_wv, ev| {
@@ -581,6 +615,11 @@ fn open_session(
                     let _ = win_evt.set_zoom((w / PAGE_LAYOUT_W).clamp(0.15, 1.5));
                 }
             }
+            tauri::WindowEvent::Focused(true) => {
+                // 用户点了窗 = 在用:续 TTL(窗题的倒计时在下一拍清扫时回满,≤30s)。
+                // 只改时刻不在回调里 set_title:事件回调跑在主线程,别再往事件循环里塞调度。
+                *last_used_evt.lk() = Instant::now();
+            }
             tauri::WindowEvent::Destroyed => {
                 // 用户手动关窗 / 被销毁:注册表同步摘除(幂等——清扫/挤位路径已先摘)。
                 // 必须真摘掉:漏一次就永久占着一个会话槽(SESSION_MAX 个),攒满就开不出窗。
@@ -598,7 +637,8 @@ fn open_session(
         load_seq,
         download_dir,
         read_cache: Mutex::new(None),
-        last_used: Mutex::new(Instant::now()),
+        last_used,
+        title: Mutex::new(host.clone()),
     });
     sessions.lk().insert(sid.clone(), entry.clone());
     Ok((sid, entry))
@@ -1685,6 +1725,14 @@ fn build_snapshot_script(collect_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 窗题倒计时格式(2026-09-17):本体 · ⏱ mm:ss,语言中立。
+    #[test]
+    fn ttl_title_formats_mmss() {
+        assert_eq!(ttl_title("电影天堂", Duration::from_secs(450)), "电影天堂 · ⏱ 07:30");
+        assert_eq!(ttl_title("x", Duration::from_secs(0)), "x · ⏱ 00:00");
+        assert_eq!(ttl_title("x", SESSION_TTL), format!("x · ⏱ {:02}:00", SESSION_TTL.as_secs() / 60));
+    }
 
     /// 通读脚本的形状守卫;`--nocapture` 打印成品脚本给预览浏览器冒烟(upload 同款手法)。
     #[test]
