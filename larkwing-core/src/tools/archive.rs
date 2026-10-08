@@ -124,7 +124,7 @@ impl Tool for FsUnzip {
 
         match ctx
             .media
-            .extract_archive(archive, target, password, (ctx.user_id, ctx.conv_id))
+            .extract_archive(archive, target, password, (ctx.user_id, ctx.conv_id), ctx.in_batch.clone())
             .await?
         {
             ExtractOutcome::Done(rep, dest) => Ok(format!(
@@ -268,7 +268,7 @@ impl Tool for FsZip {
                 .with_context(|| format!("建不出输出目录 {}", dest_dir.display()))?;
         }
 
-        match ctx.media.create_zip(inputs, dest, (ctx.user_id, ctx.conv_id)).await? {
+        match ctx.media.create_zip(inputs, dest, (ctx.user_id, ctx.conv_id), ctx.in_batch.clone()).await? {
             ZipOutcome::Done { path, files, bytes, note } => Ok(format!(
                 "打包好了:{}({},{files} 个文件)。{note}重名时已自动加序号,原件没动。",
                 path.display(),
@@ -311,6 +311,8 @@ mod tests {
                 confirm: None,
                 grants: Default::default(),
                 agent: None,
+                batch: None,
+                in_batch: None,
             },
             dir,
         )

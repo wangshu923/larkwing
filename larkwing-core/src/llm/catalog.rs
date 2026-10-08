@@ -150,13 +150,16 @@ fn catalog() -> &'static [ModelInfo] {
 /// 第 5 列 = 上下文窗口(token,2026-06 采集快照;发版前可校)。
 fn build_catalog() -> Vec<ModelInfo> {
     vec![
-        // DeepSeek(默认供应商;V4 全系 1M 窗口。牌价 = 2026-08-21 调价后的**高峰价**快照
+        // DeepSeek(默认供应商;全系 1M 窗口。牌价 = 官方定价页 2026-09-14 版的**高峰价**快照
         // (官方分时计价:空闲时段对折——不建模,同缓存折扣「宁可高估不低估」口径)。
+        // 2026-09-14 起现役只有两个 id:deepseek-flash(V4.1-Flash,官方明写支持图像理解)+ deepseek-v4-pro(不支持);
+        // 旧名 deepseek-v4-flash / deepseek-v4-flash-vision-exp 官方仍收、请求由 V4.1-Flash 代为服务 → 行留着、按新价计。
         // vision-exp 的 id **包含** deepseek-v4-flash 子串:必须排在 flash 行之前,
         // 否则被错杀成 vision=false、图遭降级(kimi-k2.5 被 kimi-k2 错杀同款坑)。
-        m("deepseek-v4-flash-vision-exp", Tier::Light, true, Some(0.44), Some(1.32), Some(1_000_000)), // 实验性多模态,flash 同价(一张图 ≤384 token)
-        m("deepseek-v4-flash", Tier::Light, false, Some(0.44), Some(1.32), Some(1_000_000)),
-        m("deepseek-v4", Tier::Balanced, false, Some(1.32), Some(3.96), Some(1_000_000)), // V4-Pro 实价
+        m("deepseek-flash", Tier::Light, true, Some(0.3), Some(1.2), Some(1_000_000)), // V4.1-Flash 现役 id
+        m("deepseek-v4-flash-vision-exp", Tier::Light, true, Some(0.3), Some(1.2), Some(1_000_000)), // 退役旧名,由 V4.1-Flash 服务
+        m("deepseek-v4-flash", Tier::Light, false, Some(0.3), Some(1.2), Some(1_000_000)), // 退役旧名;官方没明说旧名收不收图 → 保守不翻(§6.3 宁可少看图不打挂回合)
+        m("deepseek-v4", Tier::Balanced, false, Some(1.32), Some(3.96), Some(1_000_000)), // V4-Pro:官方页明写图像理解不支持
         m("deepseek-chat", Tier::Balanced, false, Some(0.28), Some(0.42), Some(1_000_000)), // 旧名,2026-07-24 弃用前仍可能遇到
         m("deepseek-reasoner", Tier::Smart, false, Some(0.28), Some(0.42), Some(1_000_000)),
         // Anthropic(Opus/Sonnet 1M,Haiku 200K)
@@ -317,6 +320,8 @@ mod tests {
     fn specific_entries_win_over_family_entries() {
         // -flash 必须先于 deepseek-v4 命中
         assert_eq!(tier_of("deepseek-v4-flash"), Tier::Light);
+        // 现役 id deepseek-flash 不含 deepseek-v4 子串,靠自己那一行命中(未登记就掉进均衡档 + 不报钱)
+        assert_eq!(tier_of("deepseek-flash"), Tier::Light);
         assert_eq!(tier_of("gpt-5-mini-2026-01"), Tier::Light);
         assert_eq!(tier_of("gpt-5"), Tier::Smart);
     }
@@ -335,7 +340,9 @@ mod tests {
         let usage =
             Usage { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_hit_tokens: 0 };
         let cost = est_cost_usd("deepseek-v4-pro", &usage).unwrap();
-        assert!((cost - 5.28).abs() < 1e-9, "1.32 + 3.96 = 5.28(2026-08-21 高峰价),实际 {cost}");
+        assert!((cost - 5.28).abs() < 1e-9, "1.32 + 3.96 = 5.28(2026-09-14 高峰价),实际 {cost}");
+        let cost = est_cost_usd("deepseek-flash", &usage).unwrap();
+        assert!((cost - 1.5).abs() < 1e-9, "0.3 + 1.2 = 1.5(V4.1-Flash 2026-09-14 高峰价),实际 {cost}");
     }
 
     #[test]
@@ -423,15 +430,18 @@ mod tests {
         assert!(!supports_vision("qwen-max"), "qwen-max 的 API 仍纯文本");
         assert!(!supports_vision("llava:13b"), "目录不认识 → false,靠覆盖标");
         assert!(supports_vision("gemini-2.5-flash") && supports_vision("claude-sonnet-5"));
-        // DeepSeek 2026-08-21 起:图片输入只有 vision-exp 一个;flash/pro 仍纯文本。
-        // vision-exp 含 deepseek-v4-flash 子串 → 这条断言同时钉住「特异在前」的排序承重。
+        // DeepSeek 官方定价页 2026-09-14 版:现役 deepseek-flash(V4.1-Flash)支持图像理解、deepseek-v4-pro 不支持;
+        // 退役旧名 vision-exp 仍收(由 V4.1-Flash 服务)。vision-exp 含 deepseek-v4-flash 子串 →
+        // 那条断言同时钉住「特异在前」的排序承重。
+        assert!(supports_vision("deepseek-flash"), "V4.1-Flash 现役 id 能看图");
+        assert!(supports_vision("openrouter/deepseek/deepseek-flash"), "中转前缀照认");
         assert!(
             supports_vision("deepseek-v4-flash-vision-exp"),
             "vision-exp 多模态;若失败多半是目录排序被动过(flash 行抢先命中)"
         );
         assert!(supports_vision("openrouter/deepseek/deepseek-v4-flash-vision-exp"), "中转前缀照认");
-        assert!(!supports_vision("deepseek-v4-flash"), "flash 本体仍纯文本");
-        assert!(!supports_vision("deepseek-v4"), "V4-Pro 仍纯文本(DeepSeek 图片输入只有 vision-exp)");
+        assert!(!supports_vision("deepseek-v4-flash"), "退役旧名保守不翻(官方没明说旧名收不收图)");
+        assert!(!supports_vision("deepseek-v4"), "V4-Pro:官方页明写图像理解不支持");
     }
 
     #[test]

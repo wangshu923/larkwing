@@ -376,6 +376,15 @@ impl BgTasks {
     /// 分开:汇报不自动念、系统线也不贴「到点了」(2026-08-15 真机:打字支使它干活,汇报却被念出来)。
     /// 插不进去只 warn(汇报丢了不至于砸任务;任务条终态仍在)。
     fn report(&self, origin: (i64, i64), text: String) {
+        // 末尾带一行后台状态(2026-10-08):「都完了」要有正向信号 —— 从前全部跑完时〔此刻〕那行
+        // 只是消失,模型拿不到一个「没有在跑的了」,于是每条汇报都答「等它们完成」。调用方
+        // (finish / Drop / 看门狗)都先置了终态再进来,所以 running 计数天然不含自己。
+        let others = self.inner.entries.lk().iter().filter(|e| e.running()).count();
+        let text = if others == 0 {
+            format!("{text}\n(后台已经没有在跑的活。)")
+        } else {
+            format!("{text}\n(后台另有 {others} 件活还在跑。)")
+        };
         let store = self.inner.store.clone();
         let (user_id, conv_id) = origin;
         let due = now_ms();
@@ -445,6 +454,39 @@ impl BgTicket {
         // finished 已置,Drop 兜底看到终态即跳过
     }
 }
+
+/// 进度落点(2026-10-08,batch 分批干活引入):长活「打点 / 查取消」的最小接口。`BgTicket` 原生实现;
+/// 分批时 inline 跑的内层工具拿到的是**整批**的落点(engine::batch::BatchScope),进度打到组的票据上 ——
+/// 看门狗据此判活,与自己开票据的路同一口径。tools / media 只认这个 trait,不认具体类型。
+pub trait Beat: Send + Sync {
+    fn beat(&self, done: usize, current: String);
+    fn is_cancelled(&self) -> bool;
+}
+
+impl Beat for BgTicket {
+    fn beat(&self, done: usize, current: String) {
+        BgTicket::beat(self, done, current)
+    }
+
+    fn is_cancelled(&self) -> bool {
+        BgTicket::is_cancelled(self)
+    }
+}
+
+/// 「容量撞限」类型标记(2026-10-08,batch 自适应用):工具失败的原因是**并发 / 配额上限**(显卡编码
+/// 会话数、以后的下载限流…),不是活本身有问题。挂在 anyhow 错误链上
+/// (`anyhow::Error::new(CapacityHit).context(话术)`,微信 `StaleContext` 同款手法):batch 的工作池
+/// 见它 → 并行降档、这件重排、不算失败;单独调时与普通错误无异(话术照回模型,标记无感)。
+#[derive(Debug, Clone, Copy)]
+pub struct CapacityHit;
+
+impl std::fmt::Display for CapacityHit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("撞上并发 / 配额上限")
+    }
+}
+
+impl std::error::Error for CapacityHit {}
 
 impl Drop for BgTicket {
     fn drop(&mut self) {
@@ -528,6 +570,25 @@ mod tests {
         assert_eq!(jobs[0].conv_id, 42);
         assert!(jobs[0].content.contains("下好 3 首"));
         assert_eq!(jobs[0].kind, "report", "汇报要与到点提醒分家(桌面据此决定念不念)");
+        assert!(
+            jobs[0].content.ends_with("(后台已经没有在跑的活。)"),
+            "没别的在跑 = 正向的「都完了」信号(2026-10-08):{}",
+            jobs[0].content
+        );
+    }
+
+    /// 汇报末尾的后台状态行(2026-10-08):别的还在跑就报个数,模型据此知道这不是最后一件。
+    #[test]
+    fn report_tells_how_many_others_still_run() {
+        let store = temp_store("others");
+        let bg = BgTasks::new(store.clone());
+        let keep = bg.submit("成批:剪第一批".into(), (1, 7), 12).unwrap();
+        let t = bg.submit("下载文件(a.mp4)".into(), (1, 7), 100).unwrap();
+        t.finish(true, "下好了");
+        let jobs = store.jobs.due(now_ms() + 1_000).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs[0].content.ends_with("(后台另有 1 件活还在跑。)"), "{}", jobs[0].content);
+        drop(keep);
     }
 
     #[test]

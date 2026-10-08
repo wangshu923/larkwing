@@ -102,6 +102,7 @@ impl MediaRuntime {
         dest: PathBuf,
         password: Option<String>,
         origin: (i64, i64),
+        batch: Option<Arc<dyn crate::bgtasks::Beat>>,
     ) -> Result<ExtractOutcome> {
         // —— 盘点(快:只读元数据):格式 / 条数 / 总量 / 要不要密码,问题全在动手前退回 ——
         let (p_arch, p_pw) = (archive.clone(), password.clone());
@@ -143,6 +144,33 @@ impl MediaRuntime {
             }
             r
         });
+
+        // —— 批内(in_batch):这批本身已在后台,直接解到底、不另开票据不另起卡;进度打到组上,
+        //     取消看组的旗标(2026-10-08)——
+        if let Some(beat) = batch {
+            let label = dest
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "解压".into());
+            let mut turn_guard = DirCancelOnDrop::new(prog.clone(), dest.clone());
+            loop {
+                tokio::select! {
+                    res = &mut work => {
+                        let rep = res.context("解压任务挂了")??;
+                        anyhow::ensure!(!rep.cancelled, "解压被取消了,解到一半的已清理");
+                        turn_guard.disarm();
+                        return Ok(ExtractOutcome::Done(rep, dest));
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        if beat.is_cancelled() {
+                            prog.cancel.store(true, Ordering::Relaxed); // 阻塞线程见旗自清半成品
+                        }
+                        let done = prog.done.load(Ordering::Relaxed);
+                        beat.beat(done, format!("解压「{label}」({done}/{total})"));
+                    }
+                }
+            }
+        }
 
         // —— 回合内窗:解完当场回;没解完转后台 ——
         // 同 zip:回合内 30s 被取消时,阻塞线程照跑到底、把整个目标目录解满,没人删(2026-08-22)。
@@ -246,6 +274,7 @@ impl MediaRuntime {
         inputs: Vec<PathBuf>,
         dest: PathBuf,
         origin: (i64, i64),
+        batch: Option<Arc<dyn crate::bgtasks::Beat>>,
     ) -> Result<ZipOutcome> {
         let plan = tokio::task::spawn_blocking(move || engine::plan_zip(&inputs))
             .await
@@ -283,6 +312,33 @@ impl MediaRuntime {
             }
             r
         });
+
+        // —— 批内(in_batch):直接打到底、不另开票据不另起卡;进度打到组上(2026-10-08)——
+        if let Some(beat) = batch {
+            let label = dest
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "打包".into());
+            let mut turn_guard = CancelOnDrop::new(prog.clone(), tmp.clone());
+            loop {
+                tokio::select! {
+                    res = &mut work => {
+                        let rep = res.context("打包任务挂了")??;
+                        anyhow::ensure!(!rep.cancelled, "打包被取消了,半成品已清理");
+                        let (path, bytes) = place_zip(&tmp, &dest)?;
+                        turn_guard.disarm(); // 成品已落位
+                        return Ok(ZipOutcome::Done { path, files: rep.files, bytes, note: plan_note });
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        if beat.is_cancelled() {
+                            prog.cancel.store(true, Ordering::Relaxed);
+                        }
+                        let done = prog.done.load(Ordering::Relaxed);
+                        beat.beat(done, format!("打包「{label}」({done}/{total})"));
+                    }
+                }
+            }
+        }
 
         // 回合内 30s 窗被取消(用户点停/新 send 抢占)→ 外层 future 被 drop,而 spawn_blocking
         // 线程不能 abort、会照跑到底写完整包 tmp,没人 place 也没人删(2026-08-22 审计)。

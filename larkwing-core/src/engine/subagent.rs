@@ -176,6 +176,7 @@ impl Engine {
                 max_rounds: SUB_MAX_ROUNDS,
                 grants: ctx.grants.clone(), // 共享父回合授权缓存(「仅这次」含派生的子回合)
                 agent: None,                // 深度 1 双锁的另一半
+                batch: None,                // 子回合不给 batch(SUB_EXCLUDED 排除 + 这里不注入)
             }
             .run(),
         );

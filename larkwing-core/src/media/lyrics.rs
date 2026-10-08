@@ -74,10 +74,13 @@ impl MediaRuntime {
     /// 首次用时下载);≤IN_TURN_MAX 回合内跑完出逐文件报告,更多转后台 job。
     /// `origin` = (user_id, conv_id):后台 job 收尾把结果插成一条 due=now 的一次性任务,
     /// 调度器捡起自启回合 → **模型拿到成败名单向用户转述**(不能只在任务条红一下,§3.5)。
+    /// `inline` = true(在某一批 batch 里跑):这批本身已在后台,不论多少个都当场跑完出报告,
+    /// 不另开 job(2026-10-08)。
     pub async fn lyrics_for_files(
         &self,
         items: Vec<LyricsItem>,
         origin: (i64, i64),
+        inline: bool,
     ) -> Result<LyricsBatchOutcome> {
         anyhow::ensure!(!items.is_empty(), "没有收到文件");
         anyhow::ensure!(
@@ -86,7 +89,7 @@ impl MediaRuntime {
             items.len()
         );
         let ffmpeg = self.ensure_component(Component::Ffmpeg).await?;
-        if items.len() <= IN_TURN_MAX {
+        if inline || items.len() <= IN_TURN_MAX {
             let net = lyrics_client();
             let mut report = Vec::with_capacity(items.len());
             for it in &items {

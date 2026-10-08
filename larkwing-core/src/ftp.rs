@@ -252,7 +252,7 @@ struct Transfer<'a> {
     cap: u64,
     /// 调用方探到的体积(SIZE);None = 服务器不支持 SIZE,那就只能信流的 EOF。
     expected: Option<u64>,
-    progress: Option<&'a crate::bgtasks::BgTicket>,
+    progress: Option<&'a dyn crate::bgtasks::Beat>,
     policy: &'a ResumePolicy,
     /// 下一次打点的累计字节阈值(跨续传保持,免得每次重连都先打一枪)。
     next_beat: u64,
@@ -446,7 +446,7 @@ impl Transfer<'_> {
 }
 
 /// 退避等待,期间每 250ms 看一眼取消旗标(用户点了停,不该还干等十几秒)。
-async fn wait_or_cancel(wait: Duration, progress: Option<&crate::bgtasks::BgTicket>) -> Result<()> {
+async fn wait_or_cancel(wait: Duration, progress: Option<&dyn crate::bgtasks::Beat>) -> Result<()> {
     let deadline = Instant::now() + wait;
     loop {
         if progress.map(|tk| tk.is_cancelled()).unwrap_or(false) {
@@ -470,7 +470,7 @@ pub async fn download_to(
     dest: &Path,
     cap: u64,
     expected: Option<u64>,
-    progress: Option<&crate::bgtasks::BgTicket>,
+    progress: Option<&dyn crate::bgtasks::Beat>,
 ) -> Result<u64> {
     download_with(t, dest, cap, expected, progress, &ResumePolicy::default()).await
 }
@@ -480,7 +480,7 @@ async fn download_with(
     dest: &Path,
     cap: u64,
     expected: Option<u64>,
-    progress: Option<&crate::bgtasks::BgTicket>,
+    progress: Option<&dyn crate::bgtasks::Beat>,
     policy: &ResumePolicy,
 ) -> Result<u64> {
     // 建文件本身也别在 tokio worker 上做(NAS 上开个文件也能顿一下);拿回 std 句柄接着用,

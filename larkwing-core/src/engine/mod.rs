@@ -11,6 +11,7 @@ mod usage;
 // 子模块能看见父模块的私有项 → 纯搬运:字段没改可见性、签名没动、调用点没动。
 // 反过来不成立(父看不见子的私有项),所以少数被跨文件调用的私有 helper 标了 pub(super)。
 mod background;
+mod batch;
 mod conversations;
 mod dispatch;
 mod library;
@@ -342,6 +343,10 @@ pub struct Engine {
     /// 同时在跑的子回合(delegate)计数:同步等待段 + 转后台段全算(§4.11 上限 4,
     /// 满了如实退回不排队);守卫式增减,panic/取消也不漏减。
     sub_active: Arc<std::sync::atomic::AtomicUsize>,
+    /// 分批干活学到的并发上限(2026-10-08,batch 撞限自适应):工具名 → 这台机器一次吃得下几路
+    /// (ffmpeg_run 撞 NVENC 会话数时记下)。进程级瞬态:重启重学,驱动升级抬了上限不会被旧值锁死;
+    /// 之后含该工具的批 `parallel` 按它封顶,汇报里如实说。
+    batch_caps: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl Engine {
@@ -387,6 +392,7 @@ impl Engine {
             confirmer,
             weak_self: std::sync::OnceLock::new(),
             sub_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            batch_caps: Arc::new(Mutex::new(HashMap::new())),
         });
         let _ = engine.weak_self.set(Arc::downgrade(&engine));
         engine

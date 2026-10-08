@@ -20,6 +20,7 @@ export default {
     end_conversation: 'Wrapping up…',
     plan_set: 'Planning…',
     delegate: 'Delegating…',
+    batch: 'Running a batch…',
     weather: 'Checking the weather…',
     media_search: 'Searching the library…',
     media_play: 'Starting playback…',
@@ -82,6 +83,8 @@ export default {
   // Task HUD: keys map 1:1 to core Text.key (bus.rs); named interpolation params
   task: {
     progress: '{n} in progress',
+    failedCount: '{n} failed', // second half of the pill (only when something failed)
+    collapse: 'Collapse', // the verb on the pinned header when the expanded stack overflows
     retry: 'Retry', // retry button on a failed task (currently media resolve / component download)
     stop: 'Stop', // stop button on a running task (cards with a bg id or a cancel token; direct flag / token, no model round-trip)
     stopping: 'Stopping…', // instant feedback between the click and the card settling
@@ -96,6 +99,7 @@ export default {
     usage: 'Sizing up disk usage',
     web_download: 'Downloading a file',
     delegate: 'Side errand: {t}',
+    batch: 'Batch: {t}', // one batch = one card (§6.5 batch)
     relocate: 'Moving data',
     update: 'Downloading update',
     remux: 'Preparing video “{name}”',
@@ -131,6 +135,7 @@ export default {
       torrent_size: 'That torrent is too big — skipped',
       torrent_stall: 'No data came through — stopped (likely no seeders)',
       delegate: 'The errand didn’t work out',
+      batch: '{fail} of {total} items failed',
     },
   },
   // Plan card (§6.5 in-session working memo): steps BT lists for long jobs; HUD/float show progress
@@ -170,6 +175,7 @@ export default {
   },
   step: {
     delegate_stats: '{calls} tool calls · {tokens} tokens', // side-errand card footnote (sub-turn totals)
+    batch: 'Item {k}/{n} {cur}', // batch card step line (cur = the running item's own progress, may be empty)
     connect: 'Connecting to {host}…',
     download: 'Downloading {done}/{total} MB',
     downloading: 'Downloading {done} MB',
@@ -537,6 +543,9 @@ export default {
     autoBackupStale: 'Auto backup hasn’t succeeded in a while — check that the backup drive is still there',
     // don't silently roll a setting back either (§3.5)
     settingFailed: 'That setting didn’t save — try again?',
+    // a failed auto turn (reminder fired / background job reported back) shouldn't leave just a bare system line either (§3.5)
+    wakeFailedReport: 'The job finished, but the follow-up turn failed — just ask again and it will pick up from there',
+    wakeFailedReminder: 'The reminder fired, but the reply turn failed — what it was about is in the system line above',
   },
   // one-click update (backlog ⑤·A): the "new version" card + manual-check feedback
   update: {

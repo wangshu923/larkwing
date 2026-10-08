@@ -115,6 +115,14 @@ impl Tool for MediaDownload {
         )
         .await?;
         let all = super::arg_bool(&args, "all", false);
+        // 批(batch)里不再套合集 job:合集下载自带后台 job 与进度卡,嵌进批里会变成「批里一件
+        // 一提交就算完」+ 它自己再报一次 —— 让模型把每首单独列成一条放进 calls(2026-10-08)。
+        if all && ctx.in_batch.is_some() {
+            anyhow::bail!(
+                "分批(batch)里别套 all=true 的合集下载;把每首单独列成一条 media_download 放进 calls,\
+                 或者把合集下载单独调(它自己会转后台、跑完汇报)。"
+            );
+        }
         let opt_str = |key: &str| {
             args.get(key)
                 .and_then(serde_json::Value::as_str)

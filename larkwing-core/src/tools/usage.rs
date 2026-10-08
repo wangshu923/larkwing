@@ -69,7 +69,7 @@ impl Tool for FsUsage {
         )
         .await?;
 
-        match ctx.media.disk_usage(path.clone(), (ctx.user_id, ctx.conv_id)).await? {
+        match ctx.media.disk_usage(path.clone(), (ctx.user_id, ctx.conv_id), ctx.in_batch.clone()).await? {
             UsageOutcome::Done(rep) => Ok(engine::render_report(&path, &rep)),
             UsageOutcome::Background { title } => Ok(format!(
                 "这个文件夹有点大,转后台接着扫了(任务「{title}」)。跑完会自动回来汇报;\
@@ -102,6 +102,8 @@ mod tests {
                 confirm: None,
                 grants: Default::default(),
                 agent: None,
+                batch: None,
+                in_batch: None,
             },
             dir,
         )

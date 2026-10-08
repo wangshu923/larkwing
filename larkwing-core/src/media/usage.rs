@@ -45,12 +45,42 @@ impl Drop for CancelOnDrop {
 
 impl MediaRuntime {
     /// 扫一棵目录树的占用。`origin` = (user_id, conv_id):转后台时收尾汇报靠它唤回合。
-    pub async fn disk_usage(&self, root: PathBuf, origin: (i64, i64)) -> Result<UsageOutcome> {
+    pub async fn disk_usage(
+        &self,
+        root: PathBuf,
+        origin: (i64, i64),
+        batch: Option<Arc<dyn crate::bgtasks::Beat>>,
+    ) -> Result<UsageOutcome> {
         let prog = Arc::new(engine::Progress::default());
         let (w_root, w_prog) = (root.clone(), prog.clone());
         let mut work = tokio::task::spawn_blocking(move || engine::scan(&w_root, &w_prog));
         // 回合内窗里被取消(future 被 drop)→ 递旗停扫,别让 C:\ 级的 walk 白跑到底
         let mut guard = CancelOnDrop(Some(prog.clone()));
+
+        // —— 批内(in_batch):直接扫到底、不另开票据不另起卡;进度打到组上(2026-10-08)——
+        if let Some(beat) = batch {
+            let label = root
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| root.display().to_string());
+            loop {
+                tokio::select! {
+                    res = &mut work => {
+                        guard.disarm();
+                        let rep = res.context("磁盘扫描任务挂了")??;
+                        anyhow::ensure!(!rep.cancelled, "磁盘扫描被取消了;数字不全,没法当结论用");
+                        return Ok(UsageOutcome::Done(rep));
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        if beat.is_cancelled() {
+                            prog.cancel.store(true, Ordering::Relaxed);
+                        }
+                        let scanned = prog.scanned.load(Ordering::Relaxed);
+                        beat.beat(0, format!("清点「{label}」(已数 {scanned} 个文件)"));
+                    }
+                }
+            }
+        }
 
         tokio::select! {
             res = &mut work => {

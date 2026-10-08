@@ -54,8 +54,14 @@ pub enum EditOutcome {
 
 impl MediaRuntime {
     /// 跑一条 ffmpeg(ffmpeg_run 的机器件)。`origin` = (user_id, conv_id):转后台时
-    /// 收尾汇报靠它唤回合(§7.1 批量收尾回报同一套机器)。
-    pub async fn ffmpeg_edit(&self, req: EditRequest, origin: (i64, i64)) -> Result<EditOutcome> {
+    /// 收尾汇报靠它唤回合(§7.1 批量收尾回报同一套机器)。`batch` = Some 表示在某一批(batch)里
+    /// 跑:这批本身已在后台 → 直接跑到底、不另开票据不另起卡,进度打到组上(2026-10-08)。
+    pub async fn ffmpeg_edit(
+        &self,
+        req: EditRequest,
+        origin: (i64, i64),
+        batch: Option<Arc<dyn crate::bgtasks::Beat>>,
+    ) -> Result<EditOutcome> {
         anyhow::ensure!(!req.inputs.is_empty(), "没有输入文件");
         let ffmpeg = self.ensure_component(Component::Ffmpeg).await?;
         // 占位替换:真要重编码才探编码器(copy 路零探测,§7.1 硬件加速判据同款);
@@ -131,6 +137,43 @@ impl MediaRuntime {
             });
         }
 
+        // —— 批内(in_batch):这批本身已在后台,直接跑到底、不另开票据不另起卡;进度打到组上,
+        //     取消看组的旗标(HUD 停止钮 / task_cancel 停的是整批)——
+        if let Some(beat) = batch {
+            let label = req
+                .dest
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "输出".into());
+            let mut last = -1.0f64;
+            loop {
+                tokio::select! {
+                    status = child.wait() => {
+                        let status = status.context("等 ffmpeg 退出失败")?;
+                        return if status.success() {
+                            let (path, bytes) = finalize(&mut guard, &req.dest)?;
+                            Ok(EditOutcome::Done { path, bytes, encoder })
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            Err(exit_error(status.code(), &tail))
+                        };
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        if beat.is_cancelled() {
+                            let _ = child.kill().await;
+                            anyhow::bail!("按要求停下了,半成品已清理");
+                        }
+                        let cur = *out_secs.lk();
+                        if cur > last {
+                            last = cur;
+                            let (text, _, done) = progress_bits(cur, duration);
+                            beat.beat(done, format!("{label} {text}"));
+                        }
+                    }
+                }
+            }
+        }
+
         // —— 回合内窗:跑完当场回;没跑完转后台 ——
         tokio::select! {
             status = child.wait() => {
@@ -141,11 +184,7 @@ impl MediaRuntime {
                 } else {
                     // stderr 读取器可能比 wait() 晚一拍,给一口气排空缓冲再取尾巴
                     tokio::time::sleep(Duration::from_millis(200)).await;
-                    Err(anyhow::anyhow!(
-                        "ffmpeg 退出码 {}:\n{}\n(照报错改参数再试;长片先剪十几秒试参数)",
-                        status.code().unwrap_or(-1),
-                        tail_text(&tail)
-                    ))
+                    Err(exit_error(status.code(), &tail))
                 };
             }
             _ = tokio::time::sleep(IN_TURN_WAIT) => {}
@@ -366,6 +405,30 @@ fn clock_text(s: f64) -> String {
     format!("{:02}:{:02}", t / 60, t % 60)
 }
 
+/// 非零退出 → 带 stderr 尾巴的错误。报错是**编码器并发撞限**时挂 `bgtasks::CapacityHit` 类型标记
+/// (2026-10-08,batch 自适应):批内据此降并行、把这件重排,不算失败;单独调时话术照回模型,标记无感。
+fn exit_error(code: Option<i32>, tail: &Arc<Mutex<VecDeque<String>>>) -> anyhow::Error {
+    let tail = tail_text(tail);
+    let msg = format!(
+        "ffmpeg 退出码 {}:\n{tail}\n(照报错改参数再试;长片先剪十几秒试参数)",
+        code.unwrap_or(-1)
+    );
+    if is_encoder_busy(&tail) {
+        anyhow::Error::new(crate::bgtasks::CapacityHit).context(msg)
+    } else {
+        anyhow::anyhow!(msg)
+    }
+}
+
+/// NVENC 超出并发会话数(GeForce 按驱动 3 / 5 / 8 路)时 ffmpeg 起手即败,报错固定是
+/// `OpenEncodeSessionEx failed: out of memory (10)`(libavcodec/nvenc.c `nvenc_open_session`);
+/// 只认这一句 —— 它就是「显卡一次吃不下这么多路」的信号,与参数错 / 文件坏那类失败分得开。
+/// QSV / AMF / VideoToolbox 没有会话数硬闸,不在此列。查显卡型号 + 驱动版本的表(漂)与事前
+/// 并发探测(白耗显卡)都评估过不做:事中按这条信号自适应,在哪台机器上都收敛到真实上限。
+pub(crate) fn is_encoder_busy(stderr: &str) -> bool {
+    stderr.contains("OpenEncodeSessionEx failed")
+}
+
 fn tail_text(tail: &Arc<Mutex<VecDeque<String>>>) -> String {
     let t = tail.lk();
     let joined = t.iter().cloned().collect::<Vec<_>>().join("\n");
@@ -384,6 +447,25 @@ fn tail_text(tail: &Arc<Mutex<VecDeque<String>>>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 撞限签名(batch 自适应):只认 NVENC 会话数超限那一句,参数错 / 文件坏那类不算,
+    /// 挂标记的错误链能被 batch 工作池认出来。
+    #[test]
+    fn encoder_busy_signature_detects_nvenc_session_limit_only() {
+        let busy = "[h264_nvenc @ 0x5] OpenEncodeSessionEx failed: out of memory (10): (no details)\n\
+                    [h264_nvenc @ 0x5] No capable devices found";
+        assert!(is_encoder_busy(busy));
+        assert!(!is_encoder_busy("Invalid argument\nError opening output file"));
+        assert!(!is_encoder_busy("No such file or directory"));
+
+        let tail = Arc::new(Mutex::new(VecDeque::from(vec![busy.to_string()])));
+        let e = exit_error(Some(1), &tail);
+        assert!(e.chain().any(|c| c.is::<crate::bgtasks::CapacityHit>()), "撞限要挂类型标记:{e:#}");
+        assert!(e.to_string().contains("ffmpeg 退出码 1"), "话术照旧在最外层:{e}");
+        let tail = Arc::new(Mutex::new(VecDeque::from(vec!["Invalid argument".to_string()])));
+        let e = exit_error(Some(1), &tail);
+        assert!(!e.chain().any(|c| c.is::<crate::bgtasks::CapacityHit>()), "普通失败不挂标记");
+    }
 
     #[test]
     fn progress_line_forms() {

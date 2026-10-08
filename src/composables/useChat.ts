@@ -637,6 +637,14 @@ async function boot() {
       state.convBadges[ev.data.conv_id] = ev.data.outcome
       return
     }
+    // 自启回合(到点提醒 / 后台忙完的汇报)在**当前会话**里失败:它没有前端 Channel、不像普通回合
+    // 会显错误气泡 —— 以前 outcome 在这一支被直接无视,用户只看到一条系统线、下面什么都没有
+    // (2026-10-08 真机实锤:分头办事「忙完了」之后一片空白,追问才知道没接上)。§3.5 不静默失败。
+    if (ev.data.outcome === 'failed') {
+      useToast().error(
+        ev.data.kind === 'report' ? t('toast.wakeFailedReport') : t('toast.wakeFailedReminder'),
+      )
+    }
     if (state.mood === 'idle') {
       api
         .loadConversation(state.convId)

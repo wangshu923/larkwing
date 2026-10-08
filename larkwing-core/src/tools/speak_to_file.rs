@@ -199,6 +199,8 @@ mod tests {
                 confirm: None,
                 grants: Default::default(),
                 agent: None,
+                batch: None,
+                in_batch: None,
             },
             dir,
         )

@@ -405,6 +405,8 @@ mod tests {
                 confirm: None,
                 grants: Default::default(),
                 agent: None,
+                batch: None,
+                in_batch: None,
             };
             let e = StartupList::new().run(serde_json::json!({}), &ctx).await.unwrap_err();
             assert!(e.to_string().contains("Windows"), "{e:#}");

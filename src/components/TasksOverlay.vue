@@ -62,9 +62,18 @@ function stop(task: TaskView) {
 }
 
 const running = computed(() => state.tasks.filter(x => x.state === 'running').length)
+const failed = computed(() => state.tasks.filter(x => x.state === 'failed').length)
 const collapsed = computed(
   () => !state.expanded && (media.fullscreen || state.tasks.length > COLLAPSE_AT),
 )
+// 胶囊文案:在跑几项(+ 有失败才带「N 项失败」;完成的 1.6s 就淡出,不计)
+const pillText = computed(() => {
+  const base = t('task.progress', { n: running.value })
+  return failed.value ? `${base} · ${t('task.failedCount', { n: failed.value })}` : base
+})
+// 展开态超额(2026-10-08 用户实锤「十几张卡从 74px 一路排到窗口外、下面的生硬消失」):
+// 列表限高可滚 + 置顶一枚可收起的头;超额之外的小批次照旧平铺。
+const overflowing = computed(() => !collapsed.value && state.tasks.length > COLLAPSE_AT)
 
 // key 不在字典(新 core 配旧前端)= 兜底文案,同 tool.unknown 的增量演化约定
 function txt(ref?: TextRef, fallback = 'task.unknown'): string {
@@ -120,10 +129,15 @@ function txt(ref?: TextRef, fallback = 'task.unknown'): string {
     <!-- 折叠胶囊:N 项进行中(点开展开) -->
     <button v-if="collapsed && state.tasks.length" class="pill" @click="state.expanded = true">
       <span class="spin" v-if="running"></span>
-      {{ t('task.progress', { n: state.tasks.length }) }}
+      {{ pillText }}
+    </button>
+    <!-- 展开态超额:置顶一枚「N 项进行中 · 收起」头,下面的列表限高可滚,不再被窗口底边切掉 -->
+    <button v-if="overflowing" class="pill head" @click="state.expanded = false">
+      <span class="spin" v-if="running"></span>
+      {{ pillText }} · {{ t('task.collapse') }}
     </button>
 
-    <TransitionGroup v-if="!collapsed" name="card" tag="div" class="stack">
+    <TransitionGroup v-if="!collapsed" name="card" tag="div" class="stack" :class="{ scroll: overflowing }">
       <div v-for="task in state.tasks" :key="task.task_id" class="card" :class="task.state">
         <div class="row">
           <span class="label">{{ txt(task.label) }}</span>
@@ -174,6 +188,16 @@ function txt(ref?: TextRef, fallback = 'task.unknown'): string {
 .tasks > * { pointer-events: auto; }
 
 .stack { display: flex; flex-direction: column; gap: 8px; width: 236px; }
+/* 超额展开:限高 + 滚动(§6.7 滚动容器加 scrollbar-gutter),底部渐隐示意「下面还有」;
+   末尾留一截内边距让最后一张能滚出渐隐区。顶 74px + 底部给输入区留 150px。 */
+.stack.scroll {
+  max-height: calc(100vh - 74px - 150px);
+  overflow-y: auto; scrollbar-gutter: stable;
+  padding-right: 2px; padding-bottom: 28px;
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 28px), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 28px), transparent);
+}
+.pill.head { margin-bottom: 8px; }
 
 .card {
   padding: 9px 11px 10px; border-radius: 10px;

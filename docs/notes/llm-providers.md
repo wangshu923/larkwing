@@ -27,3 +27,12 @@
 
 - **密钥落 keyring 已落地**(2026-06-17,§6.3 原「发布前换 keyring」待办兑现):`secrets` 模块(`secrets.rs`)把秘密类 key 存系统密钥串,**不进 SQLite 明文**。**keyring 仅 Windows 启用**(目标平台,凭据管理器随登录会话解锁、不弹框);**mac / Linux 开发机回落 `settings`**(明文,dev 可接受 §4.9)——mac Keychain 对未签名/每次重编的 dev 二进制会弹「允许访问钥匙串」,太烦(2026-06-17 用户拍板去掉),gate 在 `secrets::entry()`(非 Windows 返回 None)。秘密清单 `SECRET_KEYS` = `llm.api_key` / `llm.providers`(整块,含各 provider key)/ `crypto.ed25519.private_key` / `remote.{telegram.token,dingtalk.app_key,dingtalk.app_secret}`;**Ed25519 公钥不在内**(非秘密、给用户复制)。读写一律走 `secrets::get/set`(engine 的 load_registry/set_api_key/persist_specs/ensure_app_keypair、weather 签 JWT、channels 凭证、set_setting 的 `remote.*` 秘密臂、`remote_status` 的 configured 检查全已路由)。**keyring 不可用(headless/dev/无后端)→ 回落 `settings` 并 warn,绝不让 app 哑掉**;存的是原文(literal 或 `${ENV}`),`resolve_env` 在取值时跑。boot 调 `secrets::migrate` 把 legacy 明文一次性迁入(幂等)。✅ 2026-06-30 Windows 真机验过(凭据管理器存取 + legacy 明文迁移)。
 
+## DeepSeek 产品线 2026-09-14 版:现役 deepseek-flash + 退役旧名代服务(2026-09-18 目录刷新)
+
+> 来源:2026-09-18 会话。起因 = 用户说「v4-pro 也支持多模态」,顺手上官方定价页核实(zh / en 两版同日 2026-09-14),结论相反。
+
+- **官方页原文口径**:现役只有两个 id —— `deepseek-flash`(DeepSeek-V4.1-Flash,「图像理解:支持」,1M 窗 / 384K 出,高峰价 $0.3 / $1.2,缓存命中 $0.006)与 `deepseek-v4-pro`(「图像理解:不支持」,高峰价 $1.32 / $3.96);**旧名 `deepseek-v4-flash` / `deepseek-v4-flash-vision-exp` 官方仍收,请求由 V4.1-Flash 代为服务**。→ 「v4-pro 支持多模态」不成立,能看图的是 flash。
+- **目录改动**(`llm/catalog.rs`,纯数据 + 测试):① 新增 `deepseek-flash` 行(Light / vision=true / $0.3 / $1.2 / 1M)—— 此前这个 id **不在目录**,`id.contains(family)` 对 `deepseek-v4` 也不命中 → 用户在 ▾ 里选了现役 flash 会掉进「未知模型」:均衡档、不报钱、**vision=false → 发图被出向降级成占位文本**(vision-exp 被 flash 行错杀那个坑的另一张脸);② 两个退役旧名的牌价刷成 V4.1-Flash 新价;③ `deepseek-v4-flash` 的 vision **保守不翻**:官方只说「请求由 V4.1-Flash 服务」,没明说旧名收不收 `image_url`,按 §6.3「宁可少看图不可打挂回合」留 false(要看图就用现役 id);④ `deepseek-v4` 行不动(v4-pro 确实不看图)。测试:`supports_vision("deepseek-flash")` / `tier_of("deepseek-flash") == Light` / 估价 0.3 + 1.2 = 1.5。
+- **没动的**:前端预览夹具 `useBrainSettings.ts::fakeModels`(浏览器预览假清单,不是产品数据);DeepSeek 默认模型;出向 / quirk(同一 provider)。真 key watch:`deepseek-flash` 发图真能看(与 PLAN 2026-09-03 节那条同链,把模型名换成现役 id 即可)。
+
+- **2026-10-08 发版前复核(v0.2.39)**:官方定价页(zh / en)与更新公告再核一遍 —— 现役仍只有 `deepseek-flash`(高峰价 $0.3 / $1.2,图像理解支持)与 `deepseek-v4-pro`($1.32 / $3.96,不支持),退役旧名 `deepseek-v4-flash` / `-vision-exp` 仍由 V4.1-Flash 代服务、按 Flash 价计;更新公告最新一条仍是 2026-09-10「V4.1-Flash 发布」。目录零改动,这批(9 月 18 日会话留的未提交改动)随 v0.2.39 一起进版。

@@ -579,6 +579,192 @@ async fn report_job_marks_event_row_and_activity_as_report() {
     assert_eq!(evts[1].payload, None, "提醒的 event 行不带 payload");
 }
 
+/// 后台汇报唤起的回合要**带整段会话历史**(2026-10-08 真机实锤:分头办事「忙完了」之后汇报回合
+/// 零输出 —— 它走的是提醒的新鲜上下文,只有 40 字简报摘要 + 计划标题,接不上活);event 行落在
+/// 尾部、按 payload kind 翻译成「后台的活忙完了」形。提醒回合仍是新鲜上下文,一字不动。
+#[tokio::test(flavor = "multi_thread")]
+async fn report_wake_turn_carries_history_while_reminder_stays_fresh() {
+    let (store, engine, conv_id) = setup("wake-report-history", 1);
+    let fake = Arc::new(FakeLlm::with_delay(1));
+    engine.set_provider(Some(fake.clone()));
+    let mut bus_rx = engine.bus().subscribe();
+
+    // 先聊一轮:历史里有用户原话
+    let mut rx = engine
+        .send_message(conv_id, "把 E 盘那套动画的广告剪掉".into(), None, vec![])
+        .await
+        .unwrap();
+    while rx.recv().await.is_some() {}
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    let user = store.users.ensure_default_user().unwrap();
+
+    let user_contents = |req: &larkwing_core::llm::ChatRequest| -> Vec<String> {
+        req.messages
+            .iter()
+            .filter_map(|m| match m {
+                larkwing_core::llm::ChatMessage::User { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // ① 汇报类:请求里带会话历史(原话在),末条 = 汇报形的 event 行
+    let job = store
+        .jobs
+        .add_report(user.id, conv_id, "分头办的活「定位广告」办完了,汇报如下:第 1 集 05:00-06:30", 0)
+        .unwrap();
+    assert!(engine.wake_turn(&job).await.unwrap());
+    let req = fake.last_request().expect("开流即记请求");
+    let users = user_contents(&req);
+    assert!(
+        users.iter().any(|c| c.contains("把 E 盘那套动画的广告剪掉")),
+        "汇报回合必须带会话历史(用户原话要在):{users:?}"
+    );
+    let last = users.last().unwrap();
+    assert!(last.starts_with("【后台的活忙完了】"), "末条 = 汇报形 event 行:{last}");
+    assert!(last.contains("第 1 集 05:00-06:30") && !last.contains("定时任务到点"), "{last}");
+    // 等它收尾(忙检),再验提醒路
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Ok(larkwing_core::bus::AppEvent::Conversation(_)) = bus_rx.recv().await {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("自启回合必须广播会话动静");
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+    // ② 提醒类:仍是新鲜上下文 —— 历史不回放,末条就是到点提醒形
+    let job = store.jobs.add(user.id, conv_id, "提醒用户喝水", 0, "once").unwrap();
+    assert!(engine.wake_turn(&job).await.unwrap());
+    let req = fake.last_request().expect("开流即记请求");
+    let users = user_contents(&req);
+    assert!(
+        !users.iter().any(|c| c.contains("把 E 盘那套动画的广告剪掉")),
+        "提醒回合保持新鲜上下文,不回放历史:{users:?}"
+    );
+    assert!(users.last().unwrap().starts_with("【定时任务到点】"), "{users:?}");
+}
+
+/// 分批干活(batch,§6.5,2026-10-08):一批 = 一次工具调用 = 一次结果。内层调用在父回合同一份
+/// ctx 里并行跑完,汇总(成 / 败 + 逐件一行)作为 batch 的 ToolResult 回填;父事件流只有 batch
+/// 这一步(内层 now 不上桥);HUD 一张 kind=batch 的卡 running → done;子回合不给 batch。
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_runs_items_in_one_call_and_returns_one_summary() {
+    let (store, engine, conv_id) = setup("batch", 1);
+    engine.set_provider(Some(Arc::new(FakeLlm::scripted(vec![
+        FakeTurn {
+            text: "一批派出去".into(),
+            tool_calls: vec![call(
+                "b1",
+                "batch",
+                serde_json::json!({
+                    "title": "看三次时间",
+                    "parallel": 2,
+                    "calls": [
+                        { "tool": "now", "args": {} },
+                        { "tool": "now", "args": {} },
+                        { "tool": "now", "args": {} }
+                    ]
+                }),
+            )],
+            usage: Default::default(),
+        },
+        FakeTurn { text: "都看完了。".into(), tool_calls: vec![], usage: Default::default() },
+    ]))));
+
+    let mut bus = engine.bus().subscribe();
+    let mut rx = engine.send_message(conv_id, "分批看看时间".into(), None, vec![]).await.unwrap();
+    let mut streamed = String::new();
+    let mut batch_result = String::new();
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            TurnEvent::Delta(t) => streamed.push_str(&t),
+            TurnEvent::ToolUse {
+                name,
+                result,
+                state: larkwing_core::engine::ToolUseState::Finished,
+                ..
+            } => {
+                assert_eq!(name, "batch", "父事件流只该有 batch 这一步(内层 now 不上桥)");
+                batch_result = result;
+            }
+            TurnEvent::Done { .. } => break,
+            TurnEvent::Failed { message, .. } => panic!("不该失败: {message}"),
+            _ => {}
+        }
+    }
+    assert!(streamed.ends_with("都看完了。"), "父回合终回收尾:{streamed}");
+    assert!(
+        batch_result.contains("3 件跑完了:成 3 / 败 0") && batch_result.contains("#3 now ✓"),
+        "整批一次结果,逐件一行:{batch_result}"
+    );
+
+    // 落库形:user / assistant(带 batch 调用)/ tool(汇总)/ assistant 终回 —— 内层调用不落行
+    let msgs = store.chat.recent_messages(conv_id, 20).unwrap();
+    let roles: Vec<&str> = msgs.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(roles, ["user", "assistant", "tool", "assistant"], "内层调用不落会话行");
+    assert!(
+        msgs[2].payload.as_deref().unwrap_or("").contains("\"name\":\"batch\""),
+        "tool 行 payload 记的是 batch"
+    );
+
+    // HUD:kind=batch 一张卡 running → done
+    let saw = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let (mut started, mut done) = (false, false);
+        loop {
+            if let Ok(larkwing_core::bus::AppEvent::Task(v)) = bus.recv().await {
+                if v.kind == "batch" {
+                    match v.state {
+                        larkwing_core::bus::TaskState::Running => started = true,
+                        larkwing_core::bus::TaskState::Done => done = true,
+                        larkwing_core::bus::TaskState::Failed => panic!("全成的批任务卡不该失败"),
+                    }
+                    if started && done {
+                        return true;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(saw, "batch 任务卡该走 running → done");
+}
+
+/// 工具面校验在动手前(§3.5):件名不存在 → 整批退回报错让模型改,一件都不跑。
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_rejects_unknown_tool_before_running_anything() {
+    let (_store, engine, conv_id) = setup("batch-unknown", 1);
+    engine.set_provider(Some(Arc::new(FakeLlm::scripted(vec![
+        FakeTurn {
+            text: String::new(),
+            tool_calls: vec![call(
+                "b1",
+                "batch",
+                serde_json::json!({
+                    "title": "派错了",
+                    "calls": [ { "tool": "now", "args": {} }, { "tool": "nope_tool", "args": {} } ]
+                }),
+            )],
+            usage: Default::default(),
+        },
+        FakeTurn { text: "改一下再派。".into(), tool_calls: vec![], usage: Default::default() },
+    ]))));
+    let mut rx = engine.send_message(conv_id, "派一批".into(), None, vec![]).await.unwrap();
+    let mut result = String::new();
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            TurnEvent::ToolUse { result: r, state: larkwing_core::engine::ToolUseState::Finished, .. } => result = r,
+            TurnEvent::Done { .. } => break,
+            TurnEvent::Failed { message, .. } => panic!("不该失败: {message}"),
+            _ => {}
+        }
+    }
+    assert!(result.contains("nope_tool") && result.contains("整批都没动"), "{result}");
+}
+
 // ---- 旁听临时回合(唤醒确认层「呼名+续句」仲裁;§8.2 精度方向,2026-07-06) ----
 
 /// 等旁听终态(全局车道 kind=overheard*);10s 兜底防挂死。

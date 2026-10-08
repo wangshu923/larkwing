@@ -431,6 +431,8 @@ mod tests {
             confirm: None,
             grants: Default::default(),
             agent: None,
+            batch: None,
+            in_batch: None,
         };
         let tool = PlanSet::new();
         let out = tool.run(json!({ "items": ["第一步", "第二步"] }), &ctx).await.unwrap();

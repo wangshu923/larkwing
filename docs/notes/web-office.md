@@ -120,3 +120,7 @@
 - **web_render 窗**:`SESSION_MAX` 是全程序一张会话表(`sessions` map 全局,第 N+1 个挤掉最旧的),主 agent 与四路子 agent 共用 —— AGENT 里早记着「web_render 窗上限 2 与扇出 4 互挤(watch)」,这次用户撞实。改 2 → **10**(用户拍板)、`SESSION_TTL` 180s → **600s**(用户一步步教它办事时中间隔几分钟,3 分钟一过就得重开、页面状态全丢;§4.11 待确认),工具描述「3 分钟内有效」同步改 10 分钟。
 - 测试:`web::tests::decode_html_honours_header_then_meta_charset` / `stub_redirect_follows_js_and_meta_but_not_non_http` / `extract_links_keeps_download_schemes_with_labels`;壳层快照脚本 `node --check` 语法过、`LINK_SCHEME` 三处。**真机 watch**:真电影天堂影片页经 web_fetch / web_render 各走一遍看【页内链接】里磁力链带种子名、模型接 torrent_download;gb2312 正文不再乱码;dy2018 跳板真跟过去;10 个窗真开满时的内存与桌面右下角观感。
 - **窗题倒计时 + 在窗里动了就续命(同日追加,用户「窗口的 TTL 有没有办法让人可以看见?现在都是后台静默的是吧」)**:是静默的 —— 清扫每 30s 扫一遍,空闲超 TTL 直接 `destroy`,唯一信号是窗自己消失;且 `last_used` 只在 agent 调一步时刷新,用户在窗里点来点去不算「在用」(人机接力时窗会在手底下过期)。修 = 窗有原生标题栏,两平台都看得见:`SessionEntry.title` 存本体(站名 → 快照后换页标题),`refresh_title` 拼成「本体 · ⏱ mm:ss」(`ttl_title` 纯函数;清扫每拍刷、agent 调步后立刻刷;语言中立不产句子,§6.6 壳层同守);`last_used` 改 `Arc<Mutex<Instant>>` 提前建好,`on_navigation` 与 `WindowEvent::Focused(true)` 两个回调都刷它(回调里只改时刻不 set_title —— 事件回调跑在主线程,别再往事件循环塞调度,倒计时下一拍回满 ≤30s)。「最后一分钟提示句」没做:那是句子,壳层不产文案,聚焦续命本身就是答案。测试 `webrender::tests::ttl_title_formats_mmss`。真机 watch:Windows 标题栏上 ⏱ 与 mm:ss 是否显示正常、点窗后倒计时回满。
+
+## 视觉子调用拍板不做(2026-09-18)
+
+- 起因 = 用户问「有 TODO 吗」→ 清单里 §3 someday 一条「视觉子调用(给非视觉主脑代看)」→ 用户「没啥必要,不能看就不能看」。定案:**read_image 内部不接视觉候选代看**,要看图就把主脑换成视觉模型(DeepSeek 官方页 2026-09-14 版:`deepseek-flash`〔V4.1-Flash〕支持图像理解、`deepseek-v4-pro` 不支持);07-15 那句「默认 DeepSeek 用户看不懂画面 = 有意现状」升格为 AGENT §7.8 的明确不做,PLAN §3 那行删除。

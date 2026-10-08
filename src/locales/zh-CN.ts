@@ -19,6 +19,7 @@ export default {
     end_conversation: '收尾…',
     plan_set: '列计划…',
     delegate: '分头办事…',
+    batch: '成批干活…',
     weather: '查天气…',
     media_search: '搜片库…',
     media_play: '开始播放…',
@@ -81,6 +82,8 @@ export default {
   // 任务 HUD:key 与 core 的 Text.key 一一对应(bus.rs);params 命名插值
   task: {
     progress: '{n} 项进行中',
+    failedCount: '{n} 项失败', // 胶囊文案的后半截(有失败才带)
+    collapse: '收起', // 展开态超额时置顶那枚头的动作词
     retry: '重试', // 失败任务的重试按钮(目前仅影音解析/组件下载)
     stop: '停止', // 运行中任务的停止按钮(带 bg 编号或挂了取消令牌的卡才显;直连旗标 / 令牌,不绕模型)
     stopping: '正在停…', // 点了停止到卡收尾之间的即时反馈
@@ -95,6 +98,7 @@ export default {
     usage: '统计磁盘占用',
     web_download: '下载文件',
     delegate: '分头办事:{t}',
+    batch: '成批:{t}', // 一批 = 一张卡(§6.5 batch)
     relocate: '搬家中',
     update: '下载更新',
     remux: '准备视频「{name}」',
@@ -130,6 +134,7 @@ export default {
       torrent_size: '这个种子太大了,没有下',
       torrent_stall: '一直没数据进来,停了(可能没人做种)',
       delegate: '这路活没办成',
+      batch: '{fail} 件没成(共 {total} 件)',
     },
   },
   // 「计划」卡(§6.5 会话内工作备忘):BT 干长活时列的步骤清单,HUD/悬浮窗看进度
@@ -171,6 +176,7 @@ export default {
   },
   step: {
     delegate_stats: '工具 {calls} 次 · {tokens} tokens', // 分头办事卡的附注行(子回合累计)
+    batch: '第 {k}/{n} 件 {cur}', // 成批卡的步骤行(cur = 正在跑的那件自报的进度,可为空)
     connect: '连接 {host}…',
     download: '下载中 {done}/{total} MB',
     downloading: '下载中 {done} MB',
@@ -539,6 +545,9 @@ export default {
     autoBackupStale: '自动备份好久没成功了,看看备份的那个盘还在不在',
     // 设置没存上也别静默回滚(§3.5):从前开关自己弹回去,用户只当是手滑
     settingFailed: '这项设置没保存上,再试一下?',
+    // 自启回合(到点提醒 / 后台忙完的汇报)失败也别只剩一条系统线(§3.5):它没有前端 Channel,不会显错误气泡
+    wakeFailedReport: '活是忙完了,但接着往下说的那一轮没跑成;直接再问一句就能接上',
+    wakeFailedReminder: '提醒到点了,但这一轮回复没跑成;要提醒的内容在上面那条系统线里',
   },
   // 一键更新(清单 ⑤·A):发现新版的卡片 + 手动检查的反馈
   update: {

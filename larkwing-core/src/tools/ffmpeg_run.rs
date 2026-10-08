@@ -38,7 +38,9 @@ impl FfmpegRun {
                               lavfi 都不收;多段拼接 = 多个 -i 加 filter_complex 的 concat。\
                               快活当场返回;超过半分钟自动转后台(任务条可见、可叫停,跑完\
                               自动回来汇报)。长片重编码前先剪十几秒试参数。失败会带 ffmpeg \
-                              报错回来,照着改参数重试。",
+                              报错回来,照着改参数重试。批量加工(一堆文件各跑一条)用 batch 把\
+                              这些调用打包一次派,parallel 用缺省就行(显卡编码器一次吃不下几路),\
+                              整批跑完一次回执。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -170,7 +172,7 @@ impl Tool for FfmpegRun {
             dest,
             wants_h264: scan.wants_h264,
         };
-        match ctx.media.ffmpeg_edit(req, (ctx.user_id, ctx.conv_id)).await? {
+        match ctx.media.ffmpeg_edit(req, (ctx.user_id, ctx.conv_id), ctx.in_batch.clone()).await? {
             EditOutcome::Done { path, bytes, encoder } => {
                 let enc_note =
                     encoder.map(|e| format!(",视频编码器用了 {e}")).unwrap_or_default();

@@ -3,6 +3,7 @@
 //! 加任务能力 = 本目录加一个文件 + builtin() 里一行注册,循环与 engine 永不改。
 //! job 型不另设 trait:就是一个秒回"已启动"的阻塞工具(JobRunner 后置,见 PLAN §8)。
 
+pub mod batch;
 mod bgtask;
 mod briefing;
 pub mod delegate;
@@ -57,6 +58,7 @@ use crate::store::Store;
 /// 全场景可用。skill 三件 = 技能(工作手册)取/教/删(LAWS「技能」节点名),同族全场景在。
 /// plan_set = 干长活的工作备忘(LAWS「干长活」点名):多步/多批任务列清单防「干一半停下等人踢」。
 /// delegate = 分头办事(LAWS「干长活」点名):探查面大的一步派子回合独立跑,只拿回要点。
+/// batch = 分批干活(LAWS「干长活」点名,2026-10-08):同一批同类的活打包一次派,整批一次回执。
 pub const BASE_TOOLS: &[&str] = &[
     "remember",
     "recall",
@@ -69,6 +71,7 @@ pub const BASE_TOOLS: &[&str] = &[
     "end_conversation",
     "plan_set",
     "delegate",
+    "batch",
 ];
 
 /// 静态规格:给模型看的(name/description/parameters)+ 给运行时的(timeout)
@@ -216,6 +219,13 @@ pub struct ToolCtx {
     /// 子回合执行接缝(delegate 专用;webrender 同款):engine 实现并注入。None = 单测 /
     /// 子回合自身(深度 1 双锁的一半)→ 工具如实退回。
     pub agent: Option<Arc<dyn delegate::SubAgent>>,
+    /// 分批执行接缝(batch 专用;delegate 同款):engine 实现并注入。None = 单测 / 子回合
+    /// (子回合不给 batch)/ 批内(不嵌套)→ 工具如实退回。
+    pub batch: Option<Arc<dyn batch::BatchRunner>>,
+    /// 本次执行是否在某一批(batch)里:Some = 整批的进度落点。会转后台的工具据此**直接跑到底**,
+    /// 不另开票据 / 不另起卡 / 不等 30 秒窗 —— 这批本身已经在后台,汇报归组;进度经它打到组的
+    /// 票据上(看门狗据此判活),取消也看它。None = 常态。
+    pub in_batch: Option<Arc<dyn crate::bgtasks::Beat>>,
 }
 
 /// 工具风险分级(预留 slot,PLAN §8):`Safe` = 读/记类;`Mutating` = 会改动用户文件
@@ -314,6 +324,7 @@ impl Tools {
         tools.register(Arc::new(end_conversation::EndConversation::new()));
         tools.register(Arc::new(plan::PlanSet::new()));
         tools.register(Arc::new(delegate::Delegate::new()));
+        tools.register(Arc::new(batch::Batch::new()));
         tools.register(Arc::new(remember::Remember::new()));
         tools.register(Arc::new(recall::Recall::new()));
         tools.register(Arc::new(todo::NoteTodo::new()));
@@ -521,6 +532,7 @@ mod tests {
                 "end_conversation",
                 "plan_set",
                 "delegate",
+                "batch",
                 "now"
             ],
             "base 在前(声明里的 remember 被去重),场景序在后,ghost 被忽略"

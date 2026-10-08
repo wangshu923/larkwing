@@ -262,7 +262,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let _ = std::fs::remove_file(dir.join("t.db"));
         let store = Store::open(&dir.join("t.db")).unwrap();
-        ToolCtx { user_id: 1, conv_id: 7, media: MediaRuntime::detached(store.clone()), store, web: None, voice: None, confirm: None, grants: Default::default(), agent: None }
+        ToolCtx { user_id: 1, conv_id: 7, media: MediaRuntime::detached(store.clone()), store, web: None, voice: None, confirm: None, grants: Default::default(), agent: None, batch: None, in_batch: None }
     }
 
     #[tokio::test]

@@ -102,7 +102,7 @@ impl Tool for LyricsFetch {
             items.iter().map(|it| it.path.to_string_lossy().into_owned()).collect();
         super::guard::ensure(ctx, super::guard::Access::Create, &item_paths).await?;
 
-        match ctx.media.lyrics_for_files(items, (ctx.user_id, ctx.conv_id)).await? {
+        match ctx.media.lyrics_for_files(items, (ctx.user_id, ctx.conv_id), ctx.in_batch.is_some()).await? {
             LyricsBatchOutcome::JobStarted { total } => Ok(format!(
                 "已开始在后台给 {total} 个文件找歌词,进度在屏幕任务条上;**跑完会自动回来一条\
                  结果汇报**(成几个、哪些没配上会点名),到时再转述。现在告诉用户已经开工、\

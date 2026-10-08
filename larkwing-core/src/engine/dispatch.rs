@@ -547,6 +547,7 @@ impl Engine {
                 max_rounds: turn::MAX_TOOL_ROUNDS,
                 grants: Default::default(),
                 agent: self.sub_agent(user_msg_id),
+                batch: self.batch_runner(),
             }
             .run(),
         );
@@ -576,10 +577,12 @@ impl Engine {
         Ok(rx)
     }
 
-    /// 自启回合(调度器到点调用;PLAN §8「分离 job 型」的兑现):
-    /// 执行一律**新鲜上下文** —— 稳定前缀与聊天回合字节级相同(共享缓存),不回放历史;
-    /// 任务语境靠创建时物化进 content。无前端 Channel,engine 自己消费事件流,
-    /// 完成后经全局事件车道喊"会话有动静"。
+    /// 自启回合(调度器到点调用;PLAN §8「分离 job 型」的兑现)。上下文按 job 类分两路(2026-10-08):
+    /// · 提醒(reminder / cond)= **新鲜上下文** —— 稳定前缀与聊天回合字节级相同(共享缓存),
+    ///   不回放历史,任务语境靠创建时物化进 content;
+    /// · 后台汇报(report)= **带整段会话历史** —— 它是主 agent 派出去 / 转到后台的活回来了,
+    ///   「接着干」要的全在历史里(用户原话、派活时的完整简报、试过的参数、计划的来龙去脉)。
+    /// 无前端 Channel,engine 自己消费事件流,完成后经全局事件车道喊"会话有动静"。
     /// 返回 false = 目标会话正有在飞回合,本次不打扰(调度器下个 tick 重试)。
     pub async fn wake_turn(&self, job: &crate::store::Job) -> Result<bool, AppError> {
         let candidates = self.llm.rd().clone();
@@ -635,10 +638,19 @@ impl Engine {
         let tool_subset = self.tools.subset(&scene.tools);
         let tool_defs: Vec<ToolDef> = tool_subset.iter().map(|t| t.spec().def()).collect();
 
-        // 落 event 行(UI 渲染成系统线)+ 拼新鲜请求。汇报类(后台差事忙完)在 payload 里
-        // 记一笔 kind=report:前端据此换标签、且不自动念(到点提醒才必须出声)。
+        // 落 event 行(UI 渲染成系统线)+ 拼请求。汇报类(后台差事忙完)在 payload 里记一笔
+        // kind=report:前端据此换标签、且不自动念(到点提醒才必须出声)。
+        //
+        // 两类回合的上下文**不同**(2026-10-08 分家):
+        // · 提醒 = 新鲜上下文:内容创建时就物化成自包含(§7.4),不回放历史;
+        // · 汇报 = 带整段会话历史:新鲜上下文只给 40 字简报摘要 + 计划标题,接汇报的模型既不知道
+        //   用户要什么、也不知道自己派活时写了什么,结构上接不上活(真机实锤:分头办事「忙完了」
+        //   之后汇报回合零输出,用户追问才知道 0/6 没人推进)。装配走 assemble_request(与 send_message
+        //   同源),event 行刚落在尾部、由历史翻译按 payload kind 变成汇报形 —— 与下一回合看到的
+        //   字节一致,前缀缓存不破。
         let store = self.store.clone();
         let user_id = job.user_id;
+        let conv_user = conversation.user_id;
         let content = job.content.clone();
         let is_report = job.kind == "report";
         let (mut request, event_msg_id) = tokio::task::spawn_blocking(
@@ -646,6 +658,22 @@ impl Engine {
                 let event_payload = is_report.then_some(r#"{"kind":"report"}"#);
                 let event_msg =
                     store.chat.append_message_full(conv_id, "event", &content, event_payload)?;
+                if is_report {
+                    // 整页历史(I/O 上界分页 + 整块锚定,send_message 同一套取法)
+                    let total = store.chat.count_messages(conv_id)? as usize;
+                    let page_base = total.saturating_sub(context::HISTORY_PAGE_MAX);
+                    let history = store.chat.messages_page(
+                        conv_id,
+                        page_base as i64,
+                        (total - page_base) as i64,
+                    )?;
+                    let request = assemble_request(
+                        &store, &scene, conv_id, conv_user, user_id, &history, page_base, budget,
+                        &tool_defs,
+                    )?;
+                    return Ok((request, event_msg.id));
+                }
+                // —— 提醒:新鲜上下文 ——
                 // 只取常驻·画像层(§13.3 ②);任务回合与聊天回合共用同款前缀
                 let memories = store.memory.list_resident(user_id)?;
                 let skills = store.skills.list_enabled_index()?;
@@ -727,11 +755,18 @@ impl Engine {
         // 无人挂流:自己消费到收尾,记下终态,然后经全局事件车道喊一声
         // (UI 据此刷新列表;用户不在该会话时按 outcome 在列表项打标)
         let bus = self.bus.clone();
+        let job_kind = job.kind.clone();
         tokio::spawn(async move {
             let mut outcome = crate::bus::TurnOutcome::Done;
             while let Some(ev) = rx.recv().await {
-                if matches!(ev, TurnEvent::Failed { .. }) {
+                if let TurnEvent::Failed { kind, message } = &ev {
                     outcome = crate::bus::TurnOutcome::Failed;
+                    // 自启回合没有前端 Channel:这里不记,这次失败就只剩一条光秃秃的系统线(§3.5;
+                    // 2026-10-08 实锤)。前端另按 outcome=failed 在当前会话弹 toast。
+                    tracing::warn!(
+                        conv = conv_id, job = %job_kind, kind = ?kind, %message,
+                        "自启回合流中失败(event 行留着,前端按 outcome 提示)"
+                    );
                 }
             }
             bus.publish(crate::bus::AppEvent::Conversation(crate::bus::ConversationActivity {

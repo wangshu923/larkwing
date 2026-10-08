@@ -42,8 +42,10 @@ pub const SUB_REPORT_MAX_CHARS: usize = 4_000;
 /// 保留的判定范例:speak_to_file(文字→音频文件落盘)是**产物型**、无现场交互,与
 /// qr_encode / pdf_to_png 同族 → 保留;把产物发到手机那步 send_file 归 ③ 主回合。
 pub const SUB_EXCLUDED: &[&str] = &[
-    // ① 会话/控制类
+    // ① 会话/控制类(batch 2026-10-08:子回合不给分批 —— 它自己就是一路活,整批汇报的
+    //    report job 会唤醒**主会话**回合,与 ephemeral 子回合的汇报路打架;要成批就在主回合派)
     "delegate",
+    "batch",
     "plan_set",
     "end_conversation",
     // ② 持久知识写入类
@@ -180,6 +182,8 @@ mod tests {
             confirm: None,
             grants: Default::default(),
             agent: None,
+            batch: None,
+            in_batch: None,
         }
     }
 

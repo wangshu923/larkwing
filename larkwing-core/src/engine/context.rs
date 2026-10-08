@@ -54,6 +54,7 @@ pub(super) const LAWS: &str = "\
 ## 干长活(多步骤任务)
 一件事要分好几步、好几批才能干完(批量处理一堆文件、多步网页操作、下载完接着加工),先用 plan_set 把步骤列成清单再动手;之后每完成一批就用 plan_set 更新(做完的标 done,每次发完整清单、全量替换)。清单里还有没完成的项,就接着干下一项,**别中途停下来问「要不要继续」**——要么全部干完,要么真的卡住了向用户说明卡在哪。全部干完或者用户不要了,把清单清空(items 传空数组)。三两步能办完的小事不用列。
 探查面大、要翻很多文件或网页才能弄清的一步,用 delegate 派出去查(互不依赖的几路可以同一轮各派一个,并行跑),回来只拿要点——别把成堆的原始结果都翻进对话里;一两步能办完的小事别派。
+同一批同类的活(逐集剪、逐首配、逐个转、逐个下)用 batch 一次打包派出去,别一条条单独调,也别一次塞太多;互不相干的几批可以各派各的。一批跑完会回来**一次**汇报,拿到汇报接着派下一批或往下干,别等着别人催。
 
 ## 不是每句话都冲你来
 〔语音〕回合里,如果听到的内容明显不是对你说的——电视的声音、家里人互相聊天、没头没尾的环境碎片——就只回 __IGNORE__ 这一个词,什么都不解释。拿不准的就当是对你说的,正常回应。
@@ -91,6 +92,31 @@ pub(super) fn event_injection(content: &str) -> String {
         "【定时任务到点】{content}\n(这是之前定好的安排自动触发,不是用户此刻说的话。\
          该捎话就用你的口吻说出来;该干活就直接动手,完成后简短汇报。)"
     )
+}
+
+/// 后台差事忙完的汇报注入形(event 行 payload `{"kind":"report"}`;2026-10-08 与提醒分家):
+/// 提醒那句「不是用户此刻说的话」对汇报是错的提示 —— 汇报是它自己派出去 / 转到后台的活回来了,
+/// 该接着干;而且与法条「不是每句话都冲你来 → __IGNORE__」有被串读的口(真机实锤:分头办事
+/// 「忙完了」之后汇报回合零输出)。只在历史翻译一处构造:汇报回合带整段会话历史
+/// (dispatch::wake_turn),event 行就落在尾部,不再现场手工 push。
+pub(super) fn report_injection(content: &str) -> String {
+    format!(
+        "【后台的活忙完了】{content}\n(这是你之前交出去的活跑完回来汇报了,由系统转达、不是用户发的消息。\
+         先用一两句话把结果要点告诉用户;这件事如果还有没干完的步骤,就直接接着往下干,干完再简短汇报。)"
+    )
+}
+
+/// event 行的翻译口:按 payload 里的 kind 分发(report → 汇报形;其余 / 无 payload / 认不出 →
+/// 到点提醒形)。历史回放唯一入口;wake_turn 的提醒路现场 push 的也是 `event_injection`,两处字节一致。
+pub(super) fn event_row_injection(content: &str, payload: Option<&str>) -> String {
+    let is_report = payload
+        .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+        .is_some_and(|v| v.get("kind").and_then(|k| k.as_str()) == Some("report"));
+    if is_report {
+        report_injection(content)
+    } else {
+        event_injection(content)
+    }
 }
 
 /// 子回合(delegate 分头办事)的任务注入形:runner 现场构造成唯一 user 消息
@@ -401,8 +427,12 @@ pub(super) fn build_context(
                 };
                 messages.push(ChatMessage::user(content));
             }
-            // 定时任务的触发行:回放成 user 形 + 机制标记(与 wake 注入同一翻译)
-            "event" => messages.push(ChatMessage::user(event_injection(&msg.content))),
+            // 定时任务 / 后台汇报的触发行:回放成 user 形 + 机制标记(提醒与 wake 现场注入同一翻译;
+            // 汇报按 payload kind 换成「后台的活忙完了」形,见 event_row_injection)
+            "event" => messages.push(ChatMessage::user(event_row_injection(
+                &msg.content,
+                msg.payload.as_deref(),
+            ))),
             "assistant" => {
                 let mut payload: AssistantPayload = msg
                     .payload
@@ -521,6 +551,48 @@ mod tests {
         )
     }
 
+    /// 末条消息的 user 正文(event 行回放成 user 形)。
+    fn last_user(req: &ChatRequest) -> String {
+        match req.messages.last() {
+            Some(ChatMessage::User { content, .. }) => content.clone(),
+            _ => panic!("末条该是 user 形"),
+        }
+    }
+
+    /// event 行按 payload kind 分两形(2026-10-08):后台汇报不再套「定时任务到点 / 不是用户此刻
+    /// 说的话」—— 那句对汇报是错的提示,且与「不是对你说的 → __IGNORE__」法条有串读口;
+    /// 提醒形一字不动(与 wake_turn 现场 push 的字节一致);认不出的 payload 按提醒形(旧数据)。
+    #[test]
+    fn event_rows_translate_by_kind_report_vs_reminder() {
+        let scenes = Scenes::builtin();
+        let scene = scenes.default_scene();
+        let history = vec![
+            msg(1, "user", "把广告剪掉", None),
+            msg(2, "assistant", "好,派人去定位", None),
+            msg(
+                3,
+                "event",
+                "分头办的活「定位广告」办完了,汇报如下:第 1 集 05:00-06:30",
+                Some(r#"{"kind":"report"}"#),
+            ),
+        ];
+        let last = last_user(&bc(scene, None, None, &[], &[], &history, &[]));
+        assert!(last.starts_with("【后台的活忙完了】"), "{last}");
+        assert!(last.contains("第 1 集 05:00-06:30") && last.contains("接着往下干"), "{last}");
+        assert!(
+            !last.contains("定时任务到点") && !last.contains("不是用户此刻说的话"),
+            "汇报形不许套提醒话术:{last}"
+        );
+
+        let reminder = vec![msg(1, "event", "提醒用户喝水", None)];
+        let last = last_user(&bc(scene, None, None, &[], &[], &reminder, &[]));
+        assert_eq!(last, event_injection("提醒用户喝水"), "提醒形与 wake_turn 现场 push 的字节一致");
+
+        let odd = vec![msg(1, "event", "x", Some("not-json"))];
+        let last = last_user(&bc(scene, None, None, &[], &[], &odd, &[]));
+        assert!(last.starts_with("【定时任务到点】"), "认不出的 payload 按提醒形:{last}");
+    }
+
     #[test]
     fn laws_and_briefings_join_system_in_stable_order() {
         let scenes = Scenes::builtin();
@@ -554,6 +626,9 @@ mod tests {
         // 分头办事(§6.5 delegate):法条点名 + 「只拿要点」的上下文卫生纪律同在常驻层
         assert!(req.system.contains("delegate"), "法条点名 delegate(BASE_TOOLS 存在理由)");
         assert!(req.system.contains("只拿要点"), "「回来只拿要点」的纪律在常驻层");
+        // 分批干活(§6.5 batch,2026-10-08):法条点名 + 「一批一次汇报、拿到接着干」的纪律在常驻层
+        assert!(req.system.contains("用 batch"), "法条点名 batch(BASE_TOOLS 存在理由)");
+        assert!(req.system.contains("别等着别人催"), "「拿到汇报接着干」的纪律在常驻层");
     }
 
     #[test]

@@ -25,6 +25,8 @@ pub struct FakeLlm {
     pub delay_ms: u64,
     /// 剧本队列;空 = 回声模式(默认行为)。
     script: Mutex<VecDeque<FakeTurn>>,
+    /// 最近一次收到的请求(测「这回合带了什么上下文」用:汇报回合是否带会话历史、提醒是否仍新鲜)。
+    last: Mutex<Option<ChatRequest>>,
 }
 
 impl Default for FakeLlm {
@@ -35,11 +37,11 @@ impl Default for FakeLlm {
 
 impl FakeLlm {
     pub fn with_delay(delay_ms: u64) -> Self {
-        Self { delay_ms, script: Mutex::new(VecDeque::new()) }
+        Self { delay_ms, script: Mutex::new(VecDeque::new()), last: Mutex::new(None) }
     }
 
     pub fn scripted(turns: Vec<FakeTurn>) -> Self {
-        Self { delay_ms: 1, script: Mutex::new(turns.into()) }
+        Self { delay_ms: 1, script: Mutex::new(turns.into()), last: Mutex::new(None) }
     }
 
     /// 剩余剧本条数。给「级联取消真掐死了子回合」这类断言用:被取消的回合不该再开新流,
@@ -47,11 +49,17 @@ impl FakeLlm {
     pub fn remaining(&self) -> usize {
         self.script.lk().len()
     }
+
+    /// 最近一次 `chat_stream` 收到的完整请求(开流那一刻记下,不等回合结束)。
+    pub fn last_request(&self) -> Option<ChatRequest> {
+        self.last.lk().clone()
+    }
 }
 
 #[async_trait::async_trait]
 impl LlmProvider for FakeLlm {
     async fn chat_stream(&self, req: ChatRequest) -> Result<mpsc::Receiver<ChatEvent>, LlmError> {
+        *self.last.lk() = Some(req.clone());
         let scripted = self.script.lk().pop_front();
         let (reply, mut tool_calls, usage) = match scripted {
             Some(turn) => (turn.text, turn.tool_calls, turn.usage),

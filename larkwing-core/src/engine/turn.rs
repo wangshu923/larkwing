@@ -251,6 +251,9 @@ pub(super) struct Turn {
     /// 子回合执行接缝(经 ToolCtx 进 delegate 工具):主回合 = engine 注入;
     /// 子回合 = None(深度 1 双锁的一半,另一半是白名单排除 delegate 自身)。
     pub agent: Option<Arc<dyn crate::tools::delegate::SubAgent>>,
+    /// 分批执行接缝(经 ToolCtx 进 batch 工具,2026-10-08):主回合 = engine 注入;
+    /// 子回合 = None(子回合不给 batch,另一半是 SUB_EXCLUDED 排除 batch 自身)。
+    pub batch: Option<Arc<dyn crate::tools::batch::BatchRunner>>,
 }
 
 /// 一轮流式消费的结局。
@@ -295,6 +298,7 @@ impl Turn {
             max_rounds,
             grants,
             agent,
+            batch,
         } = self;
         // 子回合:会话行不落库(persist=false 时 persist_row_if 直接回 Some(0) = 成功语义)
         let persist = !ephemeral;
@@ -323,7 +327,19 @@ impl Turn {
         };
         let meta = usage::RoundMeta { user_id, conv_id, user_msg_id, provider_id, model };
         let mut round_start = first_round_start;
-        let ctx = ToolCtx { user_id, conv_id, store: store.clone(), media, web, voice, confirm, grants, agent };
+        let ctx = ToolCtx {
+            user_id,
+            conv_id,
+            store: store.clone(),
+            media,
+            web,
+            voice,
+            confirm,
+            grants,
+            agent,
+            batch,
+            in_batch: None,
+        };
         let label_of = |name: &str| -> String {
             tools
                 .iter()
@@ -370,11 +386,17 @@ impl Turn {
                         return;
                     }
                     RoundEnd::Failed { partial, kind, message } => {
-                        // 旁听未转正就失败(仲裁自身出错):没有可见变化,只留日志
-                        if overheard.is_none() && persist {
-                            persist_partial(&store, conv_id, &partial).await;
-                        } else if overheard.is_some() {
+                        if overheard.is_some() {
+                            // 旁听未转正就失败(仲裁自身出错):没有可见变化,只留日志
                             tracing::warn!(conv = conv_id, %message, "旁听仲裁失败(未转正,无可见变化)");
+                        } else {
+                            // 失败必须留痕(§3.5):自启回合(提醒 / 后台汇报)没有前端 Channel,这行 warn
+                            // 是它在日志里唯一的记录(2026-10-08 实锤:汇报回合失败 = UI 一条系统线 +
+                            // 日志零行);普通回合前端会显错误气泡,正式版没 devtools、日志仍要这一份。
+                            tracing::warn!(conv = conv_id, sub = ephemeral, kind = ?kind, %message, "回合流中失败");
+                            if persist {
+                                persist_partial(&store, conv_id, &partial).await;
+                            }
                         }
                         let _ = tx.send(TurnEvent::Failed { kind, message }).await;
                         return;
@@ -487,6 +509,7 @@ impl Turn {
                     Ok(next) => rx = next,
                     Err(e) => {
                         let app = AppError::from(e);
+                        tracing::warn!(conv = conv_id, kind = ?app.kind, message = %app.message, "插队后再开流失败");
                         let _ = tx.send(TurnEvent::Failed { kind: app.kind, message: app.message }).await;
                         return;
                     }
@@ -675,6 +698,7 @@ impl Turn {
                 Ok(next) => rx = next,
                 Err(e) => {
                     let app = AppError::from(e);
+                    tracing::warn!(conv = conv_id, round, kind = ?app.kind, message = %app.message, "工具轮再开流失败");
                     let _ = tx.send(TurnEvent::Failed { kind: app.kind, message: app.message }).await;
                     return;
                 }

@@ -198,6 +198,8 @@ mod tests {
             confirm: None,
             grants: Default::default(),
             agent: None,
+            batch: None,
+            in_batch: None,
         };
         let e = ReadAudio::new()
             .run(serde_json::json!({ "path": f.to_string_lossy() }), &ctx)

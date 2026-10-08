@@ -404,7 +404,8 @@ impl Tool for WebDownload {
                 super::fs::human_size(n),
                 super::fs::human_size(DOWNLOAD_JOB_MAX_BYTES)
             );
-            if n > DOWNLOAD_SYNC_MAX_BYTES {
+            // 批(batch)里不转 job:这批本身已在后台,直接下到底(上限按后台档),进度打到组上(2026-10-08)
+            if n > DOWNLOAD_SYNC_MAX_BYTES && ctx.in_batch.is_none() {
                 let name = pick_filename(&resp, wanted_name.as_deref());
                 drop(resp); // 断掉这条连接,job 里重开(省得把 resp 搬进 spawn)
                 return self.spawn_job(ctx, url, &dir, name, n, cred, referer);
@@ -414,7 +415,12 @@ impl Tool for WebDownload {
         let name = pick_filename(&resp, wanted_name.as_deref());
         // 先写临时件再改名:半截下载绝不顶着正式名躺在下载夹里
         let part = part_path(&dir);
-        let total = match stream_to_file(resp, &part, DOWNLOAD_SYNC_MAX_BYTES, None).await {
+        let (cap, progress) = match (ctx.in_batch.as_deref(), len) {
+            (Some(beat), Some(n)) => (DOWNLOAD_JOB_MAX_BYTES, Some((beat, n))),
+            (Some(_), None) => (DOWNLOAD_JOB_MAX_BYTES, None),
+            (None, _) => (DOWNLOAD_SYNC_MAX_BYTES, None),
+        };
+        let total = match stream_to_file(resp, &part, cap, progress).await {
             Ok(n) => n,
             Err(e) => {
                 let _ = std::fs::remove_file(&part);
@@ -457,13 +463,15 @@ impl WebDownload {
                 super::fs::human_size(n),
                 super::fs::human_size(DOWNLOAD_JOB_MAX_BYTES)
             );
-            if n > DOWNLOAD_SYNC_MAX_BYTES {
+            // 批(batch)里不转 job(http 侧同款):直接下到底,上限按后台档,进度打到组上
+            if n > DOWNLOAD_SYNC_MAX_BYTES && ctx.in_batch.is_none() {
                 return self.spawn_ftp_job(ctx, t, dir, n);
             }
         }
         let part = part_path(dir);
+        let cap = if ctx.in_batch.is_some() { DOWNLOAD_JOB_MAX_BYTES } else { DOWNLOAD_SYNC_MAX_BYTES };
         let total =
-            match crate::ftp::download_to(&t, &part, DOWNLOAD_SYNC_MAX_BYTES, size, None).await {
+            match crate::ftp::download_to(&t, &part, cap, size, ctx.in_batch.as_deref()).await {
                 Ok(n) => n,
                 Err(e) => {
                     let _ = std::fs::remove_file(&part);
@@ -630,7 +638,12 @@ impl WebDownload {
                     .context("下载请求失败")?;
                 anyhow::ensure!(resp.status().is_success(), "下载失败 HTTP {}", resp.status());
                 let got =
-                    stream_to_file(resp, &part, DOWNLOAD_JOB_MAX_BYTES, Some((&ticket, total)))
+                    stream_to_file(
+                        resp,
+                        &part,
+                        DOWNLOAD_JOB_MAX_BYTES,
+                        Some((&ticket as &dyn crate::bgtasks::Beat, total)),
+                    )
                         .await?;
                 let dest = crate::files::dedupe_path(&dir_owned.join(&name_owned));
                 std::fs::rename(&part, &dest).context("落盘改名失败")?;
@@ -804,7 +817,7 @@ async fn stream_to_file(
     mut resp: reqwest::Response,
     dest: &std::path::Path,
     cap: u64,
-    progress: Option<(&crate::bgtasks::BgTicket, u64)>,
+    progress: Option<(&dyn crate::bgtasks::Beat, u64)>,
 ) -> anyhow::Result<u64> {
     use tokio::io::AsyncWriteExt;
     let mut f = tokio::fs::File::create(dest)
@@ -851,7 +864,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let _ = std::fs::remove_file(dir.join("t.db"));
         let store = Store::open(&dir.join("t.db")).unwrap();
-        ToolCtx { user_id: 1, conv_id: 1, media: MediaRuntime::detached(store.clone()), store, web: None, voice: None, confirm: None, grants: Default::default(), agent: None }
+        ToolCtx { user_id: 1, conv_id: 1, media: MediaRuntime::detached(store.clone()), store, web: None, voice: None, confirm: None, grants: Default::default(), agent: None, batch: None, in_batch: None }
     }
 
     #[tokio::test]

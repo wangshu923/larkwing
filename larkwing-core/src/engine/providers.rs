@@ -453,7 +453,7 @@ mod tests {
         assert!(ranked[0].known && !ranked[3].known && !ranked[4].known);
         assert_eq!(ranked[1].tier, crate::llm::catalog::Tier::Light);
         assert!(ranked[2].vision, "vision-exp 目录标能看图");
-        assert_eq!(ranked[2].in_usd_per_m, Some(0.44));
+        assert_eq!(ranked[2].in_usd_per_m, Some(0.3), "退役旧名按 V4.1-Flash 新价(2026-09-14 高峰价)");
         assert_eq!(ranked[3].in_usd_per_m, None, "目录不认识 → 不报价");
     }
 
