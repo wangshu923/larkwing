@@ -90,3 +90,11 @@
   - ③ **主人查看家人记忆** = 回忆页「看谁的」下拉(**切视图 ≠ 切身份**,不违反「无当前用户切换」§4.2;可看可删,同提醒页主人管理面)。**共同记忆 = home-scope 需知本就全家共享**(`briefings.list_for` = home + 个人 scope,切人只换归人的小本本、共享那份对谁都在)。engine `list_memories/list_briefings/delete_memory` 加 `Option<i64>` 目标用户(None=主人、Some=校验存在的家人)。
   - 首次注册后**唤醒循环要 off→on 重启**才认得出(loop 起时才快照声纹库);此前休眠时 `speaker_user=None` 走会话用户是向前兼容行为、非 bug。真机验见 PLAN §11 D / §14。
 
+
+## 唤醒不切忙碌会话(2026-10-11,用户拍板)
+
+来历见 `agent-runtime.md`「回合状态按会话记 + reattach」:任务会话在飞时一次误唤醒把画面切到新建的语音会话,用户看到的就是「回合消失」。此前本文件与 AGENT.md 都没记「唤醒落语音专属会话」这条机制(只在 `useChat.ts` 注释里:活着就续、「完全无动作」30 分钟弃、媒体在播算动作、喊醒说话时切到它显示、可点进去打字接力),这次一并补进 AGENT §7.5。
+
+规则:当前会话有回合在飞(`inflightConvs.has(state.convId)`)或 HUD 有任务在跑(`useTasks().state.tasks` 任一 running)→ 唤醒不切界面;语音会话该建还是建(`api.newConversation('voice')` + `refreshConversations()`,不切也要进列表、收尾 badge 要有地方落),唤醒回合用 `send(…, targetConv)` 的后台形跑:不上屏、不占时钟,delta 照 `speech.pushDelta` 念,done 打 badge,`__IGNORE__` 不打 badge;用户中途点进语音会话,在飞那段由 reattach 接上。不忙 → 老行为,切过去显示。`ensureVoiceConv()` 现在返回目标会话 id,`MainLayout.onTranscribed` 据此调 `chatSend(text, 'wake', speaker, [], conv)`。
+
+两处取舍:① 「有任务在跑」没按会话判(`TaskView` 不带 conv_id)—— 任何任务在跑都不切,多不切一次的代价只是要自己点进语音会话看文字,语音回合本就以念为主;② 唤醒收尾编排(跟进窗 / wakeResume)与在不在屏上无关,后台形照走,§7.5「唤醒收尾通知一个都不能漏」不受影响。

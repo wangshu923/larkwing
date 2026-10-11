@@ -13,12 +13,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use tokio_util::sync::CancellationToken;
 
 use crate::archive as engine;
 use crate::bus::Text;
 use crate::files::human_size;
+use crate::tasks::TaskHandle;
 
-use super::edit::IN_TURN_WAIT;
+use super::edit::{CARD_GRACE, IN_TURN_WAIT};
 use super::MediaRuntime;
 
 pub enum ExtractOutcome {
@@ -172,30 +174,87 @@ impl MediaRuntime {
             }
         }
 
+        // HUD 任务卡:起跑只建取消令牌,卡过了 CARD_GRACE 才出现(edit.rs 同款,2026-10-11):原先卡只在
+        // 转后台时才建,前 30 秒看不见也停不了;几秒解完的小包又不该冒一张卡出来。点停 = 递旗给阻塞线程
+        // (它在条目间见旗收手、自清目录)。
+        let name = dest
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "解压".into());
+        let stop = CancellationToken::new();
+        let open_card = || {
+            let t = self.inner.tasks.start("archive", Text::new("task.archive"));
+            t.bind_cancel(stop.clone());
+            t
+        };
+        let mut task: Option<TaskHandle> = None;
+        let card_at = tokio::time::Instant::now() + CARD_GRACE;
+
         // —— 回合内窗:解完当场回;没解完转后台 ——
         // 同 zip:回合内 30s 被取消时,阻塞线程照跑到底、把整个目标目录解满,没人删(2026-08-22)。
         // guard 设 cancel 旗(线程见旗自删目录)+ 兜底整删目录(线程已完成时的残留;目标恒为
         // 全新目录,整删安全)。成功/转后台 disarm。
         let mut turn_guard = DirCancelOnDrop::new(prog.clone(), dest.clone());
-        tokio::select! {
-            res = &mut work => {
-                let rep = res.context("解压任务挂了")??;
-                anyhow::ensure!(!rep.cancelled, "解压被取消了");
-                turn_guard.disarm();
-                return Ok(ExtractOutcome::Done(rep, dest));
+        let deadline = tokio::time::Instant::now() + IN_TURN_WAIT;
+        let mut stopped = false;
+        let mut last = 0usize;
+        loop {
+            tokio::select! {
+                res = &mut work => {
+                    let rep = match res.context("解压任务挂了").and_then(|r| r) {
+                        Ok(rep) => rep,
+                        Err(e) => {
+                            if let Some(t) = task.take() {
+                                t.fail("task.err.archive", serde_json::Value::Null);
+                            }
+                            return Err(e);
+                        }
+                    };
+                    if rep.cancelled {
+                        if let Some(t) = task.take() {
+                            t.fail("task.err.cancelled", serde_json::Value::Null);
+                        }
+                        anyhow::bail!("解压按要求停下了(用户在任务卡上点了停止),解到一半的已清理;别重跑。");
+                    }
+                    turn_guard.disarm();
+                    if let Some(t) = task.take() {
+                        t.done();
+                    }
+                    return Ok(ExtractOutcome::Done(rep, dest));
+                }
+                // 令牌只认一次(认过就关掉这条臂,否则已取消的令牌每拍都立即就绪 = 空转)
+                _ = stop.cancelled(), if !stopped => {
+                    stopped = true;
+                    prog.cancel.store(true, Ordering::Relaxed); // 等阻塞线程在条目间见旗收手,走上面 rep.cancelled 臂
+                }
+                _ = tokio::time::sleep_until(card_at), if task.is_none() => {
+                    task = Some(open_card());
+                    last = 0; // 下一拍把已有进度补到卡上
+                }
+                _ = tokio::time::sleep_until(deadline) => break,
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    if let Some(t) = &task {
+                        let done = prog.done.load(Ordering::Relaxed);
+                        if done > last {
+                            last = done;
+                            t.step_progress(
+                                "step.archive",
+                                serde_json::json!({ "t": name, "p": format!("{done}/{total}") }),
+                                (done as f32 / total.max(1) as f32).min(0.99),
+                            );
+                        }
+                    }
+                }
             }
-            _ = tokio::time::sleep(IN_TURN_WAIT) => {}
         }
         turn_guard.disarm(); // 转后台:目录清理归后台守望的落盘/失败分支
 
-        let name = dest
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "解压".into());
+        let task = task.unwrap_or_else(open_card); // 30s 远超宽限,正常早已有卡;兜底
         let ticket = match self.inner.bg.submit(format!("解压({name})"), origin, total) {
             Ok(t) => t,
             Err(e) => {
                 prog.cancel.store(true, Ordering::Relaxed); // 阻塞线程见旗自清半成品
+                task.fail("task.err.archive", serde_json::Value::Null);
                 return Err(anyhow::anyhow!(
                     "{e:#};解压半分钟没完、想转后台接着跑但后台满了,这次先停了\
                      (解到一半的已清理),等几件后台事跑完再来"
@@ -203,8 +262,7 @@ impl MediaRuntime {
             }
         };
         let ticket_id = ticket.id();
-        let task = self.inner.tasks.start("archive", Text::new("task.archive"));
-        task.bind_bg(ticket_id); // HUD 可直接停(§7 停止钮通用件)
+        task.bind_bg(ticket_id); // HUD 可直接停(§7 停止钮通用件);同步段的卡原地续用
         let (bg_name, dest_disp) = (name.clone(), dest.display().to_string());
         let watch_prog = prog.clone();
         let join = tokio::spawn(async move {
@@ -246,7 +304,7 @@ impl MediaRuntime {
                         break;
                     }
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                        if ticket.is_cancelled() {
+                        if ticket.is_cancelled() || stop.is_cancelled() {
                             watch_prog.cancel.store(true, Ordering::Relaxed);
                             continue; // 等阻塞线程在条目间见旗收手,走上面的收尾臂
                         }
@@ -340,30 +398,92 @@ impl MediaRuntime {
             }
         }
 
-        // 回合内 30s 窗被取消(用户点停/新 send 抢占)→ 外层 future 被 drop,而 spawn_blocking
-        // 线程不能 abort、会照跑到底写完整包 tmp,没人 place 也没人删(2026-08-22 审计)。
-        // guard:drop 时设 cancel 旗(让还在跑的线程见旗自删)+ 兜底删 tmp(线程已完成时的残留)。
-        let mut turn_guard = CancelOnDrop::new(prog.clone(), tmp.clone());
-        tokio::select! {
-            res = &mut work => {
-                let rep = res.context("打包任务挂了")??;
-                anyhow::ensure!(!rep.cancelled, "打包被取消了");
-                let (path, bytes) = place_zip(&tmp, &dest)?;
-                turn_guard.disarm(); // 成品已落位
-                return Ok(ZipOutcome::Done { path, files: rep.files, bytes, note: plan_note });
-            }
-            _ = tokio::time::sleep(IN_TURN_WAIT) => {}
-        }
-        turn_guard.disarm(); // 转后台:tmp 的所有权交给下面的后台守望
-
+        // HUD 任务卡:起跑只建取消令牌,卡过了 CARD_GRACE 才出现(extract / edit.rs 同款,2026-10-11)。
         let name = dest
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "打包".into());
+        let stop = CancellationToken::new();
+        let open_card = || {
+            let t = self.inner.tasks.start("pack", Text::new("task.pack"));
+            t.bind_cancel(stop.clone());
+            t
+        };
+        let mut task: Option<TaskHandle> = None;
+        let card_at = tokio::time::Instant::now() + CARD_GRACE;
+
+        // 回合内 30s 窗被取消(用户点停/新 send 抢占)→ 外层 future 被 drop,而 spawn_blocking
+        // 线程不能 abort、会照跑到底写完整包 tmp,没人 place 也没人删(2026-08-22 审计)。
+        // guard:drop 时设 cancel 旗(让还在跑的线程见旗自删)+ 兜底删 tmp(线程已完成时的残留)。
+        let mut turn_guard = CancelOnDrop::new(prog.clone(), tmp.clone());
+        let deadline = tokio::time::Instant::now() + IN_TURN_WAIT;
+        let mut stopped = false;
+        let mut last = 0usize;
+        loop {
+            tokio::select! {
+                res = &mut work => {
+                    let rep = match res.context("打包任务挂了").and_then(|r| r) {
+                        Ok(rep) => rep,
+                        Err(e) => {
+                            if let Some(t) = task.take() {
+                                t.fail("task.err.pack", serde_json::Value::Null);
+                            }
+                            return Err(e);
+                        }
+                    };
+                    if rep.cancelled {
+                        if let Some(t) = task.take() {
+                            t.fail("task.err.cancelled", serde_json::Value::Null);
+                        }
+                        anyhow::bail!("打包按要求停下了(用户在任务卡上点了停止),半成品已清理;别重跑。");
+                    }
+                    let (path, bytes) = match place_zip(&tmp, &dest) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            if let Some(t) = task.take() {
+                                t.fail("task.err.pack", serde_json::Value::Null);
+                            }
+                            return Err(e);
+                        }
+                    };
+                    turn_guard.disarm(); // 成品已落位
+                    if let Some(t) = task.take() {
+                        t.done();
+                    }
+                    return Ok(ZipOutcome::Done { path, files: rep.files, bytes, note: plan_note });
+                }
+                _ = stop.cancelled(), if !stopped => {
+                    stopped = true;
+                    prog.cancel.store(true, Ordering::Relaxed); // 阻塞线程见旗 broken 自删 tmp → 走上面 rep.cancelled 臂
+                }
+                _ = tokio::time::sleep_until(card_at), if task.is_none() => {
+                    task = Some(open_card());
+                    last = 0; // 下一拍把已有进度补到卡上
+                }
+                _ = tokio::time::sleep_until(deadline) => break,
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    if let Some(t) = &task {
+                        let done = prog.done.load(Ordering::Relaxed);
+                        if done > last {
+                            last = done;
+                            t.step_progress(
+                                "step.pack",
+                                serde_json::json!({ "t": name, "p": format!("{done}/{total}") }),
+                                (done as f32 / total.max(1) as f32).min(0.99),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        turn_guard.disarm(); // 转后台:tmp 的所有权交给下面的后台守望
+
+        let task = task.unwrap_or_else(open_card); // 30s 远超宽限,正常早已有卡;兜底
         let ticket = match self.inner.bg.submit(format!("打包({name})"), origin, total) {
             Ok(t) => t,
             Err(e) => {
                 prog.cancel.store(true, Ordering::Relaxed);
+                task.fail("task.err.pack", serde_json::Value::Null);
                 return Err(anyhow::anyhow!(
                     "{e:#};打包半分钟没完、想转后台但后台满了,这次先停了\
                      (半成品已清理),等几件后台事跑完再来"
@@ -371,8 +491,7 @@ impl MediaRuntime {
             }
         };
         let ticket_id = ticket.id();
-        let task = self.inner.tasks.start("pack", Text::new("task.pack"));
-        task.bind_bg(ticket_id);
+        task.bind_bg(ticket_id); // 同步段的卡原地续用
         let (bg_name, bg_tmp, bg_dest) = (name.clone(), tmp.clone(), dest.clone());
         let watch_prog = prog.clone();
         let join = tokio::spawn(async move {
@@ -422,7 +541,7 @@ impl MediaRuntime {
                         break;
                     }
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                        if ticket.is_cancelled() {
+                        if ticket.is_cancelled() || stop.is_cancelled() {
                             watch_prog.cancel.store(true, Ordering::Relaxed);
                             continue;
                         }

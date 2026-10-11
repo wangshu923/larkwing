@@ -25,6 +25,7 @@ import { applyLocale, i18n } from '../i18n'
 import { hydrateUser, onProvidersUsable, useSettings } from './useSettings'
 import { useSpeech } from './useSpeech'
 import { useMedia } from './useMedia'
+import { useTasks } from './useTasks'
 import { useToast } from './useToast'
 
 const t = i18n.global.t
@@ -120,16 +121,40 @@ const state = reactive({
 })
 
 let localId = -1 // 本地占位 id 用负数,与落库的正数 id 永不冲突
-let turnSeq = 0 // 回合序号:流中再发会开新回合,旧回合的迟到事件按此作废,不串台(并发发送防竞态)
-let turnInFlight = false // 回合是否在飞:打字发送遇它=进排队区(Phase A:整轮结束自动合并发)
+// —— 回合状态**按会话**记(2026-10-11 立规)——
+// 原先 turnSeq / turnInFlight 都是全局一份:别的会话发一条就把老会话在飞回合的回调全废了
+// (切回去事件被当「旧回合」丢光、done 也不重载 = 回复永久不上屏),切会话又把 inFlight 清成
+// false(切回去再打一句就直接 send → core「同会话新 send 自动取消旧回合」= 把自己的任务掐了)。
+// 真机实锤:任务会话在飞时一次误唤醒 → 界面切到语音会话 → 切回来回合「消失」、接着说话被取消。
+/** 每个会话最新一次 send 的序号:同会话流中再发,旧回合的迟到事件按它作废(不串台)。 */
+const turnSeqByConv = new Map<number, number>()
+/** 有回合在飞的会话(本窗口发出的;core 自启的提醒 / 汇报回合不在内)。打字发进在飞会话 = 进排队区。 */
+const inflightConvs = new Set<number>()
+function nextTurnSeq(conv: number): number {
+  const n = (turnSeqByConv.get(conv) ?? 0) + 1
+  turnSeqByConv.set(conv, n)
+  return n
+}
+function turnSeqOf(conv: number): number {
+  return turnSeqByConv.get(conv) ?? 0
+}
+/** 当前会话有没有回合在飞(排队区 / 唤醒要不要切界面的判据)。 */
+function turnInFlight(): boolean {
+  return inflightConvs.has(state.convId)
+}
 // 消息列表的「代次」:每次**整表换掉** state.messages(切会话/回溯/分叉/boot/后台回合刷新)就 +1。
 // 在飞回合的闭包攥着 `wang`(数组里那个响应式对象的引用),整表一换它就成了**脱离数组的孤儿**
 // ——再往里写字一个都不会上屏,`state.messages.pop()` 更会削掉刚载入的真实历史。回合回调按
 // 代次闸一道:代次变了就只做不碰视图的收尾(2026-08-22 修「切走再切回,在飞回复永久不上屏」)。
 let listGen = 0
+/** 消息表此刻装的是哪个会话的内容(切会话那一拍 convId 先变、重载完成后表才换;这期间在飞回合
+ *  的事件按「不在屏上」处理,别把气泡接进正要被换掉的旧表)。所有 setMessages 的调用点都已先把
+ *  state.convId 指到目标会话,所以在这里记一笔就够。 */
+let viewConv = 0
 /** 整表替换 state.messages 的**唯一**入口(收口在这里,免得将来新加一处又漏掉 listGen)。 */
 function setMessages(list: UiMessage[]) {
   listGen++
+  viewConv = state.convId
   state.messages = list
 }
 /** 往**头部**插一页更早的消息(「加载更早」唯一入口)。
@@ -712,11 +737,12 @@ async function refreshConversations() {
   }
 }
 
-/** 回合任一出口收尾:解除"在飞" + 把排队区攒的消息合并成下一轮发出(Phase A:整轮结束自动发)。 */
-function settleInFlight() {
-  turnInFlight = false
-  voiceTurnConv = null
-  flushQueue()
+/** 回合任一出口收尾(按会话):解除该会话的"在飞" + 清它的语音路由;排队区属于**当前**会话,
+ *  只有收尾的正是当前会话才把攒的消息合并成下一轮发出(Phase A:整轮结束自动发)。 */
+function settleInFlight(conv: number) {
+  inflightConvs.delete(conv)
+  if (voiceTurnConv === conv) voiceTurnConv = null
+  if (conv === state.convId) flushQueue()
 }
 /** 把排队区攒的消息合并成一条作为下一轮发出(文本换行拼接,附件并起来);在飞或空则不动。
  *
@@ -730,9 +756,9 @@ function settleInFlight() {
  *     排队的话会被发进**正要离开的那个会话**。
  *  推迟一拍后:①里 `turnInFlight` 已被语音轮置 true → 老实等它结束再合并;②里队列已清空。 */
 function flushQueue() {
-  if (turnInFlight || !state.queue.length) return
+  if (turnInFlight() || !state.queue.length) return
   queueMicrotask(() => {
-    if (turnInFlight || !state.queue.length) return // 这一拍里情况可能已经变了,再判一次
+    if (turnInFlight() || !state.queue.length) return // 这一拍里情况可能已经变了,再判一次
     const items = state.queue.splice(0, state.queue.length)
     const text = items.map((it) => it.text).filter(Boolean).join('\n')
     const attachments = items.flatMap((it) => it.attachments)
@@ -779,21 +805,28 @@ function send(
   source: 'typed' | 'mic' | 'wake' = 'typed',
   speaker?: number,
   attachments: UiAttachment[] = [],
+  targetConv?: number,
 ) {
   const content = text.trim()
   if (!content && attachments.length === 0) return
 
+  // 目标会话:缺省 = 当前会话。唤醒回合可指定语音会话且**不切界面**(§7.5,2026-10-11:当前会话
+  // 忙着时唤醒不打断它的画面)→ 整轮在后台跑:不上屏只念,收尾给语音会话打 badge;用户中途点进
+  // 那个会话,在飞气泡由下面的 reattach 接到屏上。
+  const sentConv = targetConv ?? state.convId
+  const background = sentConv !== state.convId
+
   // 排队(Phase A):7274 还在回话时,打字发送不打断 → 进排队区;整轮结束后自动合并成下一轮发出。
   // (语音 mic/wake 不排队:开口即应,沿用既有打断。)
-  if (turnInFlight && source === 'typed') {
+  if (!background && inflightConvs.has(sentConv) && source === 'typed') {
     state.queue.push({ text: content, attachments })
     return
   }
 
-  // 本回合序号:流中再发时,engine 会先取消旧回合 → 旧 channel 迟到的 cancelled/残余 delta
-  // 会回调进来。它们与新回合共用 tw/mood/clock,不挡住会把新回合的打字机拆了(新回复变空泡)。
-  // 用它给每个回调闸一道:不是当前回合就直接丢弃。
-  const myTurn = ++turnSeq
+  // 本回合序号(按会话记):同会话流中再发时,engine 会先取消旧回合 → 旧 channel 迟到的
+  // cancelled/残余 delta 会回调进来。它们与新回合共用 tw/mood/clock,不挡住会把新回合的打字机
+  // 拆了(新回复变空泡)。用它给每个回调闸一道:不是该会话的当前回合就直接丢弃。
+  const myTurn = nextTurnSeq(sentConv)
 
   // 语音会话模式(PLAN §11 二分):打字/按钮说话 = UI 交互,默认不念;
   // wake = 语音交互必念(off 档不管它——喊它就是要它说话);always 档 = 全念。
@@ -842,112 +875,109 @@ function send(
     wakeSettled = true
     api.voiceWakeResume().catch(() => {})
   }
-  let fullText = '' // __IGNORE__ 判定要看全量(打字机还没放完的字不算数)
+  let fullText = '' // __IGNORE__ 判定要看全量(打字机还没放完的字不算数);也是 reattach 补屏的料
   let turnHadTrace = false // 本回合动过工具或脑 → done 后补拉 trace(详情从落库 payload 重建)
   // 本回合在飞的工具步骤:call id → 那条轨迹条目(finished 事件按 id 回填结果,
   // 同一轮并发调好几个同名工具时也认得准)。回合结束即随闭包丢弃。
   const liveSteps = new Map<string, Extract<TraceItem, { kind: 'tool' }>>()
+  const startedAt = Date.now() // 端到端计时起点:从用户按下发送起(体感真值);reattach 时拿它接回时钟
 
-  twFlush() // 上一回合的字还在放:立刻放完并收尾,别让两台打字机打架
-  state.messages.push({
-    id: localId--,
-    role: 'user',
-    text: content,
-    at: Date.now(),
-    // 立即显:图缩略 + 文件小票(base64 不进展示态,只随发送走)
-    attachments: attachments.length
-      ? attachments.map((a) => ({ kind: a.kind, name: a.name, mime: a.mime, dataUrl: a.dataUrl }))
-      : undefined,
-  })
-  state.messages.push({ id: localId--, role: 'wang', text: '' })
-  // 必须从 reactive 数组取回代理再改:reactive() 是惰性代理,push 存的是裸对象,
-  // 直接改裸对象 Vue 不追踪 —— 流式逐字、deep watch、物理避让全都会失灵
-  let wang = state.messages[state.messages.length - 1] // 插队会令它重指到新回复气泡
-  state.mood = 'thinking'
-  state.usage.turn = null // 新回合,灯带"本轮"读数清零
-  state.usage.turnStartedAt = Date.now() // 端到端计时:从用户按下发送起(体感真值)
-  startLiveClock()
-  twStart(wang)
-  turnInFlight = true // 占住"在飞":后续打字发送进排队区,直到本轮收尾
-  voiceTurnConv = wakeTurn ? state.convId : null // 确认闸的语音路由判据(§7.8)
+  // 在飞气泡 + 视图代次。后台发出的回合没有视图落点:给一个游离对象攥着轨迹 / 亮图,
+  // 代次钉成永不相等 → 用户点进那个会话后第一条事件就 reattach 把它接到屏上。
+  let wang: UiMessage
+  let myList: number
+  if (background) {
+    wang = { id: localId--, role: 'wang', text: '', at: startedAt }
+    myList = -1
+  } else {
+    twFlush() // 上一回合的字还在放:立刻放完并收尾,别让两台打字机打架
+    state.messages.push({
+      id: localId--,
+      role: 'user',
+      text: content,
+      at: startedAt,
+      // 立即显:图缩略 + 文件小票(base64 不进展示态,只随发送走)
+      attachments: attachments.length
+        ? attachments.map((a) => ({ kind: a.kind, name: a.name, mime: a.mime, dataUrl: a.dataUrl }))
+        : undefined,
+    })
+    state.messages.push({ id: localId--, role: 'wang', text: '', at: startedAt })
+    // 必须从 reactive 数组取回代理再改:reactive() 是惰性代理,push 存的是裸对象,
+    // 直接改裸对象 Vue 不追踪 —— 流式逐字、deep watch、物理避让全都会失灵
+    wang = state.messages[state.messages.length - 1] // 插队会令它重指到新回复气泡
+    state.mood = 'thinking'
+    state.usage.turn = null // 新回合,灯带"本轮"读数清零
+    state.usage.turnStartedAt = startedAt
+    startLiveClock()
+    twStart(wang)
+    myList = listGen // 视图代次快照:整表被换过就说明闭包里的 wang 已成孤儿(见下面的 reattach)
+  }
+  inflightConvs.add(sentConv) // 占住"在飞"(按会话):打字发进这个会话进排队区,直到本轮收尾
+  // 确认闸的语音路由判据(§7.8):唤醒回合落在哪个会话。同会话被打字回合接管时清掉;别的会话
+  // 在飞的唤醒回合不受影响(按会话记,不是全局一份)。
+  if (wakeTurn) voiceTurnConv = sentConv
+  else if (voiceTurnConv === sentConv) voiceTurnConv = null
 
   if (!state.inTauri) {
-    fakeStream(wang, `(浏览器预览)滴——收到「${content}」!进 Tauri 壳里我就接上真模型咯!`, speak)
+    if (background) settleInFlight(sentConv) // 预览没有后台真流,当场收尾
+    else fakeStream(wang, `(浏览器预览)滴——收到「${content}」!进 Tauri 壳里我就接上真模型咯!`, speak)
     return
   }
 
-  const sentConv = state.convId // 话题快照只认发送时的会话:流中切走了别把旧账写到新话题上
-  const myList = listGen // 视图代次快照:整表被换过就说明闭包里的 wang 已成孤儿(见下面的闸)
+  /** 这条回合此刻在不在屏上:看着它的会话、消息表也已经是这个会话的(切回来那一拍重载还没完成
+   *  时不算)、且不在历史定位页。不在屏上 = 只做不碰视图的事(念 / 记全文 / 攒轨迹 / 收尾打 badge)。 */
+  const onScreen = () => sentConv === state.convId && viewConv === sentConv && state.anchorId == null
+  /** 视图被整表换过(切走再切回 / 回溯 / 后台发出的回合被点进来看)→ 闭包里的 `wang` 已是脱离数组
+   *  的孤儿,再写一个字都不会上屏。把在飞气泡重新挂到当前列表尾:已落库的段由重载上屏,这里只补
+   *  **正在流的这一段**(fullText 全量 + 攒着的轨迹 / 亮图),之后 delta 接着进;时钟与工具泡一并接回。
+   *  (2026-08-22 的老修法是「不碰视图、done 时重载」= 切回来看不到在流的回复,像蒸发了;2026-10-11 改) */
+  const reattach = () => {
+    const fresh: UiMessage = { id: localId--, role: 'wang', text: fullText, at: wang.at }
+    if (wang.trace?.items.length) fresh.trace = { items: [...wang.trace.items] }
+    if (wang.attachments?.length) fresh.attachments = [...wang.attachments]
+    state.messages.push(fresh)
+    wang = state.messages[state.messages.length - 1]
+    twStart(wang)
+    myList = listGen
+    state.mood = 'thinking'
+    const running = [...liveSteps.values()].find((s) => !s.status)
+    state.toolAction = running?.ui_key ?? ''
+    state.usage.turnStartedAt = startedAt
+    startLiveClock()
+  }
   const outAtts: OutAttachment[] = attachments
     .filter((a) => a.base64 || a.path)
     .map((a) => ({ name: a.name, mime: a.mime || '', data: a.base64 ?? '', path: a.path }))
   api
-    .sendMessage(state.convId, content, { input: source, speak, speaker_user: speaker }, outAtts, (ev) => {
-      // 回合属于已切走的会话(发出后切到别的会话):绝不碰当前视图,只在收尾给列表打标。
-      // 放在 turnSeq 闸前 —— 切走后又在新会话发消息(turnSeq 已涨)时,旧回合的标也不漏。
-      if (sentConv !== state.convId) {
-        // 唤醒回合的收尾通知不能漏(此前这条早退路一个都不发 → core 卡 AwaitTurn 直到
-        // 180s 兜底,duck 把媒体音量压好几分钟——真机实锤的主谋):done = 把残余念完再开
-        // 跟进窗;失败/取消 = 闭嘴回待唤醒。非唤醒回合这些全是 no-op。
-        if (ev.type === 'done') {
-          if (speak) speech.endTurn() // turnActive 落下 busy 才会 false,跟进窗才开得出去
-          wakeFollowUp(!!ev.data.end_session) // 收尾信号 → 念完回待唤醒;否则开跟进窗
-        } else if (ev.type === 'failed' || ev.type === 'cancelled') {
-          speech.abort()
-          wakeResume()
-        }
-        if (ev.type === 'done') state.convBadges[sentConv] = 'done'
-        else if (ev.type === 'failed') state.convBadges[sentConv] = 'failed'
-        if (ev.type === 'done' || ev.type === 'failed') refreshConversations()
-        return
-      }
-      if (myTurn !== turnSeq) {
-        // 旧回合的迟到事件:新回合已接管,丢弃不串台。但唤醒回合的终态仍要通知唤醒循环
-        // (新回合已占麦 → 不开跟进窗,直接回待唤醒;否则 core 同样卡到 180s 兜底)。
+    .sendMessage(sentConv, content, { input: source, speak, speaker_user: speaker }, outAtts, (ev) => {
+      // ① 同会话里更新的 send 已接管(流中再发 = core 先取消旧回合):旧回合迟到事件一律丢,不串台。
+      //    但唤醒回合的终态仍要通知唤醒循环(新回合已占麦 → 不开跟进窗,直接回待唤醒;否则 core
+      //    卡 AwaitTurn 到 180s 兜底,duck 把媒体音量压好几分钟——真机实锤的主谋)。
+      if (myTurn !== turnSeqOf(sentConv)) {
         if (ev.type === 'done' || ev.type === 'failed' || ev.type === 'cancelled') wakeResume()
         return
       }
-      if (myList !== listGen) {
-        // 会话没变,但**整张消息表被换过**(切走再切回 / 回溯 / 分叉 / 后台回合刷新):
-        // 闭包里的 `wang` 已是脱离数组的孤儿 —— 再写它一个字都不会上屏,而 `messages.pop()`
-        // 更会削掉刚从库载入的真实历史。所以这里一律不碰视图,只做该做的收尾;
-        // 回复本身在 done 时从库重载补上屏(§3.5 不静默丢)。
-        if (ev.type === 'done') {
-          if (speak) speech.endTurn()
-          wakeFollowUp(!!ev.data.end_session)
-          void reloadMessages(sentConv) // 这条回复已落库 → 重载让它真正出现在屏幕上
-          refreshConversations()
-          settleTurn() // 停掉在跑的计时(不传气泡:孤儿身上钉读数没意义)
-          state.mood = 'idle'
-          state.toolAction = ''
-          settleInFlight()
-        } else if (ev.type === 'failed' || ev.type === 'cancelled') {
-          speech.abort()
-          wakeResume()
-          if (ev.type === 'failed') state.convBadges[sentConv] = 'failed'
-          settleTurn()
-          state.mood = 'idle'
-          state.toolAction = ''
-          settleInFlight()
-        }
-        return
-      }
+      // ② 在不在屏上决定碰不碰视图;在屏上但视图被换过 → 先把在飞气泡接回来。
+      const visibleNow = onScreen()
+      if (visibleNow && myList !== listGen) reattach()
       switch (ev.type) {
         case 'delta':
           fullText += ev.data
-          twPush(ev.data) // 进平滑缓冲,rAF 逐字上屏
-          if (speak) speech.pushDelta(ev.data) // 跑道切分流水线(念与显示各走各的节奏)
-          state.mood = 'speaking'
-          state.toolAction = '' // 开口了,工具泡退场
+          if (speak) speech.pushDelta(ev.data) // 跑道切分流水线(念与显示各走各的节奏;切走了也照念)
+          if (visibleNow) {
+            twPush(ev.data) // 进平滑缓冲,rAF 逐字上屏
+            state.mood = 'speaking'
+            state.toolAction = '' // 开口了,工具泡退场
+          }
           break
         case 'tool_use':
           // label 是 i18n 键;它在场时旺财保持"思考中"的体感
           if (ev.data.state === 'started') {
-            state.toolAction = ev.data.label
+            if (visibleNow) state.toolAction = ev.data.label
             turnHadTrace = true // 这回合有工具步骤 → done 后补拉 trace
             // 工具步骤实时进「想了想」:折叠层只需「·N 步」当场涨;展开层也当场有东西可看
             // ——入参随流走(已截断),结果等这一步跑完回填。done 时 hydrateTrace 再用落库
-            // 全量版整条覆盖归位(在飞看个大概,跑完看全)。
+            // 全量版整条覆盖归位(在飞看个大概,跑完看全)。不在屏上也攒:reattach 要用。
             if (!wang.trace) wang.trace = { items: [] }
             const step = {
               kind: 'tool' as const,
@@ -967,7 +997,7 @@ function send(
               step.status = ev.data.status
             }
           }
-          state.mood = 'thinking'
+          if (visibleNow) state.mood = 'thinking'
           break
         case 'shown': {
           // show_image 亮图:图卡挂当前在飞段(持有点 = wang.attachments,与重开会话时
@@ -979,7 +1009,7 @@ function send(
             file: a.file,
           }))
           wang.attachments = [...(wang.attachments ?? []), ...refs]
-          void resolveThumbs()
+          if (visibleNow) void resolveThumbs()
           break
         }
         case 'thinking':
@@ -994,28 +1024,32 @@ function send(
             if (last?.kind === 'thinking') last.text += ev.data
             else wang.trace.items.push({ kind: 'thinking', text: ev.data })
           }
-          state.mood = 'thinking'
+          if (visibleNow) state.mood = 'thinking'
           break
         case 'injected': {
           // 插队被回合接住(PLAN §9 B):收尾当前回复气泡 → 插用户气泡 → 开新回复气泡(后续 delta 进新泡)
-          twFlush() // 当前 wang 已收到的字放完(它答的是上一段输入)
           const stash = pendingInjects.shift()
-          state.messages.push({
-            id: ev.data.message_id,
-            role: 'user',
-            text: ev.data.text,
-            at: Date.now(),
-            attachments:
-              stash && stash.attachments.length
-                ? stash.attachments.map((a) => ({ kind: a.kind, name: a.name, mime: a.mime, dataUrl: a.dataUrl }))
-                : undefined,
-          })
-          state.messages.push({ id: localId--, role: 'wang', text: '' })
-          wang = state.messages[state.messages.length - 1] // 重指到新回复气泡
-          twStart(wang)
+          if (visibleNow) {
+            twFlush() // 当前 wang 已收到的字放完(它答的是上一段输入)
+            state.messages.push({
+              id: ev.data.message_id,
+              role: 'user',
+              text: ev.data.text,
+              at: Date.now(),
+              attachments:
+                stash && stash.attachments.length
+                  ? stash.attachments.map((a) => ({ kind: a.kind, name: a.name, mime: a.mime, dataUrl: a.dataUrl }))
+                  : undefined,
+            })
+            state.messages.push({ id: localId--, role: 'wang', text: '', at: Date.now() })
+            wang = state.messages[state.messages.length - 1] // 重指到新回复气泡
+            twStart(wang)
+            state.mood = 'thinking'
+          } else {
+            wang = { id: localId--, role: 'wang', text: '', at: Date.now() } // 游离:上一段已落库,切回来由重载上屏
+          }
           fullText = '' // 新一段回复,__IGNORE__ 判定重置
           turnHadTrace = false
-          state.mood = 'thinking'
           break
         }
         case 'segment': {
@@ -1024,93 +1058,123 @@ function send(
           // 让在飞消息结构 = 落库/重启结构(否则 trace 实时挂不上、重启才"多出一段")。
           // 观感上不碎:MainLayout::streamGroups 会把同轮相邻 wang 段合并渲染成一个气泡,
           // 这里只管数据段。不重置 turnHadTrace:整轮算一次,done 时一并补拉各段轨迹各就各位。
-          twFlush() // 当前段已收到的字立刻放完
-          wang.id = ev.data.message_id
-          state.messages.push({ id: localId--, role: 'wang', text: '' })
-          wang = state.messages[state.messages.length - 1] // 重指到新回复气泡
-          twStart(wang)
+          if (visibleNow) {
+            twFlush() // 当前段已收到的字立刻放完
+            wang.id = ev.data.message_id
+            state.messages.push({ id: localId--, role: 'wang', text: '', at: Date.now() })
+            wang = state.messages[state.messages.length - 1] // 重指到新回复气泡
+            twStart(wang)
+            state.mood = 'thinking'
+          } else {
+            wang = { id: localId--, role: 'wang', text: '', at: Date.now() } // 游离:封口的段已落库
+          }
           fullText = '' // 新段,__IGNORE__ 判定重置(同 injected)
-          state.mood = 'thinking'
           break
         }
         case 'usage':
-          applyRound(ev.data.round)
+          if (visibleNow) applyRound(ev.data.round) // 灯带"本轮"只记屏上这轮
           state.usage.today = ev.data.today // 后端账本快照,天然防双计/跨午夜
           if (state.convId === sentConv) state.usage.conv = ev.data.conv
           break
-        case 'done':
-          // __IGNORE__(唤醒跟进窗的环境音):吞泡不念,直接回待唤醒
+        case 'done': {
+          // __IGNORE__(唤醒跟进窗的环境音):吞泡不念,直接回待唤醒;不在屏上也不给会话打「有动静」
           if (fullText.trim() === '__IGNORE__') {
             speech.abort()
-            twFlush()
-            state.messages.pop() // wang 空泡
-            if (state.messages.at(-1)?.role === 'user') state.messages.pop() // 环境音"用户"泡一起吞
-            settleTurn()
-            state.mood = 'idle'
-            state.toolAction = ''
+            if (visibleNow) {
+              twFlush()
+              state.messages.pop() // wang 空泡
+              if (state.messages.at(-1)?.role === 'user') state.messages.pop() // 环境音"用户"泡一起吞
+              settleTurn()
+              state.mood = 'idle'
+              state.toolAction = ''
+            }
             wakeResume()
-            settleInFlight()
+            settleInFlight(sentConv)
             break
           }
           if (speak) speech.endTurn() // 残余缓冲 flush(音频节奏独立于打字机)
           // 唤醒回合:等念完开跟进窗(非唤醒 = no-op);模型判本轮结束(end_session)则收窗回待唤醒
           wakeFollowUp(!!ev.data.end_session)
+          if (!visibleNow) {
+            // 回合属于没看着的会话(发出后切走 / 后台发出):只在列表打标,进会话重载即见
+            state.convBadges[sentConv] = 'done'
+            refreshConversations()
+            settleInFlight(sentConv)
+            break
+          }
           // 收尾等字放完再生效:状态/读数与画面同步,结尾不"啪"地补一大段
           twEnd(() => {
             wang.id = ev.data.message_id // 流式文本与落库消息对账
+            // 切回来那一拍若重载已经把这条落库行载上屏(落库与 done 事件之间有窗),在飞气泡就是重影:去掉
+            const twin = state.messages.find((m) => m !== wang && m.id === ev.data.message_id)
+            if (twin) {
+              const i = state.messages.indexOf(wang)
+              if (i >= 0) state.messages.splice(i, 1)
+            }
             if (turnHadTrace) void hydrateTrace(sentConv) // 「想了想」详情从落库 payload 补拉
-            settleTurn(wang) // 端到端时长定格,读数钉在气泡上
+            settleTurn(twin ?? wang) // 端到端时长定格,读数钉在气泡上
             state.mood = 'idle'
             state.toolAction = ''
             refreshConversations() // 标题/排序可能变了
             refreshBalance() // 花了钱,余额顺手轻刷(节流)
-            settleInFlight() // 整轮结束:把排队区攒的合并成下一轮发出
+            settleInFlight(sentConv) // 整轮结束:把排队区攒的合并成下一轮发出
           })
           break
+        }
         case 'failed':
           speech.abort() // 出错即闭嘴,别把半截话念完
           wakeResume() // 唤醒回合出错:回待唤醒,别让 core 干等
-          twFlush() // 出错不演戏:先把已收到的字放完
-          wang.text = wang.text
-            ? wang.text + '\n' + t('chat.interrupted')
-            : friendly(ev.data.kind)
-          settleTurn() // 失败的半截话不钉读数,但计时归零
-          state.mood = 'idle'
-          state.toolAction = ''
-          settleInFlight()
+          if (visibleNow) {
+            twFlush() // 出错不演戏:先把已收到的字放完
+            wang.text = wang.text
+              ? wang.text + '\n' + t('chat.interrupted')
+              : friendly(ev.data.kind)
+            settleTurn() // 失败的半截话不钉读数,但计时归零
+            state.mood = 'idle'
+            state.toolAction = ''
+          } else {
+            state.convBadges[sentConv] = 'failed'
+            refreshConversations()
+          }
+          settleInFlight(sentConv)
           break
         case 'cancelled':
           speech.abort()
           wakeResume()
-          twFlush() // engine 已把收到的整段落库,画面同步到全量,与库一致
-          if (!wang.text) state.messages.pop() // 一个字没说就被打断:别留空气泡
-          settleTurn()
-          state.mood = 'idle'
-          state.toolAction = ''
-          settleInFlight() // 停止后排队的仍发出(它们是你还想要的;不想要就在排队区划掉)
+          if (visibleNow) {
+            twFlush() // engine 已把收到的整段落库,画面同步到全量,与库一致
+            if (!wang.text) {
+              const i = state.messages.indexOf(wang)
+              if (i >= 0) state.messages.splice(i, 1) // 一个字没说就被打断:别留空气泡
+            }
+            settleTurn()
+            state.mood = 'idle'
+            state.toolAction = ''
+          }
+          settleInFlight(sentConv) // 停止后排队的仍发出(它们是你还想要的;不想要就在排队区划掉)
           break
       }
     })
     .catch((e) => {
-      // 已切走会话的前置错误(没 key / 建连失败):只在列表打失败标,不碰当前视图
-      if (sentConv !== state.convId) {
-        state.convBadges[sentConv] = 'failed'
-        refreshConversations()
-        wakeResume() // 唤醒回合的前置错误也要回待唤醒(否则卡 180s 兜底;非唤醒 = no-op)
-        return
-      }
-      if (myTurn !== turnSeq) {
-        wakeResume() // 同上:被接管的唤醒回合终态不能漏通知
+      // 前置错误(AppError):没 key / 会话不存在 / 建连失败
+      if (myTurn !== turnSeqOf(sentConv)) {
+        wakeResume() // 被接管的唤醒回合终态不能漏通知
         return // 旧回合的迟到失败:新回合已接管,忽略
       }
-      // 前置错误(AppError):没 key / 会话不存在 / 建连失败
       speech.abort()
-      wakeResume()
-      twFlush()
-      wang.text = friendly((e as { kind?: ErrorKind })?.kind)
-      settleTurn()
-      state.mood = 'idle'
-      settleInFlight()
+      wakeResume() // 唤醒回合的前置错误也要回待唤醒(否则卡 180s 兜底;非唤醒 = no-op)
+      if (onScreen()) {
+        if (myList !== listGen) reattach()
+        twFlush()
+        wang.text = friendly((e as { kind?: ErrorKind })?.kind)
+        settleTurn()
+        state.mood = 'idle'
+      } else {
+        // 已切走会话 / 后台发出的前置错误:只在列表打失败标,不碰当前视图
+        state.convBadges[sentConv] = 'failed'
+        refreshConversations()
+      }
+      settleInFlight(sentConv)
     })
 }
 
@@ -1122,7 +1186,7 @@ function cancel() {
     twFlush()
     settleTurn()
     state.mood = 'idle'
-    settleInFlight()
+    settleInFlight(state.convId)
     return
   }
   api.cancelGeneration(state.convId).catch(() => {})
@@ -1162,9 +1226,9 @@ async function rollbackTo(msgId: number, localText: string): Promise<boolean> {
     // 接管在飞:旧回合的迟到事件按序号作废(尤其 cancelled 的收尾 pop,绝不许碰重拉后的
     // 新列表;终态的 wakeResume 在作废路上照发,唤醒收尾通知不漏 §7.5)。排队区攒的是
     // 被放弃方向的后续,一并清掉,不走 settleInFlight 的自动补发。
-    turnSeq++
-    turnInFlight = false
-    voiceTurnConv = null
+    nextTurnSeq(state.convId)
+    inflightConvs.delete(state.convId)
+    if (voiceTurnConv === state.convId) voiceTurnConv = null
     state.queue.splice(0)
     twFlush()
     const id = await resolveUserMsgId(msgId, localText)
@@ -1223,8 +1287,7 @@ async function selectConversation(convId: number) {
   if (convId === state.convId) return
   twFlush() // 旧会话还在放字:立刻收尾,别让打字机写进看不见的孤儿气泡
   state.queue.splice(0) // 换话题:排队区清空(它属于旧会话的在飞流程)
-  turnInFlight = false
-  voiceTurnConv = null
+  // 在飞态按会话记,切走不清:旧会话的回合照跑,切回来 reattach 接上;语音路由同理(§6.5)
   state.convId = convId
   delete state.convBadges[convId] // 进入会话即清「有动静」标
   loadConvUsage(convId) // 灯带"话题"段跟着切
@@ -1250,7 +1313,10 @@ async function reloadMessages(
     void hydrateStats(convId, opts.cursor) // 切回的历史会话:气泡 hover 读数从库回填
     void hydrateTrace(convId, opts.cursor) // …和「想了想」轨迹(与消息同一页)
     if (opts.openingIfEmpty && !msgs.length) pushOpening()
-    state.mood = 'idle'
+    // 切回有回合在飞的会话:状态灯回「在想」(停止钮 / 排队区跟着成立),在流的那段等下一条
+    // 事件 reattach 上屏;空闲会话照旧 idle
+    state.mood = inflightConvs.has(convId) ? 'thinking' : 'idle'
+    if (!inflightConvs.has(convId)) state.toolAction = ''
   } catch (e) {
     console.error('加载会话失败', e)
     useToast().error(t('toast.actionFailed'))
@@ -1295,8 +1361,6 @@ async function loadEarlier(): Promise<boolean> {
 async function jumpToMessage(convId: number, msgId: number) {
   twFlush()
   state.queue.splice(0)
-  turnInFlight = false
-  voiceTurnConv = null
   state.convId = convId
   delete state.convBadges[convId]
   loadConvUsage(convId)
@@ -1316,8 +1380,6 @@ async function backToLatest() {
 async function newConversation(channel?: string) {
   twFlush()
   state.queue.splice(0) // 新话题:排队区清空
-  turnInFlight = false
-  voiceTurnConv = null
   state.usage.conv = null // 新话题还没花过,熄灯
   if (!state.inTauri) {
     setMessages([])
@@ -1434,19 +1496,33 @@ function wireVoiceActivity() {
   )
 }
 
-/** 喊醒说话前调:有活的语音会话→切过去续;无/过期→新起一个。两种都切到它显示。 */
-async function ensureVoiceConv() {
+/** 喊醒说话前调:返回唤醒回合该落的会话 id。有活的语音会话 → 用它;无 / 过期 → 新起一个
+ *  (渠道=voice,列表带麦克风标)。
+ *  **当前会话忙着(回合在飞 / HUD 有任务在跑)就不切界面**(2026-10-11 用户拍板;真机实锤:任务
+ *  会话在飞时一次误唤醒把画面切走 = 回合「消失」):唤醒回合在语音会话里后台跑、照念,收尾给它打
+ *  badge,用户想看再点进去(在飞的由 reattach 接上)。不忙才切过去显示(老行为)。 */
+async function ensureVoiceConv(): Promise<number> {
   const alive =
     voiceConvId != null &&
     state.conversations.some((c) => c.id === voiceConvId) &&
     (mediaBusy() || Date.now() - lastVoiceActivity <= VOICE_CONV_TTL)
+  const busy = turnInFlight() || useTasks().state.tasks.some((task) => task.state === 'running')
+  let target: number
   if (alive) {
-    if (state.convId !== voiceConvId) await selectConversation(voiceConvId!)
-  } else {
-    await newConversation('voice') // 语音专属会话:渠道=voice,列表带麦克风标
+    target = voiceConvId!
+  } else if (!state.inTauri) {
+    await newConversation('voice') // 浏览器预览没有真会话:沿用老路切过去看视觉
     voiceConvId = state.convId
+    target = state.convId
+  } else {
+    const conv = await api.newConversation('voice')
+    voiceConvId = conv.id
+    target = conv.id
+    await refreshConversations() // 不切界面也要进列表(收尾的 badge 要有地方落)
   }
+  if (!busy && state.convId !== target) await selectConversation(target)
   lastVoiceActivity = Date.now()
+  return target
 }
 
 /** 旁听仲裁的目标会话:与唤醒同归语音会话,但**不切 UI、不建新会话**——仲裁可能整轮蒸发,
@@ -1530,7 +1606,7 @@ function fakeStream(msg: UiMessage, full: string, speak = false) {
       conv.cost_usd += round.cost_usd
       state.usage.conv = conv
       settleTurn(msg)
-      settleInFlight() // 假流收尾也走同一收口:排队区有就接着发(浏览器预览能验排队)
+      settleInFlight(state.convId) // 假流收尾也走同一收口:排队区有就接着发(浏览器预览能验排队)
     })
   }
   pushChunk()

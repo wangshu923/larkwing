@@ -102,3 +102,44 @@
 - **测试**:`tools::batch::tests`(参数校验五形 / 无通道退回 / 保留集 golden 47 件)、`engine::batch::tests::summary_counts_marks_and_clips`、`bgtasks::tests::report_tells_how_many_others_still_run`(+ 原收尾测试断言状态行)、`context` LAWS 点名断言、`tools::tests::builtin_registry_and_subset_base_first_scene_after` 更新 base 序;engine 测试 `batch_runs_items_in_one_call_and_returns_one_summary`(三件 now 并行 2 路 → 一次结果「成 3 / 败 0」+ 逐件 ✓,落库形 user / assistant / tool / assistant,HUD kind=batch running → done)与 `batch_rejects_unknown_tool_before_running_anything`。Mac 全绿 lib 859(含撞限自适应那四条)/ engine 23 / clippy -D warnings 零 / vue-tsc 0 / i18n 5/5(910=910);预览 `?demo=tasks` 注入 14 张卡验过置顶头 + 限高滚动 + 点头收起。真机 watch 见 PLAN §1「2026-10-08·二批」。
 - **记档 / 边界**:批内撞授权圈仍会弹确认卡,人不在屏幕前就等超时(「批量转后台授权前置到 spawn 前」对任意工具的参数做不到通用预检,真机看体感再定);A 转后台半秒就完、B 还没转那种窄窗在 batch 里不存在(整批一张票据);「汇报回合接着派下一批时用户打字会 cancel 它」的 watch 与上一节同。
 - **撞限自适应(同日追加;用户「parallel 4 在你的显卡上会不会还撞 nvenc 会话上限,这个工具能不能判断?」)**:三条路摆给用户 —— ① 事前查表(`nvidia-smi` 型号 + 驱动版本 → GeForce 老驱动 3 路 / 530 后 5 / 550 后 8 / 专业卡不限):零开销但只管 NVIDIA、表随驱动漂,而且用户那台 12 集都起来了、13–15 才被挤出来,本身就对不上表;② 事前探测(首批前并发开 8 个各编一秒测试源的 ffmpeg 数几个起得来):数字准,代价首批前两三秒显卡抖动,只对硬件编码有意义;③ **事中自适应(推荐、用户「好」)**:NVENC 超会话数时 ffmpeg 起手即败且报错固定 `OpenEncodeSessionEx failed: out of memory (10)`(nvenc.c `nvenc_open_session`),与参数错 / 文件坏分得开。落地 = `bgtasks::CapacityHit` 类型标记(微信 `StaleContext` 同款手法:`anyhow::Error::new(CapacityHit).context(话术)`,单独调时话术照回模型、标记无感)+ `edit.rs::exit_error` 认签名挂标记 + `engine/batch::run_pool` 从 `buffer_unordered` 改成自己的调度循环(FuturesUnordered + 动态 limit + 重排队列):Busy 的件不算失败,limit 降到「撞限那一刻其他在跑的件数」(至少 1),并行还在降就一直重排、降到 1 仍撞才按 `BUSY_FINAL` 当真失败(每件最多重排「降档次数 + 1」回,有界);`on_downshift` 回调把 (工具名 → limit) 记进 `Engine.batch_caps`(进程级),下一批含该工具时 `parallel` 封顶并在汇报里说「按这台机器学到的上限 N 路跑」;撞限那批的汇报说「已自动降到 N 路、把撞限的 M 件次重跑;之后默认按 N 路,不用你改参数」(模型别把撞限学成「这活干不了」)。单测:假 runner 模拟「一次只吃得下 2 路」的机器,4 路派 6 件 → 全成、降到 2、重排 ≥1、回调最后一次 = 2;永远 Busy 的机器 → 降到 1 重试仍撞当真失败、不死循环;`is_encoder_busy` 认签名不认泛错。为什么标记放 bgtasks 不放 tools:media 不能反依赖 tools(§6.1),bgtasks 是 media / tools / engine 共同的下层。
+
+## 回合状态按会话记 + reattach(误唤醒把任务会话的回合「切没了」,2026-10-11)
+
+用户原话:「任务进行中/或者 turn 进行时,一个唤醒(误唤醒 没有任何操作),turn 直接被打断,并且整个 turn 从 UI 上消失了,继续对话 agent 也不记得了。在任务进行中则 等任务执行完回执都没有了。我理解这个唤醒不应该打断当前的其它会话吧,我的是一个老的任务会话,唤醒的话肯定会在新的会话里面,事实也是。」
+
+破案(代码级)。core 侧**零**跨会话取消路径:`send_overheard` 撞在飞回合直接放弃(`dispatch.rs` 忙检)、`wake_turn` 撞在飞跳过、调度器下个 tick 再试,`Engine::cancel` 的调用点只有同会话 `send_message` / 删会话 / 回溯。所以「打断」只可能发生在同一个会话里,而且是前端一串连锁:
+1. 唤醒转出字(误唤醒若没转出字不会建会话,那次是环境音被转成了字)→ `MainLayout.onTranscribed` → `ensureVoiceConv()` 新建语音会话并把界面切过去。这就是「turn 从 UI 上消失」的第一层:屏幕被切走,老会话的回合在 core 里照跑。
+2. 切会话时 `selectConversation` / `newConversation` 把**全局**的 `turnInFlight=false`、`voiceTurnConv=null`、清排队区;唤醒回合的 `send()` 又把**全局** `turnSeq` +1。
+3. 切回老会话 → 从库重载(只见已落库的用户行 + 工具轮,`visible()` 还滤掉空文本的 assistant 行)→ 之后老回合所有事件命中 `myTurn !== turnSeq` 这道闸(它排在 `listGen` 闸前面)→ 全部丢弃,连 done 都不触发重载 → 最终回复永久不上屏,看着就像蒸发了。2026-08-22 加的 `listGen` 闸本就是为「切走再切回」准备的(done 时重载),被 turnSeq 闸吃掉了。
+4. 用户在老会话里接着说话 → `turnInFlight` 已被清成 false → 不进排队区、直接 `send_message` → core 进门 `self.cancel(conv).await`(「同会话新 send 自动取消旧回合」)= **真正的打断,由用户自己的下一句触发,不是唤醒**。取消后工具行落「已取消」,模型看到的历史是半截活 → 「不记得」;分头办事 / 批处理若还在同步段(30s 内)被级联取消 → 回执自然没有;已转后台的汇报 job 会在会话空闲时补来,但人若停在语音会话里,它只在老会话上打一个 badge。
+
+修法(用户拍板「A + B 一起做」;B 见 `voice.md`「唤醒不切忙碌会话」):
+- `turnSeqByConv: Map<conv, seq>` + `inflightConvs: Set<conv>` 取代两个全局变量;`settleInFlight(conv)` 只解除那个会话、只有收尾的正是当前会话才 flushQueue(排队区属于当前会话);`rollbackTo` 只动当前会话;切会话三处(select / jump / new)不再清在飞态。
+- 回合回调两道闸重排:① `myTurn !== turnSeqOf(sentConv)` → 丢(唤醒终态仍 wakeResume);② `onScreen()` = `sentConv === state.convId && viewConv === sentConv && anchorId == null` 决定碰不碰视图。`viewConv` 在 `setMessages` 里记「消息表此刻装的是哪个会话」:切回那一拍 convId 先变、表还没换,这期间若按在屏上处理会把气泡接进正要被换掉的旧表。
+- 在屏上但 `myList !== listGen` → `reattach()`:新建一条 wang 气泡,text = fullText(当前段全量,已落库的段由重载上屏)、trace / attachments 从孤儿气泡搬过来、`twStart`、mood 回 thinking、工具泡取 liveSteps 里还没 status 的那条、时钟接回 `startedAt`。不在屏上的事件也照攒轨迹 / 亮图(reattach 要用)、delta 照 `speech.pushDelta`(切走了也照念,原先一切走就哑)。
+- done:`twEnd` 回调里按 message_id 找重影(切回来那一拍重载已把这条落库行载上屏,落库与 done 事件之间有窗)→ 删在飞那条、读数钉在库行上;不在屏上 → 打 badge + refreshConversations。
+- `reloadMessages` 切回有回合在飞的会话 → `state.mood = 'thinking'`(停止钮 / 排队区成立);`send()` 多一个 `targetConv` 参数,后台形 = 不上屏、不占时钟,wang 是游离对象 + `myList = -1`(第一次在屏上收到事件就 reattach)。
+- `voiceTurnConv`(确认闸语音路由)跟着按会话:唤醒回合落哪记哪,同会话被打字回合接管时清,别的会话不受影响。
+
+仍不覆盖:core 自启的回合(提醒 / 汇报接着干长活)前端不知情,用户打字照旧 cancel 它(前两批 watch 已记)。按会话记是它的地基:将来 core 发一条「回合开始」事件就能把它也登记进 `inflightConvs`。
+
+验证:vue-tsc 0 / i18n 5/5(910=910);预览的假流不走事件回调,真流行为只能真机验(PLAN「2026-10-11」节)。
+
+## 加强 batch 使用:判定句 + 条件提示 + 守卫(2026-10-11)
+
+用户:「加强任务组使用,多任务尽量使用组,特别是耗时的,你看看如何优化好。」(PLAN 10-08 批就记了「DeepSeek 遵循度 = 本批最不确定」。)
+
+对着现有提示面查出来的五个洞:① LAWS「干长活」那段是建议语气(「别一条条单独调」),没有判定门槛,没说一件件调的代价,也没说「先探完、算好参数再一次派」;② 七个会转后台的工具里只有 ffmpeg_run 的描述提了 batch,batch 自己的描述也没列它是给哪些活用的;③ 运行时零反馈 —— 计划槽 / 自检都有点一句的机制,模型一件件调长活时系统什么都不说;最慢的串行形(一件 → 转后台 → 汇报 → 下一件)每步都是新回合,汇报注入只说「接着往下干」;④ 技能只有「音视频加工」第 8 条点了 batch;⑤ 没有 eval 守卫,遵循度量不出来。
+
+用户问「是根据情况补充提示词吗?」—— 答:第 3 条是,其余是静态文案。条件提示与自检句 / 计划提示同形三条共同点:不落库(只挂当前请求尾)、不破前缀缓存(排在刚变动的工具结果后面)、不含任务知识(只看工具名 + 次数,哪些算长活由单源名单说了算)。用户「好」。
+
+落法:
+- LAWS 判定句(`context.rs`):两件以上同类耗时活一律 batch;先探完算好参数再一次派;不许一件件调、不许同一轮并排调同一工具(每件一张卡一次汇报、慢好几倍);只有一件或后一件依赖前一件才单独调;派出去就等汇报、不问进度。刻意不写「30 件」这个数(LAWS 是静态串,数字单源在 batch 描述的 format!)。
+- 描述面:batch 描述点名七类耗时活 + 「只有一件活直接调那个工具」;ffmpeg_run / web_download / media_download / fs_unzip / fs_zip / fs_usage 尾句各一句。lyrics_fetch 本身收数组,不加。
+- 条件提示:`tools/batch.rs::LONG_JOB_TOOLS: &[(&str, Option<&str>)]` 七条,第二项是「认真活的参数键」—— ffmpeg_run 只认带 output 的(一轮探六个文件是正常探测,不能被当成长活点名);测试钉名单与注册表 / 排除表自洽(名字拼错 = 提示静默失效)。`turn.rs::batch_pattern`(纯函数):同一轮并排 ≥2 次同名 → 命中;这轮只单独调一次某长活且没用 batch、上一轮也是它 → 命中(串行形);命中过清零重数(紧接着一轮不唠叨);两个不同长活各一次不算同类。`batch_nudge_line` 点名工具与件数、教剩下的怎么派。接在工具结果回填之后、开流之前,优先级自检 > 分批提示 > 计划提示;子回合状态照推进但不提(它没有 batch);`BATCH_NUDGE_MAX` 2 用户拍板。`report_injection` 固定加一句「还有同类的活就用 batch 一次打包派出去,别一件件来」。
+- 技能四处:音视频加工第 8 条改「两个以上 = 批量加工」+ 先探完再一次派 + 不许并排;存歌进曲库第 2 条加「几首各有链接 → batch 打包 media_download」;整理文件第 5 条加「几个包一起解 → batch」;网页上办事第 1 条加「两个以上文件 → batch 打包 web_download」。
+- eval:`batch-many-long`(6 个空壳 .mp4 抽 mp3 → 调 batch 且带 output 的 ffmpeg_run ≤1;batch 内层调用不进主回合轨迹,所以 ≤1 就是没单独派活)/ `batch-single-no-batch`(一个文件 → 不许 batch)。只在真模型下有意义(`examples/eval.rs`)。
+
+不做:隐式分组(10-08 用户已否);few-shot 示范(前缀预算 800 token,一条 batch 示范就几百;遵循度真机仍 <4/5 再补,与其它守卫同口径)。
+
+验证:core lib 全绿(新增 batch_nudge_tests 三条 + 长活名单自洽一条)、clippy -D warnings 零;真模型遵循度归真机(PLAN「2026-10-11」节)。

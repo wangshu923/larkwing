@@ -16,9 +16,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::io::AsyncBufReadExt;
+use tokio_util::sync::CancellationToken;
 
 use crate::bus::Text;
 use crate::components::Component;
+use crate::tasks::TaskHandle;
 
 use super::MediaRuntime;
 use crate::lockext::LockExt;
@@ -26,6 +28,10 @@ use crate::lockext::LockExt;
 /// 回合内等待窗:起跑后等这么久,没跑完就转后台接着跑(§4.11 常量单源;方案已确认。
 /// pub(super):压缩包差事〔media/archive.rs〕同一个节奏,不另造第二个数)。
 pub(crate) const IN_TURN_WAIT: Duration = Duration::from_secs(30);
+/// HUD 任务卡的出现宽限(§4.11 单源,用户拍板 2026-10-11「2 秒落」):回合内长活起跑只建取消令牌,
+/// 这么久之内跑完的活从头到尾不出卡(截帧 / copy 抽轨一两秒就完,卡冒出来又消失是噪音;想了想的
+/// 工具泡本就显示着),超过它才建卡 + 挂令牌。四件长活(ffmpeg / 解压 / 打包 / 扫盘)共用。
+pub(crate) const CARD_GRACE: Duration = Duration::from_secs(2);
 /// 报错尾巴留存(行数/字符):stderr 可能很长,喂回模型自纠只要末尾这点(量约束 §7.2)。
 const STDERR_TAIL_LINES: usize = 40;
 const STDERR_TAIL_CHARS: usize = 2000;
@@ -174,32 +180,102 @@ impl MediaRuntime {
             }
         }
 
-        // —— 回合内窗:跑完当场回;没跑完转后台 ——
-        tokio::select! {
-            status = child.wait() => {
-                let status = status.context("等 ffmpeg 退出失败")?;
-                return if status.success() {
-                    let (path, bytes) = finalize(&mut guard, &req.dest)?;
-                    Ok(EditOutcome::Done { path, bytes, encoder })
-                } else {
-                    // stderr 读取器可能比 wait() 晚一拍,给一口气排空缓冲再取尾巴
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    Err(exit_error(status.code(), &tail))
-                };
-            }
-            _ = tokio::time::sleep(IN_TURN_WAIT) => {}
-        }
-
-        // —— 转后台(cap 满 = 如实退回,不排队;半成品清理交 TempGuard) ——
+        // —— HUD 任务卡:起跑只建取消令牌,卡**过了 `CARD_GRACE` 才出现**(2026-10-11 两拍定:用户先实锤
+        //     「老早看到调了 ffmpeg,任务卡过了很久才出现」—— 原先卡只在 30s 后转后台时才建,前 30 秒看不见
+        //     也停不了;改成第一秒就建后又指出「截帧 / copy 抽轨一两秒就完,卡冒出来又消失是噪音」。
+        //     于是:宽限内跑完的活从头到尾不出卡(想了想的工具泡本就显示着),超过宽限才建卡 + 挂令牌
+        //     (§7.1「回合内会跑久的活挂令牌」)。点停 = 杀子进程,半成品交 TempGuard;转后台后同一张卡
+        //     再 bind_bg,HUD 停止钮两把钥匙都拧,所以后台段两个旗一起查。——
         let name = req
             .dest
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "输出".into());
+        let stop = CancellationToken::new();
+        let open_card = || {
+            let t = self.inner.tasks.start("ffmpeg", Text::new("task.ffmpeg"));
+            t.bind_cancel(stop.clone());
+            t
+        };
+        let mut task: Option<TaskHandle> = None;
+        let card_at = tokio::time::Instant::now() + CARD_GRACE;
+
+        // —— 回合内窗:跑完当场回;没跑完转后台 ——
+        let deadline = tokio::time::Instant::now() + IN_TURN_WAIT;
+        let mut last = -1.0f64;
+        loop {
+            tokio::select! {
+                status = child.wait() => {
+                    let status = match status {
+                        Ok(s) => s,
+                        Err(e) => {
+                            if let Some(t) = task.take() {
+                                t.fail("task.err.ffmpeg", serde_json::Value::Null);
+                            }
+                            return Err(anyhow::Error::from(e).context("等 ffmpeg 退出失败"));
+                        }
+                    };
+                    return if status.success() {
+                        match finalize(&mut guard, &req.dest) {
+                            Ok((path, bytes)) => {
+                                if let Some(t) = task.take() {
+                                    t.done();
+                                }
+                                Ok(EditOutcome::Done { path, bytes, encoder })
+                            }
+                            Err(e) => {
+                                if let Some(t) = task.take() {
+                                    t.fail("task.err.ffmpeg", serde_json::Value::Null);
+                                }
+                                Err(e)
+                            }
+                        }
+                    } else {
+                        // stderr 读取器可能比 wait() 晚一拍,给一口气排空缓冲再取尾巴
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        if let Some(t) = task.take() {
+                            t.fail("task.err.ffmpeg", serde_json::Value::Null);
+                        }
+                        Err(exit_error(status.code(), &tail))
+                    };
+                }
+                _ = stop.cancelled() => {
+                    // 用户在任务卡上点了停止:杀子进程,临时件由 TempGuard 收;取消话术不报「失败」
+                    let _ = child.kill().await;
+                    if let Some(t) = task.take() {
+                        t.fail("task.err.cancelled", serde_json::Value::Null);
+                    }
+                    anyhow::bail!("按要求停下了(用户在任务卡上点了停止),半成品已清理;别重跑。");
+                }
+                _ = tokio::time::sleep_until(card_at), if task.is_none() => {
+                    task = Some(open_card());
+                    last = -1.0; // 下一拍把已有进度补到卡上
+                }
+                _ = tokio::time::sleep_until(deadline) => break,
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    if let Some(t) = &task {
+                        let cur = *out_secs.lk();
+                        if cur > last {
+                            last = cur;
+                            let (text, frac, _) = progress_bits(cur, duration);
+                            t.step_progress(
+                                "step.ffmpeg",
+                                serde_json::json!({ "t": name, "p": text }),
+                                frac,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // —— 转后台(cap 满 = 如实退回,不排队;半成品清理交 TempGuard) ——
+        let task = task.unwrap_or_else(open_card); // 30s 远超宽限,正常早已有卡;兜底别让后台段没卡
         let ticket = match self.inner.bg.submit(format!("音视频加工({name})"), origin, 100) {
             Ok(t) => t,
             Err(e) => {
                 let _ = child.kill().await;
+                task.fail("task.err.ffmpeg", serde_json::Value::Null);
                 return Err(anyhow::anyhow!(
                     "{e:#};这活半分钟没跑完、想转后台接着跑但后台满了,这次先停了\
                      (半成品已清理),等几件后台事跑完再来"
@@ -207,8 +283,7 @@ impl MediaRuntime {
             }
         };
         let ticket_id = ticket.id();
-        let task = self.inner.tasks.start("ffmpeg", Text::new("task.ffmpeg"));
-        task.bind_bg(ticket_id); // HUD 可直接停(§7 停止钮通用件)
+        task.bind_bg(ticket_id); // HUD 可直接停(§7 停止钮通用件);同步段的卡原地续用,不另起
         let dest = req.dest.clone();
         let bg_name = name.clone();
         let join = tokio::spawn(async move {
@@ -252,7 +327,8 @@ impl MediaRuntime {
                         break;
                     }
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                        if ticket.is_cancelled() {
+                        // 两把钥匙都认:bgtasks 旗(task_cancel / 嘴控)与任务卡令牌(HUD 停止钮)
+                        if ticket.is_cancelled() || stop.is_cancelled() {
                             let _ = child.kill().await;
                             task.fail("task.err.cancelled", serde_json::Value::Null);
                             ticket.finish(false, format!(

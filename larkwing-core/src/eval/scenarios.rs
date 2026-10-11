@@ -15,6 +15,12 @@ pub fn suite() -> Vec<Scenario> {
     // print-recent-file 的夹具(内容故意不是图片:防 eval 机连着打印机真出纸)
     let print_dir = std::env::temp_dir().join(format!("lw-eval-print-{}", std::process::id()));
     let print_file_s = print_dir.join("课程表.png").to_string_lossy().to_string();
+    // batch 遵循度夹具(2026-10-11):一个文件夹 6 个「视频」空壳文件 —— eval 机不一定有 ffmpeg,
+    // 只看轨迹不看产物(探测形 ffmpeg_run 失败也不影响断言)。
+    let batch_dir = std::env::temp_dir().join(format!("lw-eval-batch-{}", std::process::id()));
+    let batch_dir_s = batch_dir.to_string_lossy().to_string();
+    let batch_single_s = batch_dir.join("第01集.mp4").to_string_lossy().to_string();
+    let (batch_seed, batch_single_seed) = (batch_dir.clone(), batch_dir);
 
     vec![
         // 闲聊不该动工具(§6.5 反例纪律:不该调工具的对话就别调)。
@@ -168,6 +174,41 @@ pub fn suite() -> Vec<Scenario> {
                             .unwrap_or(false)
                 })
             })),
+        // 分批遵循度(§6.5 batch + LAWS「干长活」判定句,2026-10-11):两件以上同类耗时活 → 一次 batch
+        // 打包,不许一件件调 ffmpeg_run。探测形(不给 output)随便调,只数带 output 的真活;batch 内层
+        // 的 ffmpeg_run 不进主回合轨迹,所以「≤1」就是「没单独派活」。
+        Scenario::turn("batch-many-long")
+            .note("6 个视频抽音频 → 一次 batch 打包,不许逐个调 ffmpeg_run(§6.5)")
+            .seed(move |_s, _u| {
+                let _ = std::fs::remove_dir_all(&batch_seed);
+                let _ = std::fs::create_dir_all(&batch_seed);
+                for i in 1..=6 {
+                    let _ = std::fs::write(batch_seed.join(format!("第{i:02}集.mp4")), b"x");
+                }
+            })
+            .say(&format!("把 {batch_dir_s} 里的 6 个视频全部抽成 mp3 音频,放回原文件夹"))
+            .check(tool_called("batch"))
+            .check(custom("带 output 的 ffmpeg_run 单独调不超过 1 次", |o| {
+                o.trace
+                    .iter()
+                    .filter(|s| {
+                        s.name == "ffmpeg_run"
+                            && serde_json::from_str::<serde_json::Value>(&s.args)
+                                .map(|a| a.get("output").is_some_and(|v| !v.is_null()))
+                                .unwrap_or(false)
+                    })
+                    .count()
+                    <= 1
+            })),
+        // 反例:一件活不许套 batch(描述「只有一件活直接调那个工具」;仪式化 = 白付一轮 + 一张卡)
+        Scenario::turn("batch-single-no-batch")
+            .note("一个文件转格式不许调 batch(一件活直接调工具)")
+            .seed(move |_s, _u| {
+                let _ = std::fs::create_dir_all(&batch_single_seed);
+                let _ = std::fs::write(batch_single_seed.join("第01集.mp4"), b"x");
+            })
+            .say(&format!("把 {batch_single_s} 抽成 mp3 音频"))
+            .check(tool_not_called("batch")),
         // 教技能:用户明确说「记住这个流程」→ skill_write(§7 技能,三本账第三路)。
         Scenario::turn("skill-teach")
             .note("用户明说记住一套做法 → skill_write 存技能(§技能:明说才记)")

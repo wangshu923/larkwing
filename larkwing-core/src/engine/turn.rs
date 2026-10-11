@@ -149,6 +149,96 @@ fn plan_nudge_line(since: usize, plan: &crate::tools::plan::Plan) -> Option<Stri
     ))
 }
 
+/// 分批提示每回合封顶(§4.11 用户拍板 2,2026-10-11):提两次还不改就不再唠叨,别把 request 尾
+/// 刷成说教。
+const BATCH_NUDGE_MAX: usize = 2;
+
+/// 认「模型把同类耗时活一件件分开调」的形(纯函数,单测钉着;长活名单单源 `tools::batch::LONG_JOB_TOOLS`):
+/// ① 同一轮并排 ≥2 次同名长活 → 命中(次数 = 并排数);② 这一轮只单独调了一次某长活、且没用 batch,
+/// 而上一轮也是同一个 → 命中(串行形,一件 → 等 → 下一件,最慢的那种)。`prev_solo` 跨轮带状态:
+/// 命中过就清零重数(提过一次,下一轮立刻又提 = 唠叨)。只看工具名与次数,不认识活的内容(§5)。
+fn batch_pattern(calls: &[ToolCall], prev_solo: &mut Option<String>) -> Option<(String, usize)> {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for c in calls.iter().filter(|c| crate::tools::batch::is_long_job_call(&c.name, &c.args)) {
+        match counts.iter_mut().find(|(n, _)| *n == c.name) {
+            Some(e) => e.1 += 1,
+            None => counts.push((c.name.clone(), 1)),
+        }
+    }
+    if let Some((n, k)) = counts.iter().filter(|(_, k)| *k >= 2).max_by_key(|(_, k)| *k) {
+        *prev_solo = None;
+        return Some((n.clone(), *k));
+    }
+    let used_batch = calls.iter().any(|c| c.name == "batch");
+    let solo = (counts.len() == 1 && counts[0].1 == 1 && !used_batch).then(|| counts[0].0.clone());
+    let hit = match (&solo, &*prev_solo) {
+        (Some(a), Some(b)) if a == b => Some((a.clone(), 2)),
+        _ => None,
+    };
+    *prev_solo = if hit.is_some() { None } else { solo };
+    hit
+}
+
+/// 分批提示句(不落库、挂 request 尾,与自检句 / 计划提示同形):点名工具与件数,教它剩下的怎么派。
+fn batch_nudge_line(tool: &str, n: usize) -> String {
+    format!(
+        "[system] 你刚把 {n} 件同类的活({tool})分开调了:每件各开一张任务卡、各回一次汇报,整体也慢。\
+         剩下还有同类的活,就用 batch 一次打包派出去(calls 里每件一条,最多 {} 件,多了分几批);\
+         只剩一件、或后一件要看前一件结果的,才单独调。",
+        crate::tools::batch::BATCH_MAX_CALLS
+    )
+}
+
+#[cfg(test)]
+mod batch_nudge_tests {
+    use crate::llm::ToolCall;
+    use serde_json::json;
+
+    fn call(name: &str, args: serde_json::Value) -> ToolCall {
+        ToolCall { id: format!("{name}-{args}"), name: name.into(), args, is_incomplete: false }
+    }
+
+    #[test]
+    fn parallel_same_long_tool_hits_and_probe_form_does_not() {
+        let mut prev = None;
+        // 同一轮并排三条带 output 的 ffmpeg_run = 命中 3
+        let calls = vec![
+            call("ffmpeg_run", json!({ "args": ["-i", "a"], "output": "a.mp3" })),
+            call("ffmpeg_run", json!({ "args": ["-i", "b"], "output": "b.mp3" })),
+            call("ffmpeg_run", json!({ "args": ["-i", "c"], "output": "c.mp3" })),
+            call("now", json!({})),
+        ];
+        assert_eq!(super::batch_pattern(&calls, &mut prev), Some(("ffmpeg_run".into(), 3)));
+        // 一轮探六个文件(不给 output)= 探测形,不算长活、不提
+        let probes: Vec<_> = (0..6).map(|i| call("ffmpeg_run", json!({ "args": ["-i", format!("{i}.mp4")] }))).collect();
+        assert_eq!(super::batch_pattern(&probes, &mut prev), None);
+        // 两个不同的长活各一次(下载 + 解压)不是「同类」,不提
+        let mixed = vec![call("web_download", json!({ "url": "u" })), call("fs_unzip", json!({ "archive": "a" }))];
+        assert_eq!(super::batch_pattern(&mixed, &mut prev), None);
+    }
+
+    #[test]
+    fn serial_one_per_round_hits_on_second_round_then_resets() {
+        let mut prev = None;
+        let one = |n: &str| vec![call("fs_unzip", json!({ "archive": n }))];
+        assert_eq!(super::batch_pattern(&one("a.zip"), &mut prev), None, "第一轮只记不提");
+        assert_eq!(super::batch_pattern(&one("b.zip"), &mut prev), Some(("fs_unzip".into(), 2)), "连着第二轮提");
+        assert_eq!(super::batch_pattern(&one("c.zip"), &mut prev), None, "提过清零:紧接着的一轮不唠叨");
+        assert_eq!(super::batch_pattern(&one("d.zip"), &mut prev), Some(("fs_unzip".into(), 2)), "再连两轮才再提");
+        // 这一轮已经在用 batch 了(哪怕旁边还单独调了一件)= 它懂了,不算串行
+        let mut prev2 = Some("fs_unzip".to_string());
+        let with_batch = vec![call("batch", json!({ "title": "t", "calls": [] })), call("fs_unzip", json!({ "archive": "e" }))];
+        assert_eq!(super::batch_pattern(&with_batch, &mut prev2), None);
+    }
+
+    #[test]
+    fn nudge_line_names_tool_and_teaches_batch() {
+        let line = super::batch_nudge_line("ffmpeg_run", 4);
+        assert!(line.starts_with("[system]") && line.contains("4 件") && line.contains("ffmpeg_run"), "{line}");
+        assert!(line.contains("batch") && line.contains(&crate::tools::batch::BATCH_MAX_CALLS.to_string()), "{line}");
+    }
+}
+
 #[cfg(test)]
 mod plan_nudge_tests {
     use crate::tools::plan::{parse_args, Plan};
@@ -364,6 +454,9 @@ impl Turn {
         let mut round: usize = 0;
         // 距上次 plan_set 过了几轮(计划槽的「几轮没更新就点一句」用;plan_set ok 即归零)
         let mut rounds_since_plan: usize = 0;
+        // 分批提示的跨轮状态(§6.5,2026-10-11):上一轮单独调的那个长活 + 本回合已提几次
+        let mut prev_solo_long: Option<String> = None;
+        let mut batch_nudges: usize = 0;
         let mut stall: usize = 0; // 连续无进展(全重复 / 全失败)轮数
         let mut seen_calls: HashSet<String> = HashSet::new(); // 本回合已发过的工具调用指纹
         // 本回合是否调过 end_conversation(§7.5 会话收尾):随收尾的 Done 递给前端 → 唤醒回合
@@ -662,6 +755,13 @@ impl Turn {
             }
             stall = if made_progress { 0 } else { stall + 1 };
 
+            // 分批提示(§6.5,2026-10-11):模型把同类耗时活一件件分开调(同一轮并排 / 连续两轮串着),
+            // 下一轮开流前点一句「剩下的用 batch 打包」。状态每轮都推进(含子回合,免得判定漂),
+            // 但子回合不提(它的工具面没有 batch,§6.5 SUB_EXCLUDED),封顶 BATCH_NUDGE_MAX 次。
+            let batch_hint = batch_pattern(&tool_calls, &mut prev_solo_long)
+                .filter(|_| !ephemeral && batch_nudges < BATCH_NUDGE_MAX)
+                .map(|(tool, n)| batch_nudge_line(&tool, n));
+
             // 插队(PLAN §9 B):轮间排空注入队列,append 进 request,下一轮 LLM 就带上
             drain_injections(&store, conv_id, &tx, &inject, &mut request, persist).await;
             round += 1;
@@ -682,6 +782,10 @@ impl Turn {
                     &task_quote,
                     &plan.lk(),
                 );
+                request.messages.push(ChatMessage::user(line));
+            } else if let Some(line) = batch_hint {
+                // 分批提示优先于计划提示(更可执行;计划提示 5 轮后还会再来),自检轮让位
+                batch_nudges += 1;
                 request.messages.push(ChatMessage::user(line));
             } else if let Some(line) = plan_nudge_line(rounds_since_plan, &plan.lk()) {
                 // 计划几轮没更新就点一句(2026-09-17 用户「除了进度是不是该再给个提示」):

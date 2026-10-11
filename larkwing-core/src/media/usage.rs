@@ -12,11 +12,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use tokio_util::sync::CancellationToken;
 
 use crate::bus::Text;
+use crate::tasks::TaskHandle;
 use crate::usage as engine;
 
-use super::edit::IN_TURN_WAIT;
+use super::edit::{CARD_GRACE, IN_TURN_WAIT};
 use super::MediaRuntime;
 
 pub enum UsageOutcome {
@@ -82,25 +84,75 @@ impl MediaRuntime {
             }
         }
 
-        tokio::select! {
-            res = &mut work => {
-                guard.disarm();
-                let rep = res.context("磁盘扫描任务挂了")??;
-                anyhow::ensure!(!rep.cancelled, "磁盘扫描被取消了");
-                return Ok(UsageOutcome::Done(rep));
-            }
-            _ = tokio::time::sleep(IN_TURN_WAIT) => {}
-        }
-
+        // HUD 任务卡:起跑只建取消令牌,卡过了 CARD_GRACE 才出现(edit.rs / archive.rs 同款,2026-10-11)。
         let name = root
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| root.display().to_string()); // 盘根(C:\)没有末段,显整串
+        let stop = CancellationToken::new();
+        let open_card = || {
+            let t = self.inner.tasks.start("usage", Text::new("task.usage"));
+            t.bind_cancel(stop.clone());
+            t
+        };
+        let mut task: Option<TaskHandle> = None;
+        let card_at = tokio::time::Instant::now() + CARD_GRACE;
+
+        let deadline = tokio::time::Instant::now() + IN_TURN_WAIT;
+        let mut stopped = false;
+        let mut last = 0usize;
+        loop {
+            tokio::select! {
+                res = &mut work => {
+                    guard.disarm();
+                    let rep = match res.context("磁盘扫描任务挂了").and_then(|r| r) {
+                        Ok(rep) => rep,
+                        Err(e) => {
+                            if let Some(t) = task.take() {
+                                t.fail("task.err.usage", serde_json::Value::Null);
+                            }
+                            return Err(e);
+                        }
+                    };
+                    if rep.cancelled {
+                        if let Some(t) = task.take() {
+                            t.fail("task.err.cancelled", serde_json::Value::Null);
+                        }
+                        anyhow::bail!("磁盘扫描按要求停下了(用户在任务卡上点了停止);数字不全,没法当结论用。");
+                    }
+                    if let Some(t) = task.take() {
+                        t.done();
+                    }
+                    return Ok(UsageOutcome::Done(rep));
+                }
+                _ = stop.cancelled(), if !stopped => {
+                    stopped = true;
+                    prog.cancel.store(true, Ordering::Relaxed); // 阻塞线程尽快收手 → 走上面 rep.cancelled 臂
+                }
+                _ = tokio::time::sleep_until(card_at), if task.is_none() => {
+                    task = Some(open_card());
+                    last = 0; // 下一拍把已数到的补到卡上
+                }
+                _ = tokio::time::sleep_until(deadline) => break,
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    if let Some(t) = &task {
+                        let n = prog.scanned.load(Ordering::Relaxed);
+                        if n > last {
+                            last = n;
+                            t.step("step.usage", serde_json::json!({ "t": name, "p": n }));
+                        }
+                    }
+                }
+            }
+        }
+
+        let task = task.unwrap_or_else(open_card); // 30s 远超宽限,正常早已有卡;兜底
         let title = format!("磁盘占用({name})");
         let ticket = match self.inner.bg.submit(title.clone(), origin, 0) {
             Ok(t) => t,
             // guard 还武装着:带错返回时顺手递旗停扫
             Err(e) => {
+                task.fail("task.err.usage", serde_json::Value::Null);
                 return Err(anyhow::anyhow!(
                     "{e:#};这个文件夹半分钟没扫完、想转后台接着扫但后台满了,这次先停了,\
                      等几件后台事跑完再来"
@@ -109,8 +161,7 @@ impl MediaRuntime {
         };
         guard.disarm(); // 交棒:此后旗子归看守任务里的 guard 管
         let ticket_id = ticket.id();
-        let task = self.inner.tasks.start("usage", Text::new("task.usage"));
-        task.bind_bg(ticket_id); // HUD 可直接停(§7 停止钮通用件)
+        task.bind_bg(ticket_id); // HUD 可直接停(§7 停止钮通用件);同步段的卡原地续用
         let (bg_name, bg_root) = (name.clone(), root.clone());
         let watch_prog = prog.clone();
         let join = tokio::spawn(async move {
@@ -149,7 +200,7 @@ impl MediaRuntime {
                         break;
                     }
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                        if ticket.is_cancelled() {
+                        if ticket.is_cancelled() || stop.is_cancelled() {
                             watch_prog.cancel.store(true, Ordering::Relaxed);
                             continue; // 等阻塞线程在条目间见旗收手,走上面的收尾臂
                         }

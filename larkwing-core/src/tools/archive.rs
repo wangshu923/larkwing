@@ -29,7 +29,8 @@ impl FsUnzip {
                               里,绝不覆盖已有文件。带密码的包把用户给的密码传 password;\
                               分卷 rar 传第一卷的路径。大包半分钟没解完会自动转后台接着解\
                               (任务条可见、可叫停,跑完自动回来汇报)。解出来的视频/音乐\
-                              可以直接 media_play 放。",
+                              可以直接 media_play 放。**好几个包一起解,用 batch 把几条 fs_unzip \
+                              打包一次派**,别一个个调。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -155,7 +156,8 @@ impl FsZip {
                 description: "把几个文件/文件夹打成一个 zip 包(文件夹整棵装进去)。\
                               output 是包的文件名(不带目录,自动补 .zip),dir 缺省 = \
                               第一个输入旁边;绝不覆盖已有文件(重名自动加序号)。打包好\
-                              可以接 send_file 发到手机。只会打 zip,不做 rar/7z。",
+                              可以接 send_file 发到手机。只会打 zip,不做 rar/7z。要打好几个包\
+                              (各自一包)就用 batch 把几条 fs_zip 一次派。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {

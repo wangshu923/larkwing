@@ -65,6 +65,28 @@ pub fn allowed_in_batch(name: &str) -> bool {
     !BATCH_EXCLUDED.contains(&name)
 }
 
+/// 「会跑一阵子、可能转后台」的工具名单(单源,2026-10-11):回合循环据此认出「模型把同类耗时活
+/// 一件件分开调」的形(同一轮并排 ≥2 次同名 / 连续两轮各单独调一次),追加一句分批提示 —— 循环只看
+/// 工具名与次数,不认识 ffmpeg 还是解压(§5 任务知识零入代码);改名单不改循环。
+/// 第二项 = 认「真活」的参数键:ffmpeg_run 不给 output 是只探不产的秒回形,一轮探六个文件天经地义,
+/// 不算长活;其余工具没有探测形,None = 调了就算。
+pub const LONG_JOB_TOOLS: &[(&str, Option<&str>)] = &[
+    ("ffmpeg_run", Some("output")),
+    ("fs_unzip", None),
+    ("fs_zip", None),
+    ("fs_usage", None),
+    ("web_download", None),
+    ("media_download", None),
+    ("lyrics_fetch", None),
+];
+
+/// 这次调用算不算一件「耗时活」(名单 + 真活参数键)。
+pub fn is_long_job_call(name: &str, args: &serde_json::Value) -> bool {
+    LONG_JOB_TOOLS.iter().any(|(n, key)| {
+        *n == name && key.is_none_or(|k| args.get(k).is_some_and(|v| !v.is_null()))
+    })
+}
+
 /// 一批里的一件:内层工具名 + 它的参数(原样转交,内层工具自己校验)。
 #[derive(Debug, Clone)]
 pub struct BatchCall {
@@ -145,12 +167,15 @@ pub trait BatchRunner: Send + Sync {
 static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     format!(
         "把同一批要干的活打包成一次调用:calls 里每项 = 一次工具调用(tool 名 + 该工具的 args),\
-         程序按 parallel 路并行跑完,**整批只回一次结果**(逐件成没成、产物在哪)。适合逐集剪 / \
-         逐首配 / 逐个转 / 逐个下这类同类重复活 —— 别一条条单独调,也别一次塞太多(每批最多 \
-         {BATCH_MAX_CALLS} 件,多了分几批,每批跑完会回来一次汇报)。半分钟内跑完当场回;更久自动转后台\
-         接着跑(任务条一张卡、能叫停),跑完一次性回来汇报。parallel 按活的性质给:显卡编码一次吃不下\
-         几路(缺省 {BATCH_DEFAULT_PARALLEL}),纯网络的活可以多开。calls 里只放直接干活的工具(加工 / \
-         下载 / 解压 / 读写文件 / 查网页),不能再套 batch、分头办事、播放控制、打开网页、种子下载。"
+         程序按 parallel 路并行跑完,**整批只回一次结果**(逐件成没成、产物在哪)。**两件以上同类的耗时活\
+         一律走这里**:ffmpeg_run 加工、fs_unzip 解压、fs_zip 打包、fs_usage 扫盘、web_download / \
+         media_download 下载、lyrics_fetch 配词 —— 先把要探的探完、算好每件参数,再一次打包派出去;\
+         别一条条单独调、也别同一轮并排调好几次(那样一件一张卡、一件一次汇报,慢好几倍),也别一次塞太多\
+         (每批最多 {BATCH_MAX_CALLS} 件,多了分几批,每批跑完会回来一次汇报)。半分钟内跑完当场回;更久自动转后台\
+         接着跑(任务条一张卡、能叫停),跑完一次性回来汇报,不用去问进度。parallel 按活的性质给:显卡编码一次\
+         吃不下几路(缺省 {BATCH_DEFAULT_PARALLEL}),纯网络的活可以多开。calls 里只放直接干活的工具(加工 / \
+         下载 / 解压 / 读写文件 / 查网页),不能再套 batch、分头办事、播放控制、打开网页、种子下载。只有一件活\
+         直接调那个工具,别套 batch。"
     )
 });
 
@@ -237,6 +262,21 @@ mod tests {
             batch: None,
             in_batch: None,
         }
+    }
+
+    /// 长活名单必须与注册表 / 排除表自洽:名字拼错 = 提示永远不触发(静默失效),进了排除表 = 提示
+    /// 让模型去 batch 一个 batch 不收的工具。顺带钉死 ffmpeg_run 的探测形不算长活。
+    #[test]
+    fn long_job_tools_are_registered_and_batchable() {
+        let tools = crate::tools::Tools::builtin();
+        for (name, _) in LONG_JOB_TOOLS {
+            assert!(tools.get(name).is_some(), "长活名单里的 {name} 不在注册表");
+            assert!(allowed_in_batch(name), "长活名单里的 {name} 被 batch 排除了,提示会自相矛盾");
+        }
+        assert!(is_long_job_call("ffmpeg_run", &json!({ "args": ["-i", "a.mp4"], "output": "a.mp3" })));
+        assert!(!is_long_job_call("ffmpeg_run", &json!({ "args": ["-i", "a.mp4"] })), "探测形不算长活");
+        assert!(is_long_job_call("fs_unzip", &json!({ "archive": "a.zip" })));
+        assert!(!is_long_job_call("fs_list", &json!({ "path": "/" })), "不在名单的不算");
     }
 
     #[test]

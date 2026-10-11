@@ -31,7 +31,9 @@ impl MediaDownload {
                               (进度在屏幕任务条),本工具立即返回。**下合集的一段用 all=true + \
                               from/to**(第几首到第几首,1 起含两端):超过一次上限的大合集分几\
                               批下(如实告诉用户分几批),「只要合集里第 N 首」= from=N to=N,\
-                              不用自己去网页扒分P链接。本地已有的文件不需要下载(要挪/复制用 \
+                              不用自己去网页扒分P链接。**几首歌各有各的链接(不是同一个合集)要\
+                              一起下,用 batch 把几条 media_download 打包一次派**,别一首一首调;\
+                              同一个合集仍用 all=true。本地已有的文件不需要下载(要挪/复制用 \
                               fs_move/fs_copy)。",
                 parameters: serde_json::json!({
                     "type": "object",

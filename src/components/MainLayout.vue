@@ -378,8 +378,13 @@ function addPaths(paths: string[]) {
 //    都从这里进既有 send 链;via 决定回合形态(二分纪律) ——
 const voice = useVoice()
 onTranscribed(async (text, via, speaker) => {
-  if (via === 'wake') await ensureVoiceConv() // 唤醒走语音专属会话;mic/打字进当前会话(交互二分)
-  chatSend(text, via, speaker)
+  if (via === 'wake') {
+    // 唤醒走语音专属会话;当前会话忙着(回合在飞 / 任务在跑)就不切界面、在后台念(§7.5)
+    const conv = await ensureVoiceConv()
+    chatSend(text, via, speaker, [], conv)
+  } else {
+    chatSend(text, via, speaker) // mic/打字进当前会话(交互二分)
+  }
 })
 // 旁听(呼名+续句,唤醒确认层):整句交模型仲裁 —— 临时回合,这里不渲染不切会话
 // (蒸发必须零痕迹);转正后的念话/上屏由 ConversationActivity(kind=overheard)驱动。

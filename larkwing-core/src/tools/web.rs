@@ -273,7 +273,8 @@ impl WebDownload {
                               **不要向用户索要密码、也不要把密码写进参数**;遇到 401 就\
                               让用户去那里配。网页里挑出来的图片(web_fetch / web_render 结果\
                               的【页内图片】栏)也用它存:图站防盗链就带 referer=那一页的地址,\
-                              想直接存成 cover.jpg 这类固定名字就给 name。",
+                              想直接存成 cover.jpg 这类固定名字就给 name。**要下两个以上文件,用 \
+                              batch 把几条 web_download 打包一次派**(一张卡、一次汇报),别一条条调。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
