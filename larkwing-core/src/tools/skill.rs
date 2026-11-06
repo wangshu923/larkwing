@@ -132,7 +132,7 @@ impl SkillWrite {
                     "properties": {
                         "name": {
                             "type": "string",
-                            "description": "技能名,短小好认(如「洗照片」「报销发票」)"
+                            "description": "技能名,短小好认(如「洗照片」「周末备菜」)"
                         },
                         "when_to_use": {
                             "type": "string",

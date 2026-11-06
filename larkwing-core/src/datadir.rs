@@ -927,7 +927,7 @@ mod tests {
         // 拷贝窗口里新到的:一张新附件 + 一个收件区文件 + 旧文件被改大
         std::fs::create_dir_all(current.join("media/inbox")).unwrap();
         std::fs::write(current.join("media/attachments/刚收到的.jpg"), vec![2u8; 256]).unwrap();
-        std::fs::write(current.join("media/inbox/发票.pdf"), vec![3u8; 128]).unwrap();
+        std::fs::write(current.join("media/inbox/样张.pdf"), vec![3u8; 128]).unwrap();
         std::fs::write(current.join("media/attachments/老图.jpg"), vec![1u8; 1024]).unwrap();
 
         let plan = precheck(&current, &picked).unwrap();
@@ -935,7 +935,7 @@ mod tests {
         perform_move(&current, &plan, &task).unwrap();
         task.done();
         assert!(new_root.join("media/attachments/刚收到的.jpg").is_file(), "新附件要跟过去");
-        assert!(new_root.join("media/inbox/发票.pdf").is_file(), "收件区新文件要跟过去");
+        assert!(new_root.join("media/inbox/样张.pdf").is_file(), "收件区新文件要跟过去");
         assert_eq!(
             std::fs::metadata(new_root.join("media/attachments/老图.jpg")).unwrap().len(),
             1024,

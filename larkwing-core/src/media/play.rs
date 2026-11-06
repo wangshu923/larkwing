@@ -4,7 +4,10 @@
 //! (B 站 UGC 合集 / 番剧 PGC / 本地同文件夹),成队规则在 `queue.rs`。
 
 use super::progress::resume_position;
-use super::queue::{audio_folder_files, is_dir_path, local_episodes, shuffle_advance, shuffle_back, shuffle_seed, single_key};
+use super::queue::{
+    audio_folder_files, is_dir_path, local_episodes, same_local_path, shuffle_advance, shuffle_back, shuffle_seed,
+    single_key,
+};
 use super::*;
 
 /// 切集目标:相对挪一格(上/下一集)或第 N 集绝对定位(1 起数;嘴控「看第五集」)。
@@ -106,6 +109,10 @@ impl MediaRuntime {
     ///   · 否则有进度就接上:停在第 i 集 → 第 i 集 + 集内位置(够长才续,`resume_position`);
     ///     第 i 集已看完 → 第 i+1 集从头;末集看完 = 整部从头(resumed=false);
     ///   · 没进度(第一次看)→ 传的那个文件所在的集,匹配不上 → 第一集。
+    ///   · **歌单例外(2026-11-06)**:音频文件夹里传的是某一首的**文件**路径 = 点名那首,进度不管
+    ///     (只有正好是上次停的那首才续集内秒数,有声书同一章接着听);传**文件夹**才按进度接着。
+    ///     缘由:整夹共用一条进度记录、每放一首都写,上面那条「路径只认剧」套到歌单上 = 「放《B》」
+    ///     只在文件夹从没放过时放 B,之后永远是上次那首或它的下一首(用户实锤)。
     /// 单集 / 发现失败 → 清队列;电影按文件身份查集内位置。决策落一行 info 日志(排查续播问题靠它)。
     async fn build_queue(
         &self,
@@ -159,21 +166,35 @@ impl MediaRuntime {
         };
 
         let total = entries.len();
-        // requested = 传进来的那个文件 / 链接落在队列的第几集(本地按绝对路径、B 站按 page_url 精确匹配;
-        // 分P 的 P1 用裸 bvid url 对齐)—— 只在**没有进度**时当起点用。
-        let requested = entries.iter().position(|e| e.url == page_url);
+        // requested = 传进来的那个文件 / 链接落在队列的第几集(本地按路径组件比〔Win / mac 大小写不敏感,
+        // 模型写的大小写与磁盘不一致也对得上〕、B 站按 page_url 精确匹配;分P 的 P1 用裸 bvid url 对齐)。
+        // 视频剧集只在**没有进度**时拿它当起点;音频文件夹里传的是某一首的文件路径 = **点名那首**(named)。
+        let local = is_local_path(page_url);
+        let requested = entries
+            .iter()
+            .position(|e| if local { same_local_path(&e.url, page_url) } else { e.url == page_url });
+        // 歌单心智(2026-11-06,用户实锤「指定了歌名却从别处起播」):「放《B》」传了 B 的路径就是要 B,
+        // 不是拿 B 当歌单的把手 —— 09-07「路径只认剧」是为剧集修的(模型拿上次用过的某集路径当整部剧
+        // 的把手),套到歌单上就把点名压掉了(整夹共用一条进度记录、每放一首都写,文件夹只在从没放过时
+        // 才按传的那首起)。音频文件 + 匹配上 = 点名;正好是上次停的那首才续集内位置(有声书同一章接着
+        // 听);要按进度接着听,传**文件夹**路径(技能 / 工具描述同步教)。
+        let named = requested.filter(|_| local && super::probe::is_audio_ext(std::path::Path::new(page_url)));
         let prog = self.inner.store.media_progress.get(&key).ok().flatten();
         let stored = match &prog {
             Some(p) => entries.iter().position(|e| e.id == p.episode_id).map(|i| (i, p)),
             None => None,
         };
-        let (index, resumed, resume_at) = match (episode, restart, stored) {
-            (Some(n), _, _) => {
+        let (index, resumed, resume_at) = match (episode, restart, named, stored) {
+            (Some(n), _, _, _) => {
                 anyhow::ensure!((1..=total).contains(&n), "这部一共 {total} 集,没有第 {n} 集");
                 (n - 1, false, None)
             }
-            (None, true, _) => (0, false, None),
-            (None, false, Some((i, p))) if p.finished => {
+            (None, true, _, _) => (0, false, None),
+            (None, false, Some(r), stored) => {
+                let at = stored.filter(|(i, _)| *i == r).and_then(|(_, p)| resume_position(p));
+                (r, at.is_some(), at)
+            }
+            (None, false, None, Some((i, p))) if p.finished => {
                 // 上次那集看完了:接下一集;末集看完 = 整部看完,从头(不算「接着上次」)
                 if i + 1 < total {
                     (i + 1, true, None)
@@ -181,15 +202,16 @@ impl MediaRuntime {
                     (0, false, None)
                 }
             }
-            (None, false, Some((i, p))) => {
+            (None, false, None, Some((i, p))) => {
                 let at = resume_position(p);
                 (i, i != 0 || at.is_some(), at)
             }
-            (None, false, None) => (requested.unwrap_or(0), false, None),
+            (None, false, None, None) => (requested.unwrap_or(0), false, None),
         };
         tracing::info!(
             key = %key,
             requested = ?requested,
+            named = ?named,
             stored = ?prog.as_ref().map(|p| (p.episode_id.as_str(), p.position_seconds, p.finished)),
             episode,
             restart,
@@ -822,6 +844,57 @@ mod tests {
         rt.control("loop_one", None).unwrap();
         let np = plist(rt.play(1, &dir.to_string_lossy(), false, true, None).await.unwrap());
         assert_eq!(np.play_mode, "loop_all", "新 play() 复位到歌单默认");
+    }
+
+    /// 歌单里点名某一首 = 从那首起(2026-11-06 用户实锤「指定了歌名却从别处起播」):整夹共用一条
+    /// 进度记录、每放一首都写,原先传了 B 的路径也只在文件夹从没放过时生效,之后一律按记录
+    /// (上一首放完 → 它的下一首)。传文件夹才按进度接着;点名的正好是上次停的那首才续集内秒数。
+    #[tokio::test]
+    async fn audio_folder_named_file_starts_there() {
+        let (rt, _rx) = runtime("audio-named");
+        let dir = std::env::temp_dir().join(format!("lw-audio-named-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = touch(&dir, "a.mp3");
+        touch(&dir, "b.mp3");
+        let c = touch(&dir, "c.mp3");
+        let np = |o: PlayOutcome| match o {
+            PlayOutcome::Playing(np) => np,
+            other => panic!("应为 Playing,实际 {other:?}"),
+        };
+        let s = |p: &std::path::Path| p.to_string_lossy().to_string();
+
+        // 第一次放 a:整夹组队,从 a 起
+        let pos = np(rt.play(1, &s(&a), true, false, None).await.unwrap()).playlist.expect("整夹应组队");
+        assert_eq!((pos.index, pos.resumed), (0, false));
+        let key = rt.inner.playlist.lk().as_ref().unwrap().series_key.clone();
+        // a 放完了(短歌:位置 0、finished)
+        assert!(rt.inner.store.media_progress.set_position(&key, "a.mp3", 0.0, 180.0, true).unwrap());
+
+        // 传文件夹 = 按进度接着:a 放完了 → 它的下一首 b
+        let pos = np(rt.play(1, &s(&dir), true, false, None).await.unwrap()).playlist.unwrap();
+        assert_eq!((pos.index, pos.resumed), (1, true), "文件夹路径按进度接着");
+
+        // 点名 c(传 c 的文件路径):从 c 起,不是「上次的下一首」
+        let n = np(rt.play(1, &s(&c), true, false, None).await.unwrap());
+        assert_eq!(n.resume_at, None);
+        let pos = n.playlist.unwrap();
+        assert_eq!((pos.index, pos.resumed), (2, false), "点名的那首就从它起");
+
+        // 大小写写错也认(Windows / mac 文件系统大小写不敏感,模型写的路径常对不上磁盘)
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            let shout = dir.join("C.MP3");
+            let pos = np(rt.play(1, &s(&shout), true, false, None).await.unwrap()).playlist.unwrap();
+            assert_eq!(pos.index, 2, "大小写不同的同一文件照样点名");
+        }
+
+        // 点名的正好是上次停的那首(有声书同一章听到一半):仍续集内秒数
+        assert!(rt.inner.store.media_progress.set_position(&key, "c.mp3", 900.0, 3600.0, false).unwrap());
+        let n = np(rt.play(1, &s(&c), true, false, None).await.unwrap());
+        assert_eq!(n.resume_at, Some(900.0), "点名的正是上次停的那首 → 续集内位置");
+        let pos = n.playlist.unwrap();
+        assert_eq!((pos.index, pos.resumed), (2, true));
     }
 
     #[tokio::test]

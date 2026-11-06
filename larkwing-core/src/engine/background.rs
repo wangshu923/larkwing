@@ -153,6 +153,58 @@ impl Engine {
         });
     }
 
+    /// 惯例提炼(engine/habits.rs,2026-11-06):行为侧的「越用越懂」—— scheduler 每个节拍喊一声,
+    /// 这里做便宜闸门,与 spawn_diary 同形:**开关复用「自动记住」**(`memory.auto_consolidate`,
+    /// 零新概念);任一回合在飞就让路;每 5 分钟最多真试一次(到期 / 攒够 / 空闲窗的库侧判断在
+    /// habits::run,只是几个轻查询);防重入;匿名 provider(model_id 空)不跑(FakeLlm 剧本队列
+    /// 是共享弹出,后台杂活去弹会偷走测试 / eval 的脚本回合)。尽力件,绝不阻塞调用方。
+    pub fn spawn_habits(&self, now_ms: i64) {
+        const TRY_INTERVAL_MS: i64 = 300_000;
+        if !self.auto_consolidate_enabled() {
+            return;
+        }
+        {
+            let sessions = self.sessions.lk();
+            let busy = sessions
+                .values()
+                .any(|slot| slot.inflight.as_ref().is_some_and(|h| !h.join.is_finished()));
+            if busy {
+                return;
+            }
+        }
+        let last = self.habits_last_try.load(Ordering::Acquire);
+        if now_ms.saturating_sub(last) < TRY_INTERVAL_MS {
+            return;
+        }
+        if self.habits_inflight.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.habits_last_try.store(now_ms, Ordering::Release);
+        let release = |flag: &Arc<AtomicBool>| flag.store(false, Ordering::Release);
+        let Some(provider) = self.background_provider() else {
+            release(&self.habits_inflight);
+            return;
+        };
+        if provider.model_id().is_empty() {
+            release(&self.habits_inflight);
+            return;
+        }
+        let store = self.store.clone();
+        let flag = self.habits_inflight.clone();
+        tokio::spawn(async move {
+            match habits::run(&provider, &store, now_ms).await {
+                Ok(n) if n > 0 => {
+                    tracing::info!(target: "larkwing::habits", lines = n, "惯例提炼:学到 {n} 句")
+                }
+                Ok(_) => tracing::debug!(target: "larkwing::habits", "惯例提炼:无需动笔"),
+                Err(e) => {
+                    tracing::warn!(target: "larkwing::habits", "惯例提炼失败(尽力件,下个节拍再试): {e:#}")
+                }
+            }
+            flag.store(false, Ordering::Release);
+        });
+    }
+
     /// 回忆页「这些日子」:日记流(日期新→旧)。home 共有一本,不随「看谁的」切换。
     pub fn list_diary(&self, limit: usize) -> Result<Vec<DiaryEntry>, AppError> {
         Ok(self.store.diary.list(limit)?)
@@ -211,6 +263,15 @@ mod tests {
         assert!(eng.bump_consolidate_due(conv), "第 N 轮该触发");
         assert!(!eng.bump_consolidate_due(conv), "触发后计数归零、又从头数");
         assert!(!eng.bump_consolidate_due(2), "另一会话独立计数,不受影响");
+    }
+
+    /// 没配 provider 时惯例提炼直接放弃(不 panic、不卡住 in-flight 标志,可再次进入)。
+    #[test]
+    fn spawn_habits_noops_without_provider() {
+        let eng = engine("habits-noprov");
+        eng.spawn_habits(1_000_000);
+        assert!(!eng.habits_inflight.load(Ordering::Acquire), "早退必须复位 in-flight 旗标");
+        eng.spawn_habits(2_000_000);
     }
 
     /// 没配 provider 时后台提炼直接放弃(不 panic、不卡住 in-flight 标志)。

@@ -155,6 +155,24 @@ pub fn suite() -> Vec<Scenario> {
                     _ => false,              // 没查本地就直奔网络 = 回归
                 }
             })),
+        // 歌单里点名一首 → media_play 的 url 要是那首的**文件**路径(2026-11-06 技能 / 描述改口):
+        // 传文件夹 = 整夹按进度接着,点名的那首就丢了(用户实锤「指定歌名却从别处起播」)。
+        Scenario::turn("media-named-song-file-path")
+            .note("歌单里点名某一首要传那首的文件路径,不是整个文件夹(§7.1 歌单点名)")
+            .seed(|s, _u| {
+                let dir = eval_songs_dir();
+                let _ = s.briefings.upsert("home", "media", &format!("歌在 {}", dir.display()), true);
+            })
+            .say("放一下《晚风》")
+            .check(tool_called("media_play"))
+            .check(custom("media_play 传的是那首的文件路径", |o| {
+                o.trace.iter().filter(|s| s.name == "media_play").any(|s| {
+                    serde_json::from_str::<serde_json::Value>(&s.args)
+                        .ok()
+                        .and_then(|a| a["url"].as_str().map(|u| u.ends_with("晚风.mp3")))
+                        .unwrap_or(false)
+                })
+            })),
         // 下载合集要先确认范围(§7.1 media_download,用户拍板):已知是合集、但没说清
         // 「一首还是全部」→ 先问,别自作主张开下(不许 all=true,也不该闷头下单曲)。
         Scenario::turn("download-batch-confirm")
@@ -587,4 +605,18 @@ pub fn suite() -> Vec<Scenario> {
             }))
             .check(tool_not_called("startup_toggle")),
     ]
+}
+
+/// 「歌单里点名一首」场景的夹具:临时文件夹里三首空 mp3(名字是编的占位,§6.5 示范纪律:不嵌真实歌名),
+/// 需知指到这里。幂等,重复建无害;eval 跑真模型时 fs_find 真能找到、media_play 真能开播(直传空文件)。
+fn eval_songs_dir() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("lw-eval-songs");
+    let _ = std::fs::create_dir_all(&dir);
+    for n in ["晨光.mp3", "晚风.mp3", "雨夜.mp3"] {
+        let p = dir.join(n);
+        if !p.exists() {
+            let _ = std::fs::write(&p, b"");
+        }
+    }
+    dir
 }

@@ -2,7 +2,7 @@
 //! web_fetch 的「真浏览器」档:静态抓取回来是空壳时交给壳层 WebView 窗真渲染
 //! (webrender 接缝,壳层注入;没注入 = 如实说没有渲染组件)。
 //! L2 会话式浏览(2026-07-10 用户拍板,DOM/文本编号快照路线):每步回**编号元素**
-//! 快照(文本版 Set-of-Marks),窗口跨调用存活(session,TTL 3 分钟)——看 → 点编号 →
+//! 快照(文本版 Set-of-Marks),窗口跨调用存活(session,TTL 10 分钟,单源壳层 `webrender::SESSION_TTL`)——看 → 点编号 →
 //! 返回 → 再看连续走。完全操作第一批(2026-07-14)开了填字/批量填表/选下拉/按键/提交/
 //! 滚动 + 截图可选第二只眼;**文件上传(2026-07-15)**:upload_ref+upload_paths 把本机
 //! 文件传给页面的上传框(壳层 DataTransfer 注入)。**凭证代填 / CDP 可信输入仍不做**,
@@ -132,7 +132,7 @@ impl WebRender {
                 description: "用真浏览器打开并操作网页(要跑 JS 才显示内容的页面:web_fetch \
                               抓回来是空壳、说「动态加载」时用这个)。每次返回渲染后的正文 + 带\
                               编号的交互元素(可点 [3] 按钮「下载」/ 可填 [5] 输入框「邮箱」/ \
-                              可选 [7] 下拉「城市」/ 勾选框),并给一个 session 号——窗口保持 3 \
+                              可选 [7] 下拉「城市」/ 勾选框),并给一个 session 号——窗口保持 10 \
                               分钟,可连续操作:带 session 加 click_ref 点编号、type_ref+text 往\
                               编号输入框填字、fill 批量填表、select_ref+option 选下拉、勾选框用 \
                               click_ref 点、press_key 按键(Enter/Escape…)、submit 提交表单、\
@@ -141,7 +141,7 @@ impl WebRender {
                               下张快照会回读各框当前值,自己核对填对没。点出的下载自动存到本机并\
                               返回路径。read=true 通读当前页正文**全文**(一段段给,结果里带下一段\
                               offset;登录后的文章、动态加载的长文读全靠它);save_pdf=true 把当前\
-                              页面带排版存成 PDF 落 dir(存档发票/订单/文章)。这两个是单独的一步,\
+                              页面带排版存成 PDF 落 dir(存档订单/文章/网页)。这两个是单独的一步,\
                               不与点击/填表同调。\
                               浏览窗在屏幕右下角对用户可见:遇到要登录/扫码/验证码,或要填密码/\
                               银行卡这类敏感信息,别自己填——请用户在那个小窗里操作,完成后你带 \
@@ -736,8 +736,10 @@ impl WebRender {
             out.push_str("\n(想截图但没截到——得先有打开的页面,或这台机器不支持截图)");
         }
         if let Some(sid) = &outcome.session {
+            // 「10 分钟」= 壳层 webrender::SESSION_TTL(600s,2026-09-17 由 180s 放开);改 TTL 连这句与
+            // 上面 description / session 参数描述一起改(§4.11 双源同步点)。
             out.push_str(&format!(
-                "\n\n会话 {sid}(3 分钟内可继续:带 session 再调,click_ref 点编号 / back 返回 / url 跳新页)"
+                "\n\n会话 {sid}(10 分钟内可继续:带 session 再调,click_ref 点编号 / back 返回 / url 跳新页)"
             ));
         }
         Ok((out.trim_end().to_string(), outcome.screenshot))

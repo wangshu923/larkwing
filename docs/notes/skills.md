@@ -16,3 +16,12 @@
 
 - 原第 6 条「封面/海报不用特意嵌,播放器都按画面现抽缩略图」是给视频成品写的,对音频成品正好教反(音频没画面可抽,车机 / 手机列表全靠文件内嵌图)。拆成:第 6 条视频成品(不嵌海报、不带流式旗标、faststart、产完探一眼);第 7 条音频成品必嵌封面(来源顺序 源自带 > 同目录 cover / folder > 上网找正式海报 > 截帧兜底避开龙标取 20% 处 / 归一 600 宽 JPEG / attached_pic 配方 / mp3 `-id3v2_version 3` / ogg opus 如实说 / 产完探 attached pic)。`sync_builtins` 按 slug 刷内容,老用户下次启动即生效,enabled 状态不动。
 - 数字都是数据里的产品默认(§4.11 同族):封面边长 600、截帧取 20% 处 —— 进 PLAN §2 待用户按现值确认。技能内容纪律照旧:只教做法与工具形状,不嵌具体片名 / 路径。
+
+## 技能 / 工具描述对账(2026-11-06)
+
+> 来源:2026-11-06 会话,用户「看看技能和工具有没有可优化的地方」。子代理把 14 条技能对着 68 个工具 `spec()` + LAWS + few-shot 全量读一遍,报出的「真矛盾」逐条对代码 grep 核过才改(报告≠验证)。
+
+- **真矛盾(全改了)**:LAWS「干长活」仍教「每次发完整清单、全量替换」而 `plan_set` 09-17 起有 `done` 增量形 → 改成「做完传 done、改清单才发 items」(`plan.rs` 模块注释同步);「BT下载」第 2 条教迅雷链传 torrent_download 自动拆封,`normalize_link` 唯一调用点在 `web_download` → 改口「交 web_download,拆出磁力再转 torrent_download」;`web_render` 结果尾句「3 分钟内可继续」vs 参数「10 分钟」,TTL 09-17 已 600s → 三处统一 10 分钟并注明单源壳层 `SESSION_TTL`;`lyrics_fetch` 教「没时间轴就写纯文本 .lrc」而无时间轴 .lrc 播放条不显示(§7.1)→ 指路技能「给歌配歌词」/ read_audio;「放歌放视频」第 4 条「顺手 briefing_write 记资源」撞 LAWS「拿不准就先不记」+ 同 domain 整体覆盖(few-shot 的目录就记在 media 下)→ 改成「先 lookup 合并、拿不准别记」;「网页上办事」第 2 条与 `web_render` 描述两套下载说法 → 统一成「浏览器自己下的自动存、跳到直链(post_click_url)的接 web_download」。
+- **场景词清零**(§7.8):`skill_write` 示例「报销发票」/ `web_render`「存档发票」两处描述 + `web.rs` / `print.rs` 注释 + `desktop.rs` / `datadir.rs` 夹具 → 换中性词;`grep 发票` 在 `larkwing-core/src` + `src` 归零。
+- **工具有、技能没教的(补了)**:「定时播报」repeat 三档 / mode=task / for 跨人,「周末不用报」改 repeat=weekdays,reminder_list 是全局的自己挑今天的;「看片守约定」stop_after 到点静停、「再看一会」= 撤旧设新(提醒没有「挪」);「睡前故事」加第 5 条 stop_at_end / stop_after;「整理文件」「存歌进曲库」lyrics_fetch 缺歌名带 title/artist 重试 + 指向「给歌配歌词」;「存歌进曲库」from=N to=N;「BT下载」only;「给歌配歌词」read_audio 的 offset / from 分页;四处 batch 句补「给个 title」;fs_list / fs_find 的 offset 与 glob。
+- **没动的**:`when_to_use` 的其余重叠(故事 / 清理 / 下载 / 盯)是判断题,没收;few-shot 不加;子代理「B 类」里 send_text / speak_to_file / qr_encode 等没技能提的工具,本就不需要技能(schema 自解释),不补。

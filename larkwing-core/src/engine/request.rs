@@ -149,7 +149,7 @@ pub(super) async fn open_stream(
 
 impl Engine {
     /// 回合开始时把「此刻」背景状态追加给模型(通用缝):各源各贡献一行,拼成一条不落库的
-    /// 〔此刻 · …〕注记挂到末条 user 消息(持久前缀字节不动 → 前缀缓存不破)。目前只有 media
+    /// 〔此刻 · …〕注记挂到末条 user 消息(持久前缀字节不动 → 前缀缓存不破)。media
     /// 播放态(修「歌放完了模型却以为还在播」);以后的进行中任务 / 待触发提醒等在此各 push 一条
     /// 即可,缝不再动。在 build_context **之后**调,因装配闭包在线程池里拿不到 &self。
     pub(super) fn inject_ambient(&self, conv_id: i64, request: &mut crate::llm::ChatRequest) {
@@ -170,6 +170,10 @@ impl Engine {
             .get(&conv_id)
             .and_then(|s| s.plan.lk().ambient_line());
         if let Some(s) = plan_line {
+            lines.push(s);
+        }
+        // 时钟行恒在最后(2026-11-06):学到的时段惯例要用得上,模型得免费知道周几几点。
+        if let Some(s) = context::clock_line(crate::store::now_ms()) {
             lines.push(s);
         }
         if !lines.is_empty() {

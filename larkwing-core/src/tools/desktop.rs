@@ -767,7 +767,7 @@ mod tests {
         // 照片 / 文档 / 无扩展名 / 目录 —— 一律不是可执行,照旧不问
         for p in [
             "/tmp/photo.jpg",
-            "D:\\单据\\发票.pdf",
+            "D:\\单据\\样张.pdf",
             "~/Music/song.flac",
             "/home/u/notes.txt",
             "D:\\电影\\a.mkv",

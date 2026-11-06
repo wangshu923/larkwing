@@ -98,6 +98,26 @@ pub(super) fn is_dir_path(s: &str) -> bool {
 /// wrap = true(列表循环 / 用户点名「下一首」)→ 重开一轮(排除当前,免紧挨着重复;
 /// 队列只剩一首时退化为重放),否则 None(这一轮放完了)。seed 注入可测(§4.11 免不了随机,
 /// 但挑选逻辑本身是纯函数)。
+/// 本地路径是否同一个文件:按路径组件比,Windows / mac 文件系统大小写不敏感 → 组件忽略大小写;
+/// Windows 上 `/` 与 `\` 都是分隔符(`components()` 已归一)。模型写的路径大小写常与磁盘不一致
+/// (2026-11-06 加固:原先字符串全等,对不上就退到第一首)。不 canonicalize:不碰磁盘、不展开符号链接。
+pub(super) fn same_local_path(a: &str, b: &str) -> bool {
+    fn parts(s: &str) -> Vec<String> {
+        std::path::Path::new(s)
+            .components()
+            .map(|c| {
+                let s = c.as_os_str().to_string_lossy();
+                if cfg!(any(windows, target_os = "macos")) {
+                    s.to_lowercase()
+                } else {
+                    s.into_owned()
+                }
+            })
+            .collect()
+    }
+    parts(a) == parts(b)
+}
+
 pub(super) fn shuffle_advance(pl: &mut Playlist, wrap: bool, seed: u64) -> Option<usize> {
     let total = pl.entries.len();
     let mut candidates: Vec<usize> = (0..total).filter(|i| !pl.played.contains(i)).collect();
@@ -279,6 +299,17 @@ mod tests {
         assert!(!is_local_path("https://www.bilibili.com/video/BV1"));
         assert!(!is_local_path("//cdn.example/x"), "protocol-relative 是网络");
         assert!(!is_local_path("movies/a.mp4"), "相对路径拒收");
+    }
+
+    #[test]
+    fn same_local_path_compares_components() {
+        assert!(same_local_path("/a/b/c.mp3", "/a/b/c.mp3"));
+        assert!(!same_local_path("/a/b/c.mp3", "/a/b/d.mp3"));
+        assert!(!same_local_path("/a/b/c.mp3", "/a/b"), "目录入参匹配不到任何一首 = 自然起点");
+        // 大小写:Win / mac 文件系统不敏感 → 认;Linux 敏感 → 不认
+        assert_eq!(same_local_path("/a/B/c.mp3", "/a/b/C.MP3"), cfg!(any(windows, target_os = "macos")));
+        #[cfg(windows)]
+        assert!(same_local_path(r"D:\Music\c.mp3", "D:/Music/c.mp3"), "两种分隔符同一文件");
     }
 
     #[test]

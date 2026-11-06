@@ -33,6 +33,8 @@ pub async fn tick(engine: &Engine, now: i64) -> anyhow::Result<()> {
     // 家庭日记搭同一节拍(engine/diary.rs):跨了没写的日历日才真跑,内部自带限流/防重入/
     // FakeLlm 挡板,fire-and-forget 绝不拖慢下面的提醒。
     engine.spawn_diary(now);
+    // 惯例提炼搭同一节拍(engine/habits.rs):到期 / 攒够 / 空闲才真跑,同样 fire-and-forget。
+    engine.spawn_habits(now);
     let store = engine.store().clone();
     let due = tokio::task::spawn_blocking(move || store.jobs.due(now)).await??;
     let mut weather: Option<WeatherClient> = None; // 仅在遇到条件提醒时懒建(避免无谓建 HTTP 客户端)

@@ -214,3 +214,14 @@
 **⑤ 拖放直接播**。这是五个里最费事的:`dragDropEnabled:false` 是 c9d4a66 为了让 HTML5 drop 收附件关掉的(Windows 上两者互斥),要开原生拖放就得整体换路 —— 附件也改走路径。分流是纯函数 `media/drop.rs::plan_drop`(视频 / 音频文件播第一个、音频文件夹当歌单、视频文件夹自然排序第一集起、其它当附件、**混拖全当附件不猜**、文件夹当不了附件剔掉),壳层命令 `drop_paths` 真去 `play()`;这是程序放用户亲手拖进来的文件,不是模型的手脚 → 不经工具层、不过授权圈、不入表,也不进聊天流(像按了个钮,〔此刻〕自然带「在播 X」)。附件半边:`InAttachment` 加 `path`(serde default,老前端 / 渠道零改),`process_attachments` 的字节来源改成「有 path 按路径有界读,否则解 base64」;图沿用视觉输入的 12MB 老闸(再大就是往模型灌字节),文档 64MB;**本地文件不再往收件区抄一份**,路径行直接给原处 —— 原本抄进收件区是因为渠道来的字节没有本地路径,拖进来的本来就在用户自己的文件夹里。读不出(太大 / 不在)如实一行,图不喂空 data URL。前端在 Tauri 里让 HTML5 的 onDragEnter / onDrop 直接让位(mac 上两套都会触发,不让位就双份处理),高亮由原生 enter / leave 事件驱动;浏览器预览没有 Tauri 事件,HTML5 那套照旧。
 
 **当日状态**:Mac core lib 839 / engine 20 / clippy 两 crate 零 / vue-tsc 0 / i18n 5/5(900=900);新增 6 条单测;预览页月亮钮菜单与 `data-text-scale` 验过。原生拖放与 `::cue` 字号只能真机验。**没做 / 另议**:按键接管范围收窄(撞 09-07 拍板,待用户定)、视频下载、直播 / 电台流、文件关联「用 BT 打开」、章节导航、一键截帧、Media Session setPositionState、缓冲 buffering 态、悬浮窗迷你播控加上下曲、主窗空会话 chips 动态「接着看」。
+
+## 歌单点名:音频文件路径 = 点名那首(2026-11-06)
+
+> 来源:2026-11-06 会话。用户:「播放音乐我提一个,有一个列表的时候,我明明指定歌名,他播放的是个列表(这没问题),但是他会随便(或者是第一首),而没有播放我指定」。
+
+- **病灶两条路,都在歌单上**:① `queue::audio_folder_queue` 的 `series_key` 只认文件夹(从任一首进、或直接给文件夹都是同一个 key,续播记录共享),`progress::track_progress` 对带队列的播放一律登记、`persist_progress` 对短歌写 `finished`;于是 `play.rs::build_queue` 的「路径只认剧、不当点名」(2026-09-07 为剧集「昨晚看到 4 集今天回到 2 集」修的)套到歌单上 = 传了 B 的路径只在文件夹**从没放过**时才放 B(`(None, false, None)` 臂),之后一律按记录:上一首放完 → 它的下一首,没放完 → 重放上一首,工具还回「接着上次,从《A》继续」让模型照实转述 —— 用户看到的就是「随便放一首」。② 技能「放歌放视频」第 1 条教「把整个文件夹路径交给 media_play 就是连播歌单」,模型为了得到歌单直接传文件夹 → 恒从第一首或记录位置起。`episode=N` 是唯一能点名的参数,但 N 是 `natural_cmp` 序号、`fs_list` 是字典序(「10.mp3」排「2.mp3」前),模型结构上算不出。
+- **修**(`build_queue`):`named = requested.filter(本地 && 音频扩展名)`,匹配上 = 点名那首、进度不管;只有点名的正好是上次停的那首才 `resume_position`(有声书同章接着听);传文件夹 `requested = None` → 进度规则照旧。视频剧集规则一字不动(09-07 那条仍成立,只是歌单不该套)。决策日志加 `named` 字段。**接受的代价**:有声书文件夹里模型拿某一章当把手会从那章从头放 → 技能 / 描述同步教「接着听传文件夹」。
+- **顺带加固**:`requested` 原先字符串全等,模型写的大小写与磁盘不一致就匹配不上、退到第一首 → `queue::same_local_path` 按路径组件比、Win / mac 大小写不敏感(不 canonicalize、不碰磁盘);网络 URL 仍精确相等。
+- **教学面**:`media_play` 描述加「歌单里点名某一首:传那首的文件路径,就从它起播;要按上次听到哪接着听,传文件夹路径」,「短于 10 分钟的歌不记」改成实际行为「歌不记秒数、只记放到哪首」,`episode` 参数说明点名歌不用数序号;技能第 1 条拆成「点名传文件 / 整夹听传文件夹 / 有声书接着听传文件夹」,第 5 条补 episode / restart / stop_after;eval 守卫 `media-named-song-file-path`(临时夹三首空 mp3 + 需知指路,断言 media_play 的 url 以那首文件名结尾)。few-shot 刻意不加(62 条已远超 §6.5 的 800 token 预算,再塞只会更稀释)。
+- 测试:`play::tests::audio_folder_named_file_starts_there`(文件夹按进度 / 点名从那首起 / 大小写 / 同章续秒数)+ `queue::tests::same_local_path_compares_components`。真机 watch 见 PLAN。
+- 排查抓手:`larkwing.log` 搜「续播决策」,看 `requested / named / stored / chosen` 四个值,哪条路一眼分得开。

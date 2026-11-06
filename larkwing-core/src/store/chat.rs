@@ -107,6 +107,18 @@ pub struct SearchHit {
     pub created_at: i64,
 }
 
+/// 行为流水的一行(惯例提炼取料用,`engine/habits.rs`):只带归因所需的最少列 ——
+/// tool 行的 content 截前 200 字(配对后从结果里拿标题),其余行 content 恒空。
+#[derive(Debug, Clone)]
+pub struct BehaviorRow {
+    pub conversation_id: i64,
+    pub id: i64,
+    pub role: String,
+    pub content: String,
+    pub payload: Option<String>,
+    pub created_at: i64,
+}
+
 /// 取哪一页消息(UI 分页游标):三个读路径(载会话 / hover 读数 / 「想了想」轨迹)共用同一个
 /// 游标,页大小恒 `UI_PAGE`,所以三者取到的**是同一段消息** —— 翻上去的老气泡照样有读数与轨迹。
 /// 两个字段互斥,`around` 优先;都不给 = 最新一页(= 分页之前的固定行为,前端不传即得)。
@@ -601,6 +613,51 @@ impl ChatRepo {
         })
     }
 
+    /// 跨会话取 `[from_ms, to_ms)` 内的**行为流水**(惯例提炼取料,`engine/habits.rs`):
+    /// tool 行(事件本体)+ 带 tool_calls 的 assistant 行(入参)+ user 行(说话人归属),
+    /// 按 (conversation_id, id) 升序 → 调用方顺序扫一遍即可配对。封顶 limit(超过只取最早的)。
+    /// tool 行 content 只截前 200 字(标题在结果开头),其余行不带 content —— 不把整段回复搬出库。
+    pub fn behavior_rows_between(&self, from_ms: i64, to_ms: i64, limit: i64) -> Result<Vec<BehaviorRow>> {
+        self.db.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT conversation_id, id, role,
+                        CASE WHEN role = 'tool' THEN SUBSTR(content, 1, 200) ELSE '' END,
+                        payload, created_at
+                 FROM messages
+                 WHERE created_at >= ?1 AND created_at < ?2
+                   AND (role = 'tool' OR role = 'user'
+                        OR (role = 'assistant' AND payload LIKE '%\"tool_calls\"%'))
+                 ORDER BY conversation_id ASC, id ASC LIMIT ?3",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![from_ms, to_ms, limit], |r| {
+                    Ok(BehaviorRow {
+                        conversation_id: r.get(0)?,
+                        id: r.get(1)?,
+                        role: r.get(2)?,
+                        content: r.get(3)?,
+                        payload: r.get(4)?,
+                        created_at: r.get(5)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// `[from_ms, to_ms)` 内工具行条数(惯例提炼「攒够了就跑」的量判据,跨全家所有会话)。
+    pub fn count_tool_rows_between(&self, from_ms: i64, to_ms: i64) -> Result<i64> {
+        self.db.with(|c| {
+            let n = c.query_row(
+                "SELECT COUNT(*) FROM messages
+                 WHERE created_at >= ?1 AND created_at < ?2 AND role = 'tool'",
+                rusqlite::params![from_ms, to_ms],
+                |r| r.get(0),
+            )?;
+            Ok(n)
+        })
+    }
+
     /// 跨会话搜索(当前用户):`messages.content` 子串匹配,排除 tool/event 内部行
     /// (`role IN (user, assistant)`)。substring `LIKE` 即可(同 recall 立场,历史量小够用;
     /// 真要语义查找走 §13.9 检索核心)。最近命中在前。
@@ -974,5 +1031,42 @@ mod tests {
         // 占位已不在(等价于用户已重命名)→ 绝不覆盖
         assert!(!store.chat.set_title_if(conv.id, &placeholder, "别的").unwrap());
         assert_eq!(store.chat.get_conversation(conv.id).unwrap().unwrap().title, "整理下载文件夹");
+    }
+
+    /// 行为流水取料:只收 tool / user / 带 tool_calls 的 assistant 行,按 (会话, id) 升序;
+    /// tool 行 content 截 200 字、其余行 content 为空;工具行计数口径一致。
+    #[test]
+    fn behavior_rows_pick_tool_user_and_calling_assistant_only() {
+        let (store, me) = store("behavior-rows");
+        let conv = store.chat.create_conversation(me, "companion").unwrap();
+        store.chat.append_message(conv.id, "user", "放个歌").unwrap();
+        // 不带 tool_calls 的 assistant 行(纯回复)不该进流水
+        store.chat.append_message(conv.id, "assistant", "好的").unwrap();
+        store
+            .chat
+            .append_message_full(
+                conv.id,
+                "assistant",
+                "",
+                Some(r#"{"tool_calls":[{"id":"c1","name":"media_play","args":{"url":"D:\\x.mp3"}}]}"#),
+            )
+            .unwrap();
+        let long = "已开始播放《样例》".to_string() + &"x".repeat(400);
+        store
+            .chat
+            .append_message_full(conv.id, "tool", &long, Some(r#"{"call_id":"c1","name":"media_play","status":"ok"}"#))
+            .unwrap();
+        store.chat.append_message(conv.id, "event", "到点了").unwrap();
+
+        let now = crate::store::now_ms();
+        let rows = store.chat.behavior_rows_between(now - 60_000, now + 60_000, 100).unwrap();
+        let roles: Vec<&str> = rows.iter().map(|r| r.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "tool"], "纯回复与 event 行不进流水:{roles:?}");
+        assert_eq!(rows[0].content, "", "user 行不带 content");
+        assert_eq!(rows[1].content, "", "assistant 行不带 content");
+        assert_eq!(rows[2].content.chars().count(), 200, "tool 行截前 200 字");
+        assert!(rows[2].content.starts_with("已开始播放《样例》"));
+        assert_eq!(store.chat.count_tool_rows_between(now - 60_000, now + 60_000).unwrap(), 1);
+        assert!(store.chat.behavior_rows_between(now + 60_000, now + 120_000, 100).unwrap().is_empty());
     }
 }

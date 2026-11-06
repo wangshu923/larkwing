@@ -11,7 +11,7 @@ use crate::store::briefings::{scope_home, scope_user};
 use super::{Tool, ToolCtx, ToolSpec};
 
 /// 常驻区(进前缀)总预算,字数计(中文 ~1.5 字/token,约合 600-800 token)。
-const RESIDENT_BUDGET_CHARS: usize = 1200;
+pub(crate) const RESIDENT_BUDGET_CHARS: usize = 1200;
 /// 单条内容上限:超过则退回让模型精简/拆主题重写,**不静默截断**(§3.5)。
 /// 媒体目录+一串 URL 容易破 300,放到与常驻预算同量级;真超大条目由预算逻辑自动降按需。
 const CONTENT_MAX_CHARS: usize = 1200;

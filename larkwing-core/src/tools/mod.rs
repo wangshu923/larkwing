@@ -5,7 +5,7 @@
 
 pub mod batch;
 mod bgtask;
-mod briefing;
+pub(crate) mod briefing; // pub(crate):engine/habits.rs 共用常驻预算常量(单源)
 pub mod delegate;
 mod desktop;
 mod end_conversation;

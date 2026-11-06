@@ -21,7 +21,7 @@ use super::{Tool, ToolCtx, ToolRisk, ToolSpec};
 const CONTENT_TOP_N: usize = 3;
 const PIECE_MAX_CHARS: usize = 1200;
 const FETCH_MAX_CHARS: usize = 6000;
-/// **同步档**体积闸:回合内下完、当场返回路径。发票 PDF → pdf_to_png 那类「下完立刻接
+/// **同步档**体积闸:回合内下完、当场返回路径。单据 PDF → pdf_to_png 那类「下完立刻接
 /// 下一步」的链子依赖这个即时性,别改大(大了会把回合卡死在下载上)。
 const DOWNLOAD_SYNC_MAX_BYTES: u64 = 50 * 1024 * 1024;
 /// **后台档**体积闸:Content-Length 超过同步档就转 job(进度/取消/收尾汇报走 bgtasks)。

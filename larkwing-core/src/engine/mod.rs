@@ -4,6 +4,7 @@
 mod consolidate;
 mod context;
 pub(crate) mod diary; // pub(crate):eval 的 Drive::Diary 直调 run(评蒸馏质量)
+pub(crate) mod habits; // 行为侧提炼「这个家的惯例」(2026-11-06;pub(crate) 同 diary,留给 eval 直调)
 mod title;
 mod turn;
 mod usage;
@@ -329,6 +330,9 @@ pub struct Engine {
     /// 家庭日记(engine/diary.rs)后台补写的防重入 + 限流(app 级瞬态,丢了 = 下个节拍再试)。
     diary_inflight: Arc<AtomicBool>,
     diary_last_try: AtomicI64,
+    /// 惯例提炼(engine/habits.rs)后台跑的防重入 + 限流(同 diary;app 级瞬态)。
+    habits_inflight: Arc<AtomicBool>,
+    habits_last_try: AtomicI64,
     /// 壳层网页渲染器(web_render 工具的机器件,webrender.rs 接缝):壳层 boot 注入;
     /// 没注入(core 单测/eval/headless)= None,工具如实说没有渲染组件。
     web_renderer: std::sync::OnceLock<Arc<dyn crate::webrender::WebRenderer>>,
@@ -387,6 +391,8 @@ impl Engine {
             sessions: Mutex::new(HashMap::new()),
             diary_inflight: Arc::new(AtomicBool::new(false)),
             diary_last_try: AtomicI64::new(0),
+            habits_inflight: Arc::new(AtomicBool::new(false)),
+            habits_last_try: AtomicI64::new(0),
             web_renderer: std::sync::OnceLock::new(),
             voice: std::sync::OnceLock::new(),
             confirmer,
