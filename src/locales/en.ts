@@ -546,6 +546,7 @@ export default {
     // a failed auto turn (reminder fired / background job reported back) shouldn't leave just a bare system line either (§3.5)
     wakeFailedReport: 'The job finished, but the follow-up turn failed — just ask again and it will pick up from there',
     wakeFailedReminder: 'The reminder fired, but the reply turn failed — what it was about is in the system line above',
+    ttsFailed: "Couldn't read it aloud: speech synthesis failed. Try again later, or pick another voice in Settings",
   },
   // one-click update (backlog ⑤·A): the "new version" card + manual-check feedback
   update: {

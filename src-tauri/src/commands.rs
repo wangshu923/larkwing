@@ -808,8 +808,17 @@ pub fn voice_unenroll(state: State<'_, AppState>, user_id: i64) -> Result<(), Ap
 /// `<audio>` 的 localhost URL。切句/编排在前端(useSpeech),这里只管单句。
 #[tauri::command]
 pub async fn tts_synthesize(state: State<'_, AppState>, text: String) -> Result<String, AppError> {
-    let path = state.voice.tts_to_file(&text).await.map_err(AppError::internal)?;
-    state.media.file_url(path).await.map_err(AppError::internal)
+    // 同 voice_preview:失败以前只在前端 console 冒(正式版无 devtools)→ 日志零行、朗读整个哑掉也查不到
+    // 真因(2026-11-08 微软握手 403 就是这么藏住的)。落 warn 让它在 logs/larkwing.log 现形(§3.5)。
+    let chars = text.chars().count();
+    let path = state.voice.tts_to_file(&text).await.map_err(|e| {
+        tracing::warn!(chars, err = %format!("{e:#}"), "朗读合成失败");
+        AppError::internal(e)
+    })?;
+    state.media.file_url(path).await.map_err(|e| {
+        tracing::warn!(err = %format!("{e:#}"), "朗读音频 URL 生成失败");
+        AppError::internal(e)
+    })
 }
 
 /// 设置页音色试听:句子由前端字典传入(core 不产文案,先例 = media_login title)。

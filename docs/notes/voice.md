@@ -98,3 +98,28 @@
 规则:当前会话有回合在飞(`inflightConvs.has(state.convId)`)或 HUD 有任务在跑(`useTasks().state.tasks` 任一 running)→ 唤醒不切界面;语音会话该建还是建(`api.newConversation('voice')` + `refreshConversations()`,不切也要进列表、收尾 badge 要有地方落),唤醒回合用 `send(…, targetConv)` 的后台形跑:不上屏、不占时钟,delta 照 `speech.pushDelta` 念,done 打 badge,`__IGNORE__` 不打 badge;用户中途点进语音会话,在飞那段由 reattach 接上。不忙 → 老行为,切过去显示。`ensureVoiceConv()` 现在返回目标会话 id,`MainLayout.onTranscribed` 据此调 `chatSend(text, 'wake', speaker, [], conv)`。
 
 两处取舍:① 「有任务在跑」没按会话判(`TaskView` 不带 conv_id)—— 任何任务在跑都不切,多不切一次的代价只是要自己点进语音会话看文字,语音回合本就以念为主;② 唤醒收尾编排(跟进窗 / wakeResume)与在不在屏上无关,后台形照走,§7.5「唤醒收尾通知一个都不能漏」不受影响。
+
+## 在线朗读全哑:微软强制 Sec-MS-GEC v2(2026-11-08 破案)
+
+> 来源:2026-11-08 会话。用户:「消息的朗读没反应是不是有 bug 了」「win 最新版本」「以前是可以的,哪一版改坏了,原因要追溯」。
+
+**现象**:Windows v0.2.41 上点气泡「朗读」毫无动静,不出声、不报错。
+
+**根因(不在我们代码里)**:默认音色走微软 Edge「大声朗读」的在线接口(`speech.platform.bing.com`),这是**逆向出来的免费接口**,客户端要在握手里带一个 `Sec-MS-GEC` 令牌。2026-10-10 前后微软把令牌升级为 v2 并**强制**,v1 令牌一律 HTTP 403 —— 全球所有旧客户端同时挂(Python edge-tts 7.2.8 在 rany2/edge-tts#490 报 403,10-10 开;#492 10-13 修)。我们依赖的 `msedge-tts` 0.4.0 写死 `Sec-MS-GEC-Version: 1-130.0.2849.68`,于是建连即 403、每一句都合成失败。上游 0.4.1(2026-10-14,commit「fix: support Sec-MS-GEC v2 token to fix synthesis 403」)新增 `drm.rs` 生成 v2 令牌、版本串改 `2-155.0.4283.45`、UA 换成桌面 Edge 155。
+
+**追溯「哪一版改坏的」**:没有哪一版。逐个 tag 查 `Cargo.lock`:v0.1.1(2026-06-17)到 v0.2.41(2026-11-06)**全部**锁在 msedge-tts 0.4.0,朗读链前端(`useSpeech.ts` / `useAudioGraph.ts`)近两个月也没动过。是服务端在 10 月中旬单方面改了规矩,**所有已装的版本(包括更老的)同一天一起哑**;v0.2.39(10-08)是最后一个发出时还能念的版本,v0.2.40(10-11)与 v0.2.41 出厂即哑。
+
+**为什么近一个月没人发现、还照发了两个版本**:
+1. **失败是静默的**:`useSpeech` 合成失败只 `console.error`,`tts_synthesize` 命令不落日志 —— 正式版 WebView 没 devtools,UI 零反馈、`larkwing.log` 零行,与 §6.6「失败别静默」相左。
+2. **缓存掩盖**:TTS 按 hash(音色|语速|文本)落盘缓存,念过的句子重听照样有声,只有新句子哑,看着像「偶尔不灵」。
+3. **发版前没人碰真网**:CI 刻意不连外部服务,发版流程里也没有任何一步真去合成一句。
+
+**修**:
+- `msedge-tts` 升 0.4.1(Cargo.toml 下限钉到 0.4.1:Cargo.toml 写 "0.4.0" 时语义上早就允许 0.4.1,但锁文件不会自己升 —— 上游修了我们也拿不到)。
+- 失败必有动静:`tts_synthesize` 落 warn(字数 + 错误链,不落原文);`useSpeech` 合成失败一回合至多一条 toast `toast.ttsFailed`,`turnGen` 代次防被打断的旧回合迟到失败替新回合吭声。
+- 守卫:`tts.rs::edge_real_synth_smoke`(`#[ignore]`,真连微软合成一句;larkwing-core 新增 `rustls` dev-dependency 只为装进程级 provider,树里已有零新编译面)。**金丝雀验过**:锁回 0.4.0 跑 = FAILED「403 Forbidden」,0.4.1 = 通过。`scripts/bump-version.sh` 自动跑它,挂了即停;确知上游没修又必须先发别的修复时 `SKIP_TTS_SMOKE=1` 跳过并在 CHANGELOG 如实写。
+
+**刻意没做**:在线失败自动回落离线音色(melo)—— 是产品决策,且离线模型要另下 163MB,留给用户拍;CI 定时跑真网冒烟 —— 把 CI 绑在微软接口上会让无关提交跟着红,发版闸已够。
+
+**排查手法**:独立探针(scratchpad 小 crate,`msedge-tts = "=<版本>"` + `rustls` ring feature,main 里先 `install_default()`),一次建连就知道是不是 403;或直接跑上面的冒烟。下次在线朗读再哑,**先看 crates.io 上 msedge-tts 有没有新版**,再看 rany2/edge-tts 的 issue(Python 版通常最先修)。
+

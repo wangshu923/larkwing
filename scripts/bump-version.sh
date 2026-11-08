@@ -22,6 +22,21 @@ sed -i '' -E "s/\"version\": \"[0-9]+\.[0-9]+\.[0-9]+\"/\"version\": \"$V\"/" \
 # Cargo.lock 同步 + 编译校验(两个 crate 继承 workspace 版本)
 ( cd "$ROOT" && cargo check --workspace >/dev/null )
 
-echo "✓ 版本号已全部改到 $V(Cargo.toml 工作区 / package.json / tauri.conf.json + Cargo.lock)"
+# 在线朗读真网冒烟(AGENT §7.6):微软 Edge 朗读是逆向接口,服务端会单方面改握手 ——
+# 2026-10 强制 Sec-MS-GEC v2,msedge-tts 0.4.0 全量 403,朗读哑了近一个月、两个版本照发才发现。
+# 挂了就停:先查 crates.io 有没有新版 msedge-tts。确知上游还没修、又必须先发别的修复时,
+# SKIP_TTS_SMOKE=1 跳过(CHANGELOG 里如实写「朗读暂不可用」)。
+SMOKE="在线朗读冒烟已过"
+if [ "${SKIP_TTS_SMOKE:-}" = "1" ]; then
+  SMOKE="在线朗读冒烟已跳过"
+  echo "⚠ 已跳过在线朗读冒烟(SKIP_TTS_SMOKE=1)—— 记得在 CHANGELOG 里如实说明"
+elif ! ( cd "$ROOT" && cargo test -q -p larkwing-core --lib edge_real_synth_smoke -- --ignored >/dev/null 2>&1 ); then
+  echo "✗ 在线朗读冒烟没过:微软 Edge 朗读连不上 / 被拒(403 = 握手改了)。" >&2
+  echo "  复现:cargo test -p larkwing-core --lib edge_real_synth_smoke -- --ignored --nocapture" >&2
+  echo "  先查 crates.io 的 msedge-tts 有没有新版;版本号已改,修好后重跑本脚本即可。" >&2
+  exit 1
+fi
+
+echo "✓ 版本号已全部改到 $V(Cargo.toml 工作区 / package.json / tauri.conf.json + Cargo.lock);$SMOKE"
 echo "  下一步:CHANGELOG.md 顶部加一节 '## $V — 日期',然后"
 echo "          git add -A && git commit -m \"v$V:…\" && git tag v$V && git push origin main v$V"

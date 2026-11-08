@@ -6,10 +6,12 @@
 // 浏览器预览:无 Tauri 不出声,但切分/队列/时序全真跑(可目测切点)。
 
 import { reactive } from 'vue'
+import { i18n } from '../i18n'
 import { api, isTauri } from '../lib/backend'
 import { useCaptureRoute } from './useCaptureRoute'
 import { useSettings } from './useSettings'
 import { attachTts } from './useAudioGraph'
+import { useToast } from './useToast'
 
 // ---- 跑道切分锁死参数(PLAN §11) ----
 const CPS_ZH = 4.5 // 中文语速估算:字/秒(拿到音频元数据后用真实时长校正)
@@ -60,6 +62,10 @@ let players: [HTMLAudioElement, HTMLAudioElement] | null = null
 let playerFlip = 0
 let fakeEndTimer: ReturnType<typeof setTimeout> | undefined
 let playWatchdog: ReturnType<typeof setTimeout> | undefined // 播放看门狗:ended 没触发时强制推进
+// 代次:abort(含 beginTurn)+1。被打断的旧句合成迟到失败不该替新回合吭声。
+let turnGen = 0
+// 本回合(或这次重听)是否已为合成失败吭过声:一回合至多一条 toast,别逐句刷屏。
+let failToasted = false
 const settings = useSettings()
 const captureRoute = useCaptureRoute()
 
@@ -228,6 +234,7 @@ function pump() {
     if (c.status !== 'pending') continue
     c.status = 'synth'
     inflight++
+    const gen = turnGen
     synthWithTimeout(c.text)
       .then((url) => {
         c.url = url
@@ -238,6 +245,12 @@ function pump() {
       .catch((e) => {
         console.error('TTS 合成失败/超时(这句跳过,文字照常显示)', e)
         c.status = 'failed'
+        // §3.5 不静默失败:以前只有 console(正式版看不到)—— 点了「朗读」毫无动静,用户只能猜是不是坏了
+        // (2026-11-08 实锤:微软握手 403,每句都失败、界面零反馈)。一回合至多一条;旧回合的迟到失败不算。
+        if (gen === turnGen && !failToasted) {
+          failToasted = true
+          useToast().error(i18n.global.t('toast.ttsFailed'))
+        }
         tryPlay()
         pump()
       })
@@ -369,6 +382,8 @@ function endTurn() {
 
 /** 打断/失败/取消:立刻闭嘴,丢掉没念的。 */
 function abort() {
+  turnGen++
+  failToasted = false
   turnActive = false
   buffer = ''
   inCode = false

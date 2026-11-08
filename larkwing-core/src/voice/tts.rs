@@ -746,6 +746,22 @@ mod tests {
         eprintln!("[OUT] {} bytes -> {out}  (说: {say})", wav.len());
     }
 
+    /// 在线朗读真网冒烟(手动跑,要联网;**发版前必跑**,AGENT §7.6):真连微软 Edge 朗读服务
+    /// 合成一句。它是逆向接口,服务端会单方面改握手 —— 2026-10 强制 Sec-MS-GEC v2,msedge-tts 0.4.0
+    /// 全量 403,朗读哑了近一个月才发现(v0.2.40 / v0.2.41 都带着它发出去了)。挂了先查 crates.io
+    /// 有没有新版 msedge-tts。跑法:
+    /// `cargo test -p larkwing-core --lib edge_real_synth_smoke -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn edge_real_synth_smoke() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mp3 = EdgeTts
+            .synthesize("你好,这是一句在线朗读冒烟测试。", DEFAULT_SPEAKER, 0)
+            .unwrap_or_else(|e| panic!("微软在线朗读不通(403 = 握手被拒,先查 msedge-tts 新版):{e:#}"));
+        assert!(mp3.len() > 1000, "合成音频太小:{} 字节", mp3.len());
+        eprintln!("[EDGE] {DEFAULT_SPEAKER} -> {} 字节 mp3", mp3.len());
+    }
+
     #[test]
     fn wav_header_is_well_formed() {
         let pcm = vec![0.0f32, 0.5, -0.5, 1.0, -1.0];

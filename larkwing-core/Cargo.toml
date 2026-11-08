@@ -29,7 +29,9 @@ glob = "0.3"
 # 持久化(我们只要下载内核);**必须走 rust-tls** —— 与全局 reqwest 的 rustls-tls 对齐,
 # 否则会平白拉进 native-tls/openssl 一整套。净增 50 个 crate(树里 218 个,168 个我们已有)。
 librqbit = { version = "8.1", default-features = false, features = ["rust-tls"] }
-msedge-tts = "0.4.0"
+# 微软在线朗读(EdgeTts)。服务端会不定期收紧握手校验(Sec-MS-GEC-Version / UA),旧版直接 403、
+# 朗读全哑 —— 2026-11-08 实锤 0.4.0 被拒、0.4.1(10-14)恢复。下限钉在验证过能连的版本。
+msedge-tts = "0.4.1"
 # FTP 下载(ftp.rs)。国内影视资源圈仍大量用 ftp:// 直链(迅雷专用链拆开也多是它),
 # 浏览器删掉 FTP 支持不代表这些服务器没了。只开 `tokio`(不带 TLS —— FTPS 这边用不上,
 # 要用再加 tokio-rustls-ring)。净增仅 4 个 crate(树里 42 个,38 个我们已有)。
@@ -147,3 +149,8 @@ winreg = "0.55"
 # 只用 AudioHardware 三个只读属性(默认输出 / 传输类型 / 数据源)。
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-core-audio = "0.3"
+
+[dev-dependencies]
+# 只给 #[ignore] 真网冒烟 `edge_real_synth_smoke` 装进程级 TLS provider(壳层 lib.rs 启动时装的同一个
+# aws_lc_rs;不装 msedge-tts 建连直接 panic)。树里本就有、features 也已全开,零新编译面。
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
