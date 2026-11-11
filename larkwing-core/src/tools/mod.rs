@@ -125,6 +125,26 @@ pub(crate) fn arg_u64(args: &serde_json::Value, key: &str, default: u64) -> u64 
     }
 }
 
+/// `arg_u64` 的小数版:真数字 / 数字形字符串都认;缺省 / null / 认不出 → `None`(交调用方决定
+/// 是报「缺少 X」还是给默认)。2026-11-11 补:`value: "30"` 这种发法原先被裸 `as_f64` 当成没给,
+/// 要么静默回落默认、要么报「需要 value」白绕一轮。
+pub(crate) fn arg_f64(args: &serde_json::Value, key: &str) -> Option<f64> {
+    match args.get(key) {
+        Some(serde_json::Value::Number(n)) => n.as_f64(),
+        Some(serde_json::Value::String(s)) => s.trim().parse::<f64>().ok().filter(|v| v.is_finite()),
+        _ => None,
+    }
+}
+
+/// `arg_f64` 的有符号整数版(编号、天数这类):同样真数字 / 数字形字符串都认。
+pub(crate) fn arg_i64(args: &serde_json::Value, key: &str) -> Option<i64> {
+    match args.get(key) {
+        Some(serde_json::Value::Number(n)) => n.as_i64(),
+        Some(serde_json::Value::String(s)) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
 /// 从工具入参(顶层或数组项)里取一个**非空**字符串字段:两头空白 trim 掉,trim 完为空
 /// 等同没给(模型爱发 `""` / `"  "` 占位)。缺省 → `None`,交调用方决定给不给默认值。
 pub(crate) fn arg_str_opt<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
@@ -585,6 +605,21 @@ mod tests {
         assert_eq!(arg_u64(&json!({ "x": "abc" }), "x", 7), 7);
         assert_eq!(arg_u64(&json!({}), "x", 7), 7);
         assert_eq!(arg_u64(&json!({ "x": null }), "x", 7), 7);
+    }
+
+    #[test]
+    fn arg_f64_and_i64_tolerate_stringified_numbers() {
+        use serde_json::json;
+        assert_eq!(arg_f64(&json!({ "v": 30 }), "v"), Some(30.0));
+        assert_eq!(arg_f64(&json!({ "v": "30" }), "v"), Some(30.0), "字符串数字");
+        assert_eq!(arg_f64(&json!({ "v": " -2.5 " }), "v"), Some(-2.5));
+        assert_eq!(arg_f64(&json!({ "v": "abc" }), "v"), None);
+        assert_eq!(arg_f64(&json!({ "v": "NaN" }), "v"), None, "非有限数不收");
+        assert_eq!(arg_f64(&json!({}), "v"), None);
+        assert_eq!(arg_i64(&json!({ "id": 7 }), "id"), Some(7));
+        assert_eq!(arg_i64(&json!({ "id": "7" }), "id"), Some(7));
+        assert_eq!(arg_i64(&json!({ "id": 1.5 }), "id"), None);
+        assert_eq!(arg_i64(&json!({ "id": null }), "id"), None);
     }
 
     #[test]

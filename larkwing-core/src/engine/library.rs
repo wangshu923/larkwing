@@ -34,11 +34,19 @@ impl Engine {
     /// (主人管理面,同提醒页;delete 按 (user,id) 限定,删不到别人的行)。
     pub fn delete_memory(&self, user_id: Option<i64>, id: i64) -> Result<(), AppError> {
         let uid = self.resolve_user(user_id)?;
+        // 先记下内容:它若是惯例提炼写的个人习惯,删掉 = 用户不想要 → 进否决名单(habits.rs)
+        let content =
+            self.store.memory.list(uid)?.into_iter().find(|m| m.id == id).map(|m| m.content);
         if !self.store.memory.delete(uid, id)? {
             return Err(AppError {
                 kind: ErrorKind::NotFound,
                 message: format!("记忆 {id} 不存在"),
             });
+        }
+        if let Some(c) = content {
+            if let Err(e) = super::habits::note_memory_deleted(&self.store, uid, &c) {
+                tracing::warn!("记忆已删,但没能记进惯例否决名单(下次可能写回): {e:#}");
+            }
         }
         Ok(())
     }
@@ -139,10 +147,12 @@ impl Engine {
 
     // ---- 文件操作记录(PLAN §9 文件能力):操作记录页 + 撤销/重做 ----
 
-    /// 操作记录页:当前用户最近的文件操作批次(最近在前)。
+    /// 操作记录页:**全家**最近的文件操作批次(最近在前)。桌面是主人的管理面(2026-11-11,
+    /// 与 2026-07-04 修过的提醒页同构):文件操作记在说话人名下(`ToolCtx.user_id` = 说话人),
+    /// 原先这里只列主人自己的 —— 家人经声纹 / 手机让它动的文件,在这页看不见也撤不了。
+    /// 模型侧的 fs_undo 仍只撤说话人自己最近那批。
     pub fn list_fsops(&self) -> Result<Vec<crate::store::FsOpRow>, AppError> {
-        let user = self.store.users.ensure_default_user()?;
-        Ok(self.store.fsops.list_for(user.id, 100)?)
+        Ok(self.store.fsops.list_all(100)?)
     }
 
     /// 撤销一批(操作记录页「撤销」按钮;模型侧另有 fs_undo 工具)。
@@ -157,8 +167,10 @@ impl Engine {
         self.apply_fsops(id, "undone", "applied", false)
     }
 
-    /// 撤销/重做共用:校归属 + 校当前状态(已是目标态 = 幂等返回)→ 执行 → 翻状态。
-    /// 文件 I/O 直接在此(同 delete_* 等阻塞域方法,Tauri 在工作线程跑同步 command)。
+    /// 撤销/重做共用:校当前状态(已是目标态 = 幂等返回)→ 执行 → 翻状态。不校归属:
+    /// 这是桌面管理面的入口,全家的批次都能撤(见 `list_fsops`)。
+    /// **阻塞**:文件 I/O 直接在此(跨盘回拷 / 回收站还原可以很久)—— 调用方要放进阻塞线程,
+    /// 同步 tauri 命令是在 IPC / 界面线程上内联跑的(AGENT §8.4),不是工作线程。
     fn apply_fsops(
         &self,
         id: i64,
@@ -166,14 +178,10 @@ impl Engine {
         to: &str,
         undo: bool,
     ) -> Result<crate::files::OpReport, AppError> {
-        let user = self.store.users.ensure_default_user()?;
         let row = self.store.fsops.get(id)?.ok_or_else(|| AppError {
             kind: ErrorKind::NotFound,
             message: format!("操作记录 {id} 不存在"),
         })?;
-        if row.user_id != user.id {
-            return Err(AppError { kind: ErrorKind::NotFound, message: "不是你的操作记录".into() });
-        }
         if row.state != from {
             return Ok(crate::files::OpReport::default()); // 已是目标状态 → 幂等(前端刷新即可)
         }

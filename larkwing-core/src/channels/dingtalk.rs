@@ -11,7 +11,7 @@
 //! 不会拒收);纯文本仍走 `text` 类型(markdown 折叠单换行,短句寒暄别过)。
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
@@ -32,6 +32,9 @@ const BOT_TOPIC: &str = "/v1.0/im/bot/messages/get";
 const VOICE_MSG_MAX_SECS: i64 = 60;
 /// 媒体下载上限(TG getFile 同值的 sanity cap;语音/压缩图远小于此)。
 const FILE_MAX_BYTES: usize = 20 * 1024 * 1024;
+/// 长连接心跳间隔 / 判死的空闲上限(心跳三次没回音)。只影响「连接半开后多久发现」。
+const WS_PING_EVERY: Duration = Duration::from_secs(30);
+const WS_IDLE_MAX: Duration = Duration::from_secs(90);
 
 // ⚠️ core 侧静态话术(§6.6 本应数据化,同 telegram):渠道操作性提示,不经模型。
 const ERR_HINT: &str = "(出了点问题,稍后再试试)";
@@ -74,15 +77,34 @@ async fn serve(ctx: &Arc<ChannelCtx>, net: &Arc<net::Client>, ct: &CancellationT
     let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str()).await.context("钉钉 WS 连接失败")?;
     tracing::info!("钉钉 Stream 在线");
 
+    // 自己发心跳 + 空闲看门狗(2026-11-11):原先只在服务器来帧时才回应、从不主动发。睡眠唤醒 /
+    // NAT 超时后服务端早把连接弃了、本端却没收到 FIN,`ws.next()` 永远挂着 —— 状态行「运行中」,
+    // 钉钉怎么发都不回,直到重启。TG / 微信的长轮询自带请求超时会自愈,只有这条长连接没有。
+    // 健康的对端必须回 Pong(RFC 6455),所以「发了心跳却这么久一帧都没有」= 连接已死。
+    let mut ping = tokio::time::interval(WS_PING_EVERY);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_frame = Instant::now();
+
     loop {
         let msg = tokio::select! {
             _ = ct.cancelled() => return Ok(()),
+            _ = ping.tick() => {
+                let idle = last_frame.elapsed();
+                anyhow::ensure!(
+                    idle < WS_IDLE_MAX,
+                    "钉钉长连接 {} 秒没有任何动静(多半已经断了),重连",
+                    idle.as_secs()
+                );
+                ws.send(Message::Ping(Default::default())).await.context("钉钉心跳发不出去")?;
+                continue;
+            }
             m = ws.next() => match m {
                 Some(Ok(m)) => m,
                 Some(Err(e)) => return Err(e).context("钉钉 WS 读出错"),
                 None => return Ok(()), // 断流 → run 重连
             },
         };
+        last_frame = Instant::now(); // 任何帧(含 Pong)都算活着
         let text = match msg {
             Message::Text(t) => t.as_str().to_string(),
             Message::Ping(p) => {
@@ -384,11 +406,23 @@ async fn download_media(
         .get("downloadUrl")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("钉钉换不到 downloadUrl(HTTP {status}):{v}"))?;
-    let resp = net.send(dl, |c| c.get(dl)).await.context("钉钉媒体下载失败")?;
+    let mut resp = net.send(dl, |c| c.get(dl)).await.context("钉钉媒体下载失败")?;
     anyhow::ensure!(resp.status().is_success(), "钉钉媒体下载 HTTP {}", resp.status());
-    let bytes = resp.bytes().await.context("读媒体字节失败")?;
-    anyhow::ensure!(bytes.len() <= FILE_MAX_BYTES, "文件太大({} 字节)", bytes.len());
-    Ok(bytes.to_vec())
+    // 边收边判(2026-11-11,微信 08-22 同款):原先整个收进内存再比大小,快网下能先吃几百 MB。
+    let max = FILE_MAX_BYTES as u64;
+    if let Some(n) = resp.content_length().filter(|n| *n > max) {
+        anyhow::bail!("文件太大({n} 字节)"); // 报了长度且超限:一个字节都不用收
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.context("读媒体字节失败")? {
+        anyhow::ensure!(
+            bytes.len() as u64 + chunk.len() as u64 <= max,
+            "文件太大(超过 {} 字节)",
+            FILE_MAX_BYTES
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 /// 图片字节嗅探 MIME(钉钉不回 content-type 语义;认不出按 jpeg —— 手机拍照绝大多数是它)。

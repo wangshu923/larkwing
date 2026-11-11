@@ -18,8 +18,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::lockext::LockExt;
+
 /// 文本内容快照上限:超过则不快照(撤销/重做该条不可用)。家用笔记/清单远在此下。
 pub const SNAPSHOT_MAX: usize = 1 << 20; // 1 MiB
+/// `fs_edit` 肯读的文件上限(整份进内存)。超过 `SNAPSHOT_MAX` 的仍可改,只是撤不回(当场会说)。
+pub const EDIT_MAX_BYTES: u64 = 64 << 20; // 64 MiB
 
 /// 一条文件操作的结构化记录:足够反向(撤销)与重放(重做)。一批 = `Vec<FsOpItem>`,
 /// 序列化进 `store::fsops` 的 `ops` 列。
@@ -208,22 +212,71 @@ fn copy_would_recurse(src: &Path, dst: &Path) -> bool {
     d.starts_with(&s)
 }
 
+/// 复制 / 跨盘移动的进度与取消旗(2026-11-11):阻塞线程边干边写,看守任务每秒读一眼
+/// 往任务卡上报、见用户点了停就把 `cancel` 立起来。拷大文件 / 整棵目录是分钟级的活,
+/// 原先没有任何进度,工具 60 秒超时后模型被告知「没拿到结果」,其实线程还在拷(重试就多一份)。
+#[derive(Default)]
+pub struct TransferProgress {
+    /// 立起来 = 在下一个文件之间收手(正在拷的那个文件拷完为止)。
+    pub cancel: std::sync::atomic::AtomicBool,
+    pub files: std::sync::atomic::AtomicUsize,
+    pub bytes: std::sync::atomic::AtomicU64,
+    /// 没带过去的目录链接(见 `copy_tree`):收尾时如实点名。
+    pub skipped_links: std::sync::Mutex<Vec<String>>,
+}
+
+/// 取消时 `copy_tree` 抛的错(调用方据此区分「停下了」与「失败了」)。
+pub const TRANSFER_CANCELLED: &str = "按要求停下了";
+
 /// 递归复制(文件或目录);跨卷移动的兜底也用它。
-fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+///
+/// **目录链接跳过不跟**(符号链接 / Windows junction 指向文件夹的,2026-11-11):原先它们的
+/// `is_dir()` 为假、落进 `fs::copy` 必然报错,整批中断还留下半棵树。每个 Windows 用户的「文档」里
+/// 都有 `My Music` / `My Pictures` / `My Videos` 三个隐藏 junction,「把文档备份到 D 盘」因此必败。
+/// 跟进去又可能绕回自己,所以跳过并记名(`datadir::copy_recursive` 同一口径)。指向**文件**的
+/// 链接照旧按内容复制;`top` = 用户点名的那一项,是目录链接也照着它指向的文件夹拷。
+fn copy_tree(src: &Path, dst: &Path, prog: &TransferProgress, top: bool) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    ensure!(!prog.cancel.load(Ordering::Relaxed), TRANSFER_CANCELLED);
     let md = std::fs::symlink_metadata(src)?;
-    if md.is_dir() {
+    let is_link = md.file_type().is_symlink();
+    let is_dir = if is_link {
+        match std::fs::metadata(src) {
+            Ok(target) if target.is_file() => false,
+            Ok(_) if top => true,
+            // 指向文件夹的链接 / 断链 / 进不去的 junction:不跟、不报错,记一笔
+            _ => {
+                prog.skipped_links.lk().push(src.to_string_lossy().into_owned());
+                return Ok(());
+            }
+        }
+    } else {
+        md.is_dir()
+    };
+    if is_dir {
         std::fs::create_dir_all(dst)?;
         for entry in std::fs::read_dir(src)? {
             let entry = entry?;
-            copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
+            copy_tree(&entry.path(), &dst.join(entry.file_name()), prog, false)?;
         }
     } else {
         if let Some(p) = dst.parent() {
             std::fs::create_dir_all(p)?;
         }
-        std::fs::copy(src, dst)?;
+        let n = std::fs::copy(src, dst)?;
+        prog.files.fetch_add(1, Ordering::Relaxed);
+        prog.bytes.fetch_add(n, Ordering::Relaxed);
     }
     Ok(())
+}
+
+/// 复制到一半失败 / 被叫停:把写了一半的目标收掉,别留半棵树(它不在操作记录里,撤销够不到)。
+fn copy_tree_clean(src: &Path, dst: &Path, prog: &TransferProgress) -> Result<()> {
+    let r = copy_tree(src, dst, prog, true);
+    if r.is_err() && std::fs::symlink_metadata(dst).is_ok() {
+        let _ = remove_any(dst);
+    }
+    r
 }
 
 /// 跨卷判定:Unix `EXDEV`=18 / Windows `ERROR_NOT_SAME_DEVICE`=17 → `rename` 失败需 copy+删源。
@@ -251,6 +304,11 @@ fn into_trash(path: &Path) -> Result<()> {
 
 /// 移动 / 改名。dst 是已存在文件夹 → 移进去保留名;否则当完整目标路径。永不覆盖(冲突加后缀)。
 pub fn move_one(src: &Path, dst_req: &Path) -> Result<FsOpItem> {
+    move_one_with(src, dst_req, &TransferProgress::default())
+}
+
+/// 同 `move_one`,带进度与取消旗(跨盘时才有得报:同盘改名是一瞬间的事)。
+pub fn move_one_with(src: &Path, dst_req: &Path, prog: &TransferProgress) -> Result<FsOpItem> {
     ensure!(src.exists(), "源不存在:{}", src.display());
     let dst_req = resolve_into_dir(src, dst_req);
     if let Some(name) = dst_req.file_name().and_then(|n| n.to_str()) {
@@ -264,7 +322,8 @@ pub fn move_one(src: &Path, dst_req: &Path) -> Result<FsOpItem> {
         Ok(()) => {}
         Err(e) if is_cross_device(&e) => {
             // 跨卷:先整体复制成功,再删源(非原子 —— 复制失败就 ? 出去、不删源)
-            copy_tree(src, &dst).with_context(|| format!("跨盘移动复制阶段失败:{}", src.display()))?;
+            copy_tree_clean(src, &dst, prog)
+                .with_context(|| format!("跨盘移动复制阶段失败:{}", src.display()))?;
             remove_any(src).with_context(|| format!("跨盘移动删源失败:{}", src.display()))?;
         }
         Err(e) => return Err(e).with_context(|| format!("移动失败:{}", src.display())),
@@ -281,6 +340,11 @@ pub(crate) const TEXT_PAGE_MAX_CHARS: usize = 40_000;
 
 /// 复制(文件或目录)。语义同 move 的目标解析;永不覆盖。
 pub fn copy_one(src: &Path, dst_req: &Path) -> Result<FsOpItem> {
+    copy_one_with(src, dst_req, &TransferProgress::default())
+}
+
+/// 同 `copy_one`,带进度与取消旗。
+pub fn copy_one_with(src: &Path, dst_req: &Path, prog: &TransferProgress) -> Result<FsOpItem> {
     ensure!(src.exists(), "源不存在:{}", src.display());
     let dst_req = resolve_into_dir(src, dst_req);
     if let Some(name) = dst_req.file_name().and_then(|n| n.to_str()) {
@@ -296,7 +360,7 @@ pub fn copy_one(src: &Path, dst_req: &Path) -> Result<FsOpItem> {
         src.display(),
         dst.display()
     );
-    copy_tree(src, &dst)?;
+    copy_tree_clean(src, &dst, prog)?;
     Ok(FsOpItem::Copy {
         src: src.to_string_lossy().into_owned(),
         dst: dst.to_string_lossy().into_owned(),
@@ -372,6 +436,16 @@ pub fn append_text(path: &Path, text: &str) -> Result<FsOpItem> {
 pub fn edit_text(path: &Path, find: &str, replace: &str) -> Result<FsOpItem> {
     ensure!(path.is_file(), "要改的文件不存在:{}", path.display());
     ensure!(!find.is_empty(), "要替换的内容不能为空");
+    // 先看大小再读(2026-11-11):这是轻量的「找一处、换一处」,整份读进内存再拷一份。
+    // 指着几十 G 的日志调它会把内存吃光(`fs_read_text` 已为同一原因改成流式)。
+    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    ensure!(
+        len <= EDIT_MAX_BYTES,
+        "{} 有 {},太大了改不了(这个原语整份读进内存;上限 {})",
+        path.display(),
+        human_size(len),
+        human_size(EDIT_MAX_BYTES)
+    );
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("读不了(可能不是文本文件):{}", path.display()))?;
     let count = content.matches(find).count();
@@ -562,6 +636,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// 目录里夹着指向文件夹的链接:跳过并记名,其余照拷(2026-11-11;此前整批报错还留半棵树)。
+    /// 指向文件的链接照旧按内容复制;用户点名的那一项本身是目录链接 → 照它指向的文件夹拷。
+    #[cfg(unix)]
+    #[test]
+    fn copy_skips_dir_links_and_counts_progress() {
+        let d = sandbox("links");
+        let src = d.join("文档");
+        std::fs::create_dir_all(src.join("子")).unwrap();
+        std::fs::write(src.join("a.txt"), b"hello").unwrap();
+        std::fs::write(src.join("子").join("b.txt"), b"world!").unwrap();
+        let elsewhere = d.join("别处");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("c.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, src.join("My Music")).unwrap(); // 目录链接
+        std::os::unix::fs::symlink(src.join("a.txt"), src.join("a-link.txt")).unwrap(); // 文件链接
+
+        let prog = TransferProgress::default();
+        copy_one_with(&src, &d.join("备份"), &prog).unwrap();
+        let out = d.join("备份");
+        assert_eq!(std::fs::read(out.join("a.txt")).unwrap(), b"hello");
+        assert_eq!(std::fs::read(out.join("子").join("b.txt")).unwrap(), b"world!");
+        assert_eq!(std::fs::read(out.join("a-link.txt")).unwrap(), b"hello", "文件链接按内容拷");
+        assert!(!out.join("My Music").exists(), "目录链接不跟、不带过去");
+        let skipped = prog.skipped_links.lk().clone();
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped[0].ends_with("My Music"), "{skipped:?}");
+        use std::sync::atomic::Ordering;
+        assert_eq!(prog.files.load(Ordering::Relaxed), 3);
+        assert_eq!(prog.bytes.load(Ordering::Relaxed), 5 + 6 + 5);
+
+        // 点名的那一项本身是目录链接:照它指向的文件夹拷
+        let prog = TransferProgress::default();
+        copy_one_with(&src.join("My Music"), &d.join("音乐备份"), &prog).unwrap();
+        assert!(d.join("音乐备份").join("c.txt").is_file());
+        assert!(prog.skipped_links.lk().is_empty());
+    }
+
+    /// 叫停:不留半棵树(目标不在操作记录里,撤销够不到),源原样不动。
+    #[test]
+    fn cancelled_copy_leaves_no_partial_tree() {
+        let d = sandbox("cancel");
+        let src = d.join("相册");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.jpg"), b"x").unwrap();
+        let prog = TransferProgress::default();
+        prog.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let err = copy_one_with(&src, &d.join("相册备份"), &prog).unwrap_err();
+        assert!(format!("{err:#}").contains(TRANSFER_CANCELLED), "{err:#}");
+        assert!(!d.join("相册备份").exists(), "叫停后不留半成品");
+        assert!(src.join("a.jpg").is_file(), "源不动");
     }
 
     #[test]

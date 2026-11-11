@@ -10,7 +10,7 @@
 //! 「以文件发送」的原图也收(2026-07-08);其余类型如实回「看不了」(§3.5 不静默)。
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -18,6 +18,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use super::{drive_turn, render, split_message, ChannelCtx, ATTACH_HINT};
+use crate::lockext::LockExt;
 use crate::net::scrub;
 use crate::engine::InAttachment;
 use crate::net;
@@ -55,9 +56,14 @@ const VOICE_EMPTY_HINT: &str = "这条语音没听清,再说一遍试试?";
 pub(super) async fn run(ctx: Arc<ChannelCtx>, ct: CancellationToken) {
     // Arc:回合 spawn 出去跑(见 serve),net 随 clone 共享(Client 自身不可 Clone)
     let net = Arc::new(net::Client::new(|b| b.timeout(Duration::from_secs(POLL_TIMEOUT_S + 20))));
+    // 轮询游标活在重连循环**外面**(2026-11-11 修):原先写在 serve 里,而 serve 每次出错都重进 ——
+    // 「启动丢弃积压」于是变成「每次重连都丢弃积压」,代理掐一下长轮询 / 睡眠唤醒的那几秒里
+    // 发来的消息无痕消失。只有进程首次启动才丢积压(别把昨晚的「放首歌」留到今早执行)。
+    let mut offset: Option<i64> = None;
+    let albums: Albums = Arc::default();
     while !ct.is_cancelled() {
         ctx.set_state(CHANNEL, true, None);
-        match serve(&ctx, &net, &ct).await {
+        match serve(&ctx, &net, &ct, &mut offset, &albums).await {
             Ok(()) => break, // 正常返回 = 被取消
             Err(e) => {
                 let msg = scrub(&e);
@@ -74,11 +80,21 @@ pub(super) async fn run(ctx: Arc<ChannelCtx>, ct: CancellationToken) {
     tracing::info!("Telegram 渠道已停");
 }
 
-async fn serve(ctx: &Arc<ChannelCtx>, net: &Arc<net::Client>, ct: &CancellationToken) -> Result<()> {
+async fn serve(
+    ctx: &Arc<ChannelCtx>,
+    net: &Arc<net::Client>,
+    ct: &CancellationToken,
+    cursor: &mut Option<i64>,
+    albums: &Albums,
+) -> Result<()> {
     let token = ctx.secret("remote.telegram.token").context("没配 Telegram token")?;
     let allowed = allowed_chats(ctx);
-    // 启动丢弃积压(等价 drop_pending_updates):从最后一条之后开始
-    let mut offset = latest_offset(net, &token).await;
+    // 进程首次启动丢弃积压(等价 drop_pending_updates):从最后一条之后开始;重连沿用游标
+    let mut offset = match *cursor {
+        Some(o) => o,
+        None => latest_offset(net, &token).await,
+    };
+    *cursor = Some(offset);
     tracing::info!(offset, allow = allowed.len(), "Telegram 渠道在线");
 
     loop {
@@ -93,6 +109,7 @@ async fn serve(ctx: &Arc<ChannelCtx>, net: &Arc<net::Client>, ct: &CancellationT
         for upd in updates {
             if let Some(id) = upd.get("update_id").and_then(Value::as_i64) {
                 offset = offset.max(id + 1);
+                *cursor = Some(offset);
             }
             let Some((chat_id, incoming, sender)) = parse_update(&upd) else { continue };
             let chat = chat_id.to_string();
@@ -110,6 +127,33 @@ async fn serve(ctx: &Arc<ChannelCtx>, net: &Arc<net::Client>, ct: &CancellationT
                     .replace("{id}", &chat);
                 let _ = send_message(net, &token, chat_id, &hint).await;
                 continue;
+            }
+
+            // 相册(一次选多张图 / 多个文件):Telegram 拆成多条 update、共用一个 media_group_id,
+            // 只有第一条带说明文字。攒齐了当**一条**消息交(2026-11-11);原先带说明的那张单独起
+            // 回合,其余几张落进攒批区、补一句「文件收到了」,还会混进半小时内下一条不相干的消息。
+            if matches!(incoming, Incoming::Photo { .. } | Incoming::Document { .. }) {
+                if let Some(gid) = upd.pointer("/message/media_group_id").and_then(Value::as_str) {
+                    let key = format!("{chat}:{gid}");
+                    let first = {
+                        let mut map = albums.lk();
+                        let first = !map.contains_key(&key);
+                        let a = map.entry(key.clone()).or_default();
+                        a.items.push(incoming);
+                        a.touched = Some(Instant::now());
+                        first
+                    };
+                    if first {
+                        let (ctx, net, token, chat, albums) =
+                            (ctx.clone(), net.clone(), token.clone(), chat.clone(), albums.clone());
+                        tokio::spawn(async move {
+                            let items = settle_album(&albums, &key).await;
+                            handle_album(&ctx, &net, &token, chat_id, &chat, single, sender.as_deref(), items)
+                                .await;
+                        });
+                    }
+                    continue;
+                }
             }
 
             // 回合 **spawn** 出去跑、不阻塞收循环(对齐钉钉,2026-07-15 确认闸的前提):
@@ -316,21 +360,32 @@ async fn handle_photo(
     file_id: &str,
     caption: String,
 ) {
-    let bytes = match download_file(net, token, file_id).await {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(err = %scrub(&e), "Telegram 照片下载失败");
-            let _ = send_message(net, token, chat_id, ERR_HINT).await;
-            return;
+    match fetch_photo(net, token, file_id).await {
+        Ok(att) => {
+            reply_turn(ctx, net, token, chat_id, chat, single, caption, sender, vec![att], None).await
         }
-    };
-    let att = InAttachment {
+        Err(hint) => {
+            let _ = send_message(net, token, chat_id, hint).await;
+        }
+    }
+}
+
+/// 取一张照片成附件。Err = 该回用户的那句话(下载失败已记日志)。
+async fn fetch_photo(
+    net: &net::Client,
+    token: &str,
+    file_id: &str,
+) -> std::result::Result<InAttachment, &'static str> {
+    let bytes = download_file(net, token, file_id).await.map_err(|e| {
+        tracing::warn!(err = %scrub(&e), "Telegram 照片下载失败");
+        ERR_HINT
+    })?;
+    Ok(InAttachment {
         name: "photo.jpg".into(),
         mime: "image/jpeg".into(), // Bot API 的 photo 恒为服务端压缩 JPEG
         data: base64::engine::general_purpose::STANDARD.encode(&bytes),
         path: None,
-    };
-    reply_turn(ctx, net, token, chat_id, chat, single, caption, sender, vec![att], None).await;
+    })
 }
 
 /// 文档(document):文件方式发来的东西——能抽文字的文档下载后走桌面同缝 `InAttachment`
@@ -351,33 +406,124 @@ async fn handle_document(
     size: i64,
     caption: String,
 ) {
+    match fetch_document(net, token, file_id, file_name, mime, size).await {
+        Ok(att) => {
+            reply_turn(ctx, net, token, chat_id, chat, single, caption, sender, vec![att], None).await
+        }
+        Err(hint) => {
+            let _ = send_message(net, token, chat_id, hint).await;
+        }
+    }
+}
+
+/// 取一个文件成附件。Err = 该回用户的那句话(看不了 / 太大 / 下载失败)。
+async fn fetch_document(
+    net: &net::Client,
+    token: &str,
+    file_id: &str,
+    file_name: &str,
+    mime: &str,
+    size: i64,
+) -> std::result::Result<InAttachment, &'static str> {
     // 收不收先判(下载前):图(mime 或扩展名认出)/ 能抽文字的文档;都不是 = 看不了
     let as_image = crate::attach::is_image(mime)
         .then(|| mime.to_string())
         .or_else(|| crate::attach::image_mime_by_ext(file_name).map(str::to_string));
     if as_image.is_none() && !crate::attach::doc_supported(file_name, mime) {
-        let _ = send_message(net, token, chat_id, UNSUPPORTED_HINT).await;
-        return;
+        return Err(UNSUPPORTED_HINT);
     }
     if size > FILE_MAX_BYTES {
-        let _ = send_message(net, token, chat_id, FILE_TOO_BIG_HINT).await;
-        return;
+        return Err(FILE_TOO_BIG_HINT);
     }
-    let bytes = match download_file(net, token, file_id).await {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(err = %scrub(&e), "Telegram 文件下载失败");
-            let _ = send_message(net, token, chat_id, ERR_HINT).await;
-            return;
-        }
-    };
-    let att = InAttachment {
+    let bytes = download_file(net, token, file_id).await.map_err(|e| {
+        tracing::warn!(err = %scrub(&e), "Telegram 文件下载失败");
+        ERR_HINT
+    })?;
+    Ok(InAttachment {
         name: if file_name.is_empty() { "file".into() } else { file_name.to_string() },
         mime: as_image.unwrap_or_else(|| mime.to_string()),
         data: base64::engine::general_purpose::STANDARD.encode(&bytes),
         path: None,
-    };
-    reply_turn(ctx, net, token, chat_id, chat, single, caption, sender, vec![att], None).await;
+    })
+}
+
+/// 一个相册里已到的条目(同一个 chat + media_group_id)。
+#[derive(Default)]
+struct Album {
+    items: Vec<Incoming>,
+    touched: Option<Instant>,
+}
+type Albums = Arc<std::sync::Mutex<std::collections::HashMap<String, Album>>>;
+
+/// 相册收齐的判据:最后一条到了之后这么久没有新的。Telegram 把相册拆成的几条 update 通常同批到达,
+/// 偶尔跨两次轮询;这个数只影响「发相册到开始处理」多等多久。
+const ALBUM_SETTLE: Duration = Duration::from_millis(1200);
+
+/// 等相册收齐,取走全部条目。
+async fn settle_album(albums: &Albums, key: &str) -> Vec<Incoming> {
+    loop {
+        tokio::time::sleep(ALBUM_SETTLE).await;
+        let mut map = albums.lk();
+        let quiet = map
+            .get(key)
+            .is_none_or(|a| a.touched.is_none_or(|t| t.elapsed() >= ALBUM_SETTLE));
+        if quiet {
+            return map.remove(key).map(|a| a.items).unwrap_or_default();
+        }
+    }
+}
+
+/// 说明文字取相册里第一条非空的;附件按到达顺序。
+fn album_caption(items: &[Incoming]) -> String {
+    items
+        .iter()
+        .find_map(|it| match it {
+            Incoming::Photo { caption, .. } | Incoming::Document { caption, .. }
+                if !caption.is_empty() =>
+            {
+                Some(caption.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// 相册当一条消息处理:逐个取附件(取不了的跳过),说明文字当消息文字,一起进一个回合。
+/// 一个都没取到 → 回第一句失败提示(§3.5 不静默)。没有说明文字 → 走攒批(reply_turn 里判)。
+#[allow(clippy::too_many_arguments)]
+async fn handle_album(
+    ctx: &ChannelCtx,
+    net: &net::Client,
+    token: &str,
+    chat_id: i64,
+    chat: &str,
+    single: bool,
+    sender: Option<&str>,
+    items: Vec<Incoming>,
+) {
+    let caption = album_caption(&items);
+    let mut atts = Vec::new();
+    let mut first_hint = None;
+    for it in &items {
+        let got = match it {
+            Incoming::Photo { file_id, .. } => fetch_photo(net, token, file_id).await,
+            Incoming::Document { file_id, file_name, mime, size, .. } => {
+                fetch_document(net, token, file_id, file_name, mime, *size).await
+            }
+            _ => continue,
+        };
+        match got {
+            Ok(att) => atts.push(att),
+            Err(hint) => {
+                first_hint.get_or_insert(hint);
+            }
+        }
+    }
+    if atts.is_empty() {
+        let _ = send_message(net, token, chat_id, first_hint.unwrap_or(ERR_HINT)).await;
+        return;
+    }
+    reply_turn(ctx, net, token, chat_id, chat, single, caption, sender, atts, None).await;
 }
 
 /// 启动时取"最后一条积压之后"的 offset(offset=-1 拿最后一条;+1 = 跳过积压)。
@@ -576,6 +722,21 @@ fn allowed_chats(ctx: &ChannelCtx) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 相册:说明文字取第一条非空的;收齐后一次取走、表里不留。
+    #[tokio::test]
+    async fn album_collects_items_and_takes_first_caption() {
+        let photo = |id: &str, cap: &str| Incoming::Photo { file_id: id.into(), caption: cap.into() };
+        let items = vec![photo("a", ""), photo("b", "这几张哪张好看"), photo("c", "")];
+        assert_eq!(album_caption(&items), "这几张哪张好看");
+        assert_eq!(album_caption(&[photo("a", "")]), "", "都没写说明 = 空(走攒批)");
+
+        let albums: Albums = Arc::default();
+        albums.lk().insert("1:g".into(), Album { items, touched: Some(Instant::now()) });
+        let got = settle_album(&albums, "1:g").await;
+        assert_eq!(got.len(), 3);
+        assert!(albums.lk().is_empty(), "取走后不留表项");
+    }
 
     #[test]
     fn parse_update_extracts_text_chat_and_sender() {

@@ -328,6 +328,7 @@ export function useVoiceSettings() {
       await loadVoice()
     } catch (e) {
       console.error('删除音色失败', e)
+      useToast().error(t('toast.deleteFailed')) // 点了删却还在:吭一声(§6.6)
     }
   }
 

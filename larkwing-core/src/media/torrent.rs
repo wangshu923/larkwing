@@ -32,6 +32,9 @@ pub const TORRENT_MAX_BYTES: u64 = 50 * 1024 * 1024 * 1024; // 50 GB
 
 /// 同时下几个种子:再多带宽只是被分摊,还挤占 peer 连接数。
 pub const MAX_CONCURRENT: usize = 3;
+/// 本机 `.torrent` 文件的体积闸(读进内存之前判)。种子是清单不是内容,这个数只为挡住
+/// 「把视频当种子传进来」;真种子离它差两个数量级。
+pub const TORRENT_FILE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 /// 登记处里种子任务的标题前缀:并发闸按它数同类任务(标题由本文件拼、也由本文件数,单源)。
 const TORRENT_TITLE_PREFIX: &str = "下载种子";
 
@@ -368,6 +371,15 @@ impl TorrentLink {
             ".torrent 需要绝对路径(或给磁力链 magnet:...),收到: {s}"
         );
         anyhow::ensure!(p.is_file(), "找不到这个 .torrent 文件:{}", p.display());
+        // 先看大小再读(2026-11-11):种子文件只是一张清单,常见几十 KB、大合集也就几 MB。
+        // 模型把视频路径错当种子传进来时,原先会把整份几十 GB 读进内存。
+        let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+        anyhow::ensure!(
+            len <= TORRENT_FILE_MAX_BYTES,
+            "{} 有 {} —— 这不像一个 .torrent 种子文件(种子只是一张清单,不会这么大)。             要放这个文件本身用 media_play;要下载请给磁力链或真正的 .torrent。",
+            p.display(),
+            crate::files::human_size(len)
+        );
         let bytes = std::fs::read(&p).with_context(|| format!("读不了 {}", p.display()))?;
         anyhow::ensure!(!bytes.is_empty(), ".torrent 文件是空的:{}", p.display());
         Ok(TorrentLink::File(bytes))

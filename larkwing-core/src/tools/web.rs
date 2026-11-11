@@ -88,11 +88,7 @@ impl Tool for WebSearch {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .context("缺少 query 参数")?;
-        let count = args
-            .get("count")
-            .and_then(serde_json::Value::as_u64)
-            .map(|n| n.clamp(1, 8) as usize)
-            .unwrap_or(5);
+        let count = super::arg_u64(&args, "count", 5).clamp(1, 8) as usize;
         // 宽容解析(同 audio_only 坑):字符串 "false" 也认得,不静默回落默认。
         let with_content = super::arg_bool(&args, "fetch_content", true);
 
@@ -249,7 +245,12 @@ impl Tool for WebFetch {
 
 pub(super) struct WebDownload {
     spec: ToolSpec,
+    /// 同步档:带总超时(回合内下完的小文件)。
     net: crate::net::Client,
+    /// 批内档:不设总超时。批里的下载不转 job、要一直下到底,而 reqwest 的 `timeout` 是**连 body 在内**
+    /// 的总期限 —— 用同步档那把客户端,超过 280 秒的文件(1GB @ 3MB/s)必断(2026-11-11 修;
+    /// 工具描述又要求两个以上文件用 batch,等于大文件成批下载系统性失败、单条调用反而成功)。
+    net_long: crate::net::Client,
 }
 
 impl WebDownload {
@@ -299,6 +300,7 @@ impl WebDownload {
             },
             // 下载客户端与页面抓取分家:页面 15s 总超时对大文件太短。UA 同款(裸 UA 常被拒)。
             net: download_client(Some(Duration::from_secs(280))),
+            net_long: download_client(None),
         }
     }
 }
@@ -384,7 +386,9 @@ impl Tool for WebDownload {
         // 认证按 host 现查(WebDAV / 带账号的直链)。**密码不经模型**(§7.7):它既不在
         // 工具参数里、也不出现在任何回给模型的文本里。
         let cred = crate::web::cred_for(&crate::web::load_http_creds(&ctx.store.settings), url);
-        let resp = self.get_with_cred(url, cred.as_ref(), referer.as_deref()).await?;
+        let resp = self
+            .get_with_cred(url, cred.as_ref(), referer.as_deref(), ctx.in_batch.is_some())
+            .await?;
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
             anyhow::bail!(
@@ -416,15 +420,19 @@ impl Tool for WebDownload {
         let name = pick_filename(&resp, wanted_name.as_deref());
         // 先写临时件再改名:半截下载绝不顶着正式名躺在下载夹里
         let part = part_path(&dir);
-        let (cap, progress) = match (ctx.in_batch.as_deref(), len) {
-            (Some(beat), Some(n)) => (DOWNLOAD_JOB_MAX_BYTES, Some((beat, n))),
-            (Some(_), None) => (DOWNLOAD_JOB_MAX_BYTES, None),
-            (None, _) => (DOWNLOAD_SYNC_MAX_BYTES, None),
+        // 回合被取消 / 批被叫停时这个 future 是在 `.await` 中途被丢掉的,下面的 Err 分支根本不跑 ——
+        // 没有这个守卫,半截 `.part` 就永久留在下载夹里(批内上限是 50GB 一个;2026-11-11 补,
+        // 后台 job 段早就有)。正常改名落位后解除。
+        let mut part_guard = PartGuard::new(part.clone());
+        // 批内:进度打到组上、顺带查取消(没报大小的也打 —— 不然既没进度、停也停不下来)
+        let (cap, progress) = match ctx.in_batch.as_deref() {
+            Some(beat) => (DOWNLOAD_JOB_MAX_BYTES, Some((beat, len))),
+            None => (DOWNLOAD_SYNC_MAX_BYTES, None),
         };
         let total = match stream_to_file(resp, &part, cap, progress).await {
             Ok(n) => n,
+            Err(e) if ctx.in_batch.is_some() => return Err(e),
             Err(e) => {
-                let _ = std::fs::remove_file(&part);
                 return Err(e.context(
                     "(如果是因为超过同步下载上限:这个服务器没报文件大小,\
                      所以没能自动转后台——可以让用户确认后重试)",
@@ -432,10 +440,8 @@ impl Tool for WebDownload {
             }
         };
         let dest = crate::files::dedupe_path(&dir.join(&name));
-        if let Err(e) = std::fs::rename(&part, &dest) {
-            let _ = std::fs::remove_file(&part);
-            return Err(anyhow::anyhow!(e).context("落盘改名失败"));
-        }
+        std::fs::rename(&part, &dest).context("落盘改名失败")?;
+        part_guard.disarm();
         Ok(format!("已下载到 {}({})", dest.display(), super::fs::human_size(total)))
     }
 }
@@ -470,20 +476,13 @@ impl WebDownload {
             }
         }
         let part = part_path(dir);
+        let mut part_guard = PartGuard::new(part.clone()); // 同 http 同步段:被丢弃也清 .part
         let cap = if ctx.in_batch.is_some() { DOWNLOAD_JOB_MAX_BYTES } else { DOWNLOAD_SYNC_MAX_BYTES };
         let total =
-            match crate::ftp::download_to(&t, &part, cap, size, ctx.in_batch.as_deref()).await {
-                Ok(n) => n,
-                Err(e) => {
-                    let _ = std::fs::remove_file(&part);
-                    return Err(e);
-                }
-            };
+            crate::ftp::download_to(&t, &part, cap, size, ctx.in_batch.as_deref()).await?;
         let dest = crate::files::dedupe_path(&dir.join(&t.filename));
-        if let Err(e) = std::fs::rename(&part, &dest) {
-            let _ = std::fs::remove_file(&part);
-            return Err(anyhow::anyhow!(e).context("落盘改名失败"));
-        }
+        std::fs::rename(&part, &dest).context("落盘改名失败")?;
+        part_guard.disarm();
         Ok(format!("已下载到 {}({})", dest.display(), super::fs::human_size(total)))
     }
 
@@ -515,12 +514,13 @@ impl WebDownload {
             let part = part_path(&dir_owned);
             let mut part_guard = PartGuard::new(part.clone()); // abort/drop 兜底清 .part
             let outcome = async {
+                let beat = CardBeat { ticket: &ticket, task: &task, name: &name, sized: true };
                 let got = crate::ftp::download_to(
                     &t,
                     &part,
                     DOWNLOAD_JOB_MAX_BYTES,
                     Some(total),
-                    Some(&ticket),
+                    Some(&beat),
                 )
                 .await?;
                 let dest = crate::files::dedupe_path(&dir_owned.join(&name));
@@ -568,15 +568,16 @@ impl WebDownload {
         ))
     }
 
-    /// 带认证的 GET(没凭证 = 匿名,与从前逐字节一致)。
+    /// 带认证的 GET(没凭证 = 匿名,与从前逐字节一致)。`long` = 批内档(不设总超时)。
     async fn get_with_cred(
         &self,
         url: &str,
         cred: Option<&crate::web::HttpCred>,
         referer: Option<&str>,
+        long: bool,
     ) -> anyhow::Result<reqwest::Response> {
-        self.net
-            .send(url, |c| {
+        let net = if long { &self.net_long } else { &self.net };
+        net.send(url, |c| {
                 let req = match cred {
                     Some(cd) => c.get(url).basic_auth(&cd.user, Some(&cd.password)),
                     None => c.get(url),
@@ -638,14 +639,14 @@ impl WebDownload {
                     .await
                     .context("下载请求失败")?;
                 anyhow::ensure!(resp.status().is_success(), "下载失败 HTTP {}", resp.status());
-                let got =
-                    stream_to_file(
-                        resp,
-                        &part,
-                        DOWNLOAD_JOB_MAX_BYTES,
-                        Some((&ticket as &dyn crate::bgtasks::Beat, total)),
-                    )
-                        .await?;
+                let beat = CardBeat { ticket: &ticket, task: &task, name: &name_owned, sized: true };
+                let got = stream_to_file(
+                    resp,
+                    &part,
+                    DOWNLOAD_JOB_MAX_BYTES,
+                    Some((&beat as &dyn crate::bgtasks::Beat, Some(total))),
+                )
+                .await?;
                 let dest = crate::files::dedupe_path(&dir_owned.join(&name_owned));
                 std::fs::rename(&part, &dest).context("落盘改名失败")?;
                 part_guard.disarm(); // 已改名落位,别再删
@@ -732,6 +733,33 @@ impl Drop for PartGuard {
     }
 }
 
+/// 后台下载的进度落点:票据(给模型看的〔此刻〕/ task_status)+ 屏幕任务卡(给人看的)。
+/// 2026-11-11 补:原先进度只打到票据上,卡建好之后再没动过 —— 几个 GB 的下载跑几小时,
+/// 卡上只有「下载文件」和转圈,三个并发就是三张一模一样的卡,话术却说「进度在屏幕任务条上」。
+struct CardBeat<'a> {
+    ticket: &'a crate::bgtasks::BgTicket,
+    task: &'a crate::tasks::TaskHandle,
+    name: &'a str,
+    /// 知道总大小(`done` 是百分比,能画进度条);否则只报已下多少。
+    sized: bool,
+}
+
+impl crate::bgtasks::Beat for CardBeat<'_> {
+    fn beat(&self, done: usize, current: String) {
+        let params = serde_json::json!({ "t": self.name, "p": current });
+        if self.sized {
+            self.task.step_progress("step.file_download", params, done.min(100) as f32 / 100.0);
+        } else {
+            self.task.step("step.file_download", params);
+        }
+        self.ticket.beat(done, current);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.ticket.is_cancelled()
+    }
+}
+
 use crate::files::{default_download_dir, sanitize_filename};
 
 /// 文件名:模型指定的 `name`(2026-09-16 加;存海报成 cover.jpg 这类固定名)→ Content-Disposition
@@ -810,7 +838,8 @@ fn ext_for_mime(ct: &str) -> Option<&'static str> {
 }
 
 /// 流式写盘 + 体积硬闸(超限即停,调用方负责清理临时件)。返回写入字节数。
-/// `progress` = 后台档才传:`(票据, 预期总字节)`,每 ~1MB 打一次点(顺带查取消)。
+/// `progress` = 后台档 / 批内才传:`(进度落点, 预期总字节)`,每 ~1MB 打一次点(顺带查取消);
+/// 总字节 None = 服务器没报大小,只报已下多少(进度文本语言中立,卡片直接用)。
 ///
 /// 写盘走 `tokio::fs`(不是 `std::fs`):后台档上限 50GB,慢盘 / NAS 上每次 write 都是可观阻塞,
 /// 而这个循环跑在 tokio worker 线程上 —— 一趟大下载能把整个 worker 按住(§ 效率审计 2026-09-08)。
@@ -818,7 +847,7 @@ async fn stream_to_file(
     mut resp: reqwest::Response,
     dest: &std::path::Path,
     cap: u64,
-    progress: Option<(&dyn crate::bgtasks::Beat, u64)>,
+    progress: Option<(&dyn crate::bgtasks::Beat, Option<u64>)>,
 ) -> anyhow::Result<u64> {
     use tokio::io::AsyncWriteExt;
     let mut f = tokio::fs::File::create(dest)
@@ -840,11 +869,20 @@ async fn stream_to_file(
             }
             if total >= next_beat {
                 next_beat = total + 1024 * 1024;
-                let pct = total.saturating_mul(100).checked_div(expect).unwrap_or(0);
-                ticket.beat(
-                    pct as usize,
-                    format!("{} / {}", super::fs::human_size(total), super::fs::human_size(expect)),
-                );
+                match expect {
+                    Some(expect) => {
+                        let pct = total.saturating_mul(100).checked_div(expect).unwrap_or(0);
+                        ticket.beat(
+                            pct as usize,
+                            format!(
+                                "{} / {}",
+                                super::fs::human_size(total),
+                                super::fs::human_size(expect)
+                            ),
+                        );
+                    }
+                    None => ticket.beat(0, super::fs::human_size(total)),
+                }
             }
         }
     }

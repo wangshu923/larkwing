@@ -113,14 +113,12 @@ impl Tool for WatchSet {
                 "metric={metric} 不能配 op=is(温度要比大小):降到某度以下用 below、升到某度以上用 above"
             );
         }
-        let value_opt = args.get("value").and_then(serde_json::Value::as_f64);
+        let value_opt = super::arg_f64(&args, "value");
         if metric != "rain" && value_opt.is_none() {
             anyhow::bail!("metric={metric} 需要 value(温度阈值 ℃)");
         }
         let value = value_opt.unwrap_or(0.0);
-        let expire_days = args
-            .get("expire_days")
-            .and_then(serde_json::Value::as_i64)
+        let expire_days = super::arg_i64(&args, "expire_days")
             .unwrap_or(DEFAULT_EXPIRE_DAYS)
             .clamp(1, MAX_EXPIRE_DAYS);
 

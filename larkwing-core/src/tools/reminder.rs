@@ -167,7 +167,7 @@ impl Tool for ReminderSet {
                 // (§3.5,别设一个到点没人收的提醒)。
                 if let Some(name) = for_name {
                     let member = outbound::find_member(&store, &name)?;
-                    let (thread, target) = outbound::resolve_phone(&store, member.id, None)?;
+                    let (thread, target) = outbound::resolve_phone(&store, member.id, None, None)?;
                     let job = store.jobs.add_for(
                         member.id,
                         Some(user_id),
@@ -264,7 +264,11 @@ impl Tool for ReminderList {
         Ok(jobs
             .iter()
             .map(|j| {
-                let content: String = j.content.chars().take(80).collect();
+                // 列表只给个头,但**必须标出被截了**(2026-11-11):内容上限 2000 字且按规矩自包含,
+                // 原先静默截到 80 字,模型以为是全文,「撤旧设新」时拿截断版重建。
+                let content = crate::text::clip_fmt(&j.content, 80, |rest| {
+                    format!("…(后面还有 {rest} 字,这里只列了开头)")
+                });
                 // 跨人标注:自己给家人设的标「给谁的」,家人给自己设的标「谁设的」
                 // (名字查不到 = 家人已删,不标不崩)
                 let who = if j.user_id != user_id {
@@ -326,7 +330,7 @@ impl Tool for ReminderCancel {
     }
 
     async fn run(&self, args: serde_json::Value, ctx: &ToolCtx) -> anyhow::Result<String> {
-        let id = args.get("id").and_then(serde_json::Value::as_i64).context("缺少 id 参数")?;
+        let id = super::arg_i64(&args, "id").context("缺少 id 参数")?;
         let store = ctx.store.clone();
         let user_id = ctx.user_id;
         let cancelled = tokio::task::spawn_blocking(move || store.jobs.cancel(user_id, id))

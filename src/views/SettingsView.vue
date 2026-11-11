@@ -193,7 +193,12 @@ function onKeydown(e: KeyboardEvent) {
   if (e.key === 'Escape') emit('close')
 }
 onMounted(() => window.addEventListener('keydown', onKeydown))
-onUnmounted(() => window.removeEventListener('keydown', onKeydown))
+onUnmounted(() => {
+  window.removeEventListener('keydown', onKeydown)
+  // 整页关掉(点 rail / Esc)时人可能正停在远程 tab 扫码:作废那条长轮询 —— 原先只在切 tab 时作废,
+  // 关页后它照转到二维码过期,断网时更是每 1.5s 重试一次、转到进程退出。
+  leaveRemoteTab()
+})
 </script>
 
 <template>

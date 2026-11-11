@@ -637,6 +637,12 @@ impl WebRender {
         if let Some(path) = &outcome.download {
             out.push_str(&format!("触发了下载,已存到 {}\n", path.display()));
         }
+        if let Some(path) = &outcome.download_pending {
+            out.push_str(&format!(
+                "触发了下载,文件比较大、这一步的时间里还没下完:它在浏览窗里接着下,会存到 {}。                 **不要重复点、也不要再用 web_download 下一遍**(会多出一份);过一会儿用 fs_stat 看这个路径,                 下完才是完整文件。下载期间浏览窗会留着。\n",
+                path.display()
+            ));
+        }
         match &outcome.page {
             Some(page) => {
                 out.push_str(&format!(
@@ -714,7 +720,8 @@ impl WebRender {
                     _ => {}
                 }
             }
-            None if outcome.download.is_some() => {} // 有下载没页面快照:结果已经够用
+            // 有下载(下完了 / 还在下)没页面快照:结果已经够用
+            None if outcome.download.is_some() || outcome.download_pending.is_some() => {}
             // 快照空 + 点击后跳了页 = 多半点进了文件本身(PDF/附件),当前窗成了文件查看器、
             // 注入脚本跑不了 → **绝不 bail 把这条线丢掉**:把去向交模型接 web_download。
             None if outcome.post_click_url.is_some() => {
@@ -796,6 +803,7 @@ mod tests {
             Ok(RenderOutcome {
                 page: self.0.page.clone(),
                 download: self.0.download.clone(),
+                download_pending: self.0.download_pending.clone(),
                 post_click_url: self.0.post_click_url.clone(),
                 session: self.0.session.clone(),
                 screenshot: self.0.screenshot.clone(),

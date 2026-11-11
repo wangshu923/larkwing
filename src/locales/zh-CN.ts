@@ -15,6 +15,7 @@ export default {
   // 只露友好动词,绝不露"工具/调用"概念(铁律 §3.2)
   tool: {
     remember: '记进小本本…',
+    recall: '查小本本…',
     now: '看时间…',
     end_conversation: '收尾…',
     plan_set: '列计划…',
@@ -97,6 +98,7 @@ export default {
     pack: '打包文件',
     usage: '统计磁盘占用',
     web_download: '下载文件',
+    fs_transfer: '复制 / 移动文件',
     delegate: '分头办事:{t}',
     batch: '成批:{t}', // 一批 = 一张卡(§6.5 batch)
     relocate: '搬家中',
@@ -130,6 +132,7 @@ export default {
       archive: '没解出来',
       pack: '没打包成',
       usage: '磁盘占用没扫成',
+      fs_transfer: '文件没搬成',
       torrent_meta: '拿不到种子信息(可能没人做种,或 DHT 被限速)',
       torrent_size: '这个种子太大了,没有下',
       torrent_stall: '一直没数据进来,停了(可能没人做种)',
@@ -192,6 +195,8 @@ export default {
     archive: '解压「{t}」({p})',
     pack: '打包「{t}」({p})',
     usage: '清点「{t}」(已数 {p} 个文件)',
+    file_download: '下载「{t}」 {p}', // p = 已下 / 总大小(语言中立的数字串)
+    fs_transfer: '已处理 {n} 个文件({size})',
     torrent_meta: '查种子信息…',
     torrent: '下「{n}」 {pct}% · {sp} · {pe} 个来源',
     render_load: '打开页面…',
@@ -397,6 +402,7 @@ export default {
     audioTrack: '音轨:{label}(点击切换)',
     lyricsShow: '显示歌词',
     lyricsHide: '隐藏歌词',
+    lyricsBtn: '词', // 播放条上那颗歌词钮的字面(一格宽,越短越好)
     trackN: '音轨 {n}',
     subtitleN: '字幕 {n}',
     subtitleSidecar: '{name}(外挂)',
@@ -602,6 +608,7 @@ export default {
     searchPlaceholder: '搜聊天记录',
     searchClear: '清空',
     searchEmpty: '没找到相关的聊天',
+    searchFailed: '这次没搜成,再试一下?', // 出错别借「没找到」那句(§6.6)
     pinned: '已钉住', // 钉住标的 tooltip
     // 会话列表「有动静」标 tooltip(不在该会话时浮现;完成 / 失败)
     badge: {

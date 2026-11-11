@@ -60,6 +60,12 @@ pub(crate) const WATERMARK_KEY: &str = "habits.covered_until_ms";
 const LAST_WRITTEN_KEY: &str = "habits.last_written";
 /// 否决名单(JSON 数组):用户删过的句子,绝不再写回。
 const REJECTED_KEY: &str = "habits.rejected";
+/// 写进个人按需记忆的那些句子(JSON 数组,每项「用户 id + 分隔符 + 句子」):用户在回忆页删掉
+/// 其中一句时据此认出「这是惯例提炼写的」→ 进否决名单(`note_memory_deleted`)。
+const PERSONAL_WRITTEN_KEY: &str = "habits.personal_written";
+/// 上面那张表的界(纯管护:只为不无限长,不是产品阈值)。
+const PERSONAL_WRITTEN_MAX: usize = 500;
+const PERSONAL_SEP: char = '\u{1f}';
 /// 行与行之间的分隔(备忘正文是一段话;拆回行时也认 `;` 与换行)。
 const SEP: &str = "；";
 
@@ -429,7 +435,12 @@ pub(crate) fn gather(store: &Store, from_ms: i64, to_ms: i64) -> Result<Gathered
 }
 
 /// 构造请求(纯函数):system=整理器法条,body=已记着的 + 用户删掉的 + 证据行。
-pub(crate) fn build_request(evidence: &[String], prior: Option<&str>, rejected: &[String]) -> ChatRequest {
+pub(crate) fn build_request(
+    evidence: &[String],
+    prior: Option<&str>,
+    kept: &[String],
+    rejected: &[String],
+) -> ChatRequest {
     let mut body = String::from("【已记着的惯例】\n");
     match prior.map(split_lines).filter(|v| !v.is_empty()) {
         Some(lines) => {
@@ -440,6 +451,15 @@ pub(crate) fn build_request(evidence: &[String], prior: Option<&str>, rejected: 
             }
         }
         None => body.push_str("(暂无)\n"),
+    }
+    // 不是这个整理器写的行(用户在聊天里亲口说、或在回忆页自己改的):程序原样保留,不归模型管
+    if !kept.is_empty() {
+        body.push_str("\n【家里人自己写下的(程序会原样保留,不用你写,也别重复)】\n");
+        for l in kept {
+            body.push_str("- ");
+            body.push_str(l);
+            body.push('\n');
+        }
     }
     body.push_str("\n【用户删掉的(别再写)】\n");
     if rejected.is_empty() {
@@ -552,10 +572,46 @@ fn write_list(store: &Store, key: &str, v: &[String]) -> Result<()> {
     store.settings.set(None, key, &serde_json::to_string(v)?)
 }
 
+/// 现存内容里**不是**上次由这里写下的行(用户在聊天里亲口说的惯例、回忆页自己改过的句子)。
+/// 这些行不归整理器管:不给模型改、不会因为「痕迹里没有」被删,重写时原样带上(2026-11-11)。
+/// 此前整主题覆盖 —— 法条又把「家里的惯例」指向这个主题,用户亲口说的话下一次周跑就没了。
+pub(crate) fn foreign_lines(last_written: &[String], current: Option<&str>) -> Vec<String> {
+    let ours: HashSet<String> = last_written.iter().map(|s| norm(s)).collect();
+    current.map(split_lines).unwrap_or_default().into_iter().filter(|l| !ours.contains(l)).collect()
+}
+
+/// 用户在回忆页删掉了一条记忆:它若是惯例提炼写的个人习惯 → 进否决名单,不再写回(2026-11-11)。
+/// 原先个人习惯只靠「有没有近似的」去重,删掉之后下周证据还在就又写回来,与家级那条
+/// 「用户删掉的不再写回」不一致。只认**用户的删除**(调用方 = 回忆页的删除命令);
+/// 记忆维护自己清掉的不走这里,不会被误当成用户不想要。
+pub(crate) fn note_memory_deleted(store: &Store, user_id: i64, content: &str) -> Result<()> {
+    let entry = format!("{user_id}{PERSONAL_SEP}{}", norm(content));
+    let mut written = read_list(store, PERSONAL_WRITTEN_KEY)?;
+    let Some(pos) = written.iter().position(|w| *w == entry) else { return Ok(()) };
+    written.remove(pos);
+    write_list(store, PERSONAL_WRITTEN_KEY, &written)?;
+    let line = norm(content);
+    let mut rejected = read_list(store, REJECTED_KEY)?;
+    if !rejected.iter().any(|x| norm(x) == line) {
+        rejected.push(line);
+        if rejected.len() > REJECTED_MAX {
+            let cut = rejected.len() - REJECTED_MAX;
+            rejected.drain(..cut);
+        }
+        write_list(store, REJECTED_KEY, &rejected)?;
+        tracing::info!(target: "larkwing::habits", user = user_id, "用户删掉的个人习惯进否决名单");
+    }
+    Ok(())
+}
+
 /// 取料 + 否决名单更新(阻塞段,整段进线程池)。
 struct Prepared {
     evidence: Vec<String>,
     prior: Option<Briefing>,
+    /// 上次由这里写下、现在还在的行(给模型管)。
+    ours: Vec<String>,
+    /// 不是这里写的行(原样保留)。
+    foreign: Vec<String>,
     rejected: Vec<String>,
     names: HashMap<i64, String>,
     owner: i64,
@@ -587,7 +643,11 @@ fn prepare(store: &Store, from_ms: i64, to_ms: i64) -> Result<Prepared> {
         tracing::info!(target: "larkwing::habits", n = rejected.len(), "用户删过的惯例进否决名单");
     }
     let names = display_names(store)?;
-    Ok(Prepared { evidence, prior, rejected, names, owner })
+    let current = prior.as_ref().map(|b| b.content.as_str());
+    let foreign = foreign_lines(&last, current);
+    let ours: Vec<String> =
+        current.map(split_lines).unwrap_or_default().into_iter().filter(|l| !foreign.contains(l)).collect();
+    Ok(Prepared { evidence, prior, ours, foreign, rejected, names, owner })
 }
 
 /// 跑一次惯例提炼(调用方 = `Engine::spawn_habits`,已做限流 / 回合在飞让路 / 防重入 / FakeLlm 挡板):
@@ -620,7 +680,13 @@ pub(crate) async fn run(provider: &Arc<dyn LlmProvider>, store: &Store, now_ms: 
         set_wm(now_ms)?; // 没有够格的痕迹:翻篇,不烧钱
         return Ok(0);
     }
-    let mut req = build_request(&prepared.evidence, prepared.prior.as_ref().map(|b| b.content.as_str()), &prepared.rejected);
+    let ours = prepared.ours.join(SEP);
+    let mut req = build_request(
+        &prepared.evidence,
+        (!ours.is_empty()).then_some(ours.as_str()),
+        &prepared.foreign,
+        &prepared.rejected,
+    );
     // 思考档随全局 `llm.thinking`(与 consolidate 同款:缺省 Medium —— 后台不卡延迟,质量优先)。
     let thinking = match store.settings.get(None, "llm.thinking")?.as_deref() {
         Some("off") => crate::llm::Thinking::Off,
@@ -634,9 +700,12 @@ pub(crate) async fn run(provider: &Arc<dyn LlmProvider>, store: &Store, now_ms: 
     let text = provider.chat(req).await.map_err(|e| anyhow::anyhow!("惯例提炼 LLM 调用失败: {e:?}"))?;
     let known: HashSet<String> = prepared.names.values().cloned().collect();
     let (home, personal) = finalize(parse(&text), &prepared.rejected, &known);
+    // 家里人自己写下的行原样带上、排在前面;模型写的与它们重复的不要
+    let home: Vec<String> = home.into_iter().filter(|l| !prepared.foreign.contains(l)).collect();
     let mut written = 0usize;
     if !home.is_empty() {
-        let content = home.join(SEP);
+        let content =
+            prepared.foreign.iter().chain(home.iter()).cloned().collect::<Vec<_>>().join(SEP);
         // 预算执法:镜像 briefing_write(写入时定常驻与否,装配无条件全装 → 前缀字节稳定);
         // 覆盖同主题时旧字数让位。按主人视角算(home 行对谁都算数)。
         let old_chars = prepared
@@ -656,14 +725,24 @@ pub(crate) async fn run(provider: &Arc<dyn LlmProvider>, store: &Store, now_ms: 
         tracing::info!(target: "larkwing::habits", "模型没给出家级惯例,已记着的原条不动");
     }
     let by_name: HashMap<&String, i64> = prepared.names.iter().map(|(id, n)| (n, *id)).collect();
+    let mut personal_written = read_list(store, PERSONAL_WRITTEN_KEY)?;
+    let before = personal_written.len();
     for (who, text) in personal {
         let Some(&uid) = by_name.get(&who) else { continue };
         if store.memory.has_similar(uid, &text)? {
             continue;
         }
         store.memory.add_distilled(uid, KIND_EXPERIENCE, &text)?;
+        personal_written.push(format!("{uid}{PERSONAL_SEP}{}", norm(&text)));
         written += 1;
         tracing::info!(target: "larkwing::habits", user = uid, "个人习惯进按需记忆:{text}");
+    }
+    if personal_written.len() != before {
+        if personal_written.len() > PERSONAL_WRITTEN_MAX {
+            let cut = personal_written.len() - PERSONAL_WRITTEN_MAX;
+            personal_written.drain(..cut);
+        }
+        write_list(store, PERSONAL_WRITTEN_KEY, &personal_written)?;
     }
     set_wm(now_ms)?;
     Ok(written)
@@ -795,16 +874,22 @@ mod tests {
 
     #[test]
     fn build_request_lists_prior_rejected_and_evidence() {
-        let req = build_request(&["- media_play 《A》:4 次 / 3 天".into()], Some("晚上常放《A》；周末看动画"), &["早上听新闻".into()]);
+        let req = build_request(
+            &["- media_play 《A》:4 次 / 3 天".into()],
+            Some("晚上常放《A》；周末看动画"),
+            &["周六全家大扫除".into()],
+            &["早上听新闻".into()],
+        );
         let body = match &req.messages[0] {
             ChatMessage::User { content, .. } => content.clone(),
             other => panic!("{other:?}"),
         };
         assert!(body.contains("【已记着的惯例】\n- 晚上常放《A》\n- 周末看动画\n"), "{body}");
+        assert!(body.contains("原样保留") && body.contains("- 周六全家大扫除\n"), "{body}");
         assert!(body.contains("【用户删掉的(别再写)】\n- 早上听新闻\n"), "{body}");
         assert!(body.contains("【最近 14 天的使用痕迹】\n- media_play 《A》"), "{body}");
         assert!(req.system.contains("只输出 JSON"));
-        let empty = build_request(&[], None, &[]);
+        let empty = build_request(&[], None, &[], &[]);
         let body = match &empty.messages[0] {
             ChatMessage::User { content, .. } => content.clone(),
             _ => unreachable!(),
@@ -927,6 +1012,54 @@ mod tests {
     }
 
     /// 用户删掉的不再写回:上次写过两句、用户删了一句 → 这句进否决名单,模型再写也被滤掉。
+    /// 家里人自己写进「惯例」的话不归整理器管(2026-11-11):重写时原样带上、排在前面,
+    /// 不因为痕迹里没有就被删;整理器只记自己写的那几句为「上次写入」。
+    #[tokio::test]
+    async fn run_keeps_lines_the_family_wrote_themselves() {
+        let tag = "foreign";
+        let s = store(tag);
+        let me = s.users.ensure_default_user().unwrap();
+        let conv = s.chat.create_conversation(me.id, "companion").unwrap();
+        for d in [1, 2, 3] {
+            seed_play(&s, tag, conv.id, "汪汪队立大功", at(d, 20, 0));
+        }
+        // 现存内容:一句是上次整理器写的,一句是用户在聊天里亲口说、由聊天模型记进来的
+        s.briefings
+            .upsert(&crate::store::briefings::scope_home(), HABITS_DOMAIN, "周末看动画；周六上午全家大扫除", true)
+            .unwrap();
+        write_list(&s, LAST_WRITTEN_KEY, &["周末看动画".into()]).unwrap();
+        s.settings.set(None, WATERMARK_KEY, &(crate::store::now_ms() - PERIOD_MS - 1).to_string()).unwrap();
+        // 模型这次只写了一句新的(「周末看动画」痕迹里没了,它按法条删掉;大扫除它根本没提)
+        let json = "[{\"text\":\"晚上常放《汪汪队立大功》\",\"who\":\"\"}]";
+        let p: Arc<dyn LlmProvider> =
+            Arc::new(FakeLlm::scripted(vec![FakeTurn { text: json.into(), ..Default::default() }]));
+        run(&p, &s, crate::store::now_ms()).await.unwrap();
+        assert_eq!(
+            habits_row(&s).unwrap().content,
+            "周六上午全家大扫除；晚上常放《汪汪队立大功》",
+            "用户自己写的那句原样留着"
+        );
+        assert_eq!(
+            read_list(&s, LAST_WRITTEN_KEY).unwrap(),
+            vec!["晚上常放《汪汪队立大功》".to_string()],
+            "「上次写入」只记整理器自己写的,用户那句永远不算它的"
+        );
+        assert!(read_list(&s, REJECTED_KEY).unwrap().is_empty(), "没有人删过东西,否决名单不动");
+    }
+
+    /// 用户在回忆页删掉惯例提炼写的个人习惯 → 进否决名单;删别的记忆不受影响(2026-11-11)。
+    #[test]
+    fn deleting_a_habit_memory_bans_it_but_other_memories_do_not() {
+        let s = store("pdel");
+        let me = s.users.ensure_default_user().unwrap();
+        write_list(&s, PERSONAL_WRITTEN_KEY, &[format!("{}{PERSONAL_SEP}周末下午常看动画片", me.id)]).unwrap();
+        note_memory_deleted(&s, me.id, "用户不吃香菜").unwrap();
+        assert!(read_list(&s, REJECTED_KEY).unwrap().is_empty(), "不是惯例提炼写的,不进否决名单");
+        note_memory_deleted(&s, me.id, "周末下午常看动画片。").unwrap();
+        assert_eq!(read_list(&s, REJECTED_KEY).unwrap(), vec!["周末下午常看动画片".to_string()]);
+        assert!(read_list(&s, PERSONAL_WRITTEN_KEY).unwrap().is_empty(), "认领过的条目摘掉");
+    }
+
     #[tokio::test]
     async fn run_never_rewrites_what_the_user_deleted() {
         let tag = "deleted";

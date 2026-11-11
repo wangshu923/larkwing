@@ -264,7 +264,16 @@ fn wake_loop(d: &WakeDeps, cmd: &Receiver<WakeCmd>) -> Result<()> {
         // 命令优先(非阻塞清空)
         loop {
             match cmd.try_recv() {
-                Ok(WakeCmd::Stop) => return Ok(()),
+                Ok(WakeCmd::Stop) => {
+                    // 收尾必须知会前端(同下面 Resume 那条,2026-11-11 补):唤醒回合在飞 / 在念的时候
+                    // 循环被重启(耳机切换的自动档、麦桥自愈、改设置都会走 wake_stop),旧循环原先
+                    // 无声退出 —— 前端只认 ListenEnded 恢复媒体音量,新循环处在 Watch 又不理那条
+                    // 迟到的收尾指令,音量就卡在 20% 直到下一次完整唤醒。
+                    if !matches!(phase, Phase::Watch) {
+                        d.rt.publish(VoiceEvent::ListenEnded { reason: "wake_done".into() });
+                    }
+                    return Ok(());
+                }
                 Ok(WakeCmd::Suspend(b)) => {
                     suspended = b;
                     if !b {

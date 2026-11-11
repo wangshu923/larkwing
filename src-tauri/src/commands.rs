@@ -89,7 +89,7 @@ impl ChannelSup {
     }
 
     fn status_snapshot(&self) -> std::collections::HashMap<String, ChannelState> {
-        self.status.lock().map(|m| m.clone()).unwrap_or_default()
+        self.status.lk().clone() // 走 lockext:中毒也照取(原先中毒就静默回空表,§6.10 禁的那个形)
     }
 }
 
@@ -432,21 +432,29 @@ pub fn list_fsops(state: State<'_, AppState>) -> Result<Vec<FsOpRow>, AppError> 
 }
 
 /// 操作记录页「撤销」:把某批文件操作退回去(功能性,非安全承诺)。
+/// **async + 阻塞线程**(§8.4,2026-11-11):一批最多 300 项,含跨盘回拷与回收站还原 —— 同步命令
+/// 是在 IPC / 界面线程上内联跑的,撤销一批搬到别的盘的电影会让窗口整段无响应。
 #[tauri::command]
-pub fn fsops_undo(
+pub async fn fsops_undo(
     state: State<'_, AppState>,
     id: i64,
 ) -> Result<larkwing_core::files::OpReport, AppError> {
-    state.engine.fsops_undo(id)
+    let engine = state.engine.clone();
+    tauri::async_runtime::spawn_blocking(move || engine.fsops_undo(id))
+        .await
+        .map_err(AppError::internal)?
 }
 
-/// 操作记录页「重做」:把撤销过的那批再做一遍。
+/// 操作记录页「重做」:把撤销过的那批再做一遍。同上,放阻塞线程。
 #[tauri::command]
-pub fn fsops_redo(
+pub async fn fsops_redo(
     state: State<'_, AppState>,
     id: i64,
 ) -> Result<larkwing_core::files::OpReport, AppError> {
-    state.engine.fsops_redo(id)
+    let engine = state.engine.clone();
+    tauri::async_runtime::spawn_blocking(move || engine.fsops_redo(id))
+        .await
+        .map_err(AppError::internal)?
 }
 
 /// 确认卡应答(§7.8 确认闸):HUD 卡 / 悬浮窗按钮直连。via 记谁点的(desktop/float),
@@ -1681,14 +1689,21 @@ pub async fn relocate_data(
 }
 
 /// 搬家后「删除旧数据」:删旧根数据(保留指针)→ 清指针 old_root 字段。
+/// **async + 阻塞线程**(§8.4,2026-11-11):旧根里有语音模型、ffmpeg、几百 MB 的朗读缓存小文件,
+/// 整树删要数秒到数十秒 —— 这正是搬家后用户紧接着点的那一下,原先在界面线程上卡死。
 #[tauri::command]
-pub fn cleanup_old_data(state: State<'_, AppState>) -> Result<(), AppError> {
-    let ptr = datadir::read_pointer(&state.anchor);
-    if let Some(old) = ptr.old_root.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        datadir::cleanup_old(Path::new(old), &state.anchor).map_err(AppError::internal)?;
-    }
-    datadir::write_pointer(&state.anchor, &Pointer { data_root: ptr.data_root, old_root: None })
-        .map_err(AppError::internal)
+pub async fn cleanup_old_data(state: State<'_, AppState>) -> Result<(), AppError> {
+    let anchor = state.anchor.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), AppError> {
+        let ptr = datadir::read_pointer(&anchor);
+        if let Some(old) = ptr.old_root.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            datadir::cleanup_old(Path::new(old), &anchor).map_err(AppError::internal)?;
+        }
+        datadir::write_pointer(&anchor, &Pointer { data_root: ptr.data_root, old_root: None })
+            .map_err(AppError::internal)
+    })
+    .await
+    .map_err(AppError::internal)?
 }
 
 /// 搬家后「保留旧数据」:只清指针 old_root 字段,不删盘(用户日后自己删)。

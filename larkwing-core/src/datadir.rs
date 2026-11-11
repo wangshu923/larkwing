@@ -403,20 +403,25 @@ pub fn backup_to(data_root: &Path, dest_dir: &Path) -> Result<PathBuf> {
     }
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
     let zip_path = dest_dir.join(format!("larkwing-backup-{stamp}.zip"));
-    // VACUUM 出一致快照到系统临时目录(读进 zip 后即删,不在用户所选目录里散落临时文件)。
+    // VACUUM 出一致快照,读进 zip 后即删(不在用户所选的备份目录里散落临时文件)。
+    // **落在数据根里**(2026-11-11,原先落系统临时目录):快照有整库那么大,而用户往往正是因为
+    // C 盘小才把数据搬走的 —— 临时件不该又回到 C 盘。数据根与库同盘、是本地盘,不碰网络盘。
     // 名带进程内序号:秒级时间戳在并发调用(测试并行实锤)下会同名互删。
     static SNAP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SNAP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let snap_db = std::env::temp_dir()
-        .join(format!("lw-backup-{}-{stamp}-{seq}.db", std::process::id()));
+    let snap_db =
+        data_root.join(format!(".backup-snap-{}-{stamp}-{seq}.db", std::process::id()));
     let _ = std::fs::remove_file(&snap_db);
 
     let build = || -> Result<()> {
-        vacuum_into(&src_db, &snap_db)?;
+        // 先建包、再出快照(2026-11-11 调换):目标目录写不进(只读共享 / 盘满)在这一步就报错,
+        // 不必先白写一份整库。
         let file = std::fs::File::create(&zip_path)
             .with_context(|| format!("创建备份包失败: {}", zip_path.display()))?;
+        vacuum_into(&src_db, &snap_db)?;
         let mut zip = zip::ZipWriter::new(file);
-        let opts = zip::write::SimpleFileOptions::default();
+        // large_file:库快照过 4GiB 时必须是 zip64,否则 zip 库直接报错、备份必败(fs_zip 早就设了)。
+        let opts = zip::write::SimpleFileOptions::default().large_file(true);
 
         // 1) DB 一致快照。
         zip.start_file(DB_FILE, opts)?;
@@ -646,6 +651,47 @@ pub fn apply_pending_restore(data_root: &Path) -> Option<std::result::Result<(),
     // 成败都清负载:成功 = 已消费;失败 = 别让每次启动反复撞同一坨坏负载。
     std::fs::remove_dir_all(&pending).ok();
     Some(out)
+}
+
+/// 恢复落位之后新库却打不开(备份库过了预检 —— 只查魔数与迁移记账 —— 但开库 / 迁移失败):
+/// 把恢复前的保险副本换回来,坏库挪成 `larkwing.db.restore-failed-<时间戳>` 留着备查(2026-11-11)。
+/// 原先这种情况启动直接失败,且负载已清、之后每次启动都起不来,老库就躺在旁边却没人换回去。
+/// 调用方 = 壳层 boot:`apply_pending_restore` 报成功、紧接着 `Store::open` 失败时调。
+pub fn rollback_restore(data_root: &Path) -> Result<()> {
+    let prefix = format!("{DB_FILE}.pre-restore-");
+    let mut safeties: Vec<PathBuf> = std::fs::read_dir(data_root)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                n.starts_with(&prefix) && !n.ends_with("-wal") && !n.ends_with("-shm")
+            })
+        })
+        .collect();
+    safeties.sort(); // 名字带时间戳,字典序 = 时间序;最新那份就是这次恢复挪出来的
+    let safety = safeties.pop().context("找不到恢复前的保险副本,换不回去")?;
+    let with_suffix = |base: &Path, suffix: &str| -> PathBuf {
+        let mut s = base.as_os_str().to_os_string();
+        s.push(suffix);
+        PathBuf::from(s)
+    };
+    let live = data_root.join(DB_FILE);
+    let failed = data_root.join(format!("{DB_FILE}.restore-failed-{}", stamp()));
+    for suffix in ["", "-wal", "-shm"] {
+        let from = with_suffix(&live, suffix);
+        if from.exists() {
+            std::fs::rename(&from, with_suffix(&failed, suffix))
+                .with_context(|| format!("挪开打不开的库失败: {}", from.display()))?;
+        }
+    }
+    for suffix in ["", "-wal", "-shm"] {
+        let from = with_suffix(&safety, suffix);
+        if from.exists() {
+            std::fs::rename(&from, with_suffix(&live, suffix))
+                .with_context(|| format!("换回恢复前的数据失败: {}", from.display()))?;
+        }
+    }
+    Ok(())
 }
 
 fn apply_restore_inner(data_root: &Path, pending: &Path) -> Result<()> {
@@ -1033,6 +1079,37 @@ mod tests {
         let info = restore_precheck(&okzip, &known).unwrap();
         assert!(info.db_bytes > 0);
         assert_eq!(info.clones, 1);
+    }
+
+    /// 恢复回来的库打不开 → 换回恢复前的保险副本(连 -wal),坏库留着备查(2026-11-11)。
+    #[test]
+    fn rollback_restore_puts_the_safety_copy_back() {
+        let root = std::env::temp_dir().join(format!("lw-rollback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(DB_FILE), b"new-but-broken").unwrap();
+        // 两次恢复留下两份保险副本:要换回的是最新那份
+        std::fs::write(root.join(format!("{DB_FILE}.pre-restore-20260101-000000")), b"older").unwrap();
+        std::fs::write(root.join(format!("{DB_FILE}.pre-restore-20261111-120000")), b"good").unwrap();
+        std::fs::write(root.join(format!("{DB_FILE}.pre-restore-20261111-120000-wal")), b"good-wal").unwrap();
+
+        rollback_restore(&root).unwrap();
+        assert_eq!(std::fs::read(root.join(DB_FILE)).unwrap(), b"good");
+        assert_eq!(std::fs::read(root.join(format!("{DB_FILE}-wal"))).unwrap(), b"good-wal");
+        let failed: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".restore-failed-"))
+            .collect();
+        assert_eq!(failed.len(), 1, "坏库挪开留着,不删:{failed:?}");
+        assert!(root.join(format!("{DB_FILE}.pre-restore-20260101-000000")).exists(), "更早的副本不动");
+
+        // 没有保险副本可换:如实报错,不乱动
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(rollback_restore(&empty).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -41,6 +41,8 @@ const SYSTEM: &str = "你是后台记忆整理器,不与任何人对话,只输�
   最多 5 条,第三人称简短陈述。输出一个 JSON 数组,每项形如 \
   {\"content\":\"...\",\"kind\":\"identity|experience|fact\",\"replaces\":\"可选\"}:\
   身份/安全/家人(名字、过敏、忌口)→ identity;做事习惯/偏好 → experience;其它长期事实 → fact。\
+  【谁说的】转录里标「另一位家人」的是家里别人说的话,只当语境看:里面关于那个人自己的事一律不记\
+  (那不是「用户」的事,记了就记错人);只记关于「用户」本人、或全家共同的事。\
   【纠错替换】若「最近对话」里用户**明确纠正**了「已记得的事」里某条(『不是…是…』『改成…』『其实…』『现在…了』),\
   就在该项加 \"replaces\":\"<旧记忆里能唯一定位它的一小段原文>\",content 写纠正后的新说法。\
   **身份/安全/家人类(过敏、名字、忌口)绝不这样替换 —— 那种要本人亲口改。** 没有明确纠正就别加 replaces。\
@@ -60,8 +62,24 @@ pub(crate) struct DistilledItem {
     pub replaces: Option<String>,
 }
 
+/// `run` 取料的结果:(最近对话, 目标用户已有的记忆, 会话归属者)。
+type Loaded = (Vec<Message>, Vec<Memory>, i64);
+
+/// 这条 user 行是谁说的:payload 里的 `speaker_user`(声纹 / 渠道归人),没有 = 会话归属者
+/// (与回合装配同一口径 —— 桌面打字恒 = 会话归属者)。
+fn row_speaker(m: &Message, owner: i64) -> i64 {
+    m.payload
+        .as_deref()
+        .and_then(|p| serde_json::from_str::<super::UserMeta>(p).ok())
+        .and_then(|meta| meta.speaker_user)
+        .unwrap_or(owner)
+}
+
 /// 构造蒸馏请求(纯函数,可 golden):system=整理器法条,body=已记忆清单 + 最近对话转录。
-pub(crate) fn build_request(recent: &[Message], existing: &[Memory]) -> ChatRequest {
+/// `target` = 记忆写给谁;`owner` = 会话归属者(没标说话人的 user 行算 TA 的)。
+/// **按行标说话人(2026-11-11)**:全家共用的语音会话 / 被指认的渠道会话里,别人说的话标「另一位家人」,
+/// 否则孩子说的「我花生过敏」会以 identity 类写进触发提炼那一回合的说话人名下(且 identity 全程豁免删改)。
+pub(crate) fn build_request(recent: &[Message], existing: &[Memory], target: i64, owner: i64) -> ChatRequest {
     let mut body = String::from("【已记得的事(别重复)】\n");
     if existing.is_empty() {
         body.push_str("(暂无)\n");
@@ -75,7 +93,8 @@ pub(crate) fn build_request(recent: &[Message], existing: &[Memory]) -> ChatRequ
     body.push_str("\n【最近对话】\n");
     for m in recent {
         let who = match m.role.as_str() {
-            "user" => "用户",
+            "user" if row_speaker(m, owner) == target => "用户",
+            "user" => "另一位家人",
             // 中立角色标签(§5 底座不嵌具名;提炼模型只需分清谁在说,不需要知道名字,
             // 也免得跟用户改名后的真名打架——顺手修掉原硬编的旧默认名「7274」)
             "assistant" => "助手",
@@ -144,19 +163,21 @@ pub(crate) async fn run(
     // 「没有用户发言就别去查记忆表」也照旧(判断跟着搬进闭包里,不多查一次)。
     let loaded = {
         let store = store.clone();
-        tokio::task::spawn_blocking(move || -> Result<Option<(Vec<Message>, Vec<Memory>)>> {
+        tokio::task::spawn_blocking(move || -> Result<Option<Loaded>> {
             let recent = store.chat.recent_messages(conv_id, lookback)?;
-            // 没有用户发言 = 没有可提炼的材料(任务专属会话只有 event 行时跳过)
-            if !recent.iter().any(|m| m.role == "user") {
+            let owner = store.chat.get_conversation(conv_id)?.map(|c| c.user_id).unwrap_or(user_id);
+            // 这个人在这段里一句没说 = 没有写给 TA 的材料(任务专属会话只有 event 行、
+            // 或这一窗全是别的家人在说话时跳过)
+            if !recent.iter().any(|m| m.role == "user" && row_speaker(m, owner) == user_id) {
                 return Ok(None);
             }
             let existing = store.memory.list(user_id)?;
-            Ok(Some((recent, existing)))
+            Ok(Some((recent, existing, owner)))
         })
         .await??
     };
-    let Some((recent, existing)) = loaded else { return Ok(0) };
-    let mut req = build_request(&recent, &existing);
+    let Some((recent, existing, owner)) = loaded else { return Ok(0) };
+    let mut req = build_request(&recent, &existing, user_id, owner);
     // 提炼认全局反应模式 `llm.thinking`,**解析与回合循环完全一致**(engine/mod.rs:1461):
     // **缺省 → Medium**(2026-06-19 起后台提炼默认开思考)。依据 = eval A/B 实测:关思考时提炼
     // 几乎一律 `[]`、开思考 consolidate-learns 0/5→5/5 且 restraint 仍 5/5(双向判对)。后台任务
@@ -268,6 +289,41 @@ mod tests {
         // 进按需层 → 不在 list_resident,但 recall 取得到
         assert!(!store.memory.list_resident(user.id).unwrap().iter().any(|m| m.id == distilled[0].id));
         assert!(store.memory.recall(user.id, "歌手").unwrap().iter().any(|m| m.content.contains("歌手分")));
+    }
+
+    /// 多人会话:别人说的话标「另一位家人」,不冒充「用户」(2026-11-11 修记错人);
+    /// 这一窗目标本人一句没说 → 不调模型、不落库。
+    #[tokio::test]
+    async fn transcript_marks_other_speakers_and_skips_absent_target() {
+        let store = store("speakers");
+        let dad = store.users.ensure_default_user().unwrap();
+        let kid = store.users.create("小宝").unwrap();
+        let conv = store.chat.create_conversation(dad.id, "companion").unwrap();
+        let kid_meta = format!(r#"{{"speaker_user":{}}}"#, kid.id);
+        store.chat.append_message_full(conv.id, "user", "我花生过敏", Some(&kid_meta)).unwrap();
+        store.chat.append_message(conv.id, "user", "帮我放首歌").unwrap(); // 没标 = 会话归属者(爸爸)
+        let recent = store.chat.recent_messages(conv.id, 50).unwrap();
+
+        let body = |req: ChatRequest| match req.messages.into_iter().next() {
+            Some(ChatMessage::User { content, .. }) => content,
+            _ => panic!("提炼请求应是一条 user 消息"),
+        };
+        let for_dad = body(build_request(&recent, &[], dad.id, dad.id));
+        assert!(for_dad.contains("另一位家人: 我花生过敏"), "孩子的话不许标成「用户」:\n{for_dad}");
+        assert!(for_dad.contains("用户: 帮我放首歌"));
+        let for_kid = body(build_request(&recent, &[], kid.id, dad.id));
+        assert!(for_kid.contains("用户: 我花生过敏"), "写给孩子时孩子才是「用户」:\n{for_kid}");
+        assert!(for_kid.contains("另一位家人: 帮我放首歌"));
+
+        // 只有孩子说话的一窗:写给爸爸 = 没材料,脚本一条都不消费
+        let only_kid = store.chat.create_conversation(dad.id, "companion").unwrap();
+        store.chat.append_message_full(only_kid.id, "user", "我花生过敏", Some(&kid_meta)).unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(FakeLlm::scripted(vec![FakeTurn {
+            text: "[{\"content\":\"用户花生过敏\",\"kind\":\"identity\"}]".into(),
+            ..Default::default()
+        }]));
+        assert_eq!(run(&provider, &store, dad.id, only_kid.id, 50).await.unwrap(), 0);
+        assert!(store.memory.list(dad.id).unwrap().is_empty(), "孩子的过敏绝不落进爸爸的记忆");
     }
 
     #[tokio::test]

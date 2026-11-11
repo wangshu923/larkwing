@@ -655,11 +655,42 @@ impl VoiceRuntime {
             Some(g)
         };
         let (text2, voice2) = (text.to_string(), voice.to_string());
-        let bytes = tokio::task::spawn_blocking(move || engine.synthesize(&text2, &voice2, rate))
+        // 在线引擎(可重入 = 走网络):限并发 + 等待有界,见 tts.rs 两个常量的注释。名额由阻塞线程
+        // 自己攥着 —— 等待方超时放弃后,卡死的线程仍占着名额,泄漏量因此有界。
+        let online = engine.reentrant();
+        let work = async move {
+            let permit = if online {
+                static GATE: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+                let gate = GATE
+                    .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(tts::ONLINE_SYNTH_INFLIGHT)))
+                    .clone();
+                Some(gate.acquire_owned().await.context("朗读名额闸已关")?)
+            } else {
+                None
+            };
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                engine.synthesize(&text2, &voice2, rate)
+            })
             .await
-            .context("TTS 任务挂了")??;
-        // 先写临时名再原子改名:并发同句合成也只会留下一份完好文件
-        let tmp = self.inner.tts_dir.join(format!("{key}.{}.part", std::process::id()));
+            .context("TTS 任务挂了")?
+        };
+        let bytes = if online {
+            tokio::time::timeout(tts::ONLINE_SYNTH_TIMEOUT, work).await.map_err(|_| {
+                anyhow!(
+                    "在线朗读 {} 秒没有回应(网络不通,或朗读服务没响应)",
+                    tts::ONLINE_SYNTH_TIMEOUT.as_secs()
+                )
+            })??
+        } else {
+            work.await?
+        };
+        // 先写临时名再原子改名:并发同句合成也只会留下一份完好文件。临时名带进程号 + 自增序号 ——
+        // 只带进程号时,同一条回复里相邻两句相同(在线引擎不加锁、前端并发 2)会写同一个 .part,
+        // 后改名的那个报错(v0.2.42 起会弹朗读失败的提示,Windows 上还可能撞共享冲突)。
+        static PART_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = PART_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = self.inner.tts_dir.join(format!("{key}.{}.{seq}.part", std::process::id()));
         tokio::fs::write(&tmp, &bytes).await?;
         tokio::fs::rename(&tmp, &path).await?;
         // 刚新增一份缓存 → 顺手看看总量该不该清扫(限频、后台跑,不挡本次合成)。
@@ -1076,6 +1107,9 @@ impl VoiceRuntime {
         calib::sensitivity_to_threshold(sens)
     }
 
+    /// 唤醒启动时等应答音备好的上限;超了先起唤醒、后台接着备。
+    const PROMPT_PREP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
     async fn wake_start(&self) -> Result<()> {
         if self.wake_running() {
             return Ok(());
@@ -1099,7 +1133,24 @@ impl VoiceRuntime {
         anyhow::ensure!(!keywords_buf.is_empty(), "唤醒词一个都编不出来(只支持中文词)");
         // 短句银行(人格数据,场景给话术):断网 best-effort,空类目降级无声
         let scene_voice = self.inner.scenes.default_scene().voice.clone();
-        let bank = prompts::PromptBank::prepare(self, &scene_voice).await;
+        // 应答音只等一小会儿(2026-11-11):缓存命中是毫秒级;首次开启 / 换音色后要现合成,网络不通时
+        // 原先在这里一直等 —— 开机唤醒起不来,而唤醒本身根本不需要网络。等不到就先用空银行起循环
+        // (喊了名字走「叮」兜底,§8.2),合成在后台接着做,做完热替换。
+        let (bank, late) = match tokio::time::timeout(
+            Self::PROMPT_PREP_WAIT,
+            prompts::PromptBank::prepare(self, &scene_voice),
+        )
+        .await
+        {
+            Ok(b) => (b, false),
+            Err(_) => {
+                tracing::warn!(
+                    "唤醒应答音 {} 秒内没备好(网络慢或不通),先起唤醒、后台接着备",
+                    Self::PROMPT_PREP_WAIT.as_secs()
+                );
+                (prompts::PromptBank::default(), true)
+            }
+        };
         // 银行放进可热替换槽:换音色时后台重建并整体替换,KWS 检测与麦克风不动(问题1-B)。
         let prompts: prompts::SharedPromptBank = Arc::new(std::sync::Mutex::new(Arc::new(bank)));
 
@@ -1136,6 +1187,10 @@ impl VoiceRuntime {
         // browser 采集源永不开麦 =「开关显示开、叫不答应」,2026-07-11 真机实锤)。
         self.publish(VoiceEvent::WakeRunning { running: true, keywords: self.wake_keywords() });
         tracing::info!("免手唤醒已启动");
+        if late {
+            let rt = self.clone();
+            tokio::spawn(async move { rt.refresh_prompts().await });
+        }
         Ok(())
     }
 

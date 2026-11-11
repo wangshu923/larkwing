@@ -147,7 +147,18 @@ pub fn run() {
         }
       };
 
-      let store = Store::open(&data_dir.join("larkwing.db"))?;
+      // 恢复回来的库万一打不开(预检只查魔数与迁移记账,开库 / 迁移仍可能失败):换回恢复前的数据
+      // 再开(2026-11-11)。原先这里直接 `?` 出去 —— 负载已清,之后每次启动都起不来。
+      let db_path = data_dir.join("larkwing.db");
+      let (store, restore_outcome) = match Store::open(&db_path) {
+        Ok(s) => (s, restore_outcome),
+        Err(e) if restore_outcome == Some("ok") => {
+          tracing::error!(err = %format!("{e:#}"), "恢复回来的库打不开,换回恢复前的数据");
+          larkwing_core::datadir::rollback_restore(&data_dir)?;
+          (Store::open(&db_path)?, Some("failed"))
+        }
+        Err(e) => return Err(e.into()),
+      };
       store.users.ensure_default_user()?; // 首启零配置
       // 把 settings 里的 legacy 明文密钥迁到 keyring(§6.3;幂等,keyring 不可用则原地留 settings)
       larkwing_core::secrets::migrate(&store.settings);

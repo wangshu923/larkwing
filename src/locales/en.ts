@@ -16,6 +16,7 @@ export default {
   // friendly verbs only, never expose the "tool/call" concept (rule §3.2)
   tool: {
     remember: 'Noting it down…',
+    recall: 'Checking my notes…',
     now: 'Checking the time…',
     end_conversation: 'Wrapping up…',
     plan_set: 'Planning…',
@@ -98,6 +99,7 @@ export default {
     pack: 'Packing files',
     usage: 'Sizing up disk usage',
     web_download: 'Downloading a file',
+    fs_transfer: 'Copying / moving files',
     delegate: 'Side errand: {t}',
     batch: 'Batch: {t}', // one batch = one card (§6.5 batch)
     relocate: 'Moving data',
@@ -131,6 +133,7 @@ export default {
       archive: 'Unpack failed',
       pack: 'Packing failed',
       usage: 'Disk scan failed',
+      fs_transfer: 'Files could not be moved',
       torrent_meta: 'Could not fetch torrent info (no seeders, or DHT throttled)',
       torrent_size: 'That torrent is too big — skipped',
       torrent_stall: 'No data came through — stopped (likely no seeders)',
@@ -191,6 +194,8 @@ export default {
     archive: 'Unpacking “{t}” ({p})',
     pack: 'Packing “{t}” ({p})',
     usage: 'Counting “{t}” ({p} files so far)',
+    file_download: 'Downloading “{t}” {p}',
+    fs_transfer: '{n} files done ({size})',
     torrent_meta: 'Looking up torrent info…',
     torrent: '“{n}” {pct}% · {sp} · {pe} sources',
     render_load: 'Opening the page…',
@@ -396,6 +401,7 @@ export default {
     audioTrack: 'Audio track: {label} (click to switch)',
     lyricsShow: 'Show lyrics',
     lyricsHide: 'Hide lyrics',
+    lyricsBtn: 'Lyrics', // label on the player bar's lyrics button (keep it short)
     trackN: 'Track {n}',
     subtitleN: 'Subtitle {n}',
     subtitleSidecar: '{name} (external)',
@@ -599,6 +605,7 @@ export default {
     searchPlaceholder: 'Search chats',
     searchClear: 'Clear',
     searchEmpty: 'No matching chats',
+    searchFailed: 'Search didn’t go through. Try again?', // an error is not “no results”
     pinned: 'Pinned', // pin marker tooltip
     // conversation list activity badge tooltips (shown when not viewing that conversation)
     badge: {

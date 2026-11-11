@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,8 @@ use larkwing_core::webrender::{
 /// 会话窗空闲多久收摊(§4.11:2026-09-17 由 180s 放到 600s —— 用户一步步教它办事时中间会隔
 /// 几分钟,3 分钟一过就得重开、登录态 / 页面状态全丢;不无限占内存/进程)。
 const SESSION_TTL: Duration = Duration::from_secs(600);
+/// 有下载在途的窗最多再多活这么久(超过就照常收:下载卡死也不许让窗永远不收)。
+const DOWNLOAD_TTL_GRACE: Duration = Duration::from_secs(3600);
 /// 同时最多几个会话窗(第 N+1 个进来挤掉最旧的)。§4.11 用户拍板 2026-09-17:2 → 10 ——
 /// 这张会话表是全程序一张(主 agent + 四路子 agent 共用),2 个窗互相挤掉;代价只有真开到
 /// 10 个时的内存(每窗一个 WebView 进程),TTL 会收。
@@ -64,6 +66,9 @@ struct SessionEntry {
     dl_final: Arc<Mutex<Option<PathBuf>>>,
     /// on_download Finished 的成败信号。
     dl_done: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<bool>>,
+    /// 有下载在途(Requested 置真、Finished 置假):单步预算内没下完时据此如实回落点,
+    /// 清扫也据此让窗多活一阵(别把下到一半的文件腰斩)。
+    dl_active: Arc<AtomicBool>,
     /// 导航记录(时刻, 地址):判「点击引发了跳转」。
     navs: Arc<Mutex<Vec<(Instant, String)>>>,
     /// on_page_load Finished 计数:等「这次导航加载完」用。
@@ -79,6 +84,10 @@ struct SessionEntry {
     last_used: Arc<Mutex<Instant>>,
     /// 窗题的「本体」(站名 → 快照后换成页标题):倒计时拼在它后面显示,别把倒计时当本体存回去。
     title: Mutex<String>,
+    /// 同一个窗一次只跑一步(2026-11-11):同一轮的工具调用是并发执行的,模型对着同一张快照同时发
+    /// 「填 3 号、填 4 号、点 5 号」时,几步原先在同一个页面上互踩 —— 一步的解析脚本清掉另一步打的
+    /// 待点标记(对方被判页面变了不点)、下载信号被别的步吞掉、点击回报串台。排队即可,不拒。
+    step_gate: tokio::sync::Mutex<()>,
 }
 
 /// 通读定格(见 `SessionEntry::read_cache`)。
@@ -138,7 +147,14 @@ impl ShellWebRenderer {
                     let map = sweep.lk();
                     map.iter()
                         .filter(|(_, e)| {
-                            e.last_used.lk().elapsed() > SESSION_TTL
+                            let idle = e.last_used.lk().elapsed();
+                            // 下载在途 = 还在用,但有个头(DOWNLOAD_TTL_GRACE)
+                            let ttl = if e.dl_active.load(Ordering::Relaxed) {
+                                SESSION_TTL + DOWNLOAD_TTL_GRACE
+                            } else {
+                                SESSION_TTL
+                            };
+                            idle > ttl
                         })
                         .map(|(k, e)| (k.clone(), e.clone()))
                         .collect()
@@ -244,6 +260,23 @@ async fn browse_step_inner(
         }
     };
     entry.touch();
+    // 这个窗的步骤排队跑(见 `SessionEntry::step_gate`);等前一步的时间算在本步预算里
+    let _step = entry.step_gate.lock().await;
+    // 通读定格只认「页面加载」换代,而点击 / 填表 / 按键在单页应用里会换内容却不触发加载
+    //(点「展开全文」、接口翻页、弹层登录)—— 这一步要动页面,就先作废定格,下次通读重抽(2026-11-11;
+    // 原先动作后再通读拿到的是旧文,工具描述偏偏写着「登录后的文章用」)。滚动 / 纯观察不作废。
+    let mutates = req.click_ref.is_some()
+        || req.click_text.is_some()
+        || req.back
+        || req.type_ref.is_some()
+        || !req.fill.is_empty()
+        || req.submit
+        || req.upload_ref.is_some()
+        || req.select_ref.is_some()
+        || req.press_key.is_some();
+    if mutates {
+        *entry.read_cache.lk() = None;
+    }
 
     // ---- 2. 导航(新窗建窗即导航;老窗带了新 url 才导航)----
     let mut wait_load = fresh;
@@ -266,6 +299,7 @@ async fn browse_step_inner(
     // ---- 3. 动作:back > 输入(type/fill/select/press)> click > scroll ----
     drain_downloads(&entry).await; // 上一步残留的下载信号别混进本步
     let mut download = None;
+    let mut download_pending = None;
     let mut post_click_url = None;
     let mut skip_snapshot = false;
     let did_click = req.click_ref.is_some() || req.click_text.is_some();
@@ -325,6 +359,7 @@ async fn browse_step_inner(
                 let (dl, navigated, loaded) =
                     wait_click_outcome(&entry, act_moment, seq0, deadline).await;
                 download = dl;
+                download_pending = pending_download(&entry, &download);
                 if navigated && download.is_none() {
                     post_click_url = last_nav_after(&entry.navs, act_moment);
                     skip_snapshot = !loaded;
@@ -386,6 +421,7 @@ async fn browse_step_inner(
             let (dl, navigated, loaded) =
                 wait_click_outcome(&entry, click_moment, seq0, deadline).await;
             download = dl;
+            download_pending = pending_download(&entry, &download);
             if navigated && download.is_none() {
                 post_click_url = last_nav_after(&entry.navs, click_moment);
                 // 文件内联(PDF/附件:导航了但永不触发 page-load)→ 当前窗已不是可注入脚本的
@@ -475,6 +511,7 @@ async fn browse_step_inner(
     Ok(RenderOutcome {
         page,
         download,
+        download_pending,
         post_click_url,
         session: Some(sid),
         screenshot,
@@ -539,6 +576,8 @@ fn open_session(
     let load_seq = Arc::new(AtomicU64::new(0));
 
     let dl_slot = dl_final.clone();
+    let dl_active = Arc::new(AtomicBool::new(false));
+    let dl_active_evt = dl_active.clone();
     let dl_dir = download_dir.clone();
     let nav_slot = navs.clone();
     let seq_slot = load_seq.clone();
@@ -584,8 +623,10 @@ fn open_session(
                     let dest = larkwing_core::files::dedupe_path(&dir.join(name));
                     *destination = dest.clone();
                     *dl_slot.lk() = Some(dest);
+                    dl_active_evt.store(true, Ordering::Relaxed);
                 }
                 tauri::webview::DownloadEvent::Finished { success, .. } => {
+                    dl_active_evt.store(false, Ordering::Relaxed);
                     let _ = dl_tx.send(success);
                 }
                 _ => {}
@@ -633,10 +674,12 @@ fn open_session(
         win,
         dl_final,
         dl_done: tokio::sync::Mutex::new(dl_rx),
+        dl_active,
         navs,
         load_seq,
         download_dir,
         read_cache: Mutex::new(None),
+        step_gate: tokio::sync::Mutex::new(()),
         last_used,
         title: Mutex::new(host.clone()),
     });
@@ -695,6 +738,14 @@ async fn wait_for_text(
     let _ = entry.win.eval(js.as_str());
     let until = (tokio::time::Instant::now() + LOAD_WAIT).min(deadline);
     let _ = tokio::time::timeout_at(until, rx).await;
+}
+
+/// 这一步等完了、下载却还在途 → 它的落点(交工具层如实告诉模型「还在下,存到哪」)。
+fn pending_download(entry: &Arc<SessionEntry>, done: &Option<PathBuf>) -> Option<PathBuf> {
+    if done.is_some() || !entry.dl_active.load(Ordering::Relaxed) {
+        return None;
+    }
+    entry.dl_final.lk().clone()
 }
 
 /// 清空残留下载信号 + 上一步的落点记录(每步动作只认自己触发的下载)。

@@ -79,6 +79,17 @@ impl Tool for TorrentDownload {
             .ok_or_else(|| {
                 anyhow::anyhow!("缺少 link 参数(要用户给的磁力链或本机 .torrent 路径)")
             })?;
+        // 本机 .torrent = 读一个文件 → 先过授权圈(§7.2:收路径的工具一律在动手前 ensure;
+        // 2026-11-11 补,此前只有落盘目录过了闸、读种子这一下漏了)。磁力链 / 网址不是路径,不过。
+        let trimmed = raw.trim();
+        if !trimmed.starts_with("magnet:") && !trimmed.contains("://") {
+            super::guard::ensure(
+                ctx,
+                super::guard::Access::Read,
+                &[super::expand_home(trimmed)],
+            )
+            .await?;
+        }
         // 磁力链形状 / .torrent 读盘都在这儿同步做完 —— 参数不对要当场退回给模型,
         // 别等进了后台 job 才炸(那时只能靠收尾汇报,绕一大圈)。
         let link = TorrentLink::parse(raw)?;

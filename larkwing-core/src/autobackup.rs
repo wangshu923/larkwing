@@ -37,6 +37,10 @@ const FIRST_DELAY: std::time::Duration = std::time::Duration::from_secs(3 * 60);
 const NAG_AFTER_MS: i64 = 14 * 24 * 3_600_000;
 /// 提示频控:最多每 3 天烦一次。
 const NAG_EVERY_MS: i64 = 3 * 24 * 3_600_000;
+/// 失败后隔多久再试(2026-11-11)。原先失败不推水位、下一拍照跑 —— 目标写不进时每 10 分钟
+/// 全量导出一次整库再删,一天 144 遍,只有日志里一行 warn。备份是天级的事,几小时试一次足够;
+/// 重启后不记这个(内存态),开机会再试一次。
+const RETRY_AFTER_MS: i64 = 6 * 3_600_000;
 
 /// 目标目录(app 级 settings;非空 = 开)。§6.8:前端 DEFAULTS 与 APP_SETTING_KEYS 两边各一行。
 pub const DIR_KEY: &str = "backup.auto.dir";
@@ -54,6 +58,8 @@ pub struct AutoBackup {
     data_root: PathBuf,
     bus: Bus,
     inflight: Arc<AtomicBool>,
+    /// 上次失败的时刻(毫秒;0 = 没失败过 / 之后成功了)。失败退避用,见 `RETRY_AFTER_MS`。
+    last_fail: Arc<std::sync::atomic::AtomicI64>,
 }
 
 /// 设置页状态视图(命令 `auto_backup_status` 过桥)。
@@ -70,7 +76,13 @@ pub struct AutoBackupStatus {
 
 impl AutoBackup {
     pub fn new(store: Store, data_root: PathBuf, bus: Bus) -> AutoBackup {
-        AutoBackup { store, data_root, bus, inflight: Arc::new(AtomicBool::new(false)) }
+        AutoBackup {
+            store,
+            data_root,
+            bus,
+            inflight: Arc::new(AtomicBool::new(false)),
+            last_fail: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        }
     }
 
     /// 常驻循环(壳层 `tauri::async_runtime::spawn` 挂起)。
@@ -92,6 +104,10 @@ impl AutoBackup {
         if !force && now - last_ok < INTERVAL_MS {
             return None; // 还没到期
         }
+        let last_fail = self.last_fail.load(Ordering::Relaxed);
+        if !force && last_fail > 0 && now - last_fail < RETRY_AFTER_MS {
+            return None; // 刚失败过:退避,别十分钟一遍地白导出整库
+        }
         if self.inflight.swap(true, Ordering::SeqCst) {
             return None; // 已有一趟在跑(zip 大克隆音色可能要一会儿)
         }
@@ -100,6 +116,7 @@ impl AutoBackup {
 
         match &result {
             Ok(zip) => {
+                self.last_fail.store(0, Ordering::Relaxed);
                 self.set_state(LAST_OK_KEY, &now.to_string());
                 self.set_state(LAST_ERR_KEY, "");
                 tracing::info!(zip = %zip.display(), "自动备份完成");
@@ -107,8 +124,9 @@ impl AutoBackup {
                 self.bus.publish(AppEvent::Backup(BackupNote { ok: true, stale: false }));
             }
             Err(e) => {
+                self.last_fail.store(now, Ordering::Relaxed);
                 self.set_state(LAST_ERR_KEY, &format!("{e:#}"));
-                tracing::warn!(err = %e, dir = %dir, "自动备份失败(下轮再试)");
+                tracing::warn!(err = %e, dir = %dir, "自动备份失败({} 小时后再试)", RETRY_AFTER_MS / 3_600_000);
                 // 超期太久才提示,且频控 —— 单次失败(盘暂时没插)不烦人。
                 let stale = now - last_ok >= NAG_AFTER_MS;
                 let nagged_recently = now - self.setting_i64(LAST_NAG_KEY) < NAG_EVERY_MS;
@@ -293,6 +311,10 @@ mod tests {
         assert!(ab.tick(later, false).await.expect("到期该跑").is_err());
         assert_eq!(ab.status().last_ok_ms, Some(now + 1000), "失败不推水位");
         assert!(ab.status().last_error.is_some(), "失败原因给设置页看(§3.5)");
+        // 失败退避(2026-11-11):十分钟后的下一拍不再白跑一遍;过了退避期才再试;手动「立即备份」不受限
+        assert!(ab.tick(later + 10 * 60_000, false).await.is_none(), "刚失败过,这一拍不跑");
+        assert!(ab.tick(later + RETRY_AFTER_MS + 1, false).await.expect("退避期过了该再试").is_err());
+        assert!(ab.tick(later + RETRY_AFTER_MS + 2, true).await.expect("force 不看退避").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

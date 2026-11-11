@@ -40,12 +40,14 @@ impl BatchRunner for EngineBatchRunner {
 }
 
 /// 一件的结局。`Busy` 只在工作池内部流转(撞限 → 重排),终局里不会出现(降到 1 路仍撞 → `Err`)。
+/// `Busy` 带着工具的原始报错:降到 1 路仍起不来时要把它交给模型(2026-11-11;原先只回一句固定话术,
+/// 模型看不到真实 stderr,没法判断该改用软编还是如实告诉用户)。
 #[derive(Debug, Clone)]
 pub(crate) enum ItemOutcome {
     Ok(String),
     Err(String),
     Cancelled,
-    Busy,
+    Busy(String),
 }
 
 /// 工作池的调度备注(进汇报,模型据此不把撞限学成「这活干不了」)。
@@ -131,11 +133,11 @@ async fn run_item(
         r = tool.run(call.args.clone(), ctx) => match r {
             Ok(text) => ItemOutcome::Ok(text),
             Err(e) => {
+                let full = crate::net::scrub(&e);
                 if e.chain().any(|c| c.is::<CapacityHit>()) {
                     tracing::info!(tool = %call.tool, "批内一件撞上并发上限,降并行重排");
-                    return ItemOutcome::Busy;
+                    return ItemOutcome::Busy(full.chars().take(500).collect());
                 }
-                let full = crate::net::scrub(&e);
                 tracing::warn!(tool = %call.tool, "批内一件出错: {full}");
                 ItemOutcome::Err(full.chars().take(500).collect())
             }
@@ -171,7 +173,7 @@ where
         }
         let Some((i, outcome)) = inflight.next().await else { break };
         match outcome {
-            ItemOutcome::Busy => {
+            ItemOutcome::Busy(why) => {
                 // 自己已出列:此刻其他在跑的件数 = 这台机器眼下吃得下的量(至少留 1 路)
                 let new_limit = inflight.len().max(1);
                 let decreased = new_limit < limit;
@@ -184,7 +186,7 @@ where
                     note.requeued += 1;
                     queue.push_back(i);
                 } else {
-                    let _ = tx.send((i, ItemOutcome::Err(BUSY_FINAL.into()))).await;
+                    let _ = tx.send((i, ItemOutcome::Err(format!("{BUSY_FINAL}。原始报错:{why}")))).await;
                 }
             }
             other => {
@@ -193,6 +195,23 @@ where
         }
     }
     note
+}
+
+/// 学到的上限试探着回升(2026-11-11):这批是按学到的上限封顶跑的、且一次都没撞限 → 涉及的工具
+/// 各加一路。原先只降不升、进程级 —— 别的程序(或自家播放转码)占着编码会话时跑过一批,学成 1 路,
+/// 之后到重启前所有批都按 1 路跑(程序常驻托盘,等于永久)。回升若又撞限,下一批自己会再降回来,
+/// 代价是那一件重排一次。
+pub(crate) fn relax_caps(caps: &Mutex<HashMap<String, usize>>, calls: &[BatchCall], note: &PoolNote) {
+    if note.seeded.is_none() || note.downshift.is_some() {
+        return;
+    }
+    let tools: HashSet<&str> = calls.iter().map(|c| c.tool.as_str()).collect();
+    let mut caps = caps.lk();
+    for t in tools {
+        if let Some(v) = caps.get_mut(t) {
+            *v += 1;
+        }
+    }
 }
 
 /// 汇总(纯函数,单测钉着):头一行成 / 败 / 停 + 调度备注,逐件一行(✓ / ✗ / ■ + 结果首段按字截),
@@ -226,7 +245,7 @@ pub(crate) fn compose_summary(
             ItemOutcome::Ok(t) => ("✓", t.as_str()),
             ItemOutcome::Err(e) => ("✗", e.as_str()),
             ItemOutcome::Cancelled => ("■", "按要求停下了,没做"),
-            ItemOutcome::Busy => ("✗", BUSY_FINAL), // 终局里不该出现,防御性兜一行
+            ItemOutcome::Busy(_) => ("✗", BUSY_FINAL), // 终局里不该出现,防御性兜一行
         };
         let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
         s.push_str(&format!(
@@ -334,7 +353,8 @@ impl Engine {
         let (tx, mut rx) = mpsc::channel::<(usize, ItemOutcome)>(n.max(1));
         let calls = Arc::new(calls);
         let pool = {
-            // 降档回调:按撞限那件的工具名记这台机器的上限(只降不升;重启重学)
+            // 降档回调:按撞限那件的工具名记这台机器的上限(这里只降;没撞限的批收尾时由
+            // `relax_caps` 试探着回升;重启重学)
             let (caps, names) = (self.batch_caps.clone(), calls.clone());
             let on_downshift = move |i: usize, limit: usize| {
                 let mut caps = caps.lk();
@@ -375,6 +395,7 @@ impl Engine {
                 note.downshift = pool_note.downshift;
                 note.requeued = pool_note.requeued;
             }
+            relax_caps(&self.batch_caps, &calls, &note);
             let outs: Vec<ItemOutcome> = outcomes
                 .into_iter()
                 .map(|o| o.unwrap_or_else(|| ItemOutcome::Err("没拿到结果".into())))
@@ -411,6 +432,7 @@ impl Engine {
         // 后台看守:收剩下的结果,全到齐就收尾汇报;每 2s 查旗标(HUD 停止钮 / task_cancel 拨的是
         // bgtasks 协作旗标,翻译成整批的取消令牌)。interval 不随事件重置(subagent 同款教训)。
         let (scope_bg, calls_bg, title_bg, token_bg) = (scope.clone(), calls, title, token.clone());
+        let caps_bg = self.batch_caps.clone();
         tokio::spawn(async move {
             let mut outcomes = outcomes;
             let mut finished = finished;
@@ -439,6 +461,7 @@ impl Engine {
                 note.downshift = pool_note.downshift;
                 note.requeued = pool_note.requeued;
             }
+            relax_caps(&caps_bg, &calls_bg, &note);
             let outs: Vec<ItemOutcome> = outcomes
                 .into_iter()
                 .map(|o| {
@@ -472,6 +495,22 @@ mod tests {
 
     fn call(tool: &str) -> BatchCall {
         BatchCall { tool: tool.into(), args: serde_json::json!({}) }
+    }
+
+    #[test]
+    fn learned_cap_relaxes_only_after_a_clean_capped_batch() {
+        let caps = Mutex::new(HashMap::from([("ffmpeg_run".to_string(), 1usize)]));
+        let calls = vec![call("ffmpeg_run"), call("ffmpeg_run"), call("web_download")];
+        // 没被上限封顶的批(本来就要得少):不动
+        relax_caps(&caps, &calls, &PoolNote::default());
+        assert_eq!(caps.lk()["ffmpeg_run"], 1);
+        // 封顶跑、但中途又撞限:不升(降档回调已把它压到实测值)
+        relax_caps(&caps, &calls, &PoolNote { seeded: Some(1), downshift: Some(1), requeued: 1 });
+        assert_eq!(caps.lk()["ffmpeg_run"], 1);
+        // 封顶跑、一次没撞:加一路(同名工具只加一次;没学过上限的工具不凭空出现)
+        relax_caps(&caps, &calls, &PoolNote { seeded: Some(1), downshift: None, requeued: 0 });
+        assert_eq!(caps.lk()["ffmpeg_run"], 2);
+        assert!(!caps.lk().contains_key("web_download"));
     }
 
     #[test]
@@ -527,7 +566,7 @@ mod tests {
                 async move {
                     if active.fetch_add(1, Ordering::SeqCst) + 1 > CAP {
                         active.fetch_sub(1, Ordering::SeqCst);
-                        return ItemOutcome::Busy;
+                        return ItemOutcome::Busy("假的撞限".into());
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(15)).await;
                     active.fetch_sub(1, Ordering::SeqCst);
@@ -551,7 +590,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn pool_gives_up_after_retry_at_one_lane() {
         let (tx, mut rx) = mpsc::channel(8);
-        let note = run_pool(2, 2, |_i| async { ItemOutcome::Busy }, tx, |_, _| {}).await;
+        let note = run_pool(2, 2, |_i| async { ItemOutcome::Busy("OpenEncodeSessionEx failed".into()) }, tx, |_, _| {}).await;
         let mut got = Vec::new();
         while let Ok(x) = rx.try_recv() {
             got.push(x);

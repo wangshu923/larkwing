@@ -335,7 +335,7 @@ onUnmounted(() => {
       @click="toggleLyrics"
       :title="kb(lyricsOn ? t('media.lyricsHide') : t('media.lyricsShow'), 'C')"
     >
-      词
+      {{ t('media.lyricsBtn') }}
     </button>
     <!-- 倍速(有声书/故事 1.25x 常用):点开档位菜单,滚轮微调;与视频浮层同一张档位表 -->
     <button

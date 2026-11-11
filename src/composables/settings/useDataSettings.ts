@@ -174,10 +174,11 @@ export function useDataSettings(petName: { value: string }) {
   async function cleanupOld() {
     try {
       await api.cleanupOldData()
-    } catch (e) {
-      console.error('清理旧数据失败', e)
-    } finally {
       oldDataRoot.value = null
+    } catch (e) {
+      // 没删成就别把「旧数据待清理」那张卡收掉(原先 finally 里照收 = 假装清完了,旧数据还占着盘)
+      console.error('清理旧数据失败', e)
+      useToast().error(t('toast.deleteFailed'))
     }
   }
   async function keepOld() {

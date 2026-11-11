@@ -261,20 +261,32 @@ struct TurnHandle {
 /// · **旁听仲裁撞上在飞 → 旁听让路**(机会性的,真输入优先 §8.2)—— 取消刚起的自己,
 ///   绝不能反过来把用户的真回合杀掉。
 /// · 旧句柄已经跑完(is_finished)= 不算在飞,既不算忙、也不需要取消。
+/// 回合登记时撞上在飞回合,谁让路。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Claim {
+    /// 用户发起的回合:新的赢(与 send_message 先 cancel 同语义)。
+    Normal,
+    /// 旁听仲裁:让路,且不收插队(真输入优先 §8.2)。
+    Overheard,
+    /// 自启回合(提醒到点 / 后台汇报):让路、收插队。2026-11-11 修:忙检与登记之间隔着整次建连,
+    /// 这一两秒里用户恰好发消息,原先自启回合按「新的赢」把用户刚起的回合取消掉 —— 回复半截中断。
+    SelfStarted,
+}
+
 fn register_inflight(
     slot: &mut SessionSlot,
     new_handle: TurnHandle,
-    is_overheard: bool,
+    claim: Claim,
     inject: Arc<Mutex<InjectState>>,
 ) -> Option<TurnHandle> {
     let busy = slot.inflight.as_ref().is_some_and(|h| !h.join.is_finished());
-    if is_overheard && busy {
-        return Some(new_handle); // 让路:不登记,取消刚起的仲裁
+    if claim != Claim::Normal && busy {
+        return Some(new_handle); // 让路:不登记,取消刚起的自己
     }
     let old = slot.inflight.replace(new_handle);
     // 旁听仲裁不收插队:用户此刻打字 = inject 落空 → 前端走普通发送 →
     // send_message 的 cancel 把未转正的仲裁整轮挤掉(真输入优先,零痕迹)。
-    slot.inject = if is_overheard { None } else { Some(inject) };
+    slot.inject = if claim == Claim::Overheard { None } else { Some(inject) };
     old.filter(|h| !h.join.is_finished())
 }
 
@@ -517,12 +529,12 @@ mod tests {
 
         // ① 空槽 + 普通:登记,无人被取消
         let mut slot = SessionSlot::default();
-        assert!(register_inflight(&mut slot, running(), false, q()).is_none(), "空槽无 loser");
+        assert!(register_inflight(&mut slot, running(), Claim::Normal, q()).is_none(), "空槽无 loser");
         assert!(slot.inflight.is_some() && slot.inject.is_some(), "登记上了,且收插队");
 
         // ② 在飞 + 普通:新的赢,**旧的必须被交出来取消**(否则它无主地跑)
         let old_tok = slot.inflight.as_ref().unwrap().token.clone();
-        let loser = register_inflight(&mut slot, running(), false, q()).expect("旧的要被交出来");
+        let loser = register_inflight(&mut slot, running(), Claim::Normal, q()).expect("旧的要被交出来");
         loser.token.cancel();
         assert!(old_tok.is_cancelled(), "被挤掉的那支必须有人取消它");
 
@@ -531,7 +543,7 @@ mod tests {
         let new_tok = CancellationToken::new();
         let newcomer =
             TurnHandle { token: new_tok.clone(), join: tokio::spawn(async { std::future::pending::<()>().await }) };
-        let loser = register_inflight(&mut slot, newcomer, true, q()).expect("旁听自己让路");
+        let loser = register_inflight(&mut slot, newcomer, Claim::Overheard, q()).expect("旁听自己让路");
         loser.token.cancel();
         assert!(new_tok.is_cancelled(), "让路的是刚起的仲裁");
         assert!(!kept.is_cancelled(), "真回合绝不能被旁听杀掉");
@@ -541,10 +553,24 @@ mod tests {
 
         // ④ 旧句柄已跑完:不算忙 → 旁听也能登记,且没有谁需要取消
         let mut slot = SessionSlot { inflight: Some(done().await), ..Default::default() };
-        assert!(register_inflight(&mut slot, running(), true, q()).is_none(), "跑完的不需取消");
+        assert!(register_inflight(&mut slot, running(), Claim::Overheard, q()).is_none(), "跑完的不需取消");
         assert!(slot.inject.is_none(), "旁听回合不收插队");
         // ⑤ 普通回合同理:跑完的旧句柄不当 loser 交出去
         let mut slot = SessionSlot { inflight: Some(done().await), ..Default::default() };
-        assert!(register_inflight(&mut slot, running(), false, q()).is_none());
+        assert!(register_inflight(&mut slot, running(), Claim::Normal, q()).is_none());
+
+        // ⑥ 在飞 + **自启回合**:让路(用户刚起的回合绝不被提醒 / 汇报挤掉),空槽时照常登记且收插队
+        let mut slot = SessionSlot::default();
+        assert!(register_inflight(&mut slot, running(), Claim::Normal, q()).is_none());
+        let user_tok = slot.inflight.as_ref().unwrap().token.clone();
+        let wake_tok = CancellationToken::new();
+        let wake =
+            TurnHandle { token: wake_tok.clone(), join: tokio::spawn(async { std::future::pending::<()>().await }) };
+        let loser = register_inflight(&mut slot, wake, Claim::SelfStarted, q()).expect("自启回合让路");
+        loser.token.cancel();
+        assert!(wake_tok.is_cancelled() && !user_tok.is_cancelled(), "让路的是自启回合");
+        let mut slot = SessionSlot::default();
+        assert!(register_inflight(&mut slot, running(), Claim::SelfStarted, q()).is_none());
+        assert!(slot.inject.is_some(), "自启回合收插队(用户打字能折进它)");
     }
 }

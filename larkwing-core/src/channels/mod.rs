@@ -418,16 +418,21 @@ const REMIND_FALLBACK_MAX: usize = 200;
 
 /// 推送取料(可单测的纯查库部分):反查映射 + 按终态选文本。
 /// None = 非渠道会话(桌面提醒本就不推);文本 None = 库里没得可推(如实放弃)。
-/// Done 推最后一条 assistant 回复;Failed 推提醒原文(event 行)截断保底。
+/// Done 推**这次 event 行之后**说的全部话(多段拼接);Failed、或 Done 却一句没说 → 推提醒原文
+/// (event 行)截断保底 —— 到点必须有动静(§3.5),且绝不拿上一轮的旧回复顶替。
 fn reminder_push_payload(
     store: &crate::store::Store,
     conv_id: i64,
     outcome: crate::bus::TurnOutcome,
 ) -> anyhow::Result<Option<(crate::store::ChannelThread, Option<String>)>> {
     let Some(thread) = store.channels.thread_by_conv(conv_id)? else { return Ok(None) };
-    let text = match outcome {
-        crate::bus::TurnOutcome::Done => store.chat.latest_assistant_line(conv_id)?,
-        crate::bus::TurnOutcome::Failed => store.chat.latest_event_line(conv_id)?.map(|c| {
+    let said = match outcome {
+        crate::bus::TurnOutcome::Done => store.chat.assistant_text_after_last_event(conv_id)?,
+        crate::bus::TurnOutcome::Failed => None,
+    };
+    let text = match said {
+        Some(t) => Some(t),
+        None => store.chat.latest_event_line(conv_id)?.map(|c| {
             let head: String = c.chars().take(REMIND_FALLBACK_MAX).collect();
             format!("{REMIND_FALLBACK_PREFIX}{head}")
         }),
@@ -558,6 +563,12 @@ pub(crate) async fn drive_turn(
     single: bool,
 ) -> anyhow::Result<Option<String>> {
     let store = engine.store().clone();
+    // 同一个 chat 的消息串行过「解析会话 → 插队或起回合」这一段(2026-11-11):三渠道都是每条
+    // 消息 spawn 一个任务,转发多条 / 连发时两条会同时走到这里 —— 前一条的回合还没登记在飞,
+    // 后一条的 inject 落空也去 send_message,「新的赢」把前一条取消掉(半截回复 / 没人答)。
+    // 闸只罩到拿到 rx(回合已登记)为止,不罩整个回合:后一条随即 inject 折进去。
+    let gate = chat_gate(channel, ext_id);
+    let entry = gate.lock().await;
     // 会话映射:续接名下最近有动静的会话;单聊闲置 12h 轮换、映射悬空自愈(resolve_conv)
     let (conv_id, speaker) =
         resolve_conv(&store, channel, ext_id, single, crate::store::now_ms(), || {
@@ -579,13 +590,17 @@ pub(crate) async fn drive_turn(
         return Ok(None);
     }
     let mut rx = engine.send_message(conv_id, text, meta, attachments).await?;
+    drop(entry); // 回合已登记在飞:同 chat 的下一条可以进来 inject 了
     let mut buf = String::new();
     while let Some(ev) = rx.recv().await {
         match ev {
             TurnEvent::Delta(t) => buf.push_str(&t),
+            // 一段话说完、接着去调工具:下一段另起一段(否则「我先查一下」和工具后的正文粘成一行,
+            // 第二段以标题 / 列表开头时 markdown 结构也跟着坏)
+            TurnEvent::Segment { .. } => push_paragraph_break(&mut buf),
             TurnEvent::Failed { message, .. } => anyhow::bail!("回合失败: {message}"),
             TurnEvent::Done { .. } => break,
-            // Thinking/ToolUse/Usage/Segment/Injected/Cancelled:远程纯文本不需要,忽略
+            // Thinking/ToolUse/Usage/Injected/Cancelled:远程纯文本不需要,忽略
             _ => {}
         }
     }
@@ -597,6 +612,30 @@ pub(crate) async fn drive_turn(
         outcome: crate::bus::TurnOutcome::Done,
     }));
     Ok(Some(buf))
+}
+
+/// 每个 chat 一把异步锁(`drive_turn` 用)。表按「来过消息的 chat」增长,一个家的量级就是个位数。
+fn chat_gate(channel: &str, ext_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    GATES
+        .get_or_init(Default::default)
+        .lk()
+        .entry(format!("{channel}\u{1}{ext_id}"))
+        .or_default()
+        .clone()
+}
+
+/// 段与段之间空一行(已经以空行结尾 / 还没内容就不加)。
+fn push_paragraph_break(buf: &mut String) {
+    if buf.trim().is_empty() || buf.ends_with("\n\n") {
+        return;
+    }
+    while buf.ends_with('\n') {
+        buf.pop();
+    }
+    buf.push_str("\n\n");
 }
 
 /// 长消息按平台上限切片(优先在换行处断,放不下才硬切;robot Telegram 4096 同款)。
@@ -868,6 +907,40 @@ mod tests {
         let text = text.unwrap();
         assert!(text.starts_with(REMIND_FALLBACK_PREFIX));
         assert!(text.contains("三点吃药"));
+
+        // 多段回合:event 行之后的每一段都推(中间空一行),不是只推最后一段
+        store.chat.append_message(conv.id, "event", "提醒用户:五点接孩子").unwrap();
+        store.chat.append_message(conv.id, "assistant", "该去接孩子了。").unwrap();
+        store.chat.append_message(conv.id, "tool", "晴 12°C").unwrap();
+        store.chat.append_message(conv.id, "assistant", "外面 12 度,带件外套。").unwrap();
+        let (_, text) = reminder_push_payload(&store, conv.id, crate::bus::TurnOutcome::Done)
+            .unwrap()
+            .unwrap();
+        assert_eq!(text.as_deref(), Some("该去接孩子了。\n\n外面 12 度,带件外套。"));
+
+        // 自启回合 Done 却一句没说:推提醒原文保底,**绝不**把上一轮的旧回复推出去
+        store.chat.append_message(conv.id, "event", "提醒用户:七点倒垃圾").unwrap();
+        let (_, text) = reminder_push_payload(&store, conv.id, crate::bus::TurnOutcome::Done)
+            .unwrap()
+            .unwrap();
+        let text = text.unwrap();
+        assert!(text.starts_with(REMIND_FALLBACK_PREFIX) && text.contains("七点倒垃圾"), "{text}");
+        assert!(!text.contains("外套"), "旧回复不许顶上来");
+    }
+
+    #[test]
+    fn paragraph_break_between_segments() {
+        let mut buf = String::from("我先查一下");
+        push_paragraph_break(&mut buf);
+        buf.push_str("## 结果");
+        assert_eq!(buf, "我先查一下\n\n## 结果");
+        let mut empty = String::new();
+        push_paragraph_break(&mut empty);
+        assert!(empty.is_empty(), "还没内容不加空行");
+        let mut tail = String::from("甲\n");
+        push_paragraph_break(&mut tail);
+        push_paragraph_break(&mut tail);
+        assert_eq!(tail, "甲\n\n", "不叠加");
     }
 
     #[test]

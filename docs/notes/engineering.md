@@ -175,3 +175,59 @@
 **验收**:`git show HEAD:relay.rs` 与 `cat relay/*.rs` 各去空行排序比多重集 —— 丢 20 行、每行都是加了 `pub(super)` 的签名;多 108 行全是文件头 / `mod` / `use` / 九份 `mod tests` 壳。lib 839 / engine 20 / clippy 两 crate 零。一条小坑:`pub(crate) use preview::{cover_jpeg, crop_sprite_cell};` 里 `crop_sprite_cell` 没人在 relay 外用,unused import 在 `-D warnings` 下是红 —— **re-export 只给真被外面用的**。
 
 **落点**:`mod.rs`(Entry / Relay / Inner / 注册表 / FifoCache / 常量 / register_* / `lookup` `bad` `bytes_response`)· `encoder.rs` · `upstream.rs`(/s/ /dash/ + fetch_head + build_mpd)· `file.rs` · `hls.rs` · `adaptive.rs` · `ffmpeg.rs`(gen_video_* / build_*_frag_cmd / run_ffmpeg_collect)· `progressive.rs`(/m/ + spawn_stream)· `preview.rs`(thumb / sprites / cover)· `collect.rs`。**没顺手改的**:`preview.rs` 816 行仍是最大的一个(三条预览路本就同一把串行闸与两级缓存,再切会把闸切散);`stream_ffmpeg` 与 `run_ffmpeg_collect` 的两条「子进程纪律」注释各在一处,没合并成一段。
+
+## 体检二轮:第一二档修复(2026-11-11)
+
+**起因**:用户「扫一遍,看看有没有什么可优化的、新做的」。上次全仓体检是 2026-09-08,影音单独体检是 09-16;这次六路只读扫描(引擎与 agent 运行时 / 工具·web·文件·存储 / 语音与渠道 / 前端 / 壳层·CI·依赖 / AGENT 对账),重点看 09-08 之后新进的代码。子代理的报告逐条下代码核过才算数(第一档十三条全部亲手读过那几行;第二档少数几条是子代理读代码确证、主会话没复核,落地时又各自读了一遍)。用户看完清单拍板「第 1、2 档一起做」。前端那一半(`src/`)由一个分身并行改,主会话改 Rust,最后逐段核对分身的 diff。
+
+下面按「坏法 → 修法」记,行号是修之前的。
+
+### 钥匙与记忆
+
+- **Windows 上配第三家大脑,钥匙静默落回明文**。keyring-3 的 Windows 后端在 `set_password` 之前校验 `password.encode_utf16().count() * 2 > CRED_MAX_CREDENTIAL_BLOB_SIZE`(2560),超了报 TooLong。`llm.providers` 是 `to_string_pretty` 的整张 JSON,`ProviderSpec` 与 `Quirks` 没有任何 `skip_serializing_if`,每家约 550 字符;`effective_specs` 恒含 DeepSeek 与 Anthropic 两个模板,所以保存任何第三方供应商就是三条、约 1600 个单元。`secrets::set` 的失败分支先删 keyring 旧条目再把整张 JSON 写进 `settings`,只有一行 warn —— §6.3「不进 SQLite 明文」悄悄失效,一键备份 / 自动备份的 zip 里也带着全部钥匙。09-04「国内五家接通」之后这是常态路径。修 = `secrets.rs` 内分片:抽 `Vault` trait(Windows = keyring,测试 = 带同一条长度闸的内存表),`vault_set` 放得下单条存、放不下按 1200 单元切(按 char 累计,不劈代理对),先写新一代分片、最后把主条目写成 `\u{1}lw-chunks:代次:片数`、再删上一代;读时见头就拼,缺片报错不拼半截。微信多绑定与下载认证同一条路白拿。**只在 Mac 上用内存表测过协议,Windows 凭据管理器真写真读没验。**
+- **记忆提炼记错人**。`consolidate::build_request` 把所有 user 行标成「用户」,结果 `add_distilled(user_id, …)` 写给触发提炼那一回合的说话人。`habits.rs` 取料早就按行认说话人(`UserMeta.speaker_user`,没有 = 会话归属者),照搬过来。
+
+### 引擎
+
+- **自启回合挤掉用户回合**。`wake_turn` 的忙检在装配和 `open_stream` 之前,登记在之后;`register_inflight` 只给旁听让路。改成三态 `Claim`,自启回合撞上在飞自己让路:`launch` 返回 `Ok(None)`,`wake_turn` 撤 event 行返回 false,调度器下个 tick 重试(与开头忙检同一语义,只是晚一步才看见)。
+- **空转判定只看同名同参**。`web_render` 的 `click_text:"下一页"` / `scroll:"down"` 每次参数相同、结果不同,从第二次起算没进展,第六次被 `tool_choice=none` 强制收尾。把结果并进指纹会放过「反复查进度」那种轮询(`task_status` 的结果也在变),而那正是这道闸原本拦住的东西(`MAX_TOOL_ROUNDS` 是 200)。评估过四条路:按工具名单分(具名分支,§5 / §4.11 不写)、用 `Tool::risk()`(§9 点名的休眠能力,不该为这个启用)、限次数(翻 20 页是正经活)、结果相似度阈值(又一个魔法数)。落地的是**指纹里的结果去掉 ASCII 数字再哈希**:轮询的结果只有数字在动,翻页的结果是不同的文字 —— 不立名单、不加阈值,一句注释说得清。
+- **到点提醒遇会话忙无声推迟**没动:它碰 §7.4「绝不打断」,列在清单的「需要拍板」里。
+
+### 渠道
+
+- Telegram 的「启动丢弃积压」写在 `serve()` 里,而 `run()` 每次出错都重进 `serve()` → 每次重连都丢。微信的游标本来就是持久化、重启后照收积压,所以「重连照收」与它一致。
+- 相册:Telegram 把一次选的多张图拆成多条 update、共用 `media_group_id`、只有第一条带说明。全仓原先零引用这个字段。
+- `drive_turn` 的 inject-or-send:三渠道都是每条消息 spawn,前一条的回合还没登记时后一条的 inject 落空也去 `send_message`,「新的赢」把前一条取消。闸只罩到拿到 rx 为止。
+- 提醒推手机原先取「会话里最新一句非空 assistant」,没有「本次 event 行之后」的界:自启回合没出文字时推的是上一轮的旧回复。
+- 微信 `run_account` 的错误分支写了状态行,而清错误的分支在 `serve` 里、条件是 `fails > 0`,重进后 `fails` 从 0 起永远进不去。
+- 钉钉长连接只在服务器来帧时才回应;半开连接下 `ws.next()` 永远挂起。
+- `send_file` / `send_text` 的缺省目标按映射行 id 降序取第一条,而 12 小时轮换会给别的渠道插新行。
+
+### 语音
+
+- `wake.rs` 的 `Stop` 分支直接 `return`;`Resume` 分支有补发 `ListenEnded`,它没有。前端只认 `ListenEnded` 恢复媒体音量。
+- `msedge-tts` 0.4.1 的阻塞客户端是裸 `std::net::TcpStream::connect`,没有连接或读超时;`synth_cached` 的 `spawn_blocking` 也没包超时。crate 有 tokio 异步客户端,但要开新 feature、换依赖树,这次没动 —— 改成「等待有界 + 名额由阻塞线程自己攥着」,黑洞时卡死的线程数封顶 4。
+- `wake_start` 在起循环之前 `PromptBank::prepare(...).await`,应答音缓存未命中又遇网络不通时开机唤醒起不来。
+
+### 文件与下载
+
+- `fs_copy` / 跨盘 `fs_move` 是整理文件里唯一没接两阶段的长活。样板已经有四份(加工 / 解压 / 打包 / 扫盘,约 730 行),这次是第五份,写在 `tools/fs.rs::run_transfer`、照 `media/usage.rs` 的形。**没有顺手把五份抽成一个 helper**:那四件都在 PLAN 的 Windows 真机清单上,重构后要重验,不该混在修 bug 的批里。
+- `copy_tree` 用 `symlink_metadata`,目录链接的 `is_dir()` 为假、落进 `fs::copy` 必然报错。指向文件的链接照旧按内容复制(行为不变),只跳过指向文件夹的。
+- 批里的 `web_download` 用的是带 280 秒总超时的那把客户端;reqwest 的 `timeout` 是连 body 在内的总期限。
+
+### 备份
+
+- `backup_to` 先 `VACUUM INTO` 到系统临时目录、再建 zip:目标写不进时白写一份整库,而且写在 C 盘。自动备份失败不推水位,下一拍(10 分钟后)照跑。
+- `apply_pending_restore` 成功后紧跟 `Store::open(...)?`:预检只查魔数与迁移记账,开库或迁移仍可能失败,而负载已清,之后每次启动都起不来。
+
+### 前端(分身改,主会话核对)
+
+- 10-11 把回合状态改成按会话记之后留下两处回归:在屏判定加了 `anchorId == null`,而 `anchorId` 只在两处复位;屏外终态分支删掉了旧码里的停表与复位。
+- 「大字」只改了 `.layout` 的内联字号,而 `MainLayout.vue` 的 41 处字号全是 px、没有元素继承根字号。预览里量过 `.bubble` / `.field` / `.xp-text` 的 computed 值:标准档 14px、大字档 16.5px。
+- 分身用假的 `__TAURI_INTERNALS__`(假库 + 手动推回合事件)在浏览器预览里走过定位页发消息、屏外收尾、重载窗口期 done、回溯成败、排队区按会话这几条;Tauri 真链没跑。
+
+### 没做的(都在给用户的清单里,不是遗漏)
+
+「可优化」与「可新做」两栏整栏没动:时钟行对前缀缓存的影响(要先量 `usage_rounds`)、调度器睡到下一个到期点、稳定前缀瘦身、CI 补壳层单测、更新端点回落、两阶段样板归一、`voice/mod.rs` 分家,以及自启回合登记、备份带图片、足迹页明细等新功能候选。few-shot「2–4 段、≤800 token」与实际 15 段 62 条不符,是规则该改还是数据该砍,得用户定。
+
+**验证**:`cargo test -p larkwing-core --lib` 893 过(基线 878)、`--test engine` 23 过、`cargo test -p larkwing` 12 过、两个 crate 的 `clippy --all-targets -- -D warnings` 零警告、`check-locks.sh` 全过、`vue-tsc --noEmit` 无报错、`check-i18n.mjs` 5/5(918 = 918)。

@@ -65,6 +65,7 @@ impl MediaRuntime {
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| root.display().to_string());
+            let mut last = 0usize;
             loop {
                 tokio::select! {
                     res = &mut work => {
@@ -77,8 +78,13 @@ impl MediaRuntime {
                         if beat.is_cancelled() {
                             prog.cancel.store(true, Ordering::Relaxed);
                         }
+                        // 有推进才打点(2026-11-11,与下面独立后台那条路对齐):原先每秒无条件打,
+                        // 卡在掉线 NAS 的 read_dir 上时票据永远是活的,十分钟判卡不来。
                         let scanned = prog.scanned.load(Ordering::Relaxed);
-                        beat.beat(0, format!("清点「{label}」(已数 {scanned} 个文件)"));
+                        if scanned > last {
+                            last = scanned;
+                            beat.beat(0, format!("清点「{label}」(已数 {scanned} 个文件)"));
+                        }
                     }
                 }
             }

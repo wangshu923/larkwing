@@ -38,6 +38,7 @@ export function useSystemSettings() {
       autostart.value = await api.autostartEnabled() // 回读 OS 真值
     } catch (e) {
       console.error('设置开机自启失败', e)
+      useToast().error(t('toast.settingFailed')) // 用户亲手拨的开关没生效:吭一声(§6.6)
     } finally {
       autostartBusy.value = false
     }

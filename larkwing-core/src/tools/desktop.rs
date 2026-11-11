@@ -392,7 +392,7 @@ impl Tool for SystemVolume {
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .ok_or_else(|| anyhow::anyhow!("缺少 action 参数"))?;
-        let value = args.get("value").and_then(serde_json::Value::as_f64);
+        let value = super::arg_f64(&args, "value");
 
         match action {
             "set" => {

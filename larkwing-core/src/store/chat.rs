@@ -241,6 +241,27 @@ impl ChatRepo {
 
     /// 最近一条 event 行原文(自启回合落的任务语境)。提醒推回手机的 Failed 保底:
     /// 回合没跑成也把提醒本体送到人手上(§3.5 不静默)。
+    /// 最近一条 event 行**之后**说出口的全部 assistant 文本(自启回合推手机用,2026-11-11):
+    /// 多段回合按段拼接(中间空一行);一句都没有 = None。此前推送取的是「会话里最新一句」,
+    /// 自启回合没出文字时会把**上一轮的旧回复**推到手机,多段回合又只推最后一段。
+    pub fn assistant_text_after_last_event(&self, conv: i64) -> Result<Option<String>> {
+        self.db.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT content FROM messages
+                 WHERE conversation_id = ?1 AND role = 'assistant'
+                   AND content != '' AND content != '__IGNORE__'
+                   AND id > COALESCE((SELECT MAX(id) FROM messages
+                                      WHERE conversation_id = ?1 AND role = 'event'), 0)
+                 ORDER BY id ASC",
+            )?;
+            let parts = stmt
+                .query_map([conv], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let parts: Vec<&str> = parts.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+            Ok((!parts.is_empty()).then(|| parts.join("\n\n")))
+        })
+    }
+
     pub fn latest_event_line(&self, conv: i64) -> Result<Option<String>> {
         self.db.with(|c| {
             let line: Option<String> = c

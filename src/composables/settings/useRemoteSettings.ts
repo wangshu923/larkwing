@@ -52,26 +52,35 @@ export function useRemoteSettings() {
       useToast().error(t('settings.remote.weixin.unbindFailed'))
     }
   }
-  async function toggleRemote(id: string, on: boolean) {
-    await api.setSetting(`remote.${id}.enabled`, on ? '1' : '0')
-    await api.reloadChannels()
+  /** 这三条写设置都是用户亲手点的:没存上 / 渠道没重启成都得吭声(§6.6 失败别静默)——原先裸
+   *  `await`,抛出去只进 console,开关看着拨过去了、其实没生效。失败后重拉一次状态,让界面回到真相。 */
+  async function applyRemote(what: string, write: () => Promise<void>) {
+    try {
+      await write()
+      await api.reloadChannels()
+    } catch (e) {
+      console.error(`${what}失败`, e)
+      useToast().error(t('toast.settingFailed'))
+    }
     await loadRemote()
+  }
+  async function toggleRemote(id: string, on: boolean) {
+    await applyRemote('开关远程渠道', () => api.setSetting(`remote.${id}.enabled`, on ? '1' : '0'))
   }
   /** 写凭证:空 = 不改(读不回);写完清空输入框,再重启渠道。 */
   async function saveRemoteCred(key: string, val: string) {
     const v = val.trim()
     if (!v) return
-    await api.setSetting(key, v)
-    if (key.endsWith('.token')) tgToken.value = ''
-    if (key.endsWith('.app_key')) dtKey.value = ''
-    if (key.endsWith('.app_secret')) dtSecret.value = ''
-    await api.reloadChannels()
-    await loadRemote()
+    await applyRemote('保存渠道凭证', async () => {
+      await api.setSetting(key, v)
+      if (key.endsWith('.token')) tgToken.value = ''
+      if (key.endsWith('.app_key')) dtKey.value = ''
+      if (key.endsWith('.app_secret')) dtSecret.value = ''
+    })
   }
   async function saveRemote(key: string, ev: Event) {
-    await api.setSetting(key, (ev.target as HTMLInputElement).value.trim())
-    await api.reloadChannels()
-    await loadRemote()
+    const v = (ev.target as HTMLInputElement).value.trim()
+    await applyRemote('保存渠道设置', () => api.setSetting(key, v))
   }
   function remoteStatusText(c: RemoteChannelView): string {
     if (c.last_error) return t('settings.remote.statusError')

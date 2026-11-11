@@ -155,6 +155,7 @@ impl MediaRuntime {
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "解压".into());
             let mut turn_guard = DirCancelOnDrop::new(prog.clone(), dest.clone());
+            let mut last = 0usize;
             loop {
                 tokio::select! {
                     res = &mut work => {
@@ -167,8 +168,13 @@ impl MediaRuntime {
                         if beat.is_cancelled() {
                             prog.cancel.store(true, Ordering::Relaxed); // 阻塞线程见旗自清半成品
                         }
+                        // 有推进才打点(2026-11-11,与下面独立后台那条路对齐):原先每秒无条件打,
+                        // 卡死的件(NAS 掉线、盘不转)永远显得「活着」,组的卡死看门狗对它失效。
                         let done = prog.done.load(Ordering::Relaxed);
-                        beat.beat(done, format!("解压「{label}」({done}/{total})"));
+                        if done > last {
+                            last = done;
+                            beat.beat(done, format!("解压「{label}」({done}/{total})"));
+                        }
                     }
                 }
             }
@@ -378,6 +384,7 @@ impl MediaRuntime {
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "打包".into());
             let mut turn_guard = CancelOnDrop::new(prog.clone(), tmp.clone());
+            let mut last = 0usize;
             loop {
                 tokio::select! {
                     res = &mut work => {
@@ -392,7 +399,10 @@ impl MediaRuntime {
                             prog.cancel.store(true, Ordering::Relaxed);
                         }
                         let done = prog.done.load(Ordering::Relaxed);
-                        beat.beat(done, format!("打包「{label}」({done}/{total})"));
+                        if done > last { // 有推进才打点(同解压)
+                            last = done;
+                            beat.beat(done, format!("打包「{label}」({done}/{total})"));
+                        }
                     }
                 }
             }

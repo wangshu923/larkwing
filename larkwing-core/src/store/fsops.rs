@@ -88,6 +88,20 @@ impl FsOpRepo {
         })
     }
 
+    /// 全家最近的批次(桌面操作记录页 = 主人的管理面,同提醒页的口径)。
+    pub fn list_all(&self, limit: i64) -> Result<Vec<FsOpRow>> {
+        self.db.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, user_id, kind, ops, n, state, created_at, updated_at
+                 FROM fsops ORDER BY id DESC LIMIT ?1",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![limit], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
     /// 撤销(state="applied")/ 重做(state="undone")的就近入口:该用户最近一条该状态批次。
     pub fn latest(&self, user_id: i64, state: &str) -> Result<Option<FsOpRow>> {
         self.db.with(|c| {

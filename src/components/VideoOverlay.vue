@@ -272,6 +272,10 @@ const hasNext = computed(() => {
   const p = playlist.value
   return !!p && (p.index + 1 < p.total || wraps.value)
 })
+/** 片尾线上要不要自动接下一集。睡眠定时「放完这一集就停」时不接、也不预告:让它自然放到头,
+ *  走 ended → sleepStopAtEnd(useMedia.onEnded)。原先片尾越线直接 autoNext,而「放完就停」只在
+ *  onEnded 里判 → 带片尾标记的剧永远到不了 ended,定时又跨集保留,于是一集接一集放下去。 */
+const autoAdvance = computed(() => hasNext.value && state.current?.sleep?.kind !== 'at_end')
 function showSkipOsd(text: string, undoTo: number) {
   skipOsd.value = { text, undoTo }
   clearTimeout(skipOsdTimer)
@@ -283,13 +287,13 @@ function undoSkip() {
   skipOsd.value = null
   seek(u.undoTo)
 }
-/** 片尾预告:还差几秒到片尾线(1..OUTRO_NOTICE_S),没到窗口 / 已了结 / 没下一集都是 null。
+/** 片尾预告:还差几秒到片尾线(1..OUTRO_NOTICE_S),没到窗口 / 已了结 / 没下一集 / 定了「放完就停」都是 null。
  *  **纯从播放位派生,不开 interval** —— 暂停、拖走、取消都自然消失,不用管一堆定时器的生命周期。
  *  暂停时不显:停着不会往前走,挂个「即将」的牌子是说瞎话(一按播放它自己回来)。 */
 const outroNotice = computed(() => {
   const s = skipInfo.value
   if (state.status !== 'playing') return null
-  if (!s || s.outro_start == null || outroDone.value || !hasNext.value) return null
+  if (!s || s.outro_start == null || outroDone.value || !autoAdvance.value) return null
   const left = s.outro_start - state.position
   if (left <= 0 || left > OUTRO_NOTICE_S) return null
   return Math.max(1, Math.ceil(left))
@@ -458,7 +462,7 @@ watch(
         // 判「这一拍**跨过**了片尾线」而不是「已经在线后面」:否则把片尾标记往回拖到播放头之前,
         // 下一拍就会当场切集(用户只是想调标记,不是想换集)。
         outroDone.value = true
-        if (hasNext.value) autoNext() // 到点直接切,与自然播完同一条路(core 定下一集)
+        if (autoAdvance.value) autoNext() // 到点直接切,与自然播完同一条路(core 定下一集)
       }
     }
   },

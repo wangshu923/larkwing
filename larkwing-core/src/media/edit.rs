@@ -502,7 +502,10 @@ fn exit_error(code: Option<i32>, tail: &Arc<Mutex<VecDeque<String>>>) -> anyhow:
 /// QSV / AMF / VideoToolbox 没有会话数硬闸,不在此列。查显卡型号 + 驱动版本的表(漂)与事前
 /// 并发探测(白耗显卡)都评估过不做:事中按这条信号自适应,在哪台机器上都收敛到真实上限。
 pub(crate) fn is_encoder_busy(stderr: &str) -> bool {
-    stderr.contains("OpenEncodeSessionEx failed")
+    // 匹配到「out of memory (10)」为止(2026-11-11 收紧):`OpenEncodeSessionEx failed` 后面还可能跟
+    // `unsupported device (2)` 之类 —— 那是这块卡 / 驱动根本开不了编码器,不是并发撞限;当成撞限
+    // 会让批白白降到 1 路再重试,还把学到的上限压低到重启。
+    stderr.contains("OpenEncodeSessionEx failed: out of memory (10)")
 }
 
 fn tail_text(tail: &Arc<Mutex<VecDeque<String>>>) -> String {
@@ -532,6 +535,10 @@ mod tests {
                     [h264_nvenc @ 0x5] No capable devices found";
         assert!(is_encoder_busy(busy));
         assert!(!is_encoder_busy("Invalid argument\nError opening output file"));
+        assert!(
+            !is_encoder_busy("[h264_nvenc @ 0x5] OpenEncodeSessionEx failed: unsupported device (2): (no details)"),
+            "开不了编码器(设备不支持)不是并发撞限"
+        );
         assert!(!is_encoder_busy("No such file or directory"));
 
         let tail = Arc::new(Mutex::new(VecDeque::from(vec![busy.to_string()])));

@@ -35,7 +35,13 @@ const idle = useFloatIdle()
 // 允许/拒绝,confirm_action 是 core 命令、悬浮窗直连不转发;via=float 记进审计)。
 const confirm = useConfirm()
 // 「计划」(§6.5):BT 干长活的步骤清单;展开面板「进行中」区一行看进度(纯展示)。
-const { cards: plans } = usePlan()
+const { cards: allPlans } = usePlan()
+// 计划行随活动(与主窗 TasksOverlay 的 planLive 同一口径):有回合在想 / 在说、或有任务在跑才显。
+// 原先只看「有没有计划」—— 回合结束后带未完项的计划一直占着「进行中」区,还把待机轮播挡住。
+// 回合动静认全局事件车道的 mood(core 发,自启回合也算);槽不动,回合再起它就回来。
+const plans = computed(() =>
+  mood.state.mood !== 'idle' || running.value.length ? allPlans.value : [],
+)
 
 const avatars: Record<string, string> = { titan: titanIdle, dog: dogIdle, cat: catIdle }
 const avatar = computed(() => avatars[settings.get('ui.character')] ?? titanIdle)

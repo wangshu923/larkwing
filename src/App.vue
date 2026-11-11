@@ -75,7 +75,9 @@ async function noticeAction(kind: 'reset' | 'quit' | 'delete' | 'keep') {
     else await api.keepOldData()
     dataNotice.value = null
   } catch (e) {
+    // 弹窗留着(没成就别收),并吭一声 —— 原先只进 console,点了「恢复默认 / 删除旧数据」毫无反应(§6.6)
     console.error('数据提示操作失败', e)
+    useToast().error(t(kind === 'delete' ? 'toast.deleteFailed' : 'toast.actionFailed'))
   } finally {
     dataBusy.value = false
   }

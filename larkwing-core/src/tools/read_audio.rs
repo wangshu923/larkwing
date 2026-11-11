@@ -84,7 +84,7 @@ impl Tool for ReadAudio {
             .map(super::expand_home) // 「~/xxx」宽容展开(§4.4)
             .context("缺少 path 参数")?;
         super::guard::ensure(ctx, super::guard::Access::Read, std::slice::from_ref(&path)).await?;
-        let from = args.get("from").and_then(serde_json::Value::as_f64).unwrap_or(0.0).max(0.0);
+        let from = super::arg_f64(&args, "from").unwrap_or(0.0).max(0.0);
         let offset = super::arg_u64(&args, "offset", 0) as usize;
 
         let Some(voice) = ctx.voice.clone() else {

@@ -21,7 +21,9 @@ const plan = usePlan()
 const stopping = reactive<Record<number, boolean>>({})
 // 计划卡随活动(2026-09-17 用户「任务结束了还挂在那儿」):回合在飞、或有任务在跑时才显;
 // 都停了就淡出。槽仍留给模型(〔此刻〕照带),它再调 plan_set 或回合再起时卡就回来。
-const planLive = computed(() => chat.usage.turnStartedAt != null || running.value > 0)
+// 判据认「有回合在飞」而不是在飞时钟:时钟只属于屏上那一轮(切走 / 屏外收尾即停),拿它当判据,
+// 回合在屏外跑完后时钟曾永不清 → 卡再也不淡出;反过来切到别的会话,卡又会提前没了。
+const planLive = computed(() => chat.turnsInFlight > 0 || running.value > 0)
 
 // 计划卡进度条宽度(done/total;total 恒 >0,空快照到不了渲染层)
 function planPct(p: PlanCard): string {

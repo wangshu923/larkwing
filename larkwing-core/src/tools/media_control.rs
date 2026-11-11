@@ -79,7 +79,7 @@ impl Tool for MediaControl {
             .get("action")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("缺少 action 参数"))?;
-        let value = args.get("value").and_then(serde_json::Value::as_f64);
+        let value = super::arg_f64(&args, "value");
         // next/prev/episode = 队列切集(现取现播,异步):走 core 队列,不是发给前端的嘴控指令。
         // 队列在 core 手里(B 站合集/分P、本地同一套)→ 「第几集」直接定位,模型不碰链接。
         // audio_track = 切音轨(mac 直传就地启停,其余重建管线原位续播),观察文本由 core 组。

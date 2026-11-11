@@ -381,6 +381,7 @@ onTranscribed(async (text, via, speaker) => {
   if (via === 'wake') {
     // 唤醒走语音专属会话;当前会话忙着(回合在飞 / 任务在跑)就不切界面、在后台念(§7.5)
     const conv = await ensureVoiceConv()
+    if (conv == null) return // 语音会话没建成:ensureVoiceConv 已吭声并发过唤醒收尾通知(§7.5)
     chatSend(text, via, speaker, [], conv)
   } else {
     chatSend(text, via, speaker) // mic/打字进当前会话(交互二分)
@@ -608,20 +609,30 @@ function fmtTime(ts: number): string {
 // 聊天搜索:输入即查(去抖 180ms),跨会话子串命中;点结果跳该会话并清空搜索框。
 const searchQuery = ref('')
 const searchHits = ref<SearchHit[]>([])
+/** 这次搜索出错了:结果区说「没搜成」,别借「没找到」那句(出错 ≠ 没有,§6.6)。 */
+const searchFailed = ref(false)
 let searchTimer: ReturnType<typeof setTimeout> | undefined
+let searchSeq = 0 // 代次:慢的旧查询晚到,不许盖掉新查询的结果
 watch(searchQuery, (q) => {
   clearTimeout(searchTimer)
+  const mine = ++searchSeq
   const query = q.trim()
   if (!query || !chat.inTauri) {
     searchHits.value = []
+    searchFailed.value = false
     return
   }
   searchTimer = setTimeout(async () => {
     try {
-      searchHits.value = await api.searchMessages(query, 50)
+      const hits = await api.searchMessages(query, 50)
+      if (mine !== searchSeq) return
+      searchHits.value = hits
+      searchFailed.value = false
     } catch (e) {
       console.error('搜索失败', e)
+      if (mine !== searchSeq) return
       searchHits.value = []
+      searchFailed.value = true
     }
   }, 180)
 })
@@ -926,7 +937,7 @@ async function backToLatest() {
 </script>
 
 <template>
-  <div class="layout" :class="{ booting, closed: !panelOpen, cut: shape === 'cut' }" :style="{ fontSize: textScale }">
+  <div class="layout" :class="{ booting, closed: !panelOpen, cut: shape === 'cut' }" :style="{ fontSize: textScale, '--chat-fs': textScale }">
     <!-- 左:图标栏 -->
     <nav class="rail">
       <div class="rail-top">
@@ -981,7 +992,7 @@ async function backToLatest() {
           <div class="rc-snippet">{{ h.snippet }}</div>
           <span class="rc-time">{{ fmtTime(h.created_at) }}</span>
         </li>
-        <li v-if="!searchHits.length" class="rc-empty">{{ t('recents.searchEmpty') }}</li>
+        <li v-if="!searchHits.length" class="rc-empty">{{ searchFailed ? t('recents.searchFailed') : t('recents.searchEmpty') }}</li>
       </ul>
       <ul v-else class="rc-list">
         <li
@@ -1522,7 +1533,8 @@ async function backToLatest() {
 .suggest-chip { padding: 7px 14px; border-radius: 999px; font-size: 12.5px; font-family: inherit; cursor: pointer; background: rgba(var(--accent-rgb), 0.1); border: 1px solid rgba(var(--accent-rgb), 0.32); color: var(--accent); transition: border-color .15s, box-shadow .15s, background .15s; }
 .suggest-chip:hover { border-color: var(--accent); box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.28); background: rgba(var(--accent-rgb), 0.16); }
 .bubble {
-  max-width: 70%; padding: 11px 15px; border-radius: 16px; font-size: 14px; line-height: 1.55;
+  /* 字号跟「大字」档(--chat-fs 由 .layout 内联给,单源 = script 里的 textScale);写死 px 就不跟了 */
+  max-width: 70%; padding: 11px 15px; border-radius: 16px; font-size: var(--chat-fs, 14px); line-height: 1.55;
   /* blur 是"磨砂"强度:大了会把背后星空/粒子糊没(看着像不透明)。科幻皮要透出背景动态,取小值;
      文字稳靠 --bubble-them 的 tint 兜底。warm 皮气泡本身不透(token 无 alpha),blur 在那边无副作用。 */
   backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px);
@@ -1607,7 +1619,7 @@ async function backToLatest() {
 .input-row { display: flex; gap: 9px; align-items: flex-end; } /* 底对齐:输入框长高时,话筒/发送键贴底不上浮 */
 .field {
   flex: 1; background: var(--surface-deep); border: 1px solid var(--line); border-radius: 13px;
-  padding: 11px 15px; color: var(--text); font-size: 14px; outline: none;
+  padding: 11px 15px; color: var(--text); font-size: var(--chat-fs, 14px); outline: none;
   backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
 }
 .field::placeholder { color: var(--text-dim); }
@@ -1704,7 +1716,7 @@ textarea.field { resize: none; font-family: inherit; line-height: 1.5; max-heigh
 }
 .xp-text {
   flex: 1; resize: none; border: none; outline: none; background: transparent;
-  color: var(--text); padding: 18px 20px; font-family: inherit; font-size: 14px; line-height: 1.7;
+  color: var(--text); padding: 18px 20px; font-family: inherit; font-size: var(--chat-fs, 14px); line-height: 1.7;
 }
 .xp-text::placeholder { color: var(--text-dim); }
 .xp-foot {

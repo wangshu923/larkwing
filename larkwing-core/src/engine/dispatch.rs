@@ -283,10 +283,15 @@ impl Engine {
 
         let pending = turn::PendingUser { content: text, payload };
         let mut rx = match self
-            .launch(conv_id, mem_user, candidates, request, tool_subset, 0, Some(pending))
+            .launch(conv_id, mem_user, candidates, request, tool_subset, 0, Some(pending), false)
             .await
         {
-            Ok(rx) => rx,
+            Ok(Some(rx)) => rx,
+            // 只有自启回合会返回 None;真走到这儿也按「放弃仲裁」收,不 panic
+            Ok(None) => {
+                dismissed(&self.bus);
+                return Ok(());
+            }
             Err(e) => {
                 tracing::info!(conv = conv_id, err = %e.message, "旁听仲裁建连失败,放弃");
                 dismissed(&self.bus);
@@ -446,7 +451,9 @@ impl Engine {
 
         // 4+5. 开流 + spawn 回合(与 wake_turn 共用尾段)。ToolCtx.user_id = mem_user:
         // remember 写到说话人(记忆归人);会话归属仍是 conv_user。
-        self.launch(conv_id, mem_user, candidates, request, tool_subset, user_msg_id, None).await
+        self.launch(conv_id, mem_user, candidates, request, tool_subset, user_msg_id, None, false)
+            .await?
+            .ok_or_else(|| AppError::internal("只有自启回合会让路"))
     }
 
     /// 插队(PLAN §9 B):把一条消息塞进**正在跑的回合**,它在下一次 LLM 调用就带上(不打断)。
@@ -502,7 +509,8 @@ impl Engine {
         tool_subset: Vec<Arc<dyn crate::tools::Tool>>,
         user_msg_id: i64,
         overheard: Option<turn::PendingUser>,
-    ) -> Result<mpsc::Receiver<TurnEvent>, AppError> {
+        self_started: bool,
+    ) -> Result<Option<mpsc::Receiver<TurnEvent>>, AppError> {
         // 防溢出安全阀(model-aware):工具循环累积的 ToolResult / 背景状态在 build_context 之后
         // 才注入(绕过初始窗口),单条可达数万字 → 开流前对累积的 messages 再按预算封顶一道(§0.2.0)。
         context::cap_messages_tail(&mut request.messages, tail_budget(&candidates));
@@ -520,7 +528,11 @@ impl Engine {
             let mut sessions = self.sessions.lk();
             sessions.entry(conv_id).or_default().plan.clone()
         };
-        let is_overheard = overheard.is_some();
+        let claim = match (overheard.is_some(), self_started) {
+            (true, _) => super::Claim::Overheard,
+            (false, true) => super::Claim::SelfStarted,
+            (false, false) => super::Claim::Normal,
+        };
         let join = tokio::spawn(
             turn::Turn {
                 store: self.store.clone(),
@@ -560,21 +572,28 @@ impl Engine {
         // 谁让路就取消谁,任何一支都不许无主地跑下去:
         //   · 普通回合撞上在飞 → 新的赢(与 send_message 先 cancel 的语义一致),挤掉旧的;
         //   · **旁听仲裁撞上在飞 → 旁听让路**(它是机会性的,真输入优先 §8.2)——取消刚起的自己,
-        //     绝不能反过来把用户真回合杀掉。
-        let loser = {
+        //     绝不能反过来把用户真回合杀掉;
+        //   · **自启回合撞上在飞 → 自启让路**(2026-11-11),由调用方撤 event 行、调度器下拍重试。
+        let (loser, yielded) = {
             let mut sessions = self.sessions.lk();
             let slot = sessions.entry(conv_id).or_default();
-            register_inflight(slot, TurnHandle { token, join }, is_overheard, inject)
+            let busy = slot.inflight.as_ref().is_some_and(|h| !h.join.is_finished());
+            let yielded = claim != super::Claim::Normal && busy;
+            (register_inflight(slot, TurnHandle { token, join }, claim, inject), yielded)
         };
         if let Some(h) = loser {
             h.token.cancel();
+            if yielded && claim == super::Claim::SelfStarted {
+                let _ = h.join.await; // 让路的是自己:等它收完尾(空 partial 不落库),调用方再撤 event 行
+                return Ok(None);
+            }
             // 不在这里 await 收尾:launch 的调用方正等 rx(await 会把新回合的起播卡在旧回合上)。
             // 协作式取消 + partial 落库由被取消方自己走完,这里只保证它**有人取消过**。
             tokio::spawn(async move {
                 let _ = h.join.await;
             });
         }
-        Ok(rx)
+        Ok(Some(rx))
     }
 
     /// 自启回合(调度器到点调用;PLAN §8「分离 job 型」的兑现)。上下文按 job 类分两路(2026-10-08):
@@ -734,10 +753,21 @@ impl Engine {
         // 自启回合也带「此刻」背景(任务到点时音乐可能正放着);不落库、不破缓存
         self.inject_ambient(conv_id, &mut request);
         let mut rx = match self
-            .launch(conv_id, user_id, candidates, request, tool_subset, event_msg_id, None)
+            .launch(conv_id, user_id, candidates, request, tool_subset, event_msg_id, None, true)
             .await
         {
-            Ok(rx) => rx,
+            Ok(Some(rx)) => rx,
+            // 建连那一两秒里用户在这个会话发了消息:让路(2026-11-11)。event 行撤掉、job 不推进,
+            // 调度器下个 tick 再试 —— 与开头忙检同一个语义,只是晚一步才看见。
+            Ok(None) => {
+                let store = self.store.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    store.chat.delete_message(conv_id, event_msg_id)
+                })
+                .await;
+                tracing::info!(conv = conv_id, job = job.id, "自启回合建连期间用户开口,让路(下个 tick 再试)");
+                return Ok(false);
+            }
             // 建连失败(没 key / 401 / 连不上):event 行已经落了,但回合根本没起来。调度器的 Err
             // 分支不推进 due_at(留着重试),所以下个 tick 会再进来一次、再落一行 —— 撤掉这行,
             // 否则「⏰ 到点了」每 30s 堆一条、还全进后续回合上下文(2026-08-22 审计)。

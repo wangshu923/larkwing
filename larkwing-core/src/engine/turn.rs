@@ -747,8 +747,8 @@ impl Turn {
             // 进展守卫:本轮是否有"新调用且成功"的结果。全重复 / 全失败 = 这轮没推进,计一次空转;
             // 真在干活(每轮有新成功结果)则清零,深任务因此永远碰不到兜底网。先登记全部指纹再综合判。
             let mut made_progress = false;
-            for (call, status, _) in &results {
-                let fresh = seen_calls.insert(call_fingerprint(call));
+            for (call, status, out) in &results {
+                let fresh = seen_calls.insert(call_fingerprint(call, &out.text));
                 if fresh && status == "ok" {
                     made_progress = true;
                 }
@@ -931,6 +931,36 @@ async fn persist_and_announce(
 mod tests {
     use super::*;
     use crate::engine::{InjectReady, InjectState};
+
+    /// 空转指纹(2026-11-11):同一个「下一页」拿回不同的文字 = 进展;只有数字在动(查进度)= 重复。
+    #[test]
+    fn fingerprint_counts_new_text_but_not_moving_numbers() {
+        let call = |name: &str, args: serde_json::Value| ToolCall {
+            id: "c".into(),
+            name: name.into(),
+            args,
+            is_incomplete: false,
+        };
+        let next = call("web_render", serde_json::json!({"session": "s1", "click_text": "下一页"}));
+        assert_ne!(
+            call_fingerprint(&next, "第 1 页:甲乙丙"),
+            call_fingerprint(&next, "第 2 页:丁戊己"),
+            "翻页拿回新内容,不许算重复"
+        );
+        assert_eq!(
+            call_fingerprint(&next, "同一页"),
+            call_fingerprint(&next, "同一页"),
+            "同参同结果 = 重复"
+        );
+        let poll = call("task_status", serde_json::json!({}));
+        assert_eq!(
+            call_fingerprint(&poll, "下载合集 3/10(45%),已跑 12 秒"),
+            call_fingerprint(&poll, "下载合集 4/10(52%),已跑 31 秒"),
+            "轮询进度只有数字在动,仍算重复"
+        );
+        let other = call("web_render", serde_json::json!({"session": "s1", "click_text": "上一页"}));
+        assert_ne!(call_fingerprint(&next, "x"), call_fingerprint(&other, "x"), "换了参数 = 新调用");
+    }
 
     fn temp_store(name: &str) -> Store {
         let p = std::env::temp_dir().join(format!("lw_turn_{}_{}.db", std::process::id(), name));
@@ -1211,10 +1241,20 @@ fn shown_refs(shown: &[crate::tools::ShownImage]) -> Vec<AttachmentRef> {
         .collect()
 }
 
-/// 工具调用指纹(进展守卫用):同名 + 同参 = 同一调用。args 的 Display 即紧凑 JSON,
-/// 模型重复调同一个工具会发出相同串 → 命中"重复",据此判空转。
-fn call_fingerprint(call: &ToolCall) -> String {
-    format!("{}:{}", call.name, call.args)
+/// 工具调用指纹(进展守卫用):同名 + 同参 + **同结果** = 同一调用。args 的 Display 即紧凑 JSON,
+/// 模型重复调同一个工具、拿回同样的东西 → 命中"重复",据此判空转。
+///
+/// 结果算进来(2026-11-11):此前只看「同名同参」,网页翻页(每次都是 `click_text:"下一页"`)、
+/// 长页下滚从第二次起全算没进展,第六次被强制收尾 —— 明明每次都拿回了新内容。
+/// **结果里的数字不算**:反复查进度(「3/10」变「4/10」)那种轮询,结果只有数字在动,仍判重复;
+/// 翻页 / 下滚拿回的是不同的文字,才算进展。不为此立工具名单(§5 不写具名分支)。
+fn call_fingerprint(call: &ToolCall, result: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for c in result.chars().filter(|c| !c.is_ascii_digit()) {
+        c.hash(&mut h);
+    }
+    format!("{}:{}:{:x}", call.name, call.args, h.finish())
 }
 
 /// persist_row 的可关版:子回合(ephemeral)一概不落会话行 —— 返回 Some(0) 保持

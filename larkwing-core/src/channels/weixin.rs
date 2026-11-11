@@ -279,6 +279,10 @@ async fn serve(
     );
 
     let mut fails = 0u32; // 连续 API 错误计数(见下面的状态行/退避)
+    // 本次进 serve 之后有没有成功收过一次(2026-11-11):run_account 在网络错误后会把错误写进
+    // 状态行再重进这里,而 fails 从 0 起、下面那条「又通了」的分支进不去 —— 一次抖动之后设置页
+    // 永远挂着红字,用户会以为要重新扫码。第一次成功就把状态行清回在线。
+    let mut healthy = false;
     loop {
         if ct.is_cancelled() {
             return Ok(());
@@ -315,9 +319,10 @@ async fn serve(
             }
             continue;
         }
-        if fails > 0 {
+        if fails > 0 || !healthy {
             // 又通了:把状态行改回在线(否则一次抖动之后永远挂着红字)
             fails = 0;
+            healthy = true;
             ctx.set_state("weixin", true, None);
         }
         // 推进游标并持久化(空串不覆盖;per-account 键)

@@ -8,12 +8,14 @@
 //! **不做安全承诺**(用户准则)。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
 
 use super::{Tool, ToolCtx, ToolRisk, ToolSpec};
 use crate::files;
+use crate::lockext::LockExt;
 use crate::store::Store;
 
 /// 单层列目录:一页多少项(超了报总数 + 给续读起点,fs_read_text 的 offset 同款形态)。
@@ -477,6 +479,8 @@ fn finish_batch(
         .iter()
         .filter_map(|it| match it {
             files::FsOpItem::Write { path, old: None, was_new: false, .. } => Some(path.clone()),
+            // fs_edit 改的文件超过快照上限同理(2026-11-11 补:原先只认 Write,edit 撤不回却不说)
+            files::FsOpItem::Edit { path, old: None, .. } => Some(path.clone()),
             _ => None,
         })
         .collect();
@@ -827,22 +831,7 @@ impl Tool for FsMove {
         let dsts: Vec<String> = moves.iter().map(|(_, d)| d.clone()).collect();
         super::guard::ensure(ctx, super::guard::Access::Modify, &srcs).await?;
         super::guard::ensure(ctx, super::guard::Access::Create, &dsts).await?;
-        let store = ctx.store.clone();
-        let user_id = ctx.user_id;
-        tokio::task::spawn_blocking(move || {
-            let overflow = moves.len().saturating_sub(BATCH_MAX);
-            let results: Vec<_> = moves
-                .into_iter()
-                .take(BATCH_MAX)
-                .map(|(src, dst)| {
-                    files::move_one(Path::new(&src), Path::new(&dst))
-                        .map_err(|e| format!("{src} → {dst}:{e:#}"))
-                })
-                .collect();
-            finish_batch(&store, user_id, "move", "移动", results, overflow)
-        })
-        .await
-        .context("移动任务挂了")?
+        run_transfer(ctx, Transfer::Move, moves).await
     }
 }
 
@@ -898,23 +887,247 @@ impl Tool for FsCopy {
         let dsts: Vec<String> = copies.iter().map(|(_, d)| d.clone()).collect();
         super::guard::ensure(ctx, super::guard::Access::Read, &srcs).await?;
         super::guard::ensure(ctx, super::guard::Access::Create, &dsts).await?;
-        let store = ctx.store.clone();
-        let user_id = ctx.user_id;
-        tokio::task::spawn_blocking(move || {
-            let overflow = copies.len().saturating_sub(BATCH_MAX);
-            let results: Vec<_> = copies
-                .into_iter()
-                .take(BATCH_MAX)
-                .map(|(src, dst)| {
-                    files::copy_one(Path::new(&src), Path::new(&dst))
-                        .map_err(|e| format!("{src} → {dst}:{e:#}"))
-                })
-                .collect();
-            finish_batch(&store, user_id, "copy", "复制", results, overflow)
-        })
-        .await
-        .context("复制任务挂了")?
+        run_transfer(ctx, Transfer::Copy, copies).await
     }
+}
+
+/// 移动还是复制(`run_transfer` 的两种活;操作记录的 kind 与话术动词随它定)。
+#[derive(Clone, Copy)]
+enum Transfer {
+    Move,
+    Copy,
+}
+
+impl Transfer {
+    fn kind(self) -> &'static str {
+        match self {
+            Transfer::Move => "move",
+            Transfer::Copy => "copy",
+        }
+    }
+    fn verb(self) -> &'static str {
+        match self {
+            Transfer::Move => "移动",
+            Transfer::Copy => "复制",
+        }
+    }
+}
+
+/// 谁把这活扔了(回合取消 / 看门狗 abort)→ 旗子递给阻塞线程,在下一个文件之间收手。
+/// 交棒给后台看守任务、或正常收尾时解除(`media/usage.rs` 同款)。
+struct TransferCancelOnDrop(Option<Arc<files::TransferProgress>>);
+
+impl Drop for TransferCancelOnDrop {
+    fn drop(&mut self) {
+        if let Some(p) = &self.0 {
+            p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// 复制 / 移动一批文件的执行侧(2026-11-11):与解压 / 打包 / 扫盘同一个节奏 —— 回合内等
+/// `IN_TURN_WAIT`,没干完转后台(〔此刻〕可见、可停、干完自动回来汇报、卡死有看门狗)。
+///
+/// 此前是「一次阻塞调用 + 60 秒工具超时」:把电影拷到移动硬盘(USB 30MB/s 下 2GB 就要 66 秒)
+/// 时模型被告知「超时没拿到结果」,而阻塞线程其实还在拷 —— 向用户误报失败,或者重试出第二份
+/// 「名字 (2)」;跨盘移动重试更糟(两路各拷一份、后一路删源时报错)。全程没有任务卡、不可停。
+/// 这是整理文件里唯一没接两阶段的长活。同盘改名一瞬间就完,走的是同一条路的「回合内干完」。
+async fn run_transfer(
+    ctx: &ToolCtx,
+    mode: Transfer,
+    pairs: Vec<(String, String)>,
+) -> anyhow::Result<String> {
+    use crate::media::{CARD_GRACE, IN_TURN_WAIT};
+    use std::sync::atomic::Ordering;
+
+    let prog = Arc::new(files::TransferProgress::default());
+    let overflow = pairs.len().saturating_sub(BATCH_MAX);
+    let total = pairs.len().min(BATCH_MAX);
+    let wp = prog.clone();
+    let mut work = tokio::task::spawn_blocking(move || -> Vec<Result<files::FsOpItem, String>> {
+        pairs
+            .into_iter()
+            .take(BATCH_MAX)
+            .map(|(src, dst)| {
+                // 已经叫停:剩下的一件都不动(正在做的那件由 copy_tree 在文件之间收手)
+                if wp.cancel.load(Ordering::Relaxed) {
+                    return Err(format!("{src}:{}", files::TRANSFER_CANCELLED));
+                }
+                let (s, d) = (Path::new(&src), Path::new(&dst));
+                match mode {
+                    Transfer::Move => files::move_one_with(s, d, &wp),
+                    Transfer::Copy => files::copy_one_with(s, d, &wp),
+                }
+                .map_err(|e| format!("{src} → {dst}:{e:#}"))
+            })
+            .collect()
+    });
+    let mut guard = TransferCancelOnDrop(Some(prog.clone()));
+
+    // 收尾(三条路共用):落操作记录 + 汇总话术,再补「叫停了 / 有链接没带过去」两句实话
+    let (store, user_id) = (ctx.store.clone(), ctx.user_id);
+    let fin_prog = prog.clone();
+    let finish = move |results: Vec<Result<files::FsOpItem, String>>| -> anyhow::Result<String> {
+        let mut msg = finish_batch(&store, user_id, mode.kind(), mode.verb(), results, overflow)?;
+        if fin_prog.cancel.load(Ordering::Relaxed) {
+            msg.push_str(";中途按要求停下了,没做完的那些原样没动");
+        }
+        let links = std::mem::take(&mut *fin_prog.skipped_links.lk());
+        if !links.is_empty() {
+            msg.push_str(&format!(
+                ";另有 {} 个指向文件夹的链接没有带过去(只是链接,原处的东西不受影响):{}",
+                links.len(),
+                crate::bgtasks::cap_names(&links)
+            ));
+        }
+        Ok(msg)
+    };
+    // 进度文本:语言中立(任务卡直接用;给模型看的那份另拼)
+    let progress = |p: &files::TransferProgress| {
+        (p.files.load(Ordering::Relaxed), human_size(p.bytes.load(Ordering::Relaxed)))
+    };
+    let verb = mode.verb();
+
+    // —— 批内(in_batch):直接干到底、不另开票据不另起卡;进度打到组上 ——
+    if let Some(beat) = ctx.in_batch.clone() {
+        let mut last = 0usize;
+        loop {
+            tokio::select! {
+                res = &mut work => {
+                    let results = res.context("文件任务挂了")?;
+                    guard.0 = None;
+                    return finish(results);
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                    if beat.is_cancelled() {
+                        prog.cancel.store(true, Ordering::Relaxed);
+                    }
+                    let (n, size) = progress(&prog);
+                    if n > last { // 有推进才打点:卡在掉线的 NAS 上时让组的看门狗看得见
+                        last = n;
+                        beat.beat(0, format!("{verb}文件(已 {n} 个,{size})"));
+                    }
+                }
+            }
+        }
+    }
+
+    // —— 回合内:过了 CARD_GRACE 才出卡(一瞬间就完的不闪卡),到 IN_TURN_WAIT 还没完转后台 ——
+    let stop = tokio_util::sync::CancellationToken::new();
+    let tasks = ctx.media.tasks();
+    let open_card = || {
+        let t = tasks.start("fs_transfer", crate::bus::Text::new("task.fs_transfer"));
+        t.bind_cancel(stop.clone());
+        t
+    };
+    let mut task: Option<crate::tasks::TaskHandle> = None;
+    let card_at = tokio::time::Instant::now() + CARD_GRACE;
+    let deadline = tokio::time::Instant::now() + IN_TURN_WAIT;
+    let mut stopped = false;
+    let mut last = 0usize;
+    loop {
+        tokio::select! {
+            res = &mut work => {
+                guard.0 = None;
+                let results = match res.context("文件任务挂了") {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if let Some(t) = task.take() {
+                            t.fail("task.err.fs_transfer", serde_json::Value::Null);
+                        }
+                        return Err(e);
+                    }
+                };
+                if let Some(t) = task.take() {
+                    if prog.cancel.load(Ordering::Relaxed) {
+                        t.fail("task.err.cancelled", serde_json::Value::Null);
+                    } else {
+                        t.done();
+                    }
+                }
+                return finish(results);
+            }
+            _ = stop.cancelled(), if !stopped => {
+                stopped = true;
+                prog.cancel.store(true, Ordering::Relaxed); // 阻塞线程在文件之间收手 → 走上面的收尾臂
+            }
+            _ = tokio::time::sleep_until(card_at), if task.is_none() => {
+                task = Some(open_card());
+                last = 0;
+            }
+            _ = tokio::time::sleep_until(deadline) => break,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                if let Some(t) = &task {
+                    let (n, size) = progress(&prog);
+                    if n > last {
+                        last = n;
+                        t.step("step.fs_transfer", serde_json::json!({ "n": n, "size": size }));
+                    }
+                }
+            }
+        }
+    }
+
+    // —— 转后台 ——
+    let task = task.unwrap_or_else(open_card);
+    let title = format!("{verb}文件({total} 项)");
+    let ticket = match ctx.media.bg().submit(title.clone(), (ctx.user_id, ctx.conv_id), 0) {
+        Ok(t) => t,
+        Err(e) => {
+            // guard 还武装着:带错返回时递旗,让阻塞线程在文件之间收手
+            task.fail("task.err.fs_transfer", serde_json::Value::Null);
+            anyhow::bail!(
+                "{e:#};这批文件半分钟没{verb}完、想转后台接着干但后台满了,这次先停了                  (已经{verb}好的那些留着),等几件后台事跑完再来"
+            );
+        }
+    };
+    guard.0 = None; // 交棒:此后旗子归看守任务里的 guard 管
+    let ticket_id = ticket.id();
+    task.bind_bg(ticket_id);
+    let watch = prog.clone();
+    let join = tokio::spawn(async move {
+        let _guard = TransferCancelOnDrop(Some(watch.clone()));
+        let mut last = 0usize;
+        loop {
+            tokio::select! {
+                res = &mut work => {
+                    let cancelled = watch.cancel.load(Ordering::Relaxed);
+                    match res.context("文件任务挂了").and_then(finish) {
+                        Ok(msg) => {
+                            if cancelled {
+                                task.fail("task.err.cancelled", serde_json::Value::Null);
+                            } else {
+                                task.done();
+                            }
+                            ticket.finish(!cancelled, format!("{verb}文件的活收尾了:{msg}。把结果简短告诉用户。"));
+                        }
+                        Err(e) => {
+                            task.fail("task.err.fs_transfer", serde_json::Value::Null);
+                            ticket.finish(false, format!("{verb}文件没办成:{e:#}。如实告诉用户。"));
+                        }
+                    }
+                    break;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                    if ticket.is_cancelled() || stop.is_cancelled() {
+                        watch.cancel.store(true, Ordering::Relaxed);
+                        continue; // 等阻塞线程在文件之间见旗收手,走上面的收尾臂
+                    }
+                    let n = watch.files.load(Ordering::Relaxed);
+                    if n > last {
+                        last = n;
+                        let size = human_size(watch.bytes.load(Ordering::Relaxed));
+                        ticket.beat(n, format!("已{verb} {n} 个文件({size})"));
+                        task.step("step.fs_transfer", serde_json::json!({ "n": n, "size": size }));
+                    }
+                }
+            }
+        }
+    });
+    ctx.media.bg().attach_abort(ticket_id, join.abort_handle());
+    Ok(format!(
+        "这批文件比较大,已经转后台接着{verb}了(「{title}」)。进度在屏幕任务条上,可以随时停;         **干完会自动回来汇报**,到时再转述。现在告诉用户已经在{verb}了就好,**不要重试**。"
+    ))
 }
 
 // ---------------------------------------------------------------------------

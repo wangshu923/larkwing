@@ -54,11 +54,7 @@ impl Tool for MediaSearch {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow::anyhow!("缺少 query 参数"))?;
-        let limit = args
-            .get("limit")
-            .and_then(serde_json::Value::as_u64)
-            .map(|n| n.clamp(1, 10) as usize)
-            .unwrap_or(5);
+        let limit = super::arg_u64(&args, "limit", 5).clamp(1, 10) as usize;
 
         match ctx.media.search(query, limit).await {
             Ok(hits) if hits.is_empty() => Ok("没搜到相关内容,换个关键词试试".into()),

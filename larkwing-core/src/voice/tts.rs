@@ -21,6 +21,15 @@ pub trait TtsEngine: Send + Sync {
 }
 
 /// 微软 Edge 朗读 API(与 robot 的 edge-tts 同一服务,长期稳定)。
+/// 在线朗读一句最多等多久(2026-11-11)。`msedge-tts` 的阻塞客户端是裸 `TcpStream::connect`,
+/// 连接与读都没有超时 —— 网络黑洞(请求已 ACK、对端沉默)时会永远挂着。这里给等待方一个界;
+/// 取 60 秒是为了不误伤 `speak_to_file` 的千字长文,不是体感阈值(前端另有 12 秒的竞速)。
+pub(super) const ONLINE_SYNTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// 在线朗读同时在跑的上限。超时只能放弃等待,卡死的那条阻塞线程收不回来(crate 不给超时口),
+/// 所以让线程自己攥着名额:黑洞时最多卡死这么多条,之后的请求等不到名额、按超时如实失败 ——
+/// 不会一句一条地把 tokio 阻塞池(512)吃光,连带拖住 ASR / 落库 / 下载。
+pub(super) const ONLINE_SYNTH_INFLIGHT: usize = 4;
+
 /// 每次合成新建 websocket(简单可靠;句级缓存已大幅摊薄连接成本,池化等真瓶颈再说)。
 pub struct EdgeTts;
 

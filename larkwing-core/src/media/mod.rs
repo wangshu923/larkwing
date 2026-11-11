@@ -36,7 +36,7 @@ pub use download::{DownloadOutcome, DownloadedAudio, TrackMeta};
 pub use drop::{plan_drop, DropOutcome, DropPlan};
 pub use edit::{EditOutcome, EditRequest};
 /// 「回合内等多久再转后台」单源(§4.11):ffmpeg/解压/扫盘/delegate 子回合共用一个 30。
-pub(crate) use edit::IN_TURN_WAIT;
+pub(crate) use edit::{CARD_GRACE, IN_TURN_WAIT};
 pub use torrent::{
     TorrentLink, TorrentOutcome, DEFAULT_ONLY_RE, MAX_CONCURRENT as TORRENT_MAX_CONCURRENT,
 };

@@ -193,6 +193,10 @@ pub struct PendingConfirm {
 pub struct RenderOutcome {
     pub page: Option<RenderedPage>,
     pub download: Option<PathBuf>,
+    /// 点击触发了下载、但这一步的预算内没下完:它还在窗里接着下,这是它的落点(2026-11-11)。
+    /// 原先这种情况结局里只字不提 —— 模型要么拿跳转地址再下一遍(落成重名加序号的第二份),
+    /// 要么被告知「渲染超时」,而文件其实还在落盘。
+    pub download_pending: Option<PathBuf>,
     /// 点击后页面跳去的地址(有跳转、没下载时才有意义):往往就是文件直链——
     /// 模型可接 web_download 试(带会话的平台可能下不动,下不动如实说)。
     pub post_click_url: Option<String>,

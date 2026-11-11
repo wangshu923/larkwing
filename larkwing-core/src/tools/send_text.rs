@@ -102,7 +102,9 @@ impl Tool for SendText {
                 "channel 只能是 telegram/dingtalk/weixin,收到「{ch}」"
             );
         }
-        let target = outbound::resolve_target(&ctx.store, target_user, channel)?;
+        // 没点名收件人也没点名渠道 = 「发我」:优先发回这句话来的那条手机对话
+        let from_conv = (recipient.is_none() && channel.is_none()).then_some(ctx.conv_id);
+        let target = outbound::resolve_target(&ctx.store, target_user, channel, from_conv)?;
 
         let whose = recipient.as_ref().map(|u| format!("{}的", u.name)).unwrap_or_default();
         let who = recipient.as_ref().map(|u| u.name.clone()).unwrap_or_else(|| "你".to_string());
