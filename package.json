@@ -1,7 +1,7 @@
 {
   "name": "larkwing",
   "private": true,
-  "version": "0.2.42",
+  "version": "0.2.43",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -15,7 +15,6 @@
     "@tauri-apps/api": "^2.11.0",
     "@tauri-apps/plugin-updater": "^2.10.1",
     "dompurify": "^3.4.10",
-    "lottie-web": "^5.13.0",
     "marked": "^18.0.5",
     "shaka-player": "^5.1.10",
     "vue": "^3.5.13",

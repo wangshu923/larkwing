@@ -359,6 +359,10 @@ pub fn remove_scope(store: &Store, raw_path: &str) -> anyhow::Result<Vec<ScopeEn
 #[derive(Clone, Default)]
 pub struct Grants {
     inner: Arc<Mutex<GrantsInner>>,
+    /// 「去问用户」这一段一次只进一个(2026-11-11):同一轮的工具调用是并发跑的(批里 4 路更是),
+    /// 几路同时撞上同一个没授权的目录,原先各弹一张一模一样的确认卡 —— 点了第一张「仅这次」,
+    /// 其余几张还在那儿等。排队进来、拿到锁先重判一遍:前一路刚得到的放行 / 拒绝直接生效。
+    asking: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Default)]
@@ -395,6 +399,46 @@ impl Grants {
 // ensure:接入点唯一入口
 // ---------------------------------------------------------------------------
 
+/// 这批路径里哪些还得问用户(返回要请示的目录;空 = 全在圈内)。
+/// **探盘放阻塞线程**(2026-11-11):规范化要 `canonicalize`、定请示目录要 `is_dir`,路径落在
+/// 掉线的 NAS / 网络盘上时每条都吃一次超时(一批 300 条就是 300 次),原先整段压在 tokio 的
+/// 工作线程上,期间别的回合、别的工具全被拖住。
+async fn need_grant(
+    ctx: &super::ToolCtx,
+    access: Access,
+    raw_paths: &[String],
+) -> anyhow::Result<Vec<PathBuf>> {
+    let scopes = load_scopes(&ctx.store);
+    let grants = ctx.grants.allows_snapshot();
+    let raw: Vec<String> = raw_paths.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let baselines = baseline_dirs();
+        // 免闸区 = 数据根 + 系统临时目录(scratch 区,任何本地程序都能写,不算用户文件;
+        // unix 的 /tmp 与 env temp_dir 可能是两处〔mac = /var/folders/…〕,都收)
+        let mut free: Vec<PathBuf> = Vec::new();
+        if let Some(root) = DATA_ROOT.get() {
+            free.push(root.clone());
+        }
+        free.push(normalize_for_check(&std::env::temp_dir().to_string_lossy()));
+        #[cfg(unix)]
+        free.push(normalize_for_check("/tmp"));
+        let env = CheckEnv { free: &free, baselines: &baselines, scopes: &scopes, grants: &grants };
+        let mut need: Vec<PathBuf> = Vec::new();
+        for raw in &raw {
+            if raw.trim().is_empty() {
+                continue;
+            }
+            let t = normalize_for_check(raw);
+            if !allowed(&env, &t, access) {
+                need.push(confirm_dir_of(&t));
+            }
+        }
+        need
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("文件夹授权检查挂了: {e}"))
+}
+
 /// 工具边界的授权检查:`paths` 里任何不在圈内的路径 → 归并成一张确认卡问用户;
 /// 「一直允许」入表、「仅这次」记回合、拒/超时/无通道 = bail(错误观察喂模型,
 /// 话术自带「如实说、别绕」引导)。全部在圈内 = 零打扰直接 Ok。
@@ -403,31 +447,14 @@ pub(crate) async fn ensure(
     access: Access,
     raw_paths: &[String],
 ) -> anyhow::Result<()> {
-    let scopes = load_scopes(&ctx.store);
-    let grants = ctx.grants.allows_snapshot();
-    let baselines = baseline_dirs();
-    // 免闸区 = 数据根 + 系统临时目录(scratch 区,任何本地程序都能写,不算用户文件;
-    // unix 的 /tmp 与 env temp_dir 可能是两处〔mac = /var/folders/…〕,都收)
-    let mut free: Vec<PathBuf> = Vec::new();
-    if let Some(root) = DATA_ROOT.get() {
-        free.push(root.clone());
+    if need_grant(ctx, access, raw_paths).await?.is_empty() {
+        return Ok(()); // 全在圈内:零打扰(绝大多数调用走这条,不碰下面的锁)
     }
-    free.push(normalize_for_check(&std::env::temp_dir().to_string_lossy()));
-    #[cfg(unix)]
-    free.push(normalize_for_check("/tmp"));
-    let env = CheckEnv { free: &free, baselines: &baselines, scopes: &scopes, grants: &grants };
-    let mut need: Vec<PathBuf> = Vec::new();
-    for raw in raw_paths {
-        if raw.trim().is_empty() {
-            continue;
-        }
-        let t = normalize_for_check(raw);
-        if !allowed(&env, &t, access) {
-            need.push(confirm_dir_of(&t));
-        }
-    }
+    // 要问用户:排队(见 Grants::asking),拿到锁后按最新的放行 / 拒绝重判一遍
+    let _asking = ctx.grants.asking.clone().lock_owned().await;
+    let need = need_grant(ctx, access, raw_paths).await?;
     if need.is_empty() {
-        return Ok(());
+        return Ok(()); // 等锁的这会儿,前一路已经替这个目录拿到了放行
     }
     let dirs = dedup_covered(need);
     let list = dirs.iter().map(|d| d.to_string_lossy()).collect::<Vec<_>>().join("、");
@@ -758,6 +785,23 @@ mod tests {
         let ctx = e2e_ctx("noconfirm", None);
         let err = ensure(&ctx, Access::Read, &[outside_dir("nc")]).await.unwrap_err();
         assert!(err.to_string().contains("能碰的文件夹"), "{err:#}");
+    }
+
+    /// 同一轮并发的几路工具调用撞上同一个没授权的目录:只问用户一次(2026-11-11)。
+    /// 原先各弹一张一样的确认卡,点了第一张,其余几张还在等。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_ensure_asks_only_once() {
+        let ctx = e2e_ctx("concurrent", Some(crate::confirm::ConfirmReply::AllowOnce));
+        let p = outside_dir("concurrent");
+        let paths = [p];
+        let (a, b, c, d) = tokio::join!(
+            ensure(&ctx, Access::Read, &paths),
+            ensure(&ctx, Access::Read, &paths),
+            ensure(&ctx, Access::Read, &paths),
+            ensure(&ctx, Access::Read, &paths),
+        );
+        assert!(a.is_ok() && b.is_ok() && c.is_ok() && d.is_ok(), "四路都放行");
+        assert_eq!(ctx.grants.allows_snapshot().len(), 1, "只记了一次放行 = 只问了一次");
     }
 
     #[test]

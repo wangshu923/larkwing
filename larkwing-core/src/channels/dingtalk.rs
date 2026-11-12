@@ -20,7 +20,7 @@ use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
-use super::{drive_turn, render, ChannelCtx, ATTACH_HINT};
+use super::{drive_turn, render, retry_wait, ChannelCtx, ATTACH_HINT};
 use crate::net::scrub;
 use crate::engine::InAttachment;
 use crate::net;
@@ -48,19 +48,35 @@ const VOICE_EMPTY_HINT: &str = "这条语音没听清,再说一遍试试?";
 /// 渠道入口:建 net client,跑服务循环;断开/出错退避重连(不静默失败 §3.5)。
 pub(super) async fn run(ctx: Arc<ChannelCtx>, ct: CancellationToken) {
     let net = Arc::new(net::Client::new(|b| b.timeout(Duration::from_secs(30))));
+    // 凭证没填齐 = 连不了,也不是重试能好的事(2026-11-11,同 telegram):写进状态行,等用户填
+    if ctx.secret("remote.dingtalk.app_key").is_none() || ctx.secret("remote.dingtalk.app_secret").is_none() {
+        ctx.set_state(CHANNEL, false, Some("还没填钉钉应用的 AppKey / AppSecret".into()));
+        tracing::info!("钉钉渠道开着但凭证没填齐,等填了再连");
+        ct.cancelled().await;
+        ctx.set_state(CHANNEL, false, None);
+        return;
+    }
+    let mut fails = 0u32; // 连续失败次数:连上长连接即清零(退避见 super::retry_wait)
     while !ct.is_cancelled() {
-        ctx.set_state(CHANNEL, true, None);
-        if let Err(e) = serve(&ctx, &net, &ct).await {
-            // 出错(含正常的网关轮换断开抛错):记错 + 状态行可见,5s 后重连
-            tracing::warn!(err = %scrub(&e), "钉钉渠道出错,5s 后重连");
-            ctx.set_state(CHANNEL, false, Some(scrub(&e)));
-        }
+        // 状态行「在线」由 serve 在长连接真连上之后置,不在这里预先置
+        let wait = match serve(&ctx, &net, &ct, &mut fails).await {
+            // 正常返回 = 网关轮换 / 断流:马上按短间隔重连,不算失败
+            Ok(()) => super::RETRY_SHORT,
+            Err(e) => {
+                fails += 1;
+                let wait = retry_wait(fails);
+                // 出错:记错 + 状态行可见,退避后重连
+                tracing::warn!(err = %scrub(&e), fails, "钉钉渠道出错,{}s 后重连", wait.as_secs());
+                ctx.set_state(CHANNEL, false, Some(scrub(&e)));
+                wait
+            }
+        };
         if ct.is_cancelled() {
             break;
         }
         tokio::select! {
             _ = ct.cancelled() => break,
-            _ = tokio::time::sleep(Duration::from_secs(5)) => {} // 网关轮换/断线 → 重连
+            _ = tokio::time::sleep(wait) => {}
         }
     }
     ctx.set_state(CHANNEL, false, None);
@@ -68,7 +84,12 @@ pub(super) async fn run(ctx: Arc<ChannelCtx>, ct: CancellationToken) {
 }
 
 /// 一次连接的生命周期:开连接 → WS 收发 →(取消 / 网关 disconnect / 断流 → 返回,由 run 重连)。
-async fn serve(ctx: &Arc<ChannelCtx>, net: &Arc<net::Client>, ct: &CancellationToken) -> Result<()> {
+async fn serve(
+    ctx: &Arc<ChannelCtx>,
+    net: &Arc<net::Client>,
+    ct: &CancellationToken,
+    fails: &mut u32,
+) -> Result<()> {
     let app_key = ctx.secret("remote.dingtalk.app_key").context("没配钉钉 app_key")?;
     let app_secret = ctx.secret("remote.dingtalk.app_secret").context("没配钉钉 app_secret")?;
     let (endpoint, ticket) = open_connection(net, &app_key, &app_secret).await?;
@@ -76,6 +97,8 @@ async fn serve(ctx: &Arc<ChannelCtx>, net: &Arc<net::Client>, ct: &CancellationT
     let url = format!("{endpoint}?ticket={ticket}");
     let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str()).await.context("钉钉 WS 连接失败")?;
     tracing::info!("钉钉 Stream 在线");
+    ctx.set_state(CHANNEL, true, None); // 真连上了才算在线
+    *fails = 0;
 
     // 自己发心跳 + 空闲看门狗(2026-11-11):原先只在服务器来帧时才回应、从不主动发。睡眠唤醒 /
     // NAT 超时后服务端早把连接弃了、本端却没收到 FIN,`ws.next()` 永远挂着 —— 状态行「运行中」,
@@ -247,6 +270,8 @@ async fn run_reply(
     )
     .await
     {
+        // 一个字都没有(回合被取消 / 模型只调了工具没开口)就不发:空内容发出去只换回一条接口报错
+        Ok(Some(reply)) if reply.trim().is_empty() => {}
         Ok(Some(reply)) => {
             if let Err(e) = reply_webhook(net, &m.webhook, &reply).await {
                 tracing::warn!(err = %scrub(&e), "钉钉回复失败");
@@ -318,8 +343,10 @@ async fn handle_audio(
         let _ = reply_webhook(net, &m.webhook, VOICE_TOO_LONG_HINT).await;
         return;
     }
-    if !ctx.voice.asr_ready() {
+    // 听力模型或解码组件(ffmpeg)还没下:先说「准备中」并后台去下(ffmpeg 半边 2026-11-11 补,同 telegram)
+    if !ctx.voice.asr_ready() || !ctx.media.ffmpeg_ready() {
         ctx.voice.prefetch_asr(); // 后台下齐(桌面 HUD 可见),好了再发就能听
+        ctx.media.prefetch_ffmpeg();
         let _ = reply_webhook(net, &m.webhook, VOICE_PREPARING_HINT).await;
         return;
     }

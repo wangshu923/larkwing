@@ -42,13 +42,13 @@ const tab = ref<TabId>('general')
 // 与 MainLayout / FloatWindow 同一口径 —— 这是当前 agent 的名字,不是 app 名
 const petName = computed(() => settings.get('ui.pet_name') || t('pet.name'))
 
-const { asrOpts, calib, cancelCalib, startCalib, calibStepLabel, calibVerdict, cancelClone, captureRoute, captureSource, cloneArm, cloneBusy, cloneDraft, cloneErr, cloneFile, cloneRecording, loadVoice, loadWebMics, micOpts, micValue, onAsrModel, onCustomFile, onEchoCancel, onLeveling, onNightMode, onNightTime, onTtsBackend, onVoiceSeg, pickCustomVoice, previewSpeaker, previewing, recordClone, removeClone, restartWakeIfRunning, saveClone, saveSensitivity, setMic, toggleWake, voiceInfo, wakeBusy, wakeError, wakeShortName } = useVoiceSettings()
+const { asrOpts, calib, cancelCalib, startCalib, calibStepLabel, calibVerdict, cancelClone, cancelRename, commitRename, renaming, startRename, captureRoute, captureSource, cloneArm, cloneBusy, cloneDraft, cloneErr, cloneFile, cloneRecording, loadVoice, loadWebMics, micOpts, micValue, onAsrModel, onCustomFile, onEchoCancel, onLeveling, onNightMode, onNightTime, onTtsBackend, onVoiceSeg, pickCustomVoice, previewSpeaker, previewing, recordClone, removeClone, restartWakeIfRunning, saveClone, saveSensitivity, setMic, toggleWake, voiceInfo, wakeBusy, wakeError, wakeShortName } = useVoiceSettings()
 const { addFam, bindChat, channelName, chats, enrollBusy, enrollLabel, famArm, famDraft, famEditing, famError, famNew, famOpts, family, forgetVoice, loadFamily, removeFam, saveFamRename, startEnrollFam, startFamRename, voice } = useFamilySettings(restartWakeIfRunning)
 const { CUSTOM_PICK, ENDPOINT_PICK, addCustom, adding, advOpen, autoHint, billingOpts, custom, customInput, customPreset, customReady, endpointInput, endpointQuery, guessWinHint, keyDrafts, loadPick, loadPickCustom, modelDraft, modelInputs, modelMeta, onEndpointKey, onPickKey, onPickKeyCustom, openCustom, ovWinK, pickActive, pickEndpoint, pickErr, pickFiltered, pickLists, pickLoading, pickModel, pickModelCustom, pickOpen, presetRows, protoLabel, protoOpts, saveField, saveKey, saveOv, saveOvRaw, tierOpts, toggleAdv, toggleEndpointPick, togglePick, togglePickCustom, visionOpts } = useBrainSettings()
 const { autoBackup, autoBackupBusy, autoBackupLine, autoBackupOff, autoBackupPick, backupBusy, backupErr, backupMsg, backupNow, cancelRelocate, cancelRestore, cleanupOld, confirmRelocate, confirmRestore, dataRoot, gb, keepOld, loadDataLocation, mb, oldDataRoot, pendingMove, pendingRestore, relocate, relocateBusy, relocateError, restoreBusy, restoreError, restorePick, revealData } = useDataSettings(petName)
 const { appPublicKey, autostart, autostartBusy, careEnabled, copyPublicKey, credAdding, credBusy, credForm, credHosts, dropCred, floatEnabled, floatShowUsage, isDev, loadAutostart, loadCreds, openQWeatherSite, proxyEnabled, pubKeyCopied, saveCred, setFloatOpacity, setProxy, setQWeather, toggleAutostart, toggleCare, toggleFloat, toggleFloatUsage, toggleProxy, weatherConfigured } = useSystemSettings()
 const { addScopeFolder, baselineMode, baselineModeOpts, loadScopes, removeScopeRow, scopeDesktop, scopeDownloads, scopeModeOpts, scopes, setBaselineMode, setScopeMode, userScopes } = useScopeSettings()
-const { dt, dtKey, dtSecret, leaveRemoteTab, loadRemote, remoteStatusText, saveRemote, saveRemoteCred, startWeixinLogin, tg, tgToken, toggleRemote, unbindWeixin, wx, wxAccounts, wxLoginStatus, wxQrSvg, wxQrUrl, wxVerifyCode } = useRemoteSettings()
+const { allowTelegramChat, dt, dtKey, dtSecret, leaveRemoteTab, loadRemote, remoteStatusText, saveRemote, saveRemoteCred, startWeixinLogin, tg, tgToken, toggleRemote, unbindWeixin, wx, wxAccounts, wxLoginStatus, wxQrSvg, wxQrUrl, wxVerifyCode } = useRemoteSettings()
 // 关于·版本:真身读 tauri.conf.json(x.y.z),只在系统 tab 拉一次
 const appVer = ref('')
 
@@ -591,12 +591,30 @@ onUnmounted(() => {
           <span class="sp-list">
             <!-- chip 与它的删除 ✕ 包成一组:flex-wrap 换行时一起走,别把 ✕ 拆到下一行开头 -->
             <span v-for="sp in voiceInfo?.speakers ?? []" :key="sp.id" class="sp-pair">
+              <!-- 改名中:小卡换成输入框(Esc 要拦住,不然整个设置页跟着关) -->
+              <input
+                v-if="renaming?.id === sp.id"
+                v-model="renaming.name"
+                class="chip sp rename-input"
+                maxlength="24"
+                :aria-label="t('settings.voice.cloneRename')"
+                @keydown.enter.prevent="commitRename"
+                @keydown.esc.stop.prevent="cancelRename"
+                @blur="commitRename"
+              />
               <button
+                v-else
                 class="chip sp"
                 :class="{ on: (settings.get('voice.speaker') || voiceInfo?.defaultSpeaker) === sp.id, busy: previewing === sp.id }"
                 :title="t('settings.voice.preview')"
                 @click="previewSpeaker(sp.id)"
               >{{ sp.name }}</button>
+              <button
+                v-if="sp.isClone && !sp.builtin && renaming?.id !== sp.id"
+                class="chip-del rename"
+                :title="t('settings.voice.cloneRename')"
+                @click="startRename(sp)"
+              >✎</button>
               <button
                 v-if="sp.isClone && !sp.builtin"
                 class="chip-del"
@@ -880,6 +898,19 @@ onUnmounted(() => {
             :placeholder="t('settings.remote.telegram.allowedPlaceholder')"
             @change="saveRemote('remote.telegram.allowed_chats', $event)"
           />
+        </div>
+        <!-- 刚来敲过门、还没放行的对话:点一下就进白名单(不用去手机上抄 chat id) -->
+        <div v-if="tg.knocks?.length" class="row">
+          <span class="label">{{ t('settings.remote.telegram.knocks') }}</span>
+          <span class="sp-list">
+            <button
+              v-for="k in tg.knocks"
+              :key="k.id"
+              class="chip sp"
+              :title="t('settings.remote.telegram.knockAllow', { id: k.id })"
+              @click="allowTelegramChat(k.id)"
+            >+ {{ k.name || k.id }}</button>
+          </span>
         </div>
         <div class="row">
           <span class="label">{{ t('settings.remote.status') }}</span>
@@ -1437,6 +1468,8 @@ onUnmounted(() => {
 .chip-del { border: none; background: transparent; color: var(--text-dim); cursor: pointer; font-size: 11px; padding: 0 2px; align-self: center; opacity: 0.55; }
 .chip-del:hover { color: var(--danger); opacity: 1; }
 .chip-del.armed { color: var(--danger); opacity: 1; font-weight: 600; }
+.chip-del.rename:hover { color: var(--accent); }
+.chip.sp.rename-input { cursor: text; width: 9em; font: inherit; color: inherit; }
 /* 家人页:行内成员卡 + 渠道对话指认(全语义 token,换肤跟随)。
    .row 默认 space-between 会把中间按钮拉开 → 改左对齐,删除钮 margin-left:auto 靠右 */
 .fam-row { justify-content: flex-start; gap: 10px; }

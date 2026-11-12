@@ -78,6 +78,13 @@ export function useRemoteSettings() {
       if (key.endsWith('.app_secret')) dtSecret.value = ''
     })
   }
+  /** 一键放行刚来敲过门的 Telegram 对话:把它的 id 接到白名单后面(不用去手机上抄那串数字)。 */
+  async function allowTelegramChat(id: string) {
+    const cur = tg.value.allowed_chats.trim()
+    await applyRemote('放行 Telegram 对话', () =>
+      api.setSetting('remote.telegram.allowed_chats', cur ? `${cur}, ${id}` : id),
+    )
+  }
   async function saveRemote(key: string, ev: Event) {
     const v = (ev.target as HTMLInputElement).value.trim()
     await applyRemote('保存渠道设置', () => api.setSetting(key, v))
@@ -158,6 +165,7 @@ export function useRemoteSettings() {
     dtSecret,
     leaveRemoteTab,
     loadRemote,
+    allowTelegramChat,
     remoteStatusText,
     saveRemote,
     saveRemoteCred,

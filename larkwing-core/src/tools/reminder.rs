@@ -190,6 +190,8 @@ impl Tool for ReminderSet {
                     store.chat.set_title(conv.id, &title)?;
                     conv.id
                 } else {
+                    // 落当前对话:它到点得够得着人(钉钉群聊推不回去 → 此刻如实退回)
+                    outbound::ensure_conv_reachable(&store, here_conv)?;
                     here_conv
                 };
                 Ok((store.jobs.add(user_id, conv_id, &content2, first_at, repeat)?, None))
@@ -197,6 +199,7 @@ impl Tool for ReminderSet {
         )
         .await
         .context("提醒落库任务挂了")??;
+        crate::scheduler::kick(); // 调度器按「下一个到期点」睡:新提醒可能比它正在等的那个更早
 
         let place = match &routed {
             Some((name, channel)) => format!("{name}的手机上({channel})"),
@@ -370,6 +373,22 @@ mod tests {
 
     fn tomorrow_str() -> String {
         (chrono::Local::now() + chrono::Duration::days(1)).format("%Y-%m-%d 08:00").to_string()
+    }
+
+    /// 钉钉群聊里设「落在这个对话」的提醒:到点推不回群里 → 创建时就如实退回;单聊(有推送地址)照常。
+    #[tokio::test]
+    async fn remind_in_dingtalk_group_is_refused_up_front() {
+        let ctx = ctx("ding-group");
+        ctx.store.channels.bind("dingtalk", "cid-group", ctx.conv_id).unwrap();
+        let args = serde_json::json!({"content": "提醒大家开会", "first_at": tomorrow_str()});
+        let err = ReminderSet::new().run(args.clone(), &ctx).await.unwrap_err().to_string();
+        assert!(err.contains("钉钉群聊") && err.contains("私聊"), "{err}");
+        assert!(ctx.store.jobs.list_pending(1).unwrap().is_empty(), "没设成就不该留任务");
+
+        // 单聊:入站时存过推送地址 → 能推,照常设
+        ctx.store.channels.set_push_id("dingtalk", "cid-group", "staff-1").unwrap();
+        ReminderSet::new().run(args, &ctx).await.unwrap();
+        assert_eq!(ctx.store.jobs.list_pending(1).unwrap().len(), 1);
     }
 
     #[tokio::test]

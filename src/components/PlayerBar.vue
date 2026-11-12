@@ -46,8 +46,13 @@ const playlist = computed(() => state.current?.playlist ?? null)
 /** ≥2 条音轨才出切换钮(有声书双语版这类;label = 当前轨友好名)。 */
 const audioTrackCount = computed(() => state.current?.audio_tracks?.length ?? 0)
 const audioLabel = computed(() => audioTrackLabel(state.current?.audio_track ?? 0))
-/** 上/下一首:除了「放完就停」,列表都是环 —— 到头回卷,按钮永不禁用。 */
+/** 上/下一首:除了「放完就停」,列表都是环 —— 到头回卷,按钮不禁用。 */
 const wraps = computed(() => state.playMode !== 'once')
+/** 「放完就停」下到头了:那一头的钮置灰(与视频浮层同一判据;原先照样能点,core 如实退回、界面没反应)。 */
+const atFirst = computed(() => !wraps.value && (playlist.value?.index ?? 0) <= 0)
+const atLast = computed(
+  () => !wraps.value && !!playlist.value && playlist.value.index >= playlist.value.total - 1,
+)
 /** 歌手 · 专辑(有啥显啥;都没有就不占位)。 */
 const subline = computed(() => {
   const c = state.current
@@ -228,7 +233,7 @@ onUnmounted(() => {
       <img v-if="coverSrc" :src="coverSrc" alt="" decoding="async" @error="coverBroken = true" />
       <span v-else class="note" :class="{ live: state.status === 'playing' }">♪</span>
     </button>
-    <button v-if="playlist" class="pbtn" @click="prev" :title="kb(t('media.prevTrack'), 'P')">⏮</button>
+    <button v-if="playlist" class="pbtn" :disabled="atFirst" @click="prev" :title="kb(t('media.prevTrack'), 'P')">⏮</button>
     <button
       class="pbtn"
       @click="toggle"
@@ -236,7 +241,7 @@ onUnmounted(() => {
     >
       {{ state.status === 'playing' ? '⏸' : '▶' }}
     </button>
-    <button v-if="playlist" class="pbtn" @click="next" :title="kb(t('media.nextTrack'), 'N')">⏭</button>
+    <button v-if="playlist" class="pbtn" :disabled="atLast" @click="next" :title="kb(t('media.nextTrack'), 'N')">⏭</button>
     <!-- 播放模式:一个钮三档(歌单:列表循环 → 单曲 → 随机;单曲:放完就停 ↔ 单曲循环)。
          图标走内联 SVG(WindowControls 同款 stroke:currentColor):🔁🔀 这类码位是 emoji 表现形,
          永远渲染彩色、无视 CSS color,与其余单色按钮打架 -->
@@ -406,11 +411,11 @@ onUnmounted(() => {
           <div class="l side">{{ lyricAround.next }}</div>
         </div>
         <div class="np-ctl">
-          <button v-if="playlist" class="pbtn" @click="prev" :title="kb(t('media.prevTrack'), 'P')">⏮</button>
+          <button v-if="playlist" class="pbtn" :disabled="atFirst" @click="prev" :title="kb(t('media.prevTrack'), 'P')">⏮</button>
           <button class="pbtn big" @click="toggle" :title="kb(state.status === 'playing' ? t('media.pause') : t('media.play'), 'Space')">
             {{ state.status === 'playing' ? '⏸' : '▶' }}
           </button>
-          <button v-if="playlist" class="pbtn" @click="next" :title="kb(t('media.nextTrack'), 'N')">⏭</button>
+          <button v-if="playlist" class="pbtn" :disabled="atLast" @click="next" :title="kb(t('media.nextTrack'), 'N')">⏭</button>
           <span class="np-mode" @click="cycleMode" :title="kb(modeTitle, 'R')">{{ modeLabel(state.playMode) }}</span>
         </div>
       </div>

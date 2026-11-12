@@ -17,7 +17,10 @@ use base64::Engine as _;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use super::{drive_turn, render, split_message, ChannelCtx, ATTACH_HINT};
+use super::{
+    drive_turn, note_knock, note_stranger, parse_id_list, render, retry_wait, split_message, ChannelCtx,
+    ATTACH_HINT,
+};
 use crate::lockext::LockExt;
 use crate::net::scrub;
 use crate::engine::InAttachment;
@@ -42,8 +45,8 @@ const FILE_MAX_BYTES: i64 = 20 * 1024 * 1024;
 
 // ⚠️ core 侧静态话术(§6.6 本应数据化,如语音的场景 JSON 话术)——MVP 先内联,记债待迁。
 //    这些是渠道**操作性**提示(非人格),不经模型。
-const ONBOARD_HINT: &str =
-    "你好,我是{name}。你的 chat id 是 {id},把它加到设置·远程渠道的白名单里,我们就能聊啦。";
+const ONBOARD_HINT: &str = "你好,我是{name}。你的 chat id 是 {id}。在电脑上打开设置·远程渠道,\
+     点一下就能放行这个对话(或者把这个 id 填进白名单),我们就能聊啦。";
 const ERR_HINT: &str = "(出了点问题,稍后再试试)";
 const UNSUPPORTED_HINT: &str = "这个我还看不了~现在能收:文字、图片、语音,和常见文档(PDF/Word/Excel/PPT/文本)。";
 const FILE_TOO_BIG_HINT: &str = "这个文件有点大,20MB 以内的我才收得动。";
@@ -61,17 +64,30 @@ pub(super) async fn run(ctx: Arc<ChannelCtx>, ct: CancellationToken) {
     // 发来的消息无痕消失。只有进程首次启动才丢积压(别把昨晚的「放首歌」留到今早执行)。
     let mut offset: Option<i64> = None;
     let albums: Albums = Arc::default();
+    // 没填令牌 = 连不了,也不是「重试能好」的事(2026-11-11):如实写进状态行,停在这儿等用户填
+    //(保存设置会重启渠道)。原先每 5 秒报一次「没配 token」。
+    if ctx.secret("remote.telegram.token").is_none() {
+        ctx.set_state(CHANNEL, false, Some("还没填 Telegram 的 bot token".into()));
+        tracing::info!("Telegram 渠道开着但没填 token,等填了再连");
+        ct.cancelled().await;
+        ctx.set_state(CHANNEL, false, None);
+        return;
+    }
+    let mut fails = 0u32; // 连续失败次数:serve 里每成功收一轮清零(退避见 super::retry_wait)
     while !ct.is_cancelled() {
-        ctx.set_state(CHANNEL, true, None);
-        match serve(&ctx, &net, &ct, &mut offset, &albums).await {
+        // 状态行不在这里置「在线」:连上了(serve 里第一轮收成功)才算,免得网络不通时
+        // 这一轮尝试的几十秒里一直显示在线
+        match serve(&ctx, &net, &ct, &mut offset, &albums, &mut fails).await {
             Ok(()) => break, // 正常返回 = 被取消
             Err(e) => {
+                fails += 1;
+                let wait = retry_wait(fails);
                 let msg = scrub(&e);
-                tracing::warn!(err = %msg, "Telegram 渠道出错,5s 后重连");
+                tracing::warn!(err = %msg, fails, "Telegram 渠道出错,{}s 后重连", wait.as_secs());
                 ctx.set_state(CHANNEL, false, Some(msg));
                 tokio::select! {
                     _ = ct.cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    _ = tokio::time::sleep(wait) => {}
                 }
             }
         }
@@ -86,6 +102,7 @@ async fn serve(
     ct: &CancellationToken,
     cursor: &mut Option<i64>,
     albums: &Albums,
+    fails: &mut u32,
 ) -> Result<()> {
     let token = ctx.secret("remote.telegram.token").context("没配 Telegram token")?;
     let allowed = allowed_chats(ctx);
@@ -95,17 +112,26 @@ async fn serve(
         None => latest_offset(net, &token).await,
     };
     *cursor = Some(offset);
-    tracing::info!(offset, allow = allowed.len(), "Telegram 渠道在线");
+    tracing::info!(offset, allow = allowed.len(), "Telegram 渠道起跑");
 
+    // 每次(重)连的第一轮不挂长轮询(timeout=0 立刻返回):一来马上知道连不连得上、状态行据实置
+    // 「在线」,二来断线期间攒下的消息不用再等。之后才是 50 秒的长轮询。
+    let mut first = true;
     loop {
         if ct.is_cancelled() {
             return Ok(());
         }
+        let poll_s = if first { 0 } else { POLL_TIMEOUT_S };
         // 长轮询期间也能被取消(否则要等满 50s)
         let updates = tokio::select! {
             _ = ct.cancelled() => return Ok(()),
-            r = get_updates(net, &token, offset, POLL_TIMEOUT_S) => r?,
+            r = get_updates(net, &token, offset, poll_s) => r?,
         };
+        if first {
+            first = false;
+            ctx.set_state(CHANNEL, true, None);
+        }
+        *fails = 0;
         for upd in updates {
             if let Some(id) = upd.get("update_id").and_then(Value::as_i64) {
                 offset = offset.max(id + 1);
@@ -118,9 +144,12 @@ async fn serve(
             // 访问控制(非风控 §9):配了白名单就只放行名单内;空白名单 = 谁来都先发 onboarding
             if !allowed.is_empty() {
                 if !allowed.contains(&chat) {
-                    continue; // 已设名单的陌生 chat:静默忽略
+                    note_stranger(CHANNEL, &chat); // 不回话,但日志里留一笔(同一个 id 只记一次)
+                    note_knock(CHANNEL, &chat, sender.as_deref().unwrap_or("")); // 设置页可一键放行
+                    continue;
                 }
             } else {
+                note_knock(CHANNEL, &chat, sender.as_deref().unwrap_or(""));
                 // 名字跟随用户设置(§6.6 名字准则):{name} 注入主人的 ui.pet_name(空=默认名),不硬编「旺财」。
                 let hint = ONBOARD_HINT
                     .replace("{name}", &ctx.engine.pet_name())
@@ -314,8 +343,11 @@ async fn handle_voice(
         let _ = send_message(net, token, chat_id, VOICE_TOO_LONG_HINT).await;
         return;
     }
-    if !ctx.voice.asr_ready() {
+    // 听力模型或解码组件(ffmpeg)还没下:先如实说「准备中」并后台去下,别卡着等。
+    // ffmpeg 这半边是 2026-11-11 补的 —— 原先解码时内联去下几十 MB,手机那头对着空气等。
+    if !ctx.voice.asr_ready() || !ctx.media.ffmpeg_ready() {
         ctx.voice.prefetch_asr(); // 后台下齐(桌面 HUD 可见),好了再发就能听
+        ctx.media.prefetch_ffmpeg();
         let _ = send_message(net, token, chat_id, VOICE_PREPARING_HINT).await;
         return;
     }
@@ -709,14 +741,7 @@ fn is_private_chat(upd: &Value) -> bool {
 
 /// 白名单(逗号/空格/分号/换行分隔的 chat id);空 = 未配置。
 fn allowed_chats(ctx: &ChannelCtx) -> Vec<String> {
-    ctx.setting("remote.telegram.allowed_chats")
-        .map(|s| {
-            s.split([',', '，', ' ', ';', '；', '\n'])
-                .map(|x| x.trim().to_string())
-                .filter(|x| !x.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
+    ctx.setting("remote.telegram.allowed_chats").map(|s| parse_id_list(&s)).unwrap_or_default()
 }
 
 #[cfg(test)]

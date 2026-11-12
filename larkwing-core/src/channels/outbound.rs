@@ -15,6 +15,21 @@ use crate::net::scrub;
 use crate::net;
 use crate::store::Store;
 
+/// 「到点会出现在这个对话里」的提醒,这个对话到时候够不够得着人?够不着就在**创建时**如实退回
+/// (§3.5:别设一个到点没人收得到的提醒)。桌面会话、能主动推的渠道会话 → Ok。
+/// 现在只有一种够不着:**钉钉群聊** —— 机器人只能主动推单聊(群里的回话靠入站消息带的临时地址),
+/// 映射行上没有推送地址(`push_id`)。原先照设不误,到点回合跑完却推不出去,群里什么都没有。
+pub fn ensure_conv_reachable(store: &Store, conv_id: i64) -> Result<()> {
+    let Some(thread) = store.channels.thread_by_conv(conv_id)? else { return Ok(()) };
+    if thread.channel == "dingtalk" && thread.push_id.is_none() {
+        bail!(
+            "这是钉钉群聊:到点后机器人没法主动往群里发消息(钉钉只让机器人主动发单聊),这个提醒设了也送不到。\
+             如实告诉用户:请私聊我再设;或者说清楚要提醒谁,用 for 直接推到 TA 的手机上。"
+        );
+    }
+    Ok(())
+}
+
 /// 每渠道体积上限(超限如实退回,绝不静默截断/压缩)。
 const TG_FILE_MAX: u64 = 50 * 1024 * 1024;
 const DT_FILE_MAX: u64 = 20 * 1024 * 1024;
@@ -273,12 +288,18 @@ pub(crate) async fn send_file(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .ok_or_else(|| anyhow!("路径没有文件名: {}", path.display()))?;
-    let bytes = tokio::fs::read(path).await.with_context(|| format!("读文件失败 {}", path.display()))?;
+    // 字节按需读(2026-11-11):微信那条路自己读文件(要边读边加密上传),原先在这里先读了一遍
+    // 又没用上,最多白读 50MB。
+    let read = || async {
+        tokio::fs::read(path).await.with_context(|| format!("读文件失败 {}", path.display()))
+    };
     match target {
         Target::Telegram { token, chat_id } => {
+            let bytes = read().await?;
             tg_send_document(net, super::telegram::API, token, chat_id, &name, bytes, caption).await
         }
         Target::Dingtalk { app_key, app_secret, staff_id } => {
+            let bytes = read().await?;
             dt_send_file(net, app_key, app_secret, staff_id, &name, bytes).await?;
             if let Some(cap) = caption.filter(|s| !s.is_empty()) {
                 if let Err(e) = super::dingtalk::push(net, app_key, app_secret, staff_id, cap).await

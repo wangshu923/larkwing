@@ -82,6 +82,13 @@ struct SessionEntry {
     /// 是新加的 —— 原先只有 agent 调步才算,用户在窗里接手登录时窗会在手底下过期消失)。
     /// Arc:窗口回调闭包在 entry 建成之前就要拿到它。
     last_used: Arc<Mutex<Instant>>,
+    /// 最近一次**有人**在用:agent 调一步 / 用户点了窗。页面自己的导航不算(2026-11-11)——
+    /// 见 `nav_renews`:页面自己跳只能在「有人用过之后的一个 TTL 内」续命,不然会自动刷新的页
+    /// (行情 / 直播 / 轮播广告)永远不过期,那个置顶小窗就一直挂在屏幕上。
+    last_actor: Arc<Mutex<Instant>>,
+    /// 用户此刻正停在这个窗里(Focused 事件维护)。停在里面就算在用 —— 原先只在「获得焦点那一刻」
+    /// 续一次,在窗里慢慢填一张长表超过 TTL,窗会在手底下被收走。
+    focused: Arc<AtomicBool>,
     /// 窗题的「本体」(站名 → 快照后换成页标题):倒计时拼在它后面显示,别把倒计时当本体存回去。
     title: Mutex<String>,
     /// 同一个窗一次只跑一步(2026-11-11):同一轮的工具调用是并发执行的,模型对着同一张快照同时发
@@ -101,7 +108,9 @@ struct ReadCache {
 
 impl SessionEntry {
     fn touch(&self) {
-        *self.last_used.lk() = Instant::now();
+        let now = Instant::now();
+        *self.last_used.lk() = now;
+        *self.last_actor.lk() = now;
     }
 
     /// 距 TTL 收摊还剩多久(0 = 该收了)。
@@ -115,6 +124,12 @@ impl SessionEntry {
         let base = self.title.lk().clone();
         let _ = self.win.set_title(&ttl_title(&base, self.remaining()));
     }
+}
+
+/// 窗里发生一次导航,算不算「在用」(纯函数,可测):用户正停在窗里 → 算;否则只在「有人用过之后
+/// 的一个 TTL 内」算 —— 扫码登录后的跳转照旧续命,页面自己没完没了地刷新最多把窗多留一个 TTL。
+fn nav_renews(focused: bool, since_actor: Duration) -> bool {
+    focused || since_actor < SESSION_TTL
 }
 
 /// `本体 · ⏱ 07:30`(纯函数,可测)。
@@ -141,6 +156,10 @@ impl ShellWebRenderer {
                 // 倒计时上窗题(2026-09-17):锁内取快照、锁外改题(set_title 走事件循环,别持锁调)
                 let live: Vec<Arc<SessionEntry>> = sweep.lk().values().cloned().collect();
                 for e in &live {
+                    // 用户正停在窗里 = 在用(每拍续一次;离开窗那一刻起才开始倒计时)
+                    if e.focused.load(Ordering::Relaxed) {
+                        e.touch();
+                    }
                     e.refresh_title();
                 }
                 let expired: Vec<(String, Arc<SessionEntry>)> = {
@@ -588,6 +607,12 @@ fn open_session(
     let last_used = Arc::new(Mutex::new(Instant::now()));
     let last_used_nav = last_used.clone();
     let last_used_evt = last_used.clone();
+    let last_actor = Arc::new(Mutex::new(Instant::now()));
+    let last_actor_nav = last_actor.clone();
+    let last_actor_evt = last_actor.clone();
+    let focused = Arc::new(AtomicBool::new(false));
+    let focused_nav = focused.clone();
+    let focused_evt = focused.clone();
     let win = tauri::WebviewWindowBuilder::new(app, &sid, tauri::WebviewUrl::External(url))
         .title(&host)
         .inner_size(THUMB_W, THUMB_H)
@@ -607,7 +632,11 @@ fn open_session(
         .initialization_script(POPUP_TAME_JS)
         .on_navigation(move |u| {
             nav_slot.lk().push((Instant::now(), u.to_string()));
-            *last_used_nav.lk() = Instant::now(); // 窗里发生导航 = 在用(用户点链接 / 登录跳转都算)
+            // 窗里发生导航 = 在用(用户点链接 / 登录跳转都算),但页面自己刷新不能无限续(见 nav_renews)
+            let since_actor = last_actor_nav.lk().elapsed();
+            if nav_renews(focused_nav.load(Ordering::Relaxed), since_actor) {
+                *last_used_nav.lk() = Instant::now();
+            }
             true // 只观察不拦
         })
         .on_download(move |_wv, ev| {
@@ -656,10 +685,14 @@ fn open_session(
                     let _ = win_evt.set_zoom((w / PAGE_LAYOUT_W).clamp(0.15, 1.5));
                 }
             }
-            tauri::WindowEvent::Focused(true) => {
-                // 用户点了窗 = 在用:续 TTL(窗题的倒计时在下一拍清扫时回满,≤30s)。
+            tauri::WindowEvent::Focused(on) => {
+                // 用户点了窗 = 在用:续 TTL(窗题的倒计时在下一拍清扫时回满,≤30s);停在窗里期间由
+                // 清扫每拍续。离开窗也记一次时刻 —— 倒计时从离开那一刻起算,不是从上一拍清扫起算。
                 // 只改时刻不在回调里 set_title:事件回调跑在主线程,别再往事件循环里塞调度。
-                *last_used_evt.lk() = Instant::now();
+                focused_evt.store(*on, Ordering::Relaxed);
+                let now = Instant::now();
+                *last_used_evt.lk() = now;
+                *last_actor_evt.lk() = now;
             }
             tauri::WindowEvent::Destroyed => {
                 // 用户手动关窗 / 被销毁:注册表同步摘除(幂等——清扫/挤位路径已先摘)。
@@ -681,6 +714,8 @@ fn open_session(
         read_cache: Mutex::new(None),
         step_gate: tokio::sync::Mutex::new(()),
         last_used,
+        last_actor,
+        focused,
         title: Mutex::new(host.clone()),
     });
     sessions.lk().insert(sid.clone(), entry.clone());
@@ -1776,6 +1811,16 @@ fn build_snapshot_script(collect_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 导航续命(2026-11-11):用户停在窗里恒算;没人在窗里时,只有「有人用过之后的一个 TTL 内」
+    /// 的导航才算 —— 自动刷新的页最多把窗多留一个 TTL,不会永远不过期。
+    #[test]
+    fn page_driven_navigation_cannot_renew_forever() {
+        assert!(nav_renews(true, SESSION_TTL * 5), "用户正停在窗里:怎么都算在用");
+        assert!(nav_renews(false, Duration::from_secs(30)), "刚有人用过:登录跳转照旧续命");
+        assert!(!nav_renews(false, SESSION_TTL), "没人用过一个 TTL 了:页面自己刷新不再续");
+        assert!(!nav_renews(false, SESSION_TTL * 3));
+    }
 
     /// 窗题倒计时格式(2026-09-17):本体 · ⏱ mm:ss,语言中立。
     #[test]

@@ -234,13 +234,29 @@ impl MediaRuntime {
     /// 上/下一集(嘴控「下一集」、播放器按钮、`ended` 自动续播都汇到这):在**现有队列**里挪
     /// `delta`(±1),把那一集现取现播(不重建队列、流地址永不过期)。越界 = 报错喂回(到头/到顶)。
     pub async fn advance(&self, user_id: i64, delta: i32) -> Result<PlayOutcome> {
+        self.void_stale_sleep();
         self.switch_episode(user_id, EpisodeTarget::Delta(delta)).await
+    }
+
+    /// 睡眠定时的点已经过了(暂停着过的点,到点那一刻并没在放):用户之后**亲手**切歌 = 这个定时作废
+    /// (2026-11-11;原先定时跨集保留,第二天点「下一首」会被立刻淡出停掉)。只在手动入口调
+    /// (`advance` / `jump_to_episode`);`auto_next` 不调 —— 换曲间隙跨过定时点时前端下一拍照旧停下。
+    fn void_stale_sleep(&self) {
+        let stale = matches!(
+            *self.inner.sleep.lk(),
+            Some(SleepTimer::At { ends_at_ms }) if ends_at_ms <= crate::store::now_ms()
+        );
+        if stale {
+            *self.inner.sleep.lk() = None;
+            self.publish(MediaEvent::Sleep { sleep: None });
+        }
     }
 
     /// 跳到第 N 集(1 起数;嘴控「看第五集」):队列是 core 的单一真相(B 站合集/分P、本地剧集
     /// 同一套 entries,「第N/共M集」的 N/M 就来自它)—— 模型只说集数,不需要也不可能自己拼链接。
     /// 越界/没在放剧集 = 报错喂回;跳到当前集 = 从头重放该集(合「再放一遍这集」的口语义)。
     pub async fn jump_to_episode(&self, user_id: i64, episode: usize) -> Result<PlayOutcome> {
+        self.void_stale_sleep();
         self.switch_episode(user_id, EpisodeTarget::Nth(episode)).await
     }
 
@@ -779,6 +795,30 @@ mod tests {
             }
             other => panic!("应为 Playing,实际 {other:?}"),
         }
+    }
+
+    /// 睡眠定时过了点(暂停着过的):自动接下一首不动它(前端下一拍照旧停下),亲手切歌才作废(2026-11-11)。
+    #[tokio::test]
+    async fn stale_sleep_timer_survives_auto_next_but_not_a_manual_skip() {
+        let (rt, _rx) = runtime("sleep-stale");
+        let dir = std::env::temp_dir().join(format!("lw-sleep-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in ["a.mp3", "b.mp3", "c.mp3"] {
+            touch(&dir, n);
+        }
+        rt.play(1, &dir.to_string_lossy(), false, false, None).await.unwrap();
+        let past = Some(SleepTimer::At { ends_at_ms: crate::store::now_ms() - 60_000 });
+        *rt.inner.sleep.lk() = past;
+        rt.auto_next(1).await.unwrap().expect("有下一首");
+        assert_eq!(*rt.inner.sleep.lk(), past, "自动续播:过点的定时留着,交前端停");
+        rt.advance(1, 1).await.unwrap();
+        assert_eq!(*rt.inner.sleep.lk(), None, "亲手切歌:过点的定时作废");
+        // 还没到点的定时:亲手切歌照旧跨集保留
+        let future = Some(SleepTimer::At { ends_at_ms: crate::store::now_ms() + 600_000 });
+        *rt.inner.sleep.lk() = future;
+        rt.advance(1, -1).await.unwrap();
+        assert_eq!(*rt.inner.sleep.lk(), future);
     }
 
     #[tokio::test]

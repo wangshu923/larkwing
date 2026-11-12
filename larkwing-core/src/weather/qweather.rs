@@ -207,11 +207,14 @@ fn parse_days(fc: &Value, when: When) -> Vec<DayForecast> {
     let take = if when == When::Today { 1 } else { arr.len() };
     arr.iter()
         .take(take)
-        .map(|d| DayForecast {
-            date: d.get("fxDate").and_then(Value::as_str).unwrap_or("").to_string(),
-            high_c: str_i32(d.get("tempMax")).unwrap_or(0),
-            low_c: str_i32(d.get("tempMin")).unwrap_or(0),
-            text: d.get("textDay").and_then(Value::as_str).unwrap_or("").to_string(),
+        // 气温缺了的那天整天不要(同 open_meteo:缺值别落成 0°C 的假数据)
+        .filter_map(|d| {
+            Some(DayForecast {
+                date: d.get("fxDate").and_then(Value::as_str).unwrap_or("").to_string(),
+                high_c: str_i32(d.get("tempMax"))?,
+                low_c: str_i32(d.get("tempMin"))?,
+                text: d.get("textDay").and_then(Value::as_str).unwrap_or("").to_string(),
+            })
         })
         .collect()
 }

@@ -3,7 +3,7 @@
 //!   · 快照可查:`task_status` 工具 + 每回合〔此刻〕背景一行(零工具调用即知进度);
 //!   · 可取消:`task_cancel` → 协作式旗标,任务逐项自查,正在做的那一项做完就停;
 //!   · 收尾必有动静:完成/取消/半路断,一律把汇总插成 due=now 的一次性 `jobs` 任务 →
-//!     调度器 ≤30s 捡起 wake_turn 唤回合,模型向用户转述(§3.5 委托的活绝不无声收场);
+//!     入库即踢调度器、随即 wake_turn 唤回合(会话正忙则 ≤30s 后重试),模型向用户转述(§3.5 委托的活绝不无声收场);
 //!   · 卡死看门狗:超过 STALL_MS 无步进 = 判卡 + abort + 照常汇报(TaskHandle 的
 //!     drop-自动-fail 只兜「崩了」,这里兜「活着但僵住」)。
 //! 定位 = 通用件(§5 三物种判据),**不是**模型的手脚:长活工具各自决定走 job 模式后注册
@@ -371,7 +371,7 @@ impl BgTasks {
         });
     }
 
-    /// 收尾汇报:插 due=now 的一次性 jobs 任务(调度器 ≤30s 捡起 wake_turn 唤回合)。
+    /// 收尾汇报:插 due=now 的一次性 jobs 任务,入库即踢调度器(`scheduler::kick`)唤回合;会话正忙则 ≤30s 后重试。
     /// 走 `add_report`(kind=report)而不是普通提醒 —— 下游据此把「后台忙完了」与「到点提醒」
     /// 分开:汇报不自动念、系统线也不贴「到点了」(2026-08-15 真机:打字支使它干活,汇报却被念出来)。
     /// 插不进去只 warn(汇报丢了不至于砸任务;任务条终态仍在)。
@@ -389,8 +389,10 @@ impl BgTasks {
         let (user_id, conv_id) = origin;
         let due = now_ms();
         let insert = move || {
-            if let Err(e) = store.jobs.add_report(user_id, conv_id, &text, due) {
-                tracing::warn!("后台任务收尾汇报没插进任务: {e:#}");
+            match store.jobs.add_report(user_id, conv_id, &text, due) {
+                // 汇报是「现在到期」的:踢调度器一脚,别让它睡满这一觉才来开口
+                Ok(_) => crate::scheduler::kick(),
+                Err(e) => tracing::warn!("后台任务收尾汇报没插进任务: {e:#}"),
             }
         };
         // 常态在 tokio 里(收尾/看门狗)→ 丢线程池;没有运行时(Drop 兜底路/同步测试)→ 直接插

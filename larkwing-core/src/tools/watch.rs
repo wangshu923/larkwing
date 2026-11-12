@@ -30,13 +30,11 @@ impl WatchSet {
         WatchSet {
             spec: ToolSpec {
                 name: "watch_set",
-                description: "设「条件提醒」——天气满足某条件时主动提醒(不是到点,而是到天气)。\
-                              用于「降温了提醒我加衣」「下雨提醒我带伞」「太热了提醒我」这类(到点\
-                              用 reminder_set)。content 自包含:满足时看不到现在的对话,把要提醒\
-                              的事写全。metric=看哪项(low_temp 最低温 / high_temp 最高温 / \
-                              rain 有无雨雪);op=below(≤阈值)/ above(≥阈值)/ is(rain 用);\
-                              value=温度阈值(℃,rain 省略)。城市默认本地(自动定位,别反问)。\
-                              一次性:提醒过就结束。看/取消用 reminder_list / reminder_cancel。",
+                description: "设「条件提醒」——天气满足某条件时主动提醒(不是到点,而是到天气)。用于「降温了提醒我加\
+                              衣」「下雨提醒我带伞」「太热了提醒我」这类(到点用 reminder_set)。cont\
+                              ent 自包含:满足时看不到现在的对话,把要提醒的事写全。城市默认本地(自动定位,别反问\
+                              )。一次性:提醒过就结束。看/取消用 reminder_list / reminder_\
+                              cancel。",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -139,12 +137,15 @@ impl Tool for WatchSet {
         let store = ctx.store.clone();
         let (user_id, conv_id) = (ctx.user_id, ctx.conv_id);
         let content2 = content.clone();
-        // first_check_at = now:下个 tick(~30s)就先查一次,已满足则立即提醒
+        // first_check_at = now:入库后踢调度器一脚,马上先查一次,已满足则立即提醒
         let job = tokio::task::spawn_blocking(move || {
+            // 满足时在这个对话里开口:它得够得着人(钉钉群聊推不回去 → 此刻如实退回)
+            crate::channels::outbound::ensure_conv_reachable(&store, conv_id)?;
             store.jobs.add_watch(user_id, conv_id, &content2, &cond_json, now)
         })
         .await
         .context("条件提醒落库任务挂了")??;
+        crate::scheduler::kick(); // 第一次检查就是现在:不等下一拍
 
         Ok(format!(
             "已盯上了 #{}:{}(守 {} 天),满足就提醒你",

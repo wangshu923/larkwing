@@ -82,6 +82,7 @@ impl Tool for WebSearch {
     }
 
     async fn run(&self, args: serde_json::Value, _ctx: &ToolCtx) -> anyhow::Result<String> {
+        let started = std::time::Instant::now();
         let query = args
             .get("query")
             .and_then(serde_json::Value::as_str)
@@ -97,16 +98,28 @@ impl Tool for WebSearch {
             return Ok("没搜到相关结果,换个关键词试试".into());
         }
 
-        // 搜索即抓取:前 N 条并发取正文(失败的静默降级为只有摘要)
+        // 搜索即抓取:前 N 条并发取正文(失败的静默降级为只有摘要)。
+        // **这一步只用剩下的时间**(2026-11-11):前面的三源梯子最多花掉 30 秒,抓正文遇到慢站
+        // (直连超时 + 代理兜底 + 跳板页)又是二三十秒 —— 合起来超过工具的 50 秒,整次调用被从外面
+        // 掐掉,连已经搜到的结果一起丢。到点没抓回来的那几条只给摘要,搜到的条目一条不少。
+        let left = self
+            .spec
+            .timeout
+            .saturating_sub(started.elapsed())
+            .saturating_sub(std::time::Duration::from_secs(3)); // 留 3 秒拼结果、回话
         let texts: Vec<Option<String>> = if with_content {
             join_all(hits.iter().take(CONTENT_TOP_N).map(|h| {
                 let web = self.web.clone();
                 let url = h.url.clone();
                 async move {
-                    match web.fetch_text(&url).await {
-                        Ok((_, text)) => Some(clip(&text, PIECE_MAX_CHARS)),
-                        Err(e) => {
+                    match tokio::time::timeout(left, web.fetch_text(&url)).await {
+                        Ok(Ok((_, text))) => Some(clip(&text, PIECE_MAX_CHARS)),
+                        Ok(Err(e)) => {
                             tracing::debug!(url, "正文抓取失败,只给摘要: {e:#}");
+                            None
+                        }
+                        Err(_) => {
+                            tracing::debug!(url, "正文抓取超出剩余时间,只给摘要");
                             None
                         }
                     }

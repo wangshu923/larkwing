@@ -148,14 +148,30 @@ pub async fn send_message(
         .send_message(conv_id, text, meta, attachments.unwrap_or_default())
         .await?;
     tauri::async_runtime::spawn(async move {
+        let mut settled = false;
         while let Some(ev) = rx.recv().await {
+            settled |= turn_settled(&ev);
             // 前端不听了(窗口刷新等):drop rx 即可,落库由 engine 侧保证
             if on_event.send(ev).is_err() {
-                break;
+                return;
             }
+        }
+        // 通道关了却没见终态 = 回合任务异常结束(2026-11-11):前端只认终态收尾,不补这一条它就
+        // 一直停在「在想」、停止钮也按不动。文案由前端按 kind 选(§6.6),message 只进日志。
+        if !settled {
+            tracing::error!(conv_id, "回合事件通道关闭时没有终态,补发一条 Failed");
+            let _ = on_event.send(TurnEvent::Failed {
+                kind: larkwing_core::engine::ErrorKind::Internal,
+                message: "turn ended without a terminal event".into(),
+            });
         }
     });
     Ok(())
+}
+
+/// 这条事件是不是回合的终态(之后不会再有事件)。
+fn turn_settled(ev: &TurnEvent) -> bool {
+    matches!(ev, TurnEvent::Done { .. } | TurnEvent::Failed { .. } | TurnEvent::Cancelled)
 }
 
 /// 插队(PLAN §9 B):把消息塞进正在跑的回合,下一轮 LLM 带上(不打断)。
@@ -169,6 +185,12 @@ pub async fn inject_message(
     attachments: Option<Vec<larkwing_core::engine::InAttachment>>,
 ) -> Result<bool, AppError> {
     Ok(state.engine.inject(conv_id, text, meta, attachments.unwrap_or_default()).await)
+}
+
+/// 这个会话有没有回合在飞(主窗对账自启回合的「在飞」标记用;只查内存里的句柄,不碰库)。
+#[tauri::command]
+pub fn conversation_busy(state: State<'_, AppState>, conv_id: i64) -> bool {
+    state.engine.conversation_busy(conv_id)
 }
 
 /// 停止按钮;幂等。
@@ -934,6 +956,9 @@ pub async fn media_login(
     title: String,
 ) -> Result<(), AppError> {
     const LABEL: &str = "media-login";
+    // 轮询认「这一次开的窗」不认窗名(2026-11-11):关窗后 1.5 秒内又点开,上一轮的轮询会把新窗认成
+    // 自己的 —— 两轮同时读 cookie,而且上一轮的 5 分钟期限会提前把新窗关掉。
+    static LOGIN_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let spec = state
         .media
         .login_spec(&source)
@@ -955,6 +980,8 @@ pub async fn media_login(
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
     );
     builder.build().map_err(AppError::internal)?;
+    let my_gen = LOGIN_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let current = move || LOGIN_GEN.load(std::sync::atomic::Ordering::SeqCst) == my_gen;
 
     // cookie 域兜底:host 去掉 www. 前缀加点(原生 API 偶尔不回 domain 字段)
     let fallback_domain = cookie_url
@@ -967,7 +994,10 @@ pub async fn media_login(
     tauri::async_runtime::spawn(async move {
         for _ in 0..200 {
             tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-            // 用户手动关窗 = 放弃登录,轮询随之收摊
+            // 用户手动关窗 = 放弃登录,轮询随之收摊;窗已经换了一代(关了又开)= 那是别人的窗
+            if !current() {
+                return;
+            }
             let Some(win) = app.get_webview_window(LABEL) else { return };
             // mac 上 wry 的 cookies_for_url 按「cookie 域 == URL 域」精确比较,
             // `.bilibili.com` 的登录 cookie 对 www 主机永远匹配不上(2026-07-06 实锤,
@@ -1011,6 +1041,9 @@ pub async fn media_login(
             return;
         }
         // 5 分钟没扫:关窗收摊(可以再点一次重来)
+        if !current() {
+            return;
+        }
         if let Some(win) = app.get_webview_window(LABEL) {
             let _ = win.close();
         }
@@ -1245,6 +1278,8 @@ pub struct RemoteChannelView {
     pub allowed_chats: String,
     pub running: bool,
     pub last_error: Option<String>,
+    /// 最近来敲过门、还不在白名单里的对话(现在只有 Telegram 有):设置页给「点一下放行」。
+    pub knocks: Vec<larkwing_core::channels::Knock>,
 }
 
 // ---- 下载认证(WebDAV / 需要账号的直链;§7.7 凭证不过桥)。密码只进得去不出得来:
@@ -1293,9 +1328,18 @@ pub fn remote_status(state: State<'_, AppState>) -> Result<Vec<RemoteChannelView
             id: id.into(),
             enabled: get(enabled_k).as_deref() == Some("1"),
             configured,
-            allowed_chats: allowed,
             running: st.map(|s| s.running).unwrap_or(false),
             last_error: st.and_then(|s| s.last_error.clone()),
+            knocks: if id == "telegram" {
+                let listed = larkwing_core::channels::parse_id_list(&allowed);
+                larkwing_core::channels::recent_knocks(id)
+                    .into_iter()
+                    .filter(|k| !listed.contains(&k.id))
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            allowed_chats: allowed,
         }
     };
     Ok(vec![

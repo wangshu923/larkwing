@@ -164,13 +164,88 @@ fn build_inject_ready(
     eff_meta.attachments = refs.clone();
     let payload = (!eff_meta.is_default()).then(|| serde_json::to_string(&eff_meta).ok()).flatten();
     let llm_content = format!("{text}{doc_text}");
-    InjectReady { display: text, llm_content, parts, refs, payload }
+    InjectReady { display: text, llm_content, parts, refs, payload, event: false }
+}
+
+/// 自启回合事件转发时,文字 / 思考增量最多攒这么久就发一次(2026-11-12)。逐 token 发会把全局
+/// 事件车道(有界 256)塞满,别的订阅者跟着丢事件;前端本就有打字机平滑,攒几十毫秒看不出来。
+const RELAY_FLUSH_EVERY: std::time::Duration = std::time::Duration::from_millis(60);
+
+/// 把一个自启回合的 `TurnEvent` 按序转到全局事件车道(`AppEvent::Turn`):相邻的文字增量并成一条、
+/// 相邻的思考增量并成一条(两种不混),其余事件原样过、且先把攒着的增量发掉 —— 顺序不乱。
+struct TurnRelayer {
+    bus: crate::bus::Bus,
+    conv_id: i64,
+    seq: u64,
+    /// (是不是思考增量, 攒着的文字)
+    held: Option<(bool, String)>,
+    last_flush: std::time::Instant,
+}
+
+impl TurnRelayer {
+    fn new(bus: crate::bus::Bus, conv_id: i64) -> Self {
+        Self { bus, conv_id, seq: 0, held: None, last_flush: std::time::Instant::now() }
+    }
+
+    fn holding(&self) -> bool {
+        self.held.is_some()
+    }
+
+    fn emit(&mut self, ev: &TurnEvent) {
+        let Ok(event) = serde_json::to_value(ev) else { return };
+        self.bus.publish(crate::bus::AppEvent::Turn(crate::bus::TurnRelay {
+            conv_id: self.conv_id,
+            seq: self.seq,
+            event,
+        }));
+        self.seq += 1;
+    }
+
+    fn flush(&mut self) {
+        if let Some((thinking, text)) = self.held.take() {
+            let ev = if thinking { TurnEvent::Thinking(text) } else { TurnEvent::Delta(text) };
+            self.emit(&ev);
+        }
+        self.last_flush = std::time::Instant::now();
+    }
+
+    fn push(&mut self, ev: TurnEvent) {
+        let (thinking, text) = match ev {
+            TurnEvent::Delta(t) => (false, t),
+            TurnEvent::Thinking(t) => (true, t),
+            other => {
+                self.flush();
+                self.emit(&other);
+                return;
+            }
+        };
+        match &mut self.held {
+            Some((kind, buf)) if *kind == thinking => buf.push_str(&text),
+            _ => {
+                self.flush(); // 换了种类:先把另一种发掉
+                self.held = Some((thinking, text));
+            }
+        }
+        if self.last_flush.elapsed() >= RELAY_FLUSH_EVERY {
+            self.flush();
+        }
+    }
 }
 
 // ---------- Engine ----------
 
 impl Engine {
     /// 幂等取消:没在飞 = no-op。await 旧回合收尾(partial 落库完成)后才返回。
+    /// 这个会话此刻有没有回合在飞(主窗对账用:自启回合的收尾事件万一漏了,靠它把
+    /// 「在飞」标记收回来,别让打字永远进排队区)。
+    pub fn conversation_busy(&self, conv_id: i64) -> bool {
+        self.sessions
+            .lk()
+            .get(&conv_id)
+            .and_then(|s| s.inflight.as_ref())
+            .is_some_and(|h| !h.join.is_finished())
+    }
+
     pub async fn cancel(&self, conv_id: i64) {
         let handle = {
             let mut sessions = self.sessions.lk();
@@ -200,6 +275,7 @@ impl Engine {
                 conv_id,
                 kind: "overheard_dismissed".into(),
                 outcome: crate::bus::TurnOutcome::Done,
+                text: None,
             }));
         };
         let candidates = self.llm.rd().clone();
@@ -320,6 +396,7 @@ impl Engine {
                 conv_id,
                 kind: kind.into(),
                 outcome,
+                text: None,
             }));
         });
         Ok(())
@@ -602,8 +679,21 @@ impl Engine {
     /// · 后台汇报(report)= **带整段会话历史** —— 它是主 agent 派出去 / 转到后台的活回来了,
     ///   「接着干」要的全在历史里(用户原话、派活时的完整简报、试过的参数、计划的来龙去脉)。
     /// 无前端 Channel,engine 自己消费事件流,完成后经全局事件车道喊"会话有动静"。
-    /// 返回 false = 目标会话正有在飞回合,本次不打扰(调度器下个 tick 重试)。
+    /// 返回 false = 目标会话正有在飞回合、且这条排不进去(汇报 / 旁听仲裁回合 / 回合正收尾),
+    /// 本次不打扰(调度器下个 tick 重试)。**到点提醒撞上会话正忙**不再干等(2026-11-12,用户拍板):
+    /// 排进在飞回合的插队队列、立刻喊一声,返回 true(见 `queue_event`)。
     pub async fn wake_turn(&self, job: &crate::store::Job) -> Result<bool, AppError> {
+        self.wake_turn_with(job, &[]).await
+    }
+
+    /// `wake_turn` 的全形:`also` = 同一会话里**同时到期的其余汇报**的正文(2026-11-12)。它们各落
+    /// 一条 event 行、并进这同一个回合 —— 四路分头办事前后脚跑完,原先是四个串行回合、每个都带
+    /// 整段历史。只对汇报有意义(提醒是新鲜上下文、一条一个回合),传给提醒会被忽略。
+    pub async fn wake_turn_with(
+        &self,
+        job: &crate::store::Job,
+        also: &[String],
+    ) -> Result<bool, AppError> {
         let candidates = self.llm.rd().clone();
         if candidates.is_empty() {
             return Err(AppError { kind: ErrorKind::NoApiKey, message: "还没有配置 API key".into() });
@@ -638,15 +728,31 @@ impl Engine {
         // **不清 inflight**(只有 cancel/新 send 才 take),句柄常驻 Some;只查 is_some 的话,
         // 会话只要聊过一次,之后的提醒就被「会话忙」永远无声跳过(2026-07-04 真机实锤:
         // 提醒到点零动静零日志;重启曾侥幸——sessions 是内存态,重启即清)。
-        {
+        let busy = {
             let sessions = self.sessions.lk();
-            let busy = sessions
+            sessions
                 .get(&conv_id)
                 .and_then(|s| s.inflight.as_ref())
-                .is_some_and(|h| !h.join.is_finished());
-            if busy {
-                return Ok(false);
+                .is_some_and(|h| !h.join.is_finished())
+        };
+        if busy {
+            // 到点提醒:不打断、但也不再无声推迟(原先一直等到回合结束,超 2 小时直接算错过)——
+            // 排进在飞回合,模型在这一回合里顺带转述;同时立刻喊一声(桌面念 / 渠道推回手机),
+            // 「到点必有动静」不靠那个回合什么时候走到轮间。汇报不走这条:它要的是接着干活的
+            // 一整个回合,等当前回合结束再起。
+            if job.kind != "report" && self.queue_event(conv_id, &job.content) {
+                tracing::info!(job = job.id, conv = conv_id, "会话忙:到点提醒排进在飞回合,并立刻通知");
+                self.bus.publish(crate::bus::AppEvent::Conversation(
+                    crate::bus::ConversationActivity {
+                        conv_id,
+                        kind: "reminder".into(),
+                        outcome: crate::bus::TurnOutcome::Queued,
+                        text: Some(job.content.clone()),
+                    },
+                ));
+                return Ok(true);
             }
+            return Ok(false);
         }
 
         let scene = self
@@ -672,11 +778,19 @@ impl Engine {
         let conv_user = conversation.user_id;
         let content = job.content.clone();
         let is_report = job.kind == "report";
-        let (mut request, event_msg_id) = tokio::task::spawn_blocking(
-            move || -> anyhow::Result<(crate::llm::ChatRequest, i64)> {
+        // 并进来的其余汇报(只对汇报有意义)
+        let also: Vec<String> = if is_report { also.to_vec() } else { Vec::new() };
+        let (mut request, event_ids) = tokio::task::spawn_blocking(
+            move || -> anyhow::Result<(crate::llm::ChatRequest, Vec<i64>)> {
                 let event_payload = is_report.then_some(r#"{"kind":"report"}"#);
                 let event_msg =
                     store.chat.append_message_full(conv_id, "event", &content, event_payload)?;
+                let mut event_ids = vec![event_msg.id];
+                for extra in &also {
+                    event_ids.push(
+                        store.chat.append_message_full(conv_id, "event", extra, event_payload)?.id,
+                    );
+                }
                 if is_report {
                     // 整页历史(I/O 上界分页 + 整块锚定,send_message 同一套取法)
                     let total = store.chat.count_messages(conv_id)? as usize;
@@ -690,7 +804,7 @@ impl Engine {
                         &store, &scene, conv_id, conv_user, user_id, &history, page_base, budget,
                         &tool_defs,
                     )?;
-                    return Ok((request, event_msg.id));
+                    return Ok((request, event_ids));
                 }
                 // —— 提醒:新鲜上下文 ——
                 // 只取常驻·画像层(§13.3 ②);任务回合与聊天回合共用同款前缀
@@ -744,11 +858,25 @@ impl Engine {
                 if thinking != crate::llm::Thinking::Off {
                     request.options.thinking = Some(thinking);
                 }
-                Ok((request, event_msg.id))
+                Ok((request, event_ids))
             },
         )
         .await
         .map_err(AppError::internal)??;
+        // 回合的锚点(用量流水 / 渠道「这次 event 行之后说的话」)= 最后一条 event 行
+        let event_msg_id = *event_ids.last().expect("至少落了一条 event 行");
+        // 回合没起来时把这次落的 event 行全撤掉(并进来的那几条也在内)
+        let undo_events = {
+            let (store, ids) = (self.store.clone(), event_ids);
+            move || async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    for id in ids {
+                        let _ = store.chat.delete_message(conv_id, id);
+                    }
+                })
+                .await;
+            }
+        };
 
         // 自启回合也带「此刻」背景(任务到点时音乐可能正放着);不落库、不破缓存
         self.inject_ambient(conv_id, &mut request);
@@ -760,11 +888,7 @@ impl Engine {
             // 建连那一两秒里用户在这个会话发了消息:让路(2026-11-11)。event 行撤掉、job 不推进,
             // 调度器下个 tick 再试 —— 与开头忙检同一个语义,只是晚一步才看见。
             Ok(None) => {
-                let store = self.store.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    store.chat.delete_message(conv_id, event_msg_id)
-                })
-                .await;
+                undo_events().await;
                 tracing::info!(conv = conv_id, job = job.id, "自启回合建连期间用户开口,让路(下个 tick 再试)");
                 return Ok(false);
             }
@@ -773,14 +897,18 @@ impl Engine {
             // 否则「⏰ 到点了」每 30s 堆一条、还全进后续回合上下文(2026-08-22 审计)。
             // 回合真起来后的失败(Failed 事件)不走这里,那种「到点必有动静」的系统线要留(§3.5)。
             Err(e) => {
-                let store = self.store.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    store.chat.delete_message(conv_id, event_msg_id)
-                })
-                .await;
+                undo_events().await;
                 return Err(e);
             }
         };
+
+        // 起跑也喊一声(2026-11-11):主窗据此把这个会话记成在飞 —— 显停止钮、打字进排队区
+        // (而不是直接发新回合把这一轮取消掉)、计划卡照显。收尾那声在下面。
+        let wake_kind = if is_report { "report" } else { "reminder" };
+        self.bus.publish(crate::bus::AppEvent::TurnStarted(crate::bus::TurnStart {
+            conv_id,
+            kind: wake_kind.into(),
+        }));
 
         // 无人挂流:自己消费到收尾,记下终态,然后经全局事件车道喊一声
         // (UI 据此刷新列表;用户不在该会话时按 outcome 在列表项打标)
@@ -788,7 +916,22 @@ impl Engine {
         let job_kind = job.kind.clone();
         tokio::spawn(async move {
             let mut outcome = crate::bus::TurnOutcome::Done;
-            while let Some(ev) = rx.recv().await {
+            // 回合事件按序转给主窗(2026-11-12):回复流式上屏,不再等收尾后整页重载。
+            let mut relay = TurnRelayer::new(bus.clone(), conv_id);
+            loop {
+                // 手里攒着增量时最多再等一个节拍就发出去(模型停顿时别把半句话压在手里)
+                let ev = if relay.holding() {
+                    match tokio::time::timeout(RELAY_FLUSH_EVERY, rx.recv()).await {
+                        Ok(ev) => ev,
+                        Err(_) => {
+                            relay.flush();
+                            continue;
+                        }
+                    }
+                } else {
+                    rx.recv().await
+                };
+                let Some(ev) = ev else { break };
                 if let TurnEvent::Failed { kind, message } = &ev {
                     outcome = crate::bus::TurnOutcome::Failed;
                     // 自启回合没有前端 Channel:这里不记,这次失败就只剩一条光秃秃的系统线(§3.5;
@@ -798,21 +941,79 @@ impl Engine {
                         "自启回合流中失败(event 行留着,前端按 outcome 提示)"
                     );
                 }
+                relay.push(ev);
             }
+            relay.flush();
             bus.publish(crate::bus::AppEvent::Conversation(crate::bus::ConversationActivity {
                 conv_id,
                 // 汇报 ≠ 提醒:桌面据此决定念不念(渠道那边两者都照推,见 channels::outbound_loop)
                 kind: if is_report { "report".into() } else { "reminder".into() },
                 outcome,
+                text: None,
             }));
         });
         Ok(true)
+    }
+
+    /// 把一条到点提醒排进这个会话**在飞回合**的插队队列(下一个轮间落成 event 行、进 request)。
+    /// false = 排不进:没有收插队的回合(旁听仲裁回合不收)/ 回合正在收尾 —— 调用方照旧下一拍重试。
+    /// 回合若在处理到它之前被取消 / 失败,`InjectGuard` 会把它补落库(系统线不丢;那一声已经喊过了)。
+    fn queue_event(&self, conv_id: i64, content: &str) -> bool {
+        let inject = {
+            let sessions = self.sessions.lk();
+            sessions.get(&conv_id).and_then(|slot| slot.inject.clone())
+        };
+        let Some(inject) = inject else { return false };
+        let mut st = inject.lk();
+        if st.finishing {
+            return false;
+        }
+        st.buffer.push(InjectReady {
+            display: content.to_string(),
+            llm_content: content.to_string(),
+            parts: Vec::new(),
+            refs: Vec::new(),
+            payload: None,
+            event: true,
+        });
+        true
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 自启回合事件转发(2026-11-12):相邻的文字增量并成一条、思考增量并成一条(两种不混),
+    /// 别的事件原样过且先把攒着的发掉 —— 顺序不乱、序号连续。
+    #[test]
+    fn turn_relayer_coalesces_deltas_and_keeps_order() {
+        let bus = crate::bus::Bus::new();
+        let mut rx = bus.subscribe();
+        let mut relay = TurnRelayer::new(bus.clone(), 7);
+        relay.push(TurnEvent::Delta("你".into()));
+        relay.push(TurnEvent::Delta("好".into()));
+        assert!(relay.holding(), "增量先攒着");
+        relay.push(TurnEvent::Segment { message_id: 3 });
+        relay.push(TurnEvent::Thinking("想".into()));
+        relay.push(TurnEvent::Thinking("想".into()));
+        relay.push(TurnEvent::Delta("完".into()));
+        relay.push(TurnEvent::Done { message_id: 9, end_session: false });
+        assert!(!relay.holding());
+
+        let mut got = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            let crate::bus::AppEvent::Turn(t) = ev else { panic!("只该有回合转发事件") };
+            assert_eq!(t.conv_id, 7);
+            got.push((t.seq, t.event["type"].as_str().unwrap().to_string(), t.event["data"].clone()));
+        }
+        let kinds: Vec<&str> = got.iter().map(|g| g.1.as_str()).collect();
+        assert_eq!(kinds, ["delta", "segment", "thinking", "delta", "done"]);
+        assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), [0, 1, 2, 3, 4], "序号从 0 起连续");
+        assert_eq!(got[0].2, "你好", "相邻文字增量并成一条");
+        assert_eq!(got[2].2, "想想", "相邻思考增量并成一条");
+        assert_eq!(got[3].2, "完");
+    }
 
     /// 「存图到电脑」(2026-07-13,与文档收件区对称):图除当轮 image_url 注入外,原名件落
     /// 收件区、「已存到本地」路径行进 doc_text(随内容落库);UI 缩略图 hash 小票不变;

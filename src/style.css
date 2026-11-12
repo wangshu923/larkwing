@@ -157,6 +157,13 @@
 
 * { box-sizing: border-box; }
 
+/* 键盘焦点环跟皮肤走(2026-11-11):原先是浏览器默认那圈环,在四套皮里都是外来色。只在键盘操作时
+   出现(:focus-visible);组件里自己写了 outline: none 的(输入框一类,另有边框变色)照旧不显。 */
+:focus-visible {
+  outline: 2px solid rgba(var(--accent-rgb), 0.75);
+  outline-offset: 2px;
+}
+
 html, body { margin: 0; height: 100%; }
 
 body {

@@ -1,7 +1,7 @@
 // 设置·声音:音色与试听 / 唤醒开关与标定 / 朗读与响度 / 识别档位 / 采集与回声消除 / 音色克隆。
 // 从 SettingsView 抽出(2026-09-08);逻辑一行没改,只是搬了个家。
 
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { api, emitWakeChanged, isTauri, type VoiceStatus } from '../../lib/backend'
 import { useToast } from '../useToast'
@@ -332,6 +332,33 @@ export function useVoiceSettings() {
     }
   }
 
+  // 克隆音色改名(命令早就有,一直没界面;2026-11-12):点 ✎ → 那张小卡变成输入框,
+  // 回车 / 失焦保存,Esc 取消。只改显示名,音色 id 不变 —— 谁选着它都不受影响。
+  const renaming = ref<{ id: string; name: string } | null>(null)
+  function startRename(sp: { id: string; name: string }) {
+    cloneArm.value = ''
+    renaming.value = { id: sp.id, name: sp.name }
+    void nextTick(() => document.querySelector<HTMLInputElement>('.rename-input')?.select())
+  }
+  function cancelRename() {
+    renaming.value = null
+  }
+  async function commitRename() {
+    const r = renaming.value
+    if (!r) return // 回车保存后输入框拆掉会再触发一次失焦:第二次进来已经没东西可存
+    renaming.value = null
+    const name = r.name.trim()
+    const cur = voiceInfo.value?.speakers.find((s) => s.id === r.id)?.name
+    if (!name || name === cur) return
+    try {
+      await api.renameVoiceClone(r.id.replace(/^clone:/, ''), name)
+      await loadVoice()
+    } catch (e) {
+      console.error('音色改名失败', e)
+      useToast().error(t('toast.actionFailed'))
+    }
+  }
+
   const previewing = ref('')
   let previewAudio: HTMLAudioElement | null = null
   // 试听合成兜底超时:克隆走本地 ZipVoice(CPU 慢、冷启十几秒)给足 45s;在线/离线 TTS 12s。
@@ -405,6 +432,10 @@ export function useVoiceSettings() {
     calibStepLabel,
     calibVerdict,
     cancelClone,
+    cancelRename,
+    commitRename,
+    renaming,
+    startRename,
     captureRoute,
     captureSource,
     cloneArm,

@@ -109,13 +109,18 @@ fn looks_utf8(bytes: &[u8]) -> bool {
     !head.contains(&0) && std::str::from_utf8(head).is_ok()
 }
 
+/// 文档包里解压出来的 XML 最多读这么多(2026-11-11):包本身有 50MB 的闸,但压缩比没有界 ——
+/// 一个几十 KB 的畸形 docx 能解出几个 GB,原先 `read_to_string` 照单全收。正常文档的正文 XML
+/// 远小于这个数;超了按读到的部分抽文字(尾巴截掉,不报错)。xlsx 走 calamine,它自己读包,这道闸管不到。
+const OOXML_XML_MAX: u64 = 256 * 1024 * 1024;
+
 /// .docx = zip,正文在 word/document.xml:</w:p> 当段落换行,剥标签留文本,粗还原实体。
 /// 不求富格式,够喂模型即可;读不出返回 None。
 fn extract_docx(bytes: &[u8]) -> Option<String> {
     use std::io::Read;
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).ok()?;
     let mut xml = String::new();
-    zip.by_name("word/document.xml").ok()?.read_to_string(&mut xml).ok()?;
+    zip.by_name("word/document.xml").ok()?.take(OOXML_XML_MAX).read_to_string(&mut xml).ok()?;
     let text = strip_xml_text(&xml, "</w:p>");
     let text = text.trim();
     (!text.is_empty()).then(|| text.to_string())
@@ -135,11 +140,18 @@ fn extract_pptx(bytes: &[u8]) -> Option<String> {
         .collect();
     slides.sort_by_key(|n| slide_index(n));
     let mut out = String::new();
+    let mut read_total: u64 = 0;
     for name in slides {
         let mut xml = String::new();
-        if zip.by_name(&name).ok()?.read_to_string(&mut xml).is_err() {
+        // 全部幻灯片合计不超过 OOXML_XML_MAX(每页按剩余额度读)
+        let left = OOXML_XML_MAX.saturating_sub(read_total);
+        if left == 0 {
+            break;
+        }
+        if zip.by_name(&name).ok()?.take(left).read_to_string(&mut xml).is_err() {
             continue;
         }
+        read_total += xml.len() as u64;
         let page = strip_xml_text(&xml, "</a:p>");
         let page = page.trim();
         if !page.is_empty() {

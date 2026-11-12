@@ -847,7 +847,13 @@ impl MediaRuntime {
     /// 当前播放,所以放歌也预取(用户拍板,2026-06-19:预取的是工具不是转码,「下了不一定用、真用到不必等」)。
     /// 每进程至多触发一次;失败复位标记,留给后续重试。`ensure_component` 内有锁去重 + 已在磁盘即秒返回
     /// → 预取与用时下载只下一份、只冒一张卡,ffmpeg 已就绪时这步是即时 no-op。
-    fn prefetch_ffmpeg(&self) {
+    /// ffmpeg 在不在手(只看磁盘 / PATH,**绝不下载**)。渠道语音消息据此决定是直接转写,
+    /// 还是先回一句「准备中」再后台去下(别让手机那头对着空气等几十 MB 的下载)。
+    pub fn ffmpeg_ready(&self) -> bool {
+        self.inner.components.ready(Component::Ffmpeg).is_some()
+    }
+
+    pub(crate) fn prefetch_ffmpeg(&self) {
         if self.inner.ffmpeg_prefetch_started.swap(true, Ordering::Relaxed) {
             return; // 本进程已预取过(或正在跑)
         }

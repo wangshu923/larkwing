@@ -151,8 +151,9 @@ jobs:
   # 一键更新·下载走镜像(2026-06-30,清单 ⑤·A 收尾):tauri-action 生成的 latest.json 里资产下载 url
   # 是 github.com 直链——国内无代理用户「查得到、下不动」(镜像只加速了 updater 检查端点,下载管不到)。
   # 本 job 在两平台 build 都传完(latest.json 已合并)后,把它下下来、把每个平台的 url 前缀成镜像
-  #(ghfast.top)再传回。tauri updater 每平台只认一个 url、不支持下载故障转移,故只写一个镜像;前端
-  # download() 失败时已有「开了代理就带代理重下」兜底(useUpdater.ts)。换镜像 = 改下面 MIRROR 一处。
+  #(ghfast.top)再传回。tauri updater 每平台只认一个 url,故清单里只写一个镜像;它下不动时前端会
+  # 按 tauri.conf 的 endpoints 换入口重下(另一个镜像 / 官方,壳层 updatecheck.rs::update_retarget),
+  # 再不行才「开了代理就带代理重下」(useUpdater.ts)。换镜像 = 改下面 MIRROR 一处。
   # ⚠️ 现在是**单草稿**(create-release 先建),gh release ... 按 tag 解析唯一、不再像 v0.2.2 那样改错草稿。
   finalize-manifest:
     needs: [create-release, build]

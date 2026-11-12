@@ -63,10 +63,17 @@ jobs:
       - name: 集成测试(engine)
         run: cargo test -p larkwing-core --test engine
 
+      # 壳层(src-tauri)自己的单测(2026-11-11 补):此前只在 windows job 里 `cargo check` 过它,
+      # 连测试的类型检查都没有 —— webrender.rs 那几条「改回去就红」的回归守卫等于只在本机手跑时生效。
+      # 不需要先出 dist:dev 档(没开 custom-protocol)的 `generate_context!` 不嵌前端产物
+      #(本机挪走 dist、touch 源文件后重编实测:12 条全过)。
+      - name: 壳层单测(larkwing)
+        run: cargo test -p larkwing
+
       # clippy 放在测试**之后**:一个 job 里前面 step 挂了后面就不跑,
-      # 测试先跑 = 就算 clippy 红着,测试结论照样看得到。
-      - name: clippy(零警告)
-        run: cargo clippy -p larkwing-core --all-targets -- -D warnings
+      # 测试先跑 = 就算 clippy 红着,测试结论照样看得到。壳层一并查(原先只查 core)。
+      - name: clippy(零警告,两个 crate)
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       # 刻意**没有** `cargo fmt --check`:仓库当前不是 rustfmt-clean(larkwing-core/examples/ 等处
       # 有成片差异),现在加上等于让 CI 长期红着。要开这一步,先单独跑一次全仓 `cargo fmt` 重排
@@ -146,6 +153,8 @@ jobs:
           path: target/sherpa-onnx-prebuilt
           key: sherpa-onnx-windows-latest-1.13.2
 
+      # (2026-11-11 记:mac 上实测 dev 档不需要 dist —— 见 rust job 的壳层单测那步;Windows 上没试过,
+      #  这四步先留着,确认后可以删掉省几分钟。)
       # 为什么前端也要装 / 编:`src-tauri/src/lib.rs` 里的 `tauri::generate_context!()` 是**编译期**
       # 宏,要把 tauri.conf.json 的 frontendDist(= ../dist)整个嵌进二进制;而 dist/ 是 gitignore 的。
       # 所以不先 `pnpm build` 出 dist,下面 `cargo check -p larkwing` 会直接失败。

@@ -225,6 +225,15 @@ impl Matcher {
     }
 }
 
+/// 持有它的 future 一被丢掉就把旗立起来(给阻塞线程递「别干了」)。
+struct StopOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// 一条命中:深度(相对 root 的层级)+ 路径 + 是否文件夹。排序键 = (深度, 路径),
 /// 浅的先出——命中的文件夹(树的骨架)排在深处文件前面,第一页不再被某个深分支灌满
 /// (实锤:剧集库「四季各几十集」按路径排序时第一页全是第一季,被误判成只有两季)。
@@ -239,11 +248,14 @@ struct Hit {
 /// 浅层保证扫全,截掉的只是更深的;每层条目按名字排序 → 截断集合确定,offset 跨调用
 /// 对得上(旧 DFS 撞上限时收进哪些取决于 read_dir 原始序,不保证)。停在**扫描**上限
 /// 而不是一页,才有总数可报、offset 才翻得动;扫满 = 调用方如实说「可能还有」。
-fn walk(root: &Path, matcher: &Matcher) -> Vec<Hit> {
+///
+/// `stop` 立起来就收手(2026-11-11):扫描上限卡的是**命中数**,在大盘根上找一个稀有的名字会把
+/// 几层目录全走完;工具超时后调用方早就走了,这个阻塞线程原先还在那儿扫到底。
+fn walk(root: &Path, matcher: &Matcher, stop: &std::sync::atomic::AtomicBool) -> Vec<Hit> {
     let mut out = Vec::new();
     let mut queue = std::collections::VecDeque::from([(root.to_path_buf(), 0usize)]);
     while let Some((dir, depth)) = queue.pop_front() {
-        if out.len() >= FIND_SCAN_MAX {
+        if out.len() >= FIND_SCAN_MAX || stop.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
@@ -298,10 +310,13 @@ impl Tool for FsFind {
             .to_string();
         let matcher = Matcher::new(&raw)?;
         let offset = super::arg_u64(&args, "offset", 0) as usize;
+        // 这个 future 被丢掉(工具超时 / 回合取消)= 立旗,遍历线程在下一个目录收手
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _stop_on_drop = StopOnDrop(stop.clone());
         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let dir = Path::new(&root);
             anyhow::ensure!(dir.is_dir(), "{root} 不是文件夹或不存在");
-            let mut out = walk(dir, &matcher);
+            let mut out = walk(dir, &matcher, &stop);
             if out.is_empty() {
                 return Ok(format!("在 {root} 里没找到匹配「{raw}」的文件或文件夹"));
             }

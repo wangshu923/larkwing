@@ -79,6 +79,9 @@ pub enum TurnEvent {
     /// 插队(PLAN §9 B):回合在飞时注入的一条 user 消息已落库,之后的回复另起一段。
     /// 前端据此:收尾当前回复气泡 → 插用户气泡 → 开新回复气泡。
     Injected { message_id: i64, text: String, attachments: Vec<AttachmentRef> },
+    /// 到点提醒排进了这个在飞回合(2026-11-12):它的 event 行已落库,之后的回复另起一段。
+    /// 前端与 `Injected` 同构:收尾当前回复气泡 → 插一条系统线 → 开新回复气泡。
+    EventLine { message_id: i64, text: String },
     /// show_image 亮图:工具把本机图片摆进聊天给**用户**看(图卡走 UI,不喂模型)。
     /// 前端把图卡插进当前在飞气泡组;同一批 refs 已随该 tool 行 payload 落库,
     /// 重开会话由行派生同一张卡(回执小票同构的「live 事件 + 落库派生」双路)。
@@ -324,6 +327,10 @@ pub(crate) struct InjectReady {
     pub parts: Vec<crate::llm::ContentPart>,
     pub refs: Vec<AttachmentRef>,
     pub payload: Option<String>,
+    /// true = 这不是用户说的话,是**到点提醒**排进来的(`Engine::queue_event`):落 event 行、
+    /// 进 request 的是 `context::event_injection` 包过的那句(与历史回放翻译 event 行同字节)、
+    /// 通告走 `TurnEvent::EventLine`。`display` / `llm_content` 都是提醒原文。
+    pub event: bool,
 }
 
 pub struct Engine {

@@ -635,7 +635,8 @@ impl ChatRepo {
     }
 
     /// 跨会话取 `[from_ms, to_ms)` 内的**行为流水**(惯例提炼取料,`engine/habits.rs`):
-    /// tool 行(事件本体)+ 带 tool_calls 的 assistant 行(入参)+ user 行(说话人归属),
+    /// tool 行(事件本体)、带 tool_calls 的 assistant 行(入参)、user 行(说话人归属)、
+    /// event 行(自启回合的起点:它后面的工具行不是谁的使用痕迹),
     /// 按 (conversation_id, id) 升序 → 调用方顺序扫一遍即可配对。封顶 limit(超过只取最早的)。
     /// tool 行 content 只截前 200 字(标题在结果开头),其余行不带 content —— 不把整段回复搬出库。
     pub fn behavior_rows_between(&self, from_ms: i64, to_ms: i64, limit: i64) -> Result<Vec<BehaviorRow>> {
@@ -646,7 +647,7 @@ impl ChatRepo {
                         payload, created_at
                  FROM messages
                  WHERE created_at >= ?1 AND created_at < ?2
-                   AND (role = 'tool' OR role = 'user'
+                   AND (role = 'tool' OR role = 'user' OR role = 'event'
                         OR (role = 'assistant' AND payload LIKE '%\"tool_calls\"%'))
                  ORDER BY conversation_id ASC, id ASC LIMIT ?3",
             )?;
@@ -1082,7 +1083,10 @@ mod tests {
         let now = crate::store::now_ms();
         let rows = store.chat.behavior_rows_between(now - 60_000, now + 60_000, 100).unwrap();
         let roles: Vec<&str> = rows.iter().map(|r| r.role.as_str()).collect();
-        assert_eq!(roles, vec!["user", "assistant", "tool"], "纯回复与 event 行不进流水:{roles:?}");
+        // event 行也出(2026-11-11):它是自启回合的起点标记,惯例提炼据此不把提醒 / 汇报回合里的
+        // 工具调用算成谁的使用痕迹;同样不带 content
+        assert_eq!(roles, vec!["user", "assistant", "tool", "event"], "纯回复不进流水:{roles:?}");
+        assert_eq!(rows[3].content, "", "event 行不带 content");
         assert_eq!(rows[0].content, "", "user 行不带 content");
         assert_eq!(rows[1].content, "", "assistant 行不带 content");
         assert_eq!(rows[2].content.chars().count(), 200, "tool 行截前 200 字");

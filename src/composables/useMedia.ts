@@ -533,6 +533,7 @@ function pause() {
 }
 
 function resume() {
+  voidStaleSleep()
   void activeEl()?.play().catch(() => {})
 }
 
@@ -780,8 +781,10 @@ function autoNext() {
 /* —— 睡眠定时(2026-09-16 ★ 用户拍板):core 记 deadline / at_end 并镜像到 state.current.sleep,到点的活在前端 ——
  * 到点前 SLEEP_FADE_MS 开始把音量按比例压到 0,然后 pause()、音量还原(第二天「接着放」是正常音量),再回调
  * stop_after=0 让 core 清掉(它广播 sleep=None 对齐镜像)。at_end 走 onEnded:不接下一个,停在这一首末尾。
- * **不开 interval 盯钟**:挂在 timeupdate 上(与片尾预告同一口径),暂停着自然不推进 —— 暂停中到点了?一按播放
- * 下一拍就淡出,没差。到点不说话、不进聊天流(哄睡场景静默是重点)。 */
+ * **不开 interval 盯钟**:挂在 timeupdate 上(与片尾预告同一口径),暂停着自然不推进。暂停着过了点 → 用户之后
+ * **亲手**恢复播放 / 切歌 = 定时作废(`voidStaleSleep` 与 core 的手动切集入口;2026-11-11 —— 原先是「一按播放下一拍
+ * 就淡出」,晚上定的时、第二天早上一按播放又被立刻停掉)。自动接下一首不算亲手:换曲 / 卡顿的间隙跨过定时点,
+ * 下一拍照旧淡出停下。到点不说话、不进聊天流(哄睡场景静默是重点)。 */
 const SLEEP_FADE_MS = 20_000 // 淡出时长(§4.11 用户拍板 2026-09-16)
 const SLEEP_PRESETS = [15, 30, 60] as const // 月亮钮档位(§4.11 用户拍板 2026-09-16)
 let sleepFade: ReturnType<typeof setInterval> | undefined
@@ -810,6 +813,12 @@ function checkSleep() {
       clearSleep()
     }
   }, 100)
+}
+/** 定时点已经过了、而那一刻并没在放(暂停着过的点):用户现在亲手恢复播放 → 这个定时已经没有意义,清掉。
+ *  正在淡出时不动(那是定时正在兑现)。只给「亲手」的入口调(`resume`:播放键 / 嘴控恢复)。 */
+function voidStaleSleep() {
+  const s = state.current?.sleep
+  if (s?.kind === 'at' && s.ends_at_ms <= Date.now() && !sleepFade) clearSleep()
 }
 /** at_end:这一首 / 这一集放完 → 不接下一个,停在末尾(内容留着,状态 paused)。 */
 function sleepStopAtEnd() {

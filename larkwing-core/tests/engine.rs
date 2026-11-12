@@ -524,6 +524,104 @@ async fn wake_turn_fires_after_completed_turn_in_same_conv() {
     assert!(fired, "聊过的会话到点必须能触发:忙检要看 join 是否真在跑,不是句柄在不在");
 }
 
+/// 到点提醒撞上会话正忙(2026-11-12,用户拍板):不再无声推迟到回合结束 —— 排进在飞回合
+/// (轮间落成 event 行、模型接着说一段),并且**立刻**经全局车道喊一声(带原文,桌面念 / 推手机)。
+#[tokio::test(flavor = "multi_thread")]
+async fn reminder_due_while_busy_is_queued_into_the_running_turn() {
+    let (store, engine, conv_id) = setup("wake-queued", 30);
+    let mut bus = engine.bus().subscribe();
+    // 起一个慢回合占住会话(30ms/字的回声,足够提醒撞上)
+    let mut rx = engine.send_message(conv_id, "慢慢说一句".into(), None, vec![]).await.unwrap();
+    let user = store.users.ensure_default_user().unwrap();
+    let job = store.jobs.add(user.id, conv_id, "提醒用户关火", 0, "once").unwrap();
+    assert!(engine.wake_turn(&job).await.unwrap(), "排进去了 = 算触发(调度器据此推进任务)");
+
+    // 立刻的那一声:outcome=queued,带提醒原文;不等回合走到轮间
+    let act = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Ok(larkwing_core::bus::AppEvent::Conversation(c)) = bus.recv().await {
+                return c;
+            }
+        }
+    })
+    .await
+    .expect("排队那一刻必须广播");
+    assert_eq!(act.kind, "reminder");
+    assert_eq!(act.outcome, larkwing_core::bus::TurnOutcome::Queued);
+    assert_eq!(act.text.as_deref(), Some("提醒用户关火"));
+
+    // 在飞回合:先把原来那句说完 → EventLine(系统线)→ 再说一段(回声 = 模型收到了提醒那句)→ Done
+    let (mut before, mut after, mut line, mut done) = (String::new(), String::new(), None, false);
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            TurnEvent::Delta(t) if line.is_none() => before.push_str(&t),
+            TurnEvent::Delta(t) => after.push_str(&t),
+            TurnEvent::EventLine { message_id, text } => line = Some((message_id, text)),
+            TurnEvent::Done { .. } => done = true,
+            TurnEvent::Failed { message, .. } => panic!("回合不该失败: {message}"),
+            _ => {}
+        }
+    }
+    assert!(done, "回合正常收尾");
+    let (line_id, line_text) = line.expect("提醒要以 EventLine 进到回合里");
+    assert_eq!(line_text, "提醒用户关火");
+    assert!(before.contains("慢慢说一句"), "原来那句照常说完: {before}");
+    assert!(after.contains("提醒用户关火"), "提醒之后模型接着说了一段: {after}");
+
+    // 落库行序:user → assistant(原回复)→ event(提醒)→ assistant(接着说的那段)
+    let rows = store.chat.recent_messages(conv_id, 20).unwrap();
+    let roles: Vec<&str> = rows.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(roles, ["user", "assistant", "event", "assistant"], "{rows:?}");
+    assert_eq!(rows[2].id, line_id);
+    assert_eq!(rows[2].content, "提醒用户关火");
+}
+
+/// 同一会话里同时到期的多条汇报并成**一个**回合(2026-11-12):各落一条 event 行、模型一次看全。
+/// 原先逐条起回合 —— 第二条起每条都先撞「会话忙」等下一拍,而且每个回合都带整段历史。
+#[tokio::test(flavor = "multi_thread")]
+async fn simultaneous_reports_for_one_conversation_merge_into_one_turn() {
+    let store = Store::open(&temp_db("wake-merge")).unwrap();
+    let engine = Engine::new(store.clone(), Scenes::builtin());
+    let fake = Arc::new(FakeLlm::with_delay(1));
+    engine.set_provider(Some(fake.clone()));
+    let user = store.users.ensure_default_user().unwrap();
+    let conv = store.chat.create_conversation(user.id, "companion").unwrap();
+    let other = store.chat.create_conversation(user.id, "companion").unwrap();
+    let mut bus = engine.bus().subscribe();
+
+    let now = chrono::Local::now().timestamp_millis();
+    for c in ["第一路忙完了", "第二路忙完了", "第三路忙完了"] {
+        store.jobs.add_report(user.id, conv.id, c, now).unwrap();
+    }
+    store.jobs.add_report(user.id, other.id, "别的会话的活", now).unwrap();
+    larkwing_core::scheduler::tick(&engine, now + 1).await.unwrap();
+
+    // 两个会话各一个回合收尾
+    let mut ended = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while ended.len() < 2 {
+            if let Ok(larkwing_core::bus::AppEvent::Conversation(c)) = bus.recv().await {
+                assert_eq!(c.kind, "report");
+                ended.push(c.conv_id);
+            }
+        }
+    })
+    .await
+    .expect("两个会话的汇报回合都要收尾");
+
+    let rows = store.chat.recent_messages(conv.id, 20).unwrap();
+    let roles: Vec<&str> = rows.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(roles, ["event", "event", "event", "assistant"], "三条汇报一个回合: {rows:?}");
+    assert!(rows[..3].iter().all(|m| m.payload.as_deref() == Some(r#"{"kind":"report"}"#)));
+    let other_rows = store.chat.recent_messages(other.id, 20).unwrap();
+    assert_eq!(
+        other_rows.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+        ["event", "assistant"],
+        "别的会话的汇报不并进来"
+    );
+    assert!(store.jobs.due(now + 10).unwrap().is_empty(), "四条都算触发过,不留着重试");
+}
+
 /// 后台差事忙完的汇报 ≠ 到点提醒(2026-08-15 真机:打字支使它批量配歌词,汇报却被念出来,
 /// 系统线还贴着「⏰ 到点了」)。同走 wake_turn,但 event 行 payload 记 kind=report、终态广播
 /// kind=report —— 桌面据此不自动念、换标签;渠道推送两类都照推(手机上支使的活要回手机)。

@@ -24,6 +24,8 @@ use crate::lockext::LockExt;
 
 /// 同 URL 正文短缓存:防同一回合/相邻回合重复抓(任务 HUD 不掺和,这层全静默)。
 const CACHE_TTL: Duration = Duration::from_secs(600);
+/// 页面缓存最多留几页(满了挤掉最旧的)。缓存只为「同一页十分钟内续读不重抓」,不是越多越好。
+const CACHE_MAX_PAGES: usize = 32;
 /// 像真浏览器的 UA(裸 reqwest 常被搜索页拒);web_download 与壳层 webrender 隐藏窗同款
 /// (单源,§4.11——渲染窗与抓取端 UA 一致,免得同一站点见到两副面孔)。
 /// 需要认证的下载目标(WebDAV / 带账号的直链)的一条凭证。
@@ -435,6 +437,16 @@ impl WebClient {
             Err(_) => return, // 序列化失败只丢缓存,不丢结果
         };
         let mut cache = self.cache.lk();
+        // 入库时也清过期的,并封顶条数(2026-11-11):原先只在读缓存时清、没有上限 —— 一次搜索抓三页,
+        // 之后再没人查,这几页(每页可到几百 KB)就一直占着;连着翻很多页则只增不减。
+        cache.retain(|_, (at, _)| at.elapsed() < CACHE_TTL);
+        while cache.len() >= CACHE_MAX_PAGES {
+            let Some(oldest) = cache.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            cache.remove(&oldest);
+        }
         cache.insert(url.to_string(), (Instant::now(), json));
     }
 }
@@ -709,7 +721,7 @@ fn extract_text_from(doc: &Html) -> (String, String) {
         if el.value().name() == "td" && in_converted(&el, &converted) {
             continue;
         }
-        let t: String = el.text().collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
+        let t: String = own_text(&el).split_whitespace().collect::<Vec<_>>().join(" ");
         if t.chars().count() >= 8 {
             parts.push(t);
         }
@@ -722,6 +734,28 @@ fn extract_text_from(doc: &Html) -> (String, String) {
         }
     }
     (title, text)
+}
+
+/// 上面那串选择器选中的块级标签(与 `extract_text_from` 的选择器同一份名单)。
+const TEXT_BLOCKS: &[&str] = &["p", "h1", "h2", "h3", "li", "blockquote", "td", "pre", "table"];
+
+/// 这个块**自己的**文字:里面套着的别的块(它们自己也会被选中)不算(2026-11-11)。
+/// 原先取的是整棵子树的文字 —— `<li><p>…</p></li>`、`<blockquote><p>…` 这类嵌套里,同一段话
+/// 外层收一遍、里层再收一遍,正文预算白占一半。
+fn own_text(el: &scraper::ElementRef) -> String {
+    let mut out = String::new();
+    for node in el.descendants() {
+        let Some(text) = node.value().as_text() else { continue };
+        // 从这段文字往上走到 el:中间隔着别的块 = 那段文字归那个块
+        let nested = node
+            .ancestors()
+            .take_while(|a| a.id() != el.id())
+            .any(|a| a.value().as_element().is_some_and(|e| TEXT_BLOCKS.contains(&e.name())));
+        if !nested {
+            out.push_str(text);
+        }
+    }
+    out
 }
 
 /// 落在「已转 markdown 的表」里?(ancestors 不含自身;表自身判嵌套正好用它)
@@ -986,7 +1020,17 @@ pub fn decode_html(bytes: &[u8], content_type: &str) -> String {
     let enc = label
         .and_then(|l| encoding_rs::Encoding::for_label(l.trim().as_bytes()))
         .unwrap_or(encoding_rs::UTF_8);
-    enc.decode(bytes).0.into_owned()
+    let (text, _, had_errors) = enc.decode(bytes);
+    // 按声明(或默认 UTF-8)解出了坏字节 → 试一次 GB18030(2026-11-11):没声明字符集的老中文站、
+    // 声明写着 utf-8 实际是 GBK 的站,原先整页乱码且没有兜底。只在 GB18030 解得干净时才采用
+    //(真 UTF-8 页不会走到这里;歌词旁挂文件用的是同一个回退)。
+    if had_errors && enc != encoding_rs::GB18030 {
+        let (alt, _, alt_bad) = encoding_rs::GB18030.decode(bytes);
+        if !alt_bad {
+            return alt.into_owned();
+        }
+    }
+    text.into_owned()
 }
 
 /// `text/html; charset=gb2312` / `content="…; charset='gbk'"` → Some("gb2312" / "gbk")。
@@ -1290,6 +1334,32 @@ mod tests {
         assert!(text.contains("| 第29行 | 值29 |"), "封顶 30 行:{text}");
         assert!(!text.contains("| 第30行"), "{text}");
         assert!(text.contains("表格还有 5 行,截了"), "超出如实注明(§7.2):{text}");
+    }
+
+    /// 嵌套的块不重复收(2026-11-11):`<li><p>…</p></li>` 这段话原先外层一遍、里层一遍;
+    /// 外层自己有的零散文字照留。
+    #[test]
+    fn nested_blocks_are_not_collected_twice() {
+        let page = r#"<html><body>
+          <ul><li>清单标题写得足够长一些 <p>条目里面的这一段话只应该出现一次才对</p></li></ul>
+          <blockquote><p>引用里的第一段话也只出现一次哦</p><p>引用里的第二段话同样只有一次</p></blockquote>
+          <p>结尾再放一段普通的正文凑够字数,免得落到整页压平的兜底那条路上去,这样才测得到抽取本身。普通正文再长一点点。</p>
+          </body></html>"#;
+        let Page { text, .. } = extract_page(page, "https://x.example.com/");
+        for once in ["只应该出现一次", "引用里的第一段话", "引用里的第二段话"] {
+            assert_eq!(text.matches(once).count(), 1, "「{once}」重复了:\n{text}");
+        }
+        assert!(text.contains("清单标题写得足够长一些"), "外层自己的文字不丢:\n{text}");
+    }
+
+    /// 没声明字符集的 GBK 页:按 UTF-8 解出坏字节 → 回退 GB18030(2026-11-11);真 UTF-8 页不受影响。
+    #[test]
+    fn decode_html_falls_back_to_gb18030_when_undeclared() {
+        let (gbk, _, _) = encoding_rs::GBK.encode("<html><body><p>老站没写编码声明</p></body></html>");
+        assert!(decode_html(&gbk, "text/html").contains("老站没写编码声明"));
+        let (gbk2, _, _) = encoding_rs::GBK.encode("<html><body><p>声明写错了的页面</p></body></html>");
+        assert!(decode_html(&gbk2, "text/html; charset=utf-8").contains("声明写错了的页面"));
+        assert!(decode_html("<p>正常的 UTF-8 页</p>".as_bytes(), "text/html").contains("正常的 UTF-8 页"));
     }
 
     #[test]

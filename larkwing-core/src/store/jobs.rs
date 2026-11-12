@@ -224,6 +224,19 @@ impl JobRepo {
         })
     }
 
+    /// `now` 之后最近一个待触发任务的到期时刻(调度器据此决定睡多久;已经过期还没触发的不算 ——
+    /// 那些是「会话忙 / 建连失败」留下来重试的,按固定节拍再试)。
+    pub fn next_due_after(&self, now: i64) -> Result<Option<i64>> {
+        self.db.with(|c| {
+            let next: Option<i64> = c.query_row(
+                "SELECT MIN(due_at) FROM jobs WHERE status = 'pending' AND due_at > ?1",
+                [now],
+                |r| r.get(0),
+            )?;
+            Ok(next)
+        })
+    }
+
     /// 取消(按 user 限定,防串号);收件人与发起人都可撤(跨人提醒:给爸爸设的,
     /// 设的人和爸爸自己都能取消)。返回是否真取消了。
     pub fn cancel(&self, user_id: i64, id: i64) -> Result<bool> {
@@ -314,6 +327,22 @@ mod tests {
             std::env::temp_dir().join(format!("lw-jobs-test-{}-{tag}.db", std::process::id()));
         let _ = std::fs::remove_file(&p);
         Store::open(&p).unwrap()
+    }
+
+    /// 调度器「睡到下一个到期点」的取料:只看还没到期的待触发任务里最早的那个。
+    #[test]
+    fn next_due_after_picks_earliest_future_pending() {
+        let s = store("nextdue");
+        let u = s.users.ensure_default_user().unwrap();
+        assert_eq!(s.jobs.next_due_after(0).unwrap(), None, "没有任务");
+        let overdue = s.jobs.add(u.id, 1, "早就该提醒的", 500, "once").unwrap();
+        let soon = s.jobs.add(u.id, 1, "三分钟后", 4_000, "once").unwrap();
+        s.jobs.add(u.id, 1, "明天", 90_000, "daily").unwrap();
+        assert_eq!(s.jobs.next_due_after(1_000).unwrap(), Some(4_000), "过期的不算,取未来最早的");
+        s.jobs.finish(soon.id, "done").unwrap();
+        assert_eq!(s.jobs.next_due_after(1_000).unwrap(), Some(90_000), "办完的不算");
+        s.jobs.finish(overdue.id, "missed").unwrap();
+        assert_eq!(s.jobs.next_due_after(100_000).unwrap(), None);
     }
 
     #[test]

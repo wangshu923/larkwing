@@ -636,6 +636,19 @@ watch(searchQuery, (q) => {
     }
   }, 180)
 })
+/* 会话列表的键盘操作(2026-11-11;原先整列都是 `<li @click>`,键盘够不着):Tab 只停在一项上(当前会话;
+ * 当前会话不在列表里就停第一项),↑↓ 在项间挪焦点,回车 / 空格打开。`.self` = 只认落在这一行本身的键 ——
+ * 行内重命名输入框里敲空格 / 回车不归这里管。 */
+const rovingConvId = computed(() =>
+  chat.conversations.some((c) => c.id === chat.convId) ? chat.convId : chat.conversations[0]?.id,
+)
+function focusListSibling(e: KeyboardEvent, dir: 1 | -1) {
+  let el = e.currentTarget as HTMLElement | null
+  do {
+    el = (dir > 0 ? el?.nextElementSibling : el?.previousElementSibling) as HTMLElement | null
+  } while (el && !el.hasAttribute('tabindex'))
+  el?.focus()
+}
 async function openHit(hit: SearchHit) {
   // 从前这里只 selectConversation(= 载最近一页),命中若在 200 条之外,点了**看不到那条**。
   // 现在载「它周围那一页」并滚过去高亮一下;顶部同时出现「回到最新」。
@@ -987,7 +1000,16 @@ async function backToLatest() {
         <button v-if="searchQuery" class="rc-search-clear" @click="searchQuery = ''" :title="t('recents.searchClear')">×</button>
       </div>
       <ul v-if="searchQuery.trim()" class="rc-list rc-results">
-        <li v-for="(h, hi) in searchHits" :key="hi" @click="openHit(h)">
+        <li
+          v-for="(h, hi) in searchHits"
+          :key="hi"
+          :tabindex="hi === 0 ? 0 : -1"
+          @click="openHit(h)"
+          @keydown.enter.self.prevent="openHit(h)"
+          @keydown.space.self.prevent="openHit(h)"
+          @keydown.down.self.prevent="focusListSibling($event, 1)"
+          @keydown.up.self.prevent="focusListSibling($event, -1)"
+        >
           <span class="rc-title">{{ h.conversation_title || t('recents.untitled') }}</span>
           <div class="rc-snippet">{{ h.snippet }}</div>
           <span class="rc-time">{{ fmtTime(h.created_at) }}</span>
@@ -999,8 +1021,14 @@ async function backToLatest() {
           v-for="s in chat.conversations"
           :key="s.id"
           :class="{ on: s.id === chat.convId, pinned: s.pinned }"
+          :tabindex="s.id === rovingConvId ? 0 : -1"
+          :aria-current="s.id === chat.convId ? 'true' : undefined"
           @click="selectConversation(s.id)"
           @contextmenu="openConvMenu($event, s)"
+          @keydown.enter.self.prevent="selectConversation(s.id)"
+          @keydown.space.self.prevent="selectConversation(s.id)"
+          @keydown.down.self.prevent="focusListSibling($event, 1)"
+          @keydown.up.self.prevent="focusListSibling($event, -1)"
         >
           <!-- 钉住标:右上角图钉(描边、跟随主题色,与渠道图标同语言) -->
           <span v-if="s.pinned" class="rc-pin" :title="t('recents.pinned')">
@@ -1451,6 +1479,8 @@ async function backToLatest() {
   transition: border-color .15s, background .15s;
 }
 .rc-list li:hover { border-color: rgba(var(--accent-rgb), 0.4); }
+/* 焦点环画在行内侧:列表是滚动容器,画在外侧会被两边裁掉 */
+.rc-list li:focus-visible { outline-offset: -2px; }
 .rc-list li.on { background: rgba(var(--accent-rgb), 0.12); border-color: rgba(var(--accent-rgb), 0.5); box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.12); }
 /* 钉住:左缘一道强调色细条 + 标题给图钉让出右内边距 */
 .rc-list li.pinned { border-left: 2px solid rgba(var(--accent-rgb), 0.65); }

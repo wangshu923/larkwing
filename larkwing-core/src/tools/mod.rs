@@ -450,9 +450,54 @@ impl Tools {
     }
 }
 
+/// 出厂场景工具面的体量闸(各工具的描述 + 参数 schema,按字符;2026-11-12)。工具面占稳定前缀的
+/// 八成,每个回合都付。现状 30172 字符;这个数 = 现状加约 3% 余量(一两个新工具的量)。
+/// 守卫在 `tests::tool_prompt_budget`:超了先收旧的,真要抬这个数回来问(§4.11)。
+#[cfg(test)]
+const TOOL_SURFACE_MAX_CHARS: usize = 31_000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 出厂场景的工具面每回合要付多少(描述 + 参数 schema,按字符):打印一张从大到小的表
+    /// (`cargo test -p larkwing-core --lib tool_prompt_budget -- --nocapture`;再加
+    /// `LW_DUMP_TOOLS=名字,名字` 把那几个的全文打出来)。并守住 `TOOL_SURFACE_MAX_CHARS`。
+    #[test]
+    fn tool_prompt_budget() {
+        let reg = Tools::builtin();
+        let scene = crate::scenes::Scenes::builtin().default_scene().clone();
+        let mut rows: Vec<(usize, usize, &'static str)> = reg
+            .subset(&scene.tools)
+            .iter()
+            .map(|t| {
+                let s = t.spec();
+                (s.description.chars().count(), s.parameters.to_string().chars().count(), s.name)
+            })
+            .collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.0 + r.1));
+        let (desc, params): (usize, usize) =
+            rows.iter().fold((0, 0), |(d, p), r| (d + r.0, p + r.1));
+        eprintln!("TOOLS {} 个 · 描述 {desc} · 参数 {params} · 合计 {}", rows.len(), desc + params);
+        assert!(
+            desc + params <= TOOL_SURFACE_MAX_CHARS,
+            "出厂场景的工具面涨到 {} 字符了(上限 {TOOL_SURFACE_MAX_CHARS})。它进每一个回合的稳定前缀:\
+             先看上面这张表能不能收一收(描述与参数说明重复的、技能里已经有的教程),真要抬上限回来问",
+            desc + params
+        );
+        for (d, p, name) in &rows {
+            eprintln!("{:>6} = 描述 {d:>5} + 参数 {p:>5}  {name}", d + p);
+        }
+        if let Ok(want) = std::env::var("LW_DUMP_TOOLS") {
+            for t in reg.subset(&scene.tools) {
+                let sp = t.spec();
+                if want.split(',').any(|w| w == sp.name) {
+                    eprintln!("=== {} ===\n{}\n--- params ---\n{}", sp.name, sp.description,
+                        serde_json::to_string_pretty(&sp.parameters).unwrap());
+                }
+            }
+        }
+    }
 
     /// 迅雷专用链 = base64("AA" + url + "ZZ")。用真实构造法生成再解,别手抄常量。
     fn thunder(url: &str) -> String {

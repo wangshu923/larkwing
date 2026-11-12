@@ -123,14 +123,15 @@ fn parse_days(daily: Option<&Value>, when: When) -> Vec<DayForecast> {
     };
     let take = if when == When::Today { 1 } else { dates.len() };
     (0..dates.len().min(take))
-        .map(|i| {
+        .filter_map(|i| {
             let dcode = codes.and_then(|c| c.get(i)).and_then(Value::as_i64).unwrap_or(-1);
-            DayForecast {
+            // 气温缺了的那天整天不要(2026-11-11):原先缺值落成 0,等于给模型喂「最高 0°C」的假数据
+            Some(DayForecast {
                 date: dates[i].as_str().unwrap_or("").to_string(),
-                high_c: highs.get(i).and_then(Value::as_f64).map(round_i32).unwrap_or(0),
-                low_c: lows.get(i).and_then(Value::as_f64).map(round_i32).unwrap_or(0),
+                high_c: highs.get(i).and_then(Value::as_f64).map(round_i32)?,
+                low_c: lows.get(i).and_then(Value::as_f64).map(round_i32)?,
                 text: wmo_text(dcode).to_string(),
-            }
+            })
         })
         .collect()
 }

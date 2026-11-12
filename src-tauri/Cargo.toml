@@ -25,6 +25,9 @@ tauri-plugin-autostart = "2"
 tauri-plugin-opener = "2"
 # 数据目录「搬家」:原生目录选择器(从 Rust 命令侧调,不走 JS 插件命令故无需 capability)。
 tauri-plugin-dialog = "2"
+# 启动失败的原生对话框(lib.rs::startup_failed):这时 app 可能没起来,dialog 插件用不上,直接调它
+# 底下的 rfd。版本与特性照抄 dialog 插件自己的声明 → 依赖树里就是同一份,零新编译面。
+rfd = { version = "0.16", default-features = false, features = ["common-controls-v6"] }
 # 单实例:已在运行时再点快捷方式不开新进程,把已运行实例唤到前台(Win 真机诉求)。
 tauri-plugin-single-instance = "2"
 # 一键更新:app 内查清单→签名校验→原地装(Win 装前自动退出 app);走用户代理(check 自带 proxy)。

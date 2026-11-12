@@ -46,7 +46,10 @@ scan 'Mutex 裸取锁(换行形 .lock() ⏎ .unwrap)' '\.lock\(\)[[:space:]]*$'
 # RwLock:空括号的 .read()/.write() 只可能是锁(io::Read/Write 那两个方法都收 buf 参数)
 scan 'RwLock 裸取锁(.read()/.write() + unwrap/expect)' '\.(read|write)\(\)\.(unwrap|expect)\('
 # 「中毒就静默跳过」也不行(§3.5 不静默失败):中毒是要记一句的,不是当没发生
-scan '中毒静默跳过(if let Ok(..) = ..lock())' 'let Ok\(.*\.lock\(\)'
+scan '中毒静默跳过(if let Ok(..) = ..lock() / .read() / .write())' 'let Ok\(.*\.(lock|read|write)\(\)'
+# 链式的同一种病(2026-11-11 补,原先漏网两处):`.lock().map(..).unwrap_or_default()`、
+# `.read().ok()` —— 中毒时悄悄给个空值 / None,调用方看不出这块状态已经废了。
+scan '中毒静默跳过(链式 .ok() / .map() / .unwrap_or…)' '\.(lock|read|write)\(\)[[:space:]]*\.(ok|map|map_or|map_or_else|and_then|is_ok|is_err|unwrap_or|unwrap_or_default|unwrap_or_else)\('
 
 # ── 阳性对照:证明上面的扫描真的在看代码 ────────────────────────────────────
 # check-i18n.mjs 立的规矩:每条都报「扫了多少」,防「正则没匹配到东西却静默全绿」。

@@ -17,6 +17,7 @@ import {
   type OutAttachment,
   type TraceItem,
   type TraceStep,
+  type TurnEvent,
   type TurnTrace,
   type UsageDigest,
   type UsageTotals,
@@ -132,8 +133,116 @@ let localId = -1 // 本地占位 id 用负数,与落库的正数 id 永不冲突
 // 真机实锤:任务会话在飞时一次误唤醒 → 界面切到语音会话 → 切回来回合「消失」、接着说话被取消。
 /** 每个会话最新一次 send 的序号:同会话流中再发,旧回合的迟到事件按它作废(不串台)。 */
 const turnSeqByConv = new Map<number, number>()
-/** 有回合在飞的会话(本窗口发出的;core 自启的提醒 / 汇报回合不在内)。打字发进在飞会话 = 进排队区。 */
+/** 有回合在飞的会话:本窗口发出的,加上 core 自启的提醒 / 汇报回合(见 `selfTurns`)。
+ *  打字发进在飞会话 = 进排队区。 */
 const inflightConvs = new Set<number>()
+// —— core 自启的回合(提醒到点 / 后台汇报)——
+// 它们没有前端 Channel,主窗原先完全不知道它们在跑:界面是空闲态、没有停止钮、计划卡不显,
+// 这时打字会直接发新回合 —— core「同会话新发送取消旧回合」,等于把正在接着干活的汇报回合掐掉。
+// core 起跑时发一条 `turn_started`,这里把该会话记成在飞;收尾认原有的 `conversation` 事件。
+/** 自启回合还在飞的会话(`inflightConvs` 的子集:这几个没有本窗口的回调,靠事件收尾)。 */
+const selfTurns = new Set<number>()
+/** 对账节拍:收尾事件万一漏了(事件车道积压会丢),每隔这么久问 core 一声「还在飞吗」,
+ *  不在了就自己收 —— 否则这个会话的打字会永远进排队区。只在有自启回合登记着时才转。 */
+const SELF_TURN_POLL_MS = 3000
+let selfTurnPoll: ReturnType<typeof setInterval> | undefined
+/** 自启回合的流式接收口(2026-11-12):core 把这类回合的事件经全局车道按序转过来(`turn`),
+ *  交给与普通回合**同一个**事件处理器(`send` 的自启形)—— 回复逐字上屏、工具步骤当场可看,
+ *  不再等收尾后整页重载。登记(`selfTurns`)与对账节拍照旧:终态事件万一丢了仍有人收。 */
+interface SelfStream {
+  /** 喂一条回合事件(与 Channel 回调同形)。 */
+  feed: (ev: TurnEvent) => void
+  /** 作废这条流:之后迟到的事件一律不处理,念到一半的收住,时钟停表(调用方随后整页重载)。 */
+  abandon: () => void
+  /** 这条流属于该会话的第几个回合(被本窗口的新回合接管后就对不上了)。 */
+  turn: number
+  /** 下一条该是几号;对不上 = 中间丢过。 */
+  nextSeq: number
+  lossy: boolean
+  /** 终态(done / failed / cancelled)到了没有。 */
+  settled: boolean
+  /** 这一轮是边流边念的(收尾时别再整段念一遍)。 */
+  spoke: boolean
+}
+const selfStreams = new Map<number, SelfStream>()
+function selfTurnStarted(conv: number, kind: string) {
+  selfTurns.add(conv)
+  inflightConvs.add(conv)
+  state.turnsInFlight = inflightConvs.size
+  if (!selfTurnPoll) selfTurnPoll = setInterval(reconcileSelfTurns, SELF_TURN_POLL_MS)
+  // 正看着这个会话的尾部:状态灯转「在想」(停止钮 / 排队区随之成立),并把刚落库的那条系统线
+  //(到点了 / 忙完了)载上屏 —— 回复随后逐字接在它下面
+  if (conv === state.convId && viewConv === conv && state.anchorId == null) {
+    // 上一回合的字还在放(提醒正好卡在它收尾那一拍):立刻放完并跑它挂着的收尾 —— 下面要整表重载、
+    // 随后新回合还会另起打字机,不先收掉的话那一轮的气泡就永远钉不上落库 id
+    twFlush()
+    state.mood = 'thinking'
+    void reloadMessages(conv, { quiet: true })
+  }
+  send('', 'typed', undefined, [], conv, kind === 'report' ? 'report' : 'reminder')
+}
+/** 全局车道上来的一条自启回合事件:按序交给那个会话的接收口;序号断了记一笔。 */
+function feedSelfStream(conv: number, seq: number, ev: TurnEvent) {
+  const s = selfStreams.get(conv)
+  if (!s) return // 起跑那条没收到(或已收尾):收尾时走整页重载那条老路
+  if (seq !== s.nextSeq) s.lossy = true
+  s.nextSeq = seq + 1
+  if (ev.type === 'done' || ev.type === 'failed' || ev.type === 'cancelled') s.settled = true
+  s.feed(ev)
+}
+/** 到点提醒排进了在飞回合(会话正忙):立刻念一声。只管正看着的桌面会话(与到点自动开口同一道闸);
+ *  正在念别的就不打断 —— 那一回合稍后会把提醒转述出来,聊天流里也会多一条系统线。 */
+function announceQueuedReminder(conv: number, text: string) {
+  if (!text || conv !== state.convId) return
+  const ch = state.conversations.find((c) => c.id === conv)?.channel ?? 'ui'
+  if (ch !== 'ui' && ch !== 'system') return // 渠道会话的提醒由 outbound_loop 推回那台手机
+  if (useSettings().get('voice.auto_speak') === 'off') return
+  const speech = useSpeech()
+  if (speech.state.busy) return
+  speech.speakText(`${t('chat.eventDue')}:${text}`)
+}
+/** 摘掉自启回合的登记(不动在飞表):本窗口的回合接管了这个会话时用 —— 之后那条迟到的收尾事件
+ *  就不会把**用户回合**的在飞标记一并解除。返回它是不是登记过。 */
+function dropSelfTurn(conv: number): boolean {
+  if (!selfTurns.delete(conv)) return false
+  if (!selfTurns.size && selfTurnPoll) {
+    clearInterval(selfTurnPoll)
+    selfTurnPoll = undefined
+  }
+  return true
+}
+/** 自启回合收尾:解除在飞;正看着它就把状态灯放回空闲(随后由调用方重载上屏)。
+ *  没登记过(被本窗口的回合接管了 / 不是自启回合)= 什么都不做,返回 false。 */
+function selfTurnEnded(conv: number): boolean {
+  if (!dropSelfTurn(conv)) return false
+  releaseInFlight(conv)
+  if (conv === state.convId) {
+    state.mood = 'idle'
+    state.toolAction = ''
+  }
+  return true
+}
+function reconcileSelfTurns() {
+  for (const conv of [...selfTurns]) {
+    api
+      .conversationBusy(conv)
+      .then((busy) => {
+        if (busy || !selfTurnEnded(conv)) return
+        // 收尾事件没到:按「正常收尾」自己收一遍。流式接收口作废(下面整页重载对账),但条目留着、
+        // 标成已收好 —— 那条收尾事件若只是晚到,别再重载 / 再念一遍
+        const st = selfStreams.get(conv)
+        if (st) {
+          st.abandon()
+          st.settled = true
+          st.lossy = false
+        }
+        void refreshConversations()
+        if (conv === state.convId) void reloadMessages(conv, { quiet: true })
+        else if (state.conversations.some((c) => c.id === conv)) state.convBadges[conv] = 'done'
+      })
+      .catch(() => {}) // 问不到就下一拍再问
+  }
+}
 function nextTurnSeq(conv: number): number {
   const n = (turnSeqByConv.get(conv) ?? 0) + 1
   turnSeqByConv.set(conv, n)
@@ -431,23 +540,26 @@ function pushReminderDemo() {
   })
 }
 
-/** 一轮 usage 累进"本回合"(工具回合多轮);可估价的轮才累钱,估不出的由 today.unpriced 兜着。 */
+/** 把一轮 usage 加进一回合的累计(工具回合多轮);可估价的轮才累钱,估不出的由 today.unpriced 兜着。
+ *  纯函数:每个回合的账记在它自己的 send 闭包里,`state.usage.turn` 只是屏上那一轮的视图(2026-11-11)
+ *  —— 原先全程只有 state 上那一份:切走期间的轮次不进账,在别的会话发一句又把它清零,切回来接着往
+ *  别人的数上加,钉到气泡上的读数就是错的。 */
+function addRound(turn: UsageDigest | null, round: UsageDigest): UsageDigest {
+  const t: UsageDigest = turn
+    ? { ...turn }
+    : { input_tokens: 0, output_tokens: 0, cache_hit_tokens: 0, cost_usd: null, elapsed_ms: 0, ttft_ms: null }
+  t.input_tokens += round.input_tokens
+  t.output_tokens += round.output_tokens
+  t.cache_hit_tokens += round.cache_hit_tokens
+  if (round.cost_usd != null) t.cost_usd = (t.cost_usd ?? 0) + round.cost_usd
+  t.elapsed_ms += round.elapsed_ms // LLM 轮时长之和(端到端体感另在 settleTurn 测)
+  t.ttft_ms ??= round.ttft_ms // 首轮的首字延迟 = 用户等到第一点动静的时间
+  return t
+}
+
+/** 预览 / 演示路径:没有 send 闭包,直接记在屏上那一份。 */
 function applyRound(round: UsageDigest) {
-  const turn = state.usage.turn ?? {
-    input_tokens: 0,
-    output_tokens: 0,
-    cache_hit_tokens: 0,
-    cost_usd: null,
-    elapsed_ms: 0,
-    ttft_ms: null,
-  }
-  turn.input_tokens += round.input_tokens
-  turn.output_tokens += round.output_tokens
-  turn.cache_hit_tokens += round.cache_hit_tokens
-  if (round.cost_usd != null) turn.cost_usd = (turn.cost_usd ?? 0) + round.cost_usd
-  turn.elapsed_ms += round.elapsed_ms // LLM 轮时长之和(端到端体感另在 settleTurn 测)
-  turn.ttft_ms ??= round.ttft_ms // 首轮的首字延迟 = 用户等到第一点动静的时间
-  state.usage.turn = turn
+  state.usage.turn = addRound(state.usage.turn, round)
 }
 
 /** 在飞时钟:VM 持有唯一一份,灯带和在飞气泡都只是它的视图。 */
@@ -668,7 +780,22 @@ async function boot() {
       if (conv) conv.title = ev.data.title
       return
     }
+    // core 自启的回合起跑:记成在飞(见 selfTurns),并开一个流式接收口
+    if (ev.type === 'turn_started') {
+      selfTurnStarted(ev.data.conv_id, ev.data.kind)
+      return
+    }
+    if (ev.type === 'turn') {
+      feedSelfStream(ev.data.conv_id, ev.data.seq, ev.data.event)
+      return
+    }
     if (ev.type !== 'conversation') return
+    // 到点提醒排进了在飞回合(会话正忙):不是终态 —— 不刷列表、不打标,只管「到点必有动静」
+    if (ev.data.outcome === 'queued') {
+      announceQueuedReminder(ev.data.conv_id, ev.data.text ?? '')
+      return
+    }
+    const outcome = ev.data.outcome
     // 旁听蒸发:零痕迹 —— 不刷列表、不打 badge、不重拉(duck 恢复归 useVoice 管)
     if (ev.data.kind === 'overheard_dismissed') return
     // 旁听转正 = 屋里有人在跟它说话(语音交互必念 §3.4):**不管当前开着哪个会话都念**;
@@ -690,15 +817,29 @@ async function boot() {
         .catch(() => {})
     }
     refreshConversations()
+    // 自启回合收尾:解除它占着的「在飞」(正看着它时状态灯回空闲,下面随即重载上屏;排队的话
+    // 在重载落地后发出)。被本窗口的回合接管过的不在登记里,这一步是空操作
+    selfTurnEnded(ev.data.conv_id)
+    // 这一轮是流式接的(且没被本窗口的新回合接管):终态已由那个处理器收好 —— 气泡钉了读数、
+    // 该打的标打了、失败的那句也在气泡里。这里只剩把排队的话发出去。
+    const stream = selfStreams.get(ev.data.conv_id)
+    selfStreams.delete(ev.data.conv_id)
+    const streamed = stream && stream.turn === turnSeqOf(ev.data.conv_id) ? stream : undefined
+    if (streamed?.settled && !streamed.lossy) {
+      if (ev.data.conv_id === state.convId) flushQueue()
+      return
+    }
+    // 终态没等到 / 中间丢过事件:这条流作废,按老办法整页重载对一次账
+    streamed?.abandon()
     // 不在该会话界面:列表项按终态打标(完成 / 失败),进入会话即清(selectConversation)
     if (ev.data.conv_id !== state.convId) {
-      state.convBadges[ev.data.conv_id] = ev.data.outcome
+      state.convBadges[ev.data.conv_id] = outcome
       return
     }
     // 自启回合(到点提醒 / 后台忙完的汇报)在**当前会话**里失败:它没有前端 Channel、不像普通回合
     // 会显错误气泡 —— 以前 outcome 在这一支被直接无视,用户只看到一条系统线、下面什么都没有
     // (2026-10-08 真机实锤:分头办事「忙完了」之后一片空白,追问才知道没接上)。§3.5 不静默失败。
-    if (ev.data.outcome === 'failed') {
+    if (outcome === 'failed') {
       useToast().error(
         ev.data.kind === 'report' ? t('toast.wakeFailedReport') : t('toast.wakeFailedReminder'),
       )
@@ -711,7 +852,7 @@ async function boot() {
       void reloadMessages(conv, { quiet: true }).then((msgs) => {
         if (!msgs) {
           // 载的这一拍切走了:按「不在该会话」处理,列表项打标
-          if (state.convId !== conv) state.convBadges[conv] = ev.data.outcome
+          if (state.convId !== conv) state.convBadges[conv] = outcome
           return
         }
         // 提醒到点自动开口(PLAN §11 B 期):设备主动叫人,off 档才闭嘴;
@@ -724,6 +865,7 @@ async function boot() {
         const last = msgs.filter(visible).at(-1)
         if (
           deskConv &&
+          !streamed?.spoke && // 流式那条路已经边流边念过了
           ev.data.kind === 'reminder' &&
           last &&
           last.role === 'assistant' &&
@@ -776,11 +918,18 @@ async function refreshConversations() {
  *  只有收尾的正是当前会话才把攒的消息合并成下一轮发出(Phase A:整轮结束自动发)。 */
 function settleInFlight(conv: number) {
   releaseInFlight(conv)
-  if (conv === state.convId) flushQueue()
+  if (conv === state.convId) {
+    // 上一轮的字还在放的时候自启回合起跑了(提醒正好到点):这一轮收尾把状态灯放回了空闲,
+    // 而那个会话其实还在飞 —— 灯接回「在想」,停止钮才对得上
+    if (selfTurns.has(conv)) state.mood = 'thinking'
+    flushQueue()
+  }
 }
 /** 只解除「在飞」+ 语音路由,不发排队区(视图还没就绪时用:排队的等重载落地后再发,见 reloadMessages)。 */
 function releaseInFlight(conv: number) {
-  inflightConvs.delete(conv)
+  // 这个会话还有自启回合登记着:在飞标记是它的,本窗口这一轮收尾不许顺手摘掉
+  //(否则接下来打字会直接发新回合,把正在接着干活的自启回合取消)
+  if (!selfTurns.has(conv)) inflightConvs.delete(conv)
   state.turnsInFlight = inflightConvs.size
   if (voiceTurnConv === conv) voiceTurnConv = null
 }
@@ -850,15 +999,22 @@ function send(
   speaker?: number,
   attachments: UiAttachment[] = [],
   targetConv?: number,
+  /** 自启形(2026-11-12):这不是「发一条消息」,而是接一个 **core 已经起跑**的回合(提醒到点 /
+   *  后台汇报)—— 没有用户气泡、不调 sendMessage,事件由全局车道经 `selfStreams` 喂进来。
+   *  回合事件怎么处理与普通回合是同一份代码,所以借 send 的壳。 */
+  selfKind?: 'reminder' | 'report',
 ) {
   const content = text.trim()
-  if (!content && attachments.length === 0) return
+  const selfStart = selfKind != null
+  if (!selfStart && !content && attachments.length === 0) return
 
   // 目标会话:缺省 = 当前会话。唤醒回合可指定语音会话且**不切界面**(§7.5,2026-10-11:当前会话
   // 忙着时唤醒不打断它的画面)→ 整轮在后台跑:不上屏只念,收尾给语音会话打 badge;用户中途点进
   // 那个会话,在飞气泡由下面的 reattach 接到屏上。
   const sentConv = targetConv ?? state.convId
-  const background = sentConv !== state.convId
+  // 自启形恒按「后台形」起:在飞气泡先游离着,第一条事件到时若正看着这个会话就 reattach 接上屏
+  //(系统线由起跑那一拍的重载带上来,回复接在它下面)
+  const background = selfStart || sentConv !== state.convId
 
   // 排队(Phase A):7274 还在回话时,打字发送不打断 → 进排队区;整轮结束后自动合并成下一轮发出。
   // (语音 mic/wake 不排队:开口即应,沿用既有打断。)
@@ -887,9 +1043,18 @@ function send(
   // 语音会话模式(PLAN §11 二分):打字/按钮说话 = UI 交互,默认不念;
   // wake = 语音交互必念(off 档不管它——喊它就是要它说话);always 档 = 全念。
   const speech = useSpeech()
-  const speak = source === 'wake' || useSettings().get('voice.auto_speak') === 'always'
+  // 自启形:只有到点提醒念(设备主动叫人;汇报不念),且沿用到点自动开口的那道闸 —— 正看着的
+  // 桌面会话、没关朗读。渠道会话的提醒已由 outbound_loop 推回手机,桌面不重复出声。
+  const selfSpeak =
+    selfKind === 'reminder' &&
+    sentConv === state.convId &&
+    ['ui', 'system'].includes(state.conversations.find((c) => c.id === sentConv)?.channel ?? 'ui') &&
+    useSettings().get('voice.auto_speak') !== 'off'
+  const speak = selfStart
+    ? selfSpeak
+    : source === 'wake' || useSettings().get('voice.auto_speak') === 'always'
   if (speak) speech.beginTurn()
-  else speech.abort() // 新回合开口前,先停上一段念话(新话压旧话)
+  else if (!selfStart) speech.abort() // 新回合开口前,先停上一段念话(新话压旧话);后台起的回合不掐正在念的
 
   // 唤醒回合的收尾编排:念完 → 开跟进窗;失败/取消/被忽略 → 直接回待唤醒
   const wakeTurn = source === 'wake'
@@ -936,6 +1101,7 @@ function send(
   // 本回合在飞的工具步骤:call id → 那条轨迹条目(finished 事件按 id 回填结果,
   // 同一轮并发调好几个同名工具时也认得准)。回合结束即随闭包丢弃。
   const liveSteps = new Map<string, Extract<TraceItem, { kind: 'tool' }>>()
+  let turnUsage: UsageDigest | null = null // 本回合的用量账(不在屏上也照记;屏上的灯带读它)
   const startedAt = Date.now() // 端到端计时起点:从用户按下发送起(体感真值);reattach 时拿它接回时钟
 
   // 在飞气泡 + 视图代次。后台发出的回合没有视图落点:给一个游离对象攥着轨迹 / 亮图,
@@ -969,11 +1135,14 @@ function send(
     myList = listGen // 视图代次快照:整表被换过就说明闭包里的 wang 已成孤儿(见下面的 reattach)
   }
   inflightConvs.add(sentConv) // 占住"在飞"(按会话):打字发进这个会话进排队区,直到本轮收尾
+  // 这个会话若有自启回合在飞:core 会把它取消,在飞标记从此归本回合管。自启形自己不摘 ——
+  // 它就是那个自启回合,登记(与对账节拍)要留到收尾事件来
+  if (!selfStart) dropSelfTurn(sentConv)
   state.turnsInFlight = inflightConvs.size
   // 确认闸的语音路由判据(§7.8):唤醒回合落在哪个会话。同会话被打字回合接管时清掉;别的会话
   // 在飞的唤醒回合不受影响(按会话记,不是全局一份)。
   if (wakeTurn) voiceTurnConv = sentConv
-  else if (voiceTurnConv === sentConv) voiceTurnConv = null
+  else if (!selfStart && voiceTurnConv === sentConv) voiceTurnConv = null
 
   if (!state.inTauri) {
     if (background) settleInFlight(sentConv) // 预览没有后台真流,当场收尾
@@ -999,6 +1168,7 @@ function send(
     state.mood = 'thinking'
     const running = [...liveSteps.values()].find((s) => !s.status)
     state.toolAction = running?.ui_key ?? ''
+    state.usage.turn = turnUsage // 灯带"本轮"接回本回合自己的账(切走期间的轮次也在里面)
     state.usage.turnStartedAt = startedAt
     startLiveClock()
   }
@@ -1051,8 +1221,7 @@ function send(
   const outAtts: OutAttachment[] = attachments
     .filter((a) => a.base64 || a.path)
     .map((a) => ({ name: a.name, mime: a.mime || '', data: a.base64 ?? '', path: a.path }))
-  api
-    .sendMessage(sentConv, content, { input: source, speak, speaker_user: speaker }, outAtts, (ev) => {
+  const onTurnEvent = (ev: TurnEvent) => {
       // ① 同会话里更新的 send 已接管(流中再发 = core 先取消旧回合):旧回合迟到事件一律丢,不串台。
       //    但唤醒回合的终态仍要通知唤醒循环(新回合已占麦 → 不开跟进窗,直接回待唤醒;否则 core
       //    卡 AwaitTurn 到 180s 兜底,duck 把媒体音量压好几分钟——真机实锤的主谋)。
@@ -1082,14 +1251,17 @@ function send(
             // ——入参随流走(已截断),结果等这一步跑完回填。done 时 hydrateTrace 再用落库
             // 全量版整条覆盖归位(在飞看个大概,跑完看全)。不在屏上也攒:reattach 要用。
             if (!wang.trace) wang.trace = { items: [] }
-            const step = {
+            // 响应式对象:跑完回填 result / status 时要能触发重渲染。存裸对象的话,回填改的是
+            // 数组里那条的「原件」,Vue 不知道 —— 展开着的那一步要等回合收尾 hydrate 才显示结果
+            // (2026-11-11;与上面「必须从 reactive 数组取回代理再改」同一个坑)。
+            const step = reactive({
               kind: 'tool' as const,
               name: ev.data.name,
               ui_key: ev.data.label,
               args: ev.data.args,
               result: '',
               status: '',
-            }
+            })
             wang.trace.items.push(step)
             liveSteps.set(ev.data.id, step) // 按 call id 配对(同一轮可能并发好几个同名调用)
           } else {
@@ -1156,6 +1328,24 @@ function send(
           turnHadTrace = false
           break
         }
+        case 'event_line': {
+          // 到点提醒排进了这个在飞回合:收尾当前回复气泡 → 插一条系统线 → 开新回复气泡(与 injected 同构;
+          // 当前段答的是提醒之前的事,模型接下来那段才是对提醒的转述)
+          if (visibleNow) {
+            twFlush()
+            state.messages.push({ id: ev.data.message_id, role: 'event', text: ev.data.text, at: Date.now() })
+            state.messages.push({ id: localId--, role: 'wang', text: '', at: Date.now() })
+            wang = state.messages[state.messages.length - 1] // 重指到新回复气泡
+            twStart(wang)
+            state.mood = 'thinking'
+          } else {
+            wang = { id: localId--, role: 'wang', text: '', at: Date.now() } // 游离:上一段与系统线都已落库
+            resyncIfWatching()
+          }
+          fullText = ''
+          turnHadTrace = false
+          break
+        }
         case 'segment': {
           // 带文字的工具轮(PLAN §9):这段回复在落库里是独立 assistant 行 —— 封口当前段
           // (钉 message_id 供 done 后 hydrateTrace 把「想了想」挂上)、另起新段接后续文字。
@@ -1177,7 +1367,8 @@ function send(
           break
         }
         case 'usage':
-          if (visibleNow) applyRound(ev.data.round) // 灯带"本轮"只记屏上这轮
+          turnUsage = addRound(turnUsage, ev.data.round) // 本回合自己的账:在不在屏上都记
+          if (visibleNow) state.usage.turn = turnUsage // 灯带"本轮"只显屏上这轮
           state.usage.today = ev.data.today // 后端账本快照,天然防双计/跨午夜
           if (state.convId === sentConv) state.usage.conv = ev.data.conv
           break
@@ -1216,6 +1407,7 @@ function send(
               if (i >= 0) state.messages.splice(i, 1)
             }
             if (turnHadTrace) void hydrateTrace(sentConv) // 「想了想」详情从落库 payload 补拉
+            state.usage.turn = turnUsage // 钉读数用本回合自己的账(屏上那份可能被别的会话的回合动过)
             settleTurn(twin ?? wang) // 端到端时长定格,读数钉在气泡上
             state.mood = 'idle'
             state.toolAction = ''
@@ -1259,7 +1451,27 @@ function send(
           settleInFlight(sentConv) // 停止后排队的仍发出(它们是你还想要的;不想要就在排队区划掉)
           break
       }
+  }
+  if (selfStart) {
+    // 自启形:回合早已在 core 里跑着,事件从全局车道来(feedSelfStream)。没有「发送失败」那一支。
+    selfStreams.set(sentConv, {
+      feed: onTurnEvent,
+      abandon: () => {
+        nextTurnSeq(sentConv) // 迟到的事件从此对不上号
+        if (speak) speech.endTurn()
+        if (state.usage.turnStartedAt === startedAt) settleTurn()
+        if (onScreen() && myList === listGen) twFlush()
+      },
+      turn: myTurn,
+      nextSeq: 0,
+      lossy: false,
+      settled: false,
+      spoke: speak,
     })
+    return
+  }
+  api
+    .sendMessage(sentConv, content, { input: source, speak, speaker_user: speaker }, outAtts, onTurnEvent)
     .catch((e) => {
       // 前置错误(AppError):没 key / 会话不存在 / 建连失败
       if (myTurn !== turnSeqOf(sentConv)) {

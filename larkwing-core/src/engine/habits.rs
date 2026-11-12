@@ -365,11 +365,16 @@ pub(crate) fn gather(store: &Store, from_ms: i64, to_ms: i64) -> Result<Gathered
     let mut out = Gathered::default();
     let mut cur_conv = i64::MIN;
     let mut speaker: Option<i64> = None;
+    // 正处在自启回合里(提醒到点 / 后台汇报):它调的工具是程序按计划 / 接着干活调的,不是谁的
+    // 使用习惯(2026-11-11)。原先这些也算痕迹、还记在上一个说话人头上 —— 每天定时的播报
+    // 天然满足「多次、跨多天」,会被写成一条等于在复述定时任务的「惯例」。
+    let mut self_started = false;
     let mut calls: HashMap<String, (String, serde_json::Value)> = HashMap::new();
     for r in rows {
         if r.conversation_id != cur_conv {
             cur_conv = r.conversation_id;
             speaker = None;
+            self_started = false;
             calls.clear();
         }
         let owner = *owner_of
@@ -379,7 +384,9 @@ pub(crate) fn gather(store: &Store, from_ms: i64, to_ms: i64) -> Result<Gathered
             sp.or(owner).and_then(|id| names.get(&id).cloned()).unwrap_or_else(|| "家里人".into())
         };
         match r.role.as_str() {
+            "event" => self_started = true,
             "user" => {
+                self_started = false;
                 speaker = r
                     .payload
                     .as_deref()
@@ -399,8 +406,8 @@ pub(crate) fn gather(store: &Store, from_ms: i64, to_ms: i64) -> Result<Gathered
                 else {
                     continue;
                 };
-                if p.status != "ok" {
-                    continue; // 失败的尝试不是惯例
+                if p.status != "ok" || self_started {
+                    continue; // 失败的尝试不是惯例;自启回合里的调用也不是(见 self_started)
                 }
                 let (name, args) = calls.remove(&p.call_id).unwrap_or((p.name.clone(), serde_json::Value::Null));
                 let who = who(speaker);
@@ -1012,6 +1019,31 @@ mod tests {
     }
 
     /// 用户删掉的不再写回:上次写过两句、用户删了一句 → 这句进否决名单,模型再写也被滤掉。
+    /// 自启回合(提醒到点 / 后台汇报)里调的工具不算谁的使用痕迹(2026-11-11):每晚定时放故事的
+    /// 提醒连着触发三天,取料里一条播放事件都没有;人自己开口点的照算。
+    #[test]
+    fn gather_skips_tool_rows_of_self_started_turns() {
+        let tag = "selfturn";
+        let s = store(tag);
+        let me = s.users.ensure_default_user().unwrap();
+        let conv = s.chat.create_conversation(me.id, "companion").unwrap();
+        for d in [1, 2, 3] {
+            let ev = s.chat.append_message(conv.id, "event", "到点放睡前故事").unwrap();
+            backdate(tag, ev.id, at(d, 20, 0) - 5000);
+            seed_play(&s, tag, conv.id, "睡前故事", at(d, 20, 0));
+        }
+        let now = crate::store::now_ms();
+        let g = gather(&s, now - LOOKBACK_DAYS * 86_400_000, now).unwrap();
+        assert!(g.events.is_empty(), "定时任务自己放的不算使用痕迹:{:?}", g.events);
+        // 人开口点的照算(user 行把「自启回合」这段收住)
+        let u = s.chat.append_message(conv.id, "user", "放汪汪队").unwrap();
+        backdate(tag, u.id, at(0, 9, 0) - 5000);
+        seed_play(&s, tag, conv.id, "汪汪队立大功", at(0, 9, 0));
+        let now = crate::store::now_ms();
+        let g = gather(&s, now - LOOKBACK_DAYS * 86_400_000, now).unwrap();
+        assert_eq!(g.events.len(), 1, "{:?}", g.events);
+    }
+
     /// 家里人自己写进「惯例」的话不归整理器管(2026-11-11):重写时原样带上、排在前面,
     /// 不因为痕迹里没有就被删;整理器只记自己写的那几句为「上次写入」。
     #[tokio::test]

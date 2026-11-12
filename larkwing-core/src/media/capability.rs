@@ -12,6 +12,7 @@
 //! 需要改变结论的事(能力探测、copy 快车道、字幕)都在后续期,改时测试会红给你看。
 
 use super::probe::Container;
+use crate::lockext::RwLockExt;
 
 /// 探测方式:看容器决定「拿什么去问事实」(第一段判定,不涉及路由)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,14 +234,13 @@ static CODECS: std::sync::RwLock<Option<Codecs>> = std::sync::RwLock::new(None);
 
 /// 前端探完灌进来(换 WebView 版本会重探 → 允许覆盖)。
 pub fn set_codecs(c: Codecs) {
-    if let Ok(mut w) = CODECS.write() {
-        *w = Some(c);
-    }
+    *CODECS.wr() = Some(c);
 }
 
-/// 取当前快照(集合很小,克隆比端着锁进判定安全)。锁中毒 → `None` = 回落白名单,绝不 panic。
+/// 取当前快照(集合很小,克隆比端着锁进判定安全)。走 lockext:锁中毒也照取(记一句 warn),
+/// 不 panic、也不再悄悄当成「没探过」(§6.10;这两处原先是守卫脚本漏网的写法,2026-11-11 补)。
 pub fn codecs() -> Option<Codecs> {
-    CODECS.read().ok().and_then(|r| r.clone())
+    CODECS.rd().clone()
 }
 
 /// 两路共用的查法:先归一,再看**探过没有**,最后才答支持与否。

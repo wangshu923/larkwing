@@ -89,10 +89,13 @@ impl FsOpRepo {
     }
 
     /// 全家最近的批次(桌面操作记录页 = 主人的管理面,同提醒页的口径)。
+    /// **`ops` 这一列不取**(给空串,2026-11-11):它是整批操作的明细 JSON,写 / 改类的批次里带着
+    /// 改动前后的全文快照(单条可到 2MiB),而这一页只显示「什么操作、几个、撤没撤」—— 原先 100 行
+    /// 全量过桥,最坏是上百 MB 的 JSON。要明细的(撤销 / 重做)走 `get`。
     pub fn list_all(&self, limit: i64) -> Result<Vec<FsOpRow>> {
         self.db.with(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, user_id, kind, ops, n, state, created_at, updated_at
+                "SELECT id, user_id, kind, '' AS ops, n, state, created_at, updated_at
                  FROM fsops ORDER BY id DESC LIMIT ?1",
             )?;
             let rows = stmt

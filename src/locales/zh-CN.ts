@@ -869,6 +869,7 @@ export default {
       cloneCancel: '取消',
       cloneDelete: '删掉',
       cloneDeleteArm: '删?',
+      cloneRename: '改名',
       cloneImportFailed: '这个文件没认出来 —— 换个 wav/mp3/m4a 再试。',
       cloneSaveFailed: '没存上 —— 名字和文字稿都填了再试一次。',
       // 试听句经 voice_preview 传给 core 合成(core 不产文案,先例 = 登录窗标题)
@@ -958,6 +959,8 @@ export default {
         tokenPlaceholder: '粘贴 BotFather 给的 token',
         allowed: '允许的 chat',
         allowedPlaceholder: '你的 chat id(逗号分隔);先留空,bot 会告诉你',
+        knocks: '刚来找过它的',
+        knockAllow: '放行这个对话(chat id {id})',
         steps: '开启后先在 Telegram 给 bot 发一句,它会回复你的 chat id;把 id 填进上面、保存即可对话。',
         linkPre: '没有 bot?去',
       },

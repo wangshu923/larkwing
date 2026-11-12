@@ -12,15 +12,49 @@ use crate::engine::Engine;
 use crate::store::Job;
 use crate::weather::{qweather_cfg, Weather, WeatherClient, When};
 
+/// 兜底节拍:没有任何任务快到期时也每隔这么久醒一次(日记 / 惯例提炼搭这一拍;因会话忙、
+/// 建连失败留下的过期任务也按它重试)。
 const POLL: std::time::Duration = std::time::Duration::from_secs(30);
 /// 错过宽限:超过它的不补发 —— once 标 missed;重复型推进到未来最近一次。
 const MISS_GRACE_MS: i64 = 2 * 3600 * 1000;
 
+/// 新任务入库时踢调度器一脚(`kick`):别等它睡满这一觉。permit 语义 —— 它正忙着跑一轮时
+/// 踢的那一脚不丢,下一觉立刻醒。
+static KICK: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// 有新任务落库了(设提醒 / 盯天气 / 后台的活忙完要汇报):叫醒调度器重新看一眼。
+/// 同步、廉价,哪个线程都能调;没有调度器在跑(测试)= 白调无害。
+pub fn kick() {
+    KICK.notify_one();
+}
+
+/// 这一觉睡多久(纯函数,可测):有任务在 `POLL` 之内到期就睡到它到点,否则睡满 `POLL`。
+/// 2026-11-11 改:原先固定每 30 秒看一次 —— 「3 分钟后叫我」最坏晚 30 秒(「1 分钟后」等于晚一半),
+/// 后台的活跑完到开口汇报也要白等最多 30 秒。
+fn sleep_for(now: i64, next_due: Option<i64>) -> std::time::Duration {
+    match next_due {
+        Some(due) if due > now => {
+            std::time::Duration::from_millis((due - now) as u64).min(POLL)
+        }
+        _ => POLL,
+    }
+}
+
 /// 常驻循环(壳层经 tauri::async_runtime::spawn 挂起)。
 pub async fn run(engine: Arc<Engine>) {
-    tracing::info!("任务调度器在线(每 {POLL:?} 轮询)");
+    tracing::info!("任务调度器在线(睡到下一个到期点,最长 {POLL:?})");
     loop {
-        tokio::time::sleep(POLL).await;
+        let now = Local::now().timestamp_millis();
+        let store = engine.store().clone();
+        let next = tokio::task::spawn_blocking(move || store.jobs.next_due_after(now))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .flatten();
+        tokio::select! {
+            _ = tokio::time::sleep(sleep_for(now, next)) => {}
+            _ = KICK.notified() => {} // 有新任务入库:立刻看一眼(它可能就是「现在到期」)
+        }
         let now = Local::now().timestamp_millis();
         if let Err(e) = tick(&engine, now).await {
             tracing::warn!("调度器单轮失败: {e:#}");
@@ -38,11 +72,16 @@ pub async fn tick(engine: &Engine, now: i64) -> anyhow::Result<()> {
     let store = engine.store().clone();
     let due = tokio::task::spawn_blocking(move || store.jobs.due(now)).await??;
     let mut weather: Option<WeatherClient> = None; // 仅在遇到条件提醒时懒建(避免无谓建 HTTP 客户端)
-    for job in due {
+    // 已随同会话的另一条汇报一起交出去(或一起被挡回)的:这一拍不再单独处理
+    let mut merged: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for (i, job) in due.iter().enumerate() {
+        if merged.contains(&job.id) {
+            continue;
+        }
         // 条件提醒:due_at 是「下次检查时刻」,走天气求值分支;time 型照旧
         if job.kind == "cond" {
             let client = weather.get_or_insert_with(WeatherClient::new);
-            if let Err(e) = tick_cond(engine, client, &job, now).await {
+            if let Err(e) = tick_cond(engine, client, job, now).await {
                 tracing::warn!(job = job.id, "条件提醒检查失败: {e:#}");
             }
             continue;
@@ -62,15 +101,28 @@ pub async fn tick(engine: &Engine, now: i64) -> anyhow::Result<()> {
             tracing::info!(job = job.id, repeat = %job.repeat, "任务超出宽限期,跳过本次");
             continue;
         }
-        match engine.wake_turn(&job).await {
+        // 同一会话里同时到期的其余汇报并进这一回合(2026-11-12):四路分头办事前后脚跑完,原先是
+        // 四个串行回合(第二条起每条都先撞一次「会话忙」等下一拍)、每个都带整段历史。
+        let mates = report_mates(&due[i + 1..], job, now);
+        merged.extend(mates.iter().map(|j| j.id)); // 成不成都算处理过:挡回来的下一拍一起重试
+        let also: Vec<String> = mates.iter().map(|j| j.content.clone()).collect();
+        match engine.wake_turn_with(job, &also).await {
             Ok(true) => {
                 // 触发即推进:once → done;重复 → 锚定原钟点的下一次
                 let store = engine.store().clone();
-                let (id, due_at, repeat) = (job.id, job.due_at, job.repeat.clone());
+                let fired: Vec<(i64, i64, String)> = std::iter::once(job)
+                    .chain(mates.iter().copied())
+                    .map(|j| (j.id, j.due_at, j.repeat.clone()))
+                    .collect();
+                if fired.len() > 1 {
+                    tracing::info!(conv = job.conv_id, n = fired.len(), "同会话同时到期的汇报并成一个回合");
+                }
                 tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                    match next_due(due_at, &repeat) {
-                        Some(n) => store.jobs.advance(id, n)?,
-                        None => store.jobs.finish(id, "done")?,
+                    for (id, due_at, repeat) in fired {
+                        match next_due(due_at, &repeat) {
+                            Some(n) => store.jobs.advance(id, n)?,
+                            None => store.jobs.finish(id, "done")?,
+                        }
                     }
                     Ok(())
                 })
@@ -89,6 +141,22 @@ pub async fn tick(engine: &Engine, now: i64) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `rest`(本拍到期清单里排在 `lead` 之后的那些)里能并进 `lead` 这一回合的:都是汇报、落在同一个
+/// 会话、同一个说话人名下,且没超出错过宽限(超了的让它自己走「错过」那条路)。`lead` 不是汇报 → 空。
+fn report_mates<'a>(rest: &'a [Job], lead: &Job, now: i64) -> Vec<&'a Job> {
+    if lead.kind != "report" {
+        return Vec::new();
+    }
+    rest.iter()
+        .filter(|j| {
+            j.kind == "report"
+                && j.conv_id == lead.conv_id
+                && j.user_id == lead.user_id
+                && now - j.due_at <= MISS_GRACE_MS
+        })
+        .collect()
 }
 
 /// 下一次 due(锚定原 due 的钟点,本地时区):daily +1 天;weekdays 跳过周末;
@@ -290,6 +358,16 @@ mod tests {
         }
     }
 
+    /// 睡到下一个到期点(2026-11-11):快到期的睡到它到点,远的 / 没有的 / 已过期的睡满兜底节拍。
+    #[test]
+    fn sleeps_until_next_due_but_never_longer_than_poll() {
+        use std::time::Duration as D;
+        assert_eq!(sleep_for(1_000, Some(4_500)), D::from_millis(3_500), "3.5 秒后到期就睡 3.5 秒");
+        assert_eq!(sleep_for(1_000, Some(1_000 + 10 * 60_000)), POLL, "十分钟后才到期:睡满一拍");
+        assert_eq!(sleep_for(1_000, None), POLL, "没有待触发的任务");
+        assert_eq!(sleep_for(1_000, Some(900)), POLL, "已过期的不算(那是留着重试的,按节拍来)");
+    }
+
     #[test]
     fn next_due_keeps_clock_and_skips_weekends() {
         // 2026-06-12 是周五
@@ -375,16 +453,32 @@ mod tests {
 
         tick(&engine, 5_000).await.unwrap();
 
-        // 等自启回合收尾的广播(完成才发,带超时防挂死)
-        let ev = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        // 等自启回合收尾的广播(完成才发,带超时防挂死)。顺带记下它之前有没有先喊过「起跑了」
+        // (2026-11-11:主窗靠这条把会话记成在飞 —— 必须先于收尾到,且会话 / 种类对得上)。
+        let (started, ev) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut started = None;
             loop {
-                if let Ok(AppEvent::Conversation(c)) = bus_rx.recv().await {
-                    return c;
+                match bus_rx.recv().await {
+                    Ok(AppEvent::TurnStarted(s)) => started = Some(s),
+                    Ok(AppEvent::Conversation(c)) => return (started, c),
+                    _ => {}
                 }
             }
         })
         .await
         .expect("自启回合必须广播会话动静");
+        let started = started.expect("收尾之前必须先广播起跑");
+        assert_eq!((started.conv_id, started.kind.as_str()), (conv.id, "reminder"));
+        // 收尾广播与回合任务结束几乎同时(事件通道关了 → 任务随即返回):给它一小会儿再查
+        let mut busy = engine.conversation_busy(conv.id);
+        for _ in 0..40 {
+            if !busy {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            busy = engine.conversation_busy(conv.id);
+        }
+        assert!(!busy, "回合收尾后对账口径要回到「不在飞」(主窗靠它兜漏掉的收尾事件)");
         assert_eq!(ev.conv_id, conv.id);
         assert_eq!(ev.kind, "reminder");
 

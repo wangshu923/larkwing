@@ -388,9 +388,14 @@ fn vacuum_into(src_db: &Path, dest_db: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 备份包里跟着库走的两个媒体目录(都在 `<数据根>/media/` 下、都是平铺的):`attachments` = 聊天里
+/// 的图(内容寻址,气泡靠它回看),`inbox` = 收到的文件(收件区原名件)。
+const BACKUP_MEDIA_DIRS: [&str; 2] = ["attachments", "inbox"];
+
 /// 一键备份:在用户所选目录 `dest_dir` 生成 `larkwing-backup-<时间戳>.zip`,内含
 /// **DB 一致快照**(`VACUUM INTO`,WAL 下也是完整已提交库)+ **克隆音色 wav**
-/// (`voice/clones/`)—— 都是不可重建的用户数据。可重新下载的模型 / 缓存 / 媒体 / 日志
+/// (`voice/clones/`)+ **聊天图片与收到的文件**(`media/attachments/`、`media/inbox/`,
+/// 2026-11-12 起)—— 都是不可重建的用户数据。可重新下载的模型 / 缓存 / 下载的影音 / 日志
 /// 一律不收(免备份包动辄上 G)。区别于「搬家」:不翻指针、不重启,纯导出一份拷贝。
 /// 返回生成的压缩包绝对路径(前端提示「已备份到…」)。
 pub fn backup_to(data_root: &Path, dest_dir: &Path) -> Result<PathBuf> {
@@ -439,6 +444,35 @@ pub fn backup_to(data_root: &Path, dest_dir: &Path) -> Result<PathBuf> {
                     )?;
                     std::io::copy(&mut std::fs::File::open(&p)?, &mut zip)?;
                 }
+            }
+        }
+
+        // 3) 聊天图片与收到的文件(2026-11-12)。原先不收:换机恢复后老对话里的图全是破图、收到的
+        //    文件也没了。多半已是压缩格式(jpg / png / pdf / docx),只存不压,省掉白费的 CPU。
+        //    单个文件打不开(被别的程序独占)只记日志跳过 —— 不让一张图拦住整份备份,库才是命根子。
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for sub in BACKUP_MEDIA_DIRS {
+            let dir = data_root.join("media").join(sub);
+            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                if !p.is_file() {
+                    continue;
+                }
+                let mut src = match std::fs::File::open(&p) {
+                    Ok(f) => f,
+                    Err(err) => {
+                        tracing::warn!(file = %p.display(), err = %err, "备份:这个文件读不了,跳过");
+                        continue;
+                    }
+                };
+                let len = src.metadata().map(|m| m.len()).unwrap_or(0);
+                zip.start_file(
+                    format!("media/{sub}/{}", e.file_name().to_string_lossy()),
+                    stored.large_file(len > u32::MAX as u64),
+                )?;
+                std::io::copy(&mut src, &mut zip)?;
             }
         }
         zip.finish()?;
@@ -586,8 +620,8 @@ pub fn restore_precheck(
 }
 
 /// 把备份负载解到 `<root>/restore-pending/`(先 `.tmp` 后原子改名 = 落定标记),供下次 boot 落位。
-/// 只认识 DB 与 `voice/clones/`(其余条目跳过 = 老程序对未来备份成员向前兼容);
-/// 条目路径走 `enclosed_name` 防 zip-slip。调用方应先跑过 `restore_precheck`。
+/// 只认识 DB、`voice/clones/` 与 `media/{attachments,inbox}/`(其余条目跳过 = 老程序对未来备份
+/// 成员向前兼容);条目路径走 `enclosed_name` 防 zip-slip。调用方应先跑过 `restore_precheck`。
 pub fn stage_restore(data_root: &Path, zip_path: &Path) -> Result<()> {
     let pending = data_root.join(RESTORE_PENDING);
     let tmp = data_root.join(format!("{RESTORE_PENDING}.tmp"));
@@ -618,6 +652,11 @@ pub fn stage_restore(data_root: &Path, zip_path: &Path) -> Result<()> {
             let dir = tmp.join("voice").join("clones");
             std::fs::create_dir_all(&dir)?;
             dir.join(name)
+        } else if let Some(sub) = media_member(&rel) {
+            let Some(name) = rel.file_name() else { continue };
+            let dir = tmp.join("media").join(sub);
+            std::fs::create_dir_all(&dir)?;
+            dir.join(name)
         } else {
             tracing::debug!(entry = %rel.display(), "备份包里不认识的条目,跳过");
             continue;
@@ -633,6 +672,19 @@ pub fn stage_restore(data_root: &Path, zip_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 备份包条目是不是 `media/<attachments|inbox>/<文件名>`(恰好三段,不认更深的层级);是 → 哪个目录。
+fn media_member(rel: &Path) -> Option<&'static str> {
+    let mut parts = rel.components();
+    let (Some(a), Some(b), Some(_), None) = (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    if a.as_os_str() != "media" {
+        return None;
+    }
+    BACKUP_MEDIA_DIRS.into_iter().find(|s| b.as_os_str() == *s)
+}
+
 /// boot 最先(开库前)调:有待恢复负载就把它换进来。
 /// - `None` = 没有待恢复负载,无事;
 /// - `Some(Ok(()))` = 恢复成功(原库留保险副本 `larkwing.db.pre-restore-<时间戳>`);
@@ -645,21 +697,30 @@ pub fn apply_pending_restore(data_root: &Path) -> Option<std::result::Result<(),
     }
     let pending = data_root.join(RESTORE_PENDING);
     if !pending.is_dir() {
+        // 没有待恢复的:顺手把历次恢复攒下的保险副本收到上限内(老用户手里可能已经攒了一堆)。
+        prune_restore_safeties(data_root, RESTORE_SAFETY_KEEP);
         return None;
     }
     let out = apply_restore_inner(data_root, &pending).map_err(|e| format!("{e:#}"));
     // 成败都清负载:成功 = 已消费;失败 = 别让每次启动反复撞同一坨坏负载。
     std::fs::remove_dir_all(&pending).ok();
+    if out.is_ok() {
+        // 这次刚挪出来的那份是最新的,必在保留之列(紧接着开库失败时 `rollback_restore` 还要它)。
+        prune_restore_safeties(data_root, RESTORE_SAFETY_KEEP);
+    }
     Some(out)
 }
 
-/// 恢复落位之后新库却打不开(备份库过了预检 —— 只查魔数与迁移记账 —— 但开库 / 迁移失败):
-/// 把恢复前的保险副本换回来,坏库挪成 `larkwing.db.restore-failed-<时间戳>` 留着备查(2026-11-11)。
-/// 原先这种情况启动直接失败,且负载已清、之后每次启动都起不来,老库就躺在旁边却没人换回去。
-/// 调用方 = 壳层 boot:`apply_pending_restore` 报成功、紧接着 `Store::open` 失败时调。
-pub fn rollback_restore(data_root: &Path) -> Result<()> {
+/// 恢复前的保险副本留几份(用户拍板 2026-11-12:最近 3 份)。每份都是一整个库,原先永不清。
+pub const RESTORE_SAFETY_KEEP: usize = 3;
+
+/// 数据根下全部保险副本的主文件(不含 `-wal` / `-shm` 伴生件),按名字里的时间戳从旧到新。
+/// 只认自家命名 `larkwing.db.pre-restore-<时间戳>`;时间戳是定宽的,字典序 = 时间序。
+fn restore_safeties(data_root: &Path) -> Vec<PathBuf> {
     let prefix = format!("{DB_FILE}.pre-restore-");
-    let mut safeties: Vec<PathBuf> = std::fs::read_dir(data_root)?
+    let mut v: Vec<PathBuf> = std::fs::read_dir(data_root)
+        .into_iter()
+        .flatten()
         .flatten()
         .map(|e| e.path())
         .filter(|p| {
@@ -668,8 +729,46 @@ pub fn rollback_restore(data_root: &Path) -> Result<()> {
             })
         })
         .collect();
-    safeties.sort(); // 名字带时间戳,字典序 = 时间序;最新那份就是这次恢复挪出来的
-    let safety = safeties.pop().context("找不到恢复前的保险副本,换不回去")?;
+    v.sort();
+    v
+}
+
+/// 只留最新 `keep` 份保险副本,其余连伴生件一起删(直接删、不进回收站 —— 与自动备份的轮转同口径)。
+/// 返回删掉的份数;删不掉的只记日志。
+fn prune_restore_safeties(data_root: &Path, keep: usize) -> usize {
+    let all = restore_safeties(data_root);
+    let extra = all.len().saturating_sub(keep);
+    let mut removed = 0;
+    for base in all.into_iter().take(extra) {
+        let mut ok = true;
+        for suffix in ["", "-wal", "-shm"] {
+            let mut name = base.as_os_str().to_os_string();
+            name.push(suffix);
+            let p = PathBuf::from(name);
+            if p.exists() {
+                if let Err(err) = std::fs::remove_file(&p) {
+                    tracing::warn!(file = %p.display(), err = %err, "清理旧的恢复保险副本失败");
+                    ok = false;
+                }
+            }
+        }
+        if ok {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        tracing::info!(removed, keep, "清掉了多出来的恢复保险副本");
+    }
+    removed
+}
+
+/// 恢复落位之后新库却打不开(备份库过了预检 —— 只查魔数与迁移记账 —— 但开库 / 迁移失败):
+/// 把恢复前的保险副本换回来,坏库挪成 `larkwing.db.restore-failed-<时间戳>` 留着备查(2026-11-11)。
+/// 原先这种情况启动直接失败,且负载已清、之后每次启动都起不来,老库就躺在旁边却没人换回去。
+/// 调用方 = 壳层 boot:`apply_pending_restore` 报成功、紧接着 `Store::open` 失败时调。
+pub fn rollback_restore(data_root: &Path) -> Result<()> {
+    // 名字带时间戳,最新那份就是这次恢复挪出来的
+    let safety = restore_safeties(data_root).pop().context("找不到恢复前的保险副本,换不回去")?;
     let with_suffix = |base: &Path, suffix: &str| -> PathBuf {
         let mut s = base.as_os_str().to_os_string();
         s.push(suffix);
@@ -755,6 +854,25 @@ fn apply_restore_inner(data_root: &Path, pending: &Path) -> Result<()> {
                 if let Err(err) = std::fs::rename(&p, &dest) {
                     tracing::warn!(file = %dest.display(), err = %err, "恢复克隆音色失败(跳过)");
                 }
+            }
+        }
+    }
+
+    // 4) 聊天图片与收到的文件:**只补缺、不覆盖**。图片是内容寻址的(同名即同内容);收件区同名的
+    //    留现有那份 —— 恢复不替用户删文件。单个失败只记日志。
+    for sub in BACKUP_MEDIA_DIRS {
+        let src = pending.join("media").join(sub);
+        let Ok(rd) = std::fs::read_dir(&src) else { continue };
+        let dst_dir = data_root.join("media").join(sub);
+        std::fs::create_dir_all(&dst_dir).ok();
+        for e in rd.flatten() {
+            let p = e.path();
+            let dest = dst_dir.join(e.file_name());
+            if !p.is_file() || dest.exists() {
+                continue;
+            }
+            if let Err(err) = std::fs::rename(&p, &dest) {
+                tracing::warn!(file = %dest.display(), err = %err, "恢复聊天文件失败(跳过)");
             }
         }
     }
@@ -856,6 +974,87 @@ mod tests {
         let mut buf = vec![];
         z.by_name(DB_FILE).unwrap().read_to_end(&mut buf).unwrap();
         assert!(buf.len() > 16 && &buf[0..16] == b"SQLite format 3\0", "DB 快照应为合法 sqlite");
+    }
+
+    /// 保险副本只留最新几份:旧的连 -wal / -shm 一起删,别的文件(现库、restore-failed)不碰。
+    #[test]
+    fn restore_safety_copies_are_pruned_to_the_newest_few() {
+        let root = tmp("safety-prune");
+        std::fs::write(root.join(DB_FILE), b"live").unwrap();
+        for ts in ["20260101-000000", "20260201-000000", "20260301-000000", "20260401-000000", "20260501-000000"] {
+            std::fs::write(root.join(format!("{DB_FILE}.pre-restore-{ts}")), ts).unwrap();
+        }
+        std::fs::write(root.join(format!("{DB_FILE}.pre-restore-20260101-000000-wal")), b"w").unwrap();
+        std::fs::write(root.join(format!("{DB_FILE}.pre-restore-20260501-000000-wal")), b"w").unwrap();
+        std::fs::write(root.join(format!("{DB_FILE}.restore-failed-20260102-000000")), b"bad").unwrap();
+
+        // 没有待恢复负载的那条启动路也会顺手清
+        assert!(apply_pending_restore(&root).is_none());
+        let left: Vec<String> = restore_safeties(&root)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            left,
+            vec![
+                format!("{DB_FILE}.pre-restore-20260301-000000"),
+                format!("{DB_FILE}.pre-restore-20260401-000000"),
+                format!("{DB_FILE}.pre-restore-20260501-000000"),
+            ]
+        );
+        assert!(!root.join(format!("{DB_FILE}.pre-restore-20260101-000000-wal")).exists(), "伴生件跟着删");
+        assert!(root.join(format!("{DB_FILE}.pre-restore-20260501-000000-wal")).exists(), "留下的那份伴生件不动");
+        assert!(root.join(DB_FILE).exists() && root.join(format!("{DB_FILE}.restore-failed-20260102-000000")).exists());
+        assert_eq!(prune_restore_safeties(&root, RESTORE_SAFETY_KEEP), 0, "已在上限内,再清一次什么都不删");
+    }
+
+    /// 备份带上聊天图片与收件区;恢复时只补缺、不覆盖现有的同名文件;更深层级 / 别的 media 子目录不认。
+    #[test]
+    fn backup_and_restore_carry_chat_images_and_inbox() {
+        let root = tmp("backup-media-src");
+        {
+            let c = rusqlite::Connection::open(root.join(DB_FILE)).unwrap();
+            c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);").unwrap();
+        }
+        let atts = root.join("media").join("attachments");
+        let inbox = root.join("media").join("inbox");
+        std::fs::create_dir_all(&atts).unwrap();
+        std::fs::create_dir_all(&inbox).unwrap();
+        std::fs::write(atts.join("abc123.jpg"), b"jpeg-bytes").unwrap();
+        std::fs::write(inbox.join("样张.pdf"), b"pdf-old").unwrap();
+        std::fs::write(inbox.join("只在备份里.txt"), b"hello").unwrap();
+        // 下载的影音是可重建的,不该进包
+        std::fs::create_dir_all(root.join("media").join("cache")).unwrap();
+        std::fs::write(root.join("media").join("cache").join("big.bin"), b"x").unwrap();
+
+        let dest = tmp("backup-media-dest");
+        let zip_path = backup_to(&root, &dest).unwrap();
+        let names: Vec<String> = {
+            let mut z = zip::ZipArchive::new(std::fs::File::open(&zip_path).unwrap()).unwrap();
+            (0..z.len()).map(|i| z.by_index(i).unwrap().name().to_string()).collect()
+        };
+        assert!(names.iter().any(|n| n == "media/attachments/abc123.jpg"), "{names:?}");
+        assert!(names.iter().any(|n| n == "media/inbox/样张.pdf"), "{names:?}");
+        assert!(!names.iter().any(|n| n.contains("cache")), "别的 media 子目录不收: {names:?}");
+
+        // 恢复到另一个数据根:那里已有一份同名的收件区文件(内容不同)→ 留现有的,缺的补上
+        let other = tmp("backup-media-restore");
+        std::fs::create_dir_all(other.join("media").join("inbox")).unwrap();
+        std::fs::write(other.join("media").join("inbox").join("样张.pdf"), b"pdf-new").unwrap();
+        stage_restore(&other, &zip_path).unwrap();
+        assert_eq!(apply_pending_restore(&other), Some(Ok(())));
+        assert_eq!(std::fs::read(other.join("media/attachments/abc123.jpg")).unwrap(), b"jpeg-bytes");
+        assert_eq!(std::fs::read(other.join("media/inbox/只在备份里.txt")).unwrap(), b"hello");
+        assert_eq!(
+            std::fs::read(other.join("media/inbox/样张.pdf")).unwrap(),
+            b"pdf-new",
+            "同名的收件区文件留现有那份,恢复不覆盖"
+        );
+
+        assert_eq!(media_member(Path::new("media/attachments/a.jpg")), Some("attachments"));
+        assert_eq!(media_member(Path::new("media/inbox/sub/a.jpg")), None, "不认更深的层级");
+        assert_eq!(media_member(Path::new("media/cache/a.bin")), None);
+        assert_eq!(media_member(Path::new("other/inbox/a.bin")), None);
     }
 
     #[test]

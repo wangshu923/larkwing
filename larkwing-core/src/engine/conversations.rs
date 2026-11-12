@@ -180,6 +180,25 @@ impl Engine {
     pub async fn rollback_conversation(&self, conv_id: i64, msg_id: i64) -> Result<(), AppError> {
         self.cancel(conv_id).await;
         self.store.chat.truncate_from(conv_id, msg_id)?;
+        // 计划槽一并清(2026-11-11):被回溯掉的那几轮列的计划属于放弃了的方向,原先留在槽里 ——
+        // 下一回合的〔此刻〕还带着它,屏幕上的计划卡也还挂着。分不清计划是切点之前还是之后列的,
+        // 一律清:它本来就是可丢的瞬态,还用得着的话再说一句就重建(§6.5)。
+        let had_plan = {
+            let sessions = self.sessions.lk();
+            sessions.get(&conv_id).is_some_and(|slot| {
+                let mut plan = slot.plan.lk();
+                let had = !plan.is_empty();
+                *plan = Default::default();
+                had
+            })
+        };
+        if had_plan {
+            self.bus.publish(crate::bus::AppEvent::Plan(crate::bus::PlanCard {
+                conv_id,
+                title: None,
+                items: vec![],
+            }));
+        }
         Ok(())
     }
 

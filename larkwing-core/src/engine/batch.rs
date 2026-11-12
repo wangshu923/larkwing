@@ -16,6 +16,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use futures_util::FutureExt;
 
 use super::*;
 use crate::bgtasks::{Beat, BgTicket, CapacityHit};
@@ -127,12 +128,20 @@ async fn run_item(
     let Some(tool) = face.iter().find(|t| t.spec().name == call.tool) else {
         return ItemOutcome::Err(format!("没有叫 {} 的工具", call.tool));
     };
+    // 这一件自己崩了(工具里 panic)只算这一件失败(2026-11-11):工作池是在同一个任务里轮着跑
+    // 各件的,原先一件 panic 会顺着把整个池带走 —— 已经跑完的那些件的结果一起丢,模型多半整批重派。
+    let run = std::panic::AssertUnwindSafe(tool.run(call.args.clone(), ctx)).catch_unwind();
     tokio::select! {
+        biased; // 已经叫停:排着队还没开工的件直接按「停了」收,别再起跑
         _ = token.cancelled() => ItemOutcome::Cancelled,
         // 纯文本 run:批里不收图(汇总是文本;要看图单独调 read_image)
-        r = tool.run(call.args.clone(), ctx) => match r {
-            Ok(text) => ItemOutcome::Ok(text),
-            Err(e) => {
+        r = run => match r {
+            Err(_) => {
+                tracing::error!(tool = %call.tool, "批内一件在执行中崩了(panic),按这一件失败收");
+                ItemOutcome::Err("这一件在执行中崩了(程序内部错误),没做成;其余各件不受影响".into())
+            }
+            Ok(Ok(text)) => ItemOutcome::Ok(text),
+            Ok(Err(e)) => {
                 let full = crate::net::scrub(&e);
                 if e.chain().any(|c| c.is::<CapacityHit>()) {
                     tracing::info!(tool = %call.tool, "批内一件撞上并发上限,降并行重排");
@@ -495,6 +504,58 @@ mod tests {
 
     fn call(tool: &str) -> BatchCall {
         BatchCall { tool: tool.into(), args: serde_json::json!({}) }
+    }
+
+    /// 批里一件 panic 只算那一件失败,不带走别的(2026-11-11)。
+    #[tokio::test]
+    async fn a_panicking_item_fails_alone() {
+        struct Boom(crate::tools::ToolSpec);
+        #[async_trait::async_trait]
+        impl Tool for Boom {
+            fn spec(&self) -> &crate::tools::ToolSpec {
+                &self.0
+            }
+            async fn run(&self, args: serde_json::Value, _ctx: &ToolCtx) -> anyhow::Result<String> {
+                if args.get("boom").is_some() {
+                    panic!("工具里炸了");
+                }
+                Ok("好了".into())
+            }
+        }
+        let spec = crate::tools::ToolSpec {
+            name: "boom",
+            description: "",
+            parameters: serde_json::json!({}),
+            timeout: std::time::Duration::from_secs(5),
+            ui_key: "tool.unknown",
+        };
+        let face: Vec<Arc<dyn Tool>> = vec![Arc::new(Boom(spec))];
+        let dir = std::env::temp_dir().join(format!("lw-batch-panic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(dir.join("t.db"));
+        let store = crate::store::Store::open(&dir.join("t.db")).unwrap();
+        let ctx = ToolCtx {
+            user_id: 1,
+            conv_id: 1,
+            media: crate::media::MediaRuntime::detached(store.clone()),
+            store,
+            web: None,
+            voice: None,
+            confirm: None,
+            grants: Default::default(),
+            agent: None,
+            batch: None,
+            in_batch: None,
+        };
+        let token = CancellationToken::new();
+        let bad = BatchCall { tool: "boom".into(), args: serde_json::json!({ "boom": true }) };
+        let good = BatchCall { tool: "boom".into(), args: serde_json::json!({}) };
+        let out = run_item(&face, &bad, &ctx, &token).await;
+        assert!(matches!(&out, ItemOutcome::Err(e) if e.contains("崩了")), "{out:?}");
+        assert!(matches!(run_item(&face, &good, &ctx, &token).await, ItemOutcome::Ok(_)));
+        // 已经叫停:不再起跑
+        token.cancel();
+        assert!(matches!(run_item(&face, &good, &ctx, &token).await, ItemOutcome::Cancelled));
     }
 
     #[test]

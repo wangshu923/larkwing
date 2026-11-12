@@ -457,6 +457,10 @@ impl Turn {
         // 分批提示的跨轮状态(§6.5,2026-10-11):上一轮单独调的那个长活 + 本回合已提几次
         let mut prev_solo_long: Option<String> = None;
         let mut batch_nudges: usize = 0;
+        // 这一轮算出来却没发出去的分批提示(让位给了自检句),留到下一轮发(2026-11-11):
+        // 认出「一件件分开调」那一刻判定状态就清零了,原先撞上自检轮这句提示直接丢,要等模型
+        // 再犯一次才会再认出来。
+        let mut batch_hint_carry: Option<String> = None;
         let mut stall: usize = 0; // 连续无进展(全重复 / 全失败)轮数
         let mut seen_calls: HashSet<String> = HashSet::new(); // 本回合已发过的工具调用指纹
         // 本回合是否调过 end_conversation(§7.5 会话收尾):随收尾的 Done 递给前端 → 唤醒回合
@@ -760,7 +764,8 @@ impl Turn {
             // 但子回合不提(它的工具面没有 batch,§6.5 SUB_EXCLUDED),封顶 BATCH_NUDGE_MAX 次。
             let batch_hint = batch_pattern(&tool_calls, &mut prev_solo_long)
                 .filter(|_| !ephemeral && batch_nudges < BATCH_NUDGE_MAX)
-                .map(|(tool, n)| batch_nudge_line(&tool, n));
+                .map(|(tool, n)| batch_nudge_line(&tool, n))
+                .or_else(|| batch_hint_carry.take());
 
             // 插队(PLAN §9 B):轮间排空注入队列,append 进 request,下一轮 LLM 就带上
             drain_injections(&store, conv_id, &tx, &inject, &mut request, persist).await;
@@ -783,6 +788,7 @@ impl Turn {
                     &plan.lk(),
                 );
                 request.messages.push(ChatMessage::user(line));
+                batch_hint_carry = batch_hint; // 自检轮让位:分批提示留到下一轮
             } else if let Some(line) = batch_hint {
                 // 分批提示优先于计划提示(更可执行;计划提示 5 轮后还会再来),自检轮让位
                 batch_nudges += 1;
@@ -916,6 +922,17 @@ async fn persist_and_announce(
     it: super::InjectReady,
     persist: bool,
 ) -> (String, Vec<crate::llm::ContentPart>) {
+    if it.event {
+        // 到点提醒排进在飞回合(2026-11-12):落 event 行(UI 的系统线;下一回合回放时与普通到点
+        // 同形),进 request 的那句与回放翻译 event 行逐字节相同 —— 前缀缓存不破。
+        if let Some(id) =
+            persist_row_if(persist, store, conv_id, "event", &it.llm_content, it.payload.as_deref())
+                .await
+        {
+            let _ = tx.send(TurnEvent::EventLine { message_id: id, text: it.display }).await;
+        }
+        return (super::context::event_injection(&it.llm_content), Vec::new());
+    }
     if let Some(id) =
         persist_row_if(persist, store, conv_id, "user", &it.llm_content, it.payload.as_deref())
             .await
@@ -931,6 +948,64 @@ async fn persist_and_announce(
 mod tests {
     use super::*;
     use crate::engine::{InjectReady, InjectState};
+
+    /// 工具自己 panic 只算这一次调用失败(2026-11-11):同一轮里并排的另一次调用照常拿到结果,
+    /// 回合任务不被带走(否则不落库、不发终态,主窗一直停在「在想」)。
+    #[tokio::test]
+    async fn a_panicking_tool_fails_alone() {
+        struct Boom(crate::tools::ToolSpec);
+        #[async_trait::async_trait]
+        impl Tool for Boom {
+            fn spec(&self) -> &crate::tools::ToolSpec {
+                &self.0
+            }
+            async fn run(&self, args: serde_json::Value, _ctx: &ToolCtx) -> anyhow::Result<String> {
+                if args.get("boom").is_some() {
+                    panic!("工具里炸了");
+                }
+                Ok("好了".into())
+            }
+        }
+        let spec = crate::tools::ToolSpec {
+            name: "boom",
+            description: "",
+            parameters: serde_json::json!({}),
+            timeout: std::time::Duration::from_secs(5),
+            ui_key: "tool.unknown",
+        };
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(Boom(spec))];
+        let dir = std::env::temp_dir().join(format!("lw-turn-panic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(dir.join("t.db"));
+        let store = crate::store::Store::open(&dir.join("t.db")).unwrap();
+        let ctx = ToolCtx {
+            user_id: 1,
+            conv_id: 1,
+            media: crate::media::MediaRuntime::detached(store.clone()),
+            store,
+            web: None,
+            voice: None,
+            confirm: None,
+            grants: Default::default(),
+            agent: None,
+            batch: None,
+            in_batch: None,
+        };
+        let call = |id: &str, args: serde_json::Value| ToolCall {
+            id: id.into(),
+            name: "boom".into(),
+            args,
+            is_incomplete: false,
+        };
+        let calls =
+            vec![call("a", serde_json::json!({ "boom": true })), call("b", serde_json::json!({}))];
+        let out = run_tools(&tools, &calls, &ctx).await;
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].1, "error");
+        assert!(out[0].2.text.contains("崩了"), "{}", out[0].2.text);
+        assert_eq!(out[1].1, "ok");
+        assert_eq!(out[1].2.text, "好了");
+    }
 
     /// 空转指纹(2026-11-11):同一个「下一页」拿回不同的文字 = 进展;只有数字在动(查进度)= 重复。
     #[test]
@@ -974,6 +1049,7 @@ mod tests {
             parts: Vec::new(),
             refs: Vec::new(),
             payload: None,
+            event: false,
         }
     }
 
@@ -1197,14 +1273,25 @@ async fn run_tools(
                 ToolOutput::text(format!("没有叫 {} 的工具", call.name)),
             );
         };
-        match tokio::time::timeout(tool.spec().timeout, tool.run_output(call.args.clone(), ctx))
-            .await
-        {
+        // 工具自己崩了(panic)只算这一次调用失败(2026-11-11):工具是在回合任务里就地跑的,原先一个
+        // panic 顺着把整个回合任务带走 —— 不落库、不发终态,主窗一直停在「在想」,停止钮也按不动
+        // (它等的 `cancelled` 永远不来)。接住后当观察喂回模型,回合照常收尾。
+        use futures_util::FutureExt;
+        let run = std::panic::AssertUnwindSafe(tool.run_output(call.args.clone(), ctx)).catch_unwind();
+        match tokio::time::timeout(tool.spec().timeout, run).await {
             Err(_) => {
                 tracing::warn!(tool = %call.name, "工具执行超时,没有拿到结果");
                 (call.clone(), "timeout".to_string(), ToolOutput::text("工具执行超时,没有拿到结果"))
             }
-            Ok(Err(e)) => {
+            Ok(Err(_)) => {
+                tracing::error!(tool = %call.name, "工具在执行中崩了(panic),按这一次调用失败收");
+                (
+                    call.clone(),
+                    "error".to_string(),
+                    ToolOutput::text("这个工具在执行中崩了(程序内部错误),这一步没做成。换个办法,或如实告诉用户。"),
+                )
+            }
+            Ok(Ok(Err(e))) => {
                 // 观测:工具失败原因进日志(之前只回喂模型,控制台看不见 → 用户"看不出问题")。
                 // 错误仍当观察喂回模型(截断 500),但全量进日志便于排障。
                 let full = crate::net::scrub(&e);
@@ -1212,7 +1299,7 @@ async fn run_tools(
                 let msg: String = full.chars().take(500).collect();
                 (call.clone(), "error".to_string(), ToolOutput::text(msg))
             }
-            Ok(Ok(out)) => (call.clone(), "ok".to_string(), out),
+            Ok(Ok(Ok(out))) => (call.clone(), "ok".to_string(), out),
         }
     });
     futures_util::future::join_all(futs).await

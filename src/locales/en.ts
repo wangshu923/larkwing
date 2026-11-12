@@ -870,6 +870,7 @@ export default {
       cloneCancel: 'Cancel',
       cloneDelete: 'Delete',
       cloneDeleteArm: 'Delete?',
+      cloneRename: 'Rename',
       cloneImportFailed: 'Could not read that file — try a wav/mp3/m4a.',
       cloneSaveFailed: 'Save failed — fill in both the name and transcript, then retry.',
       // preview line goes to core via voice_preview for synthesis (core produces no copy; precedent = login window title)
@@ -959,6 +960,8 @@ export default {
         tokenPlaceholder: 'Paste the token from BotFather',
         allowed: 'Allowed chats',
         allowedPlaceholder: 'Your chat id (comma-separated); leave blank and the bot will tell you',
+        knocks: 'Recently knocked',
+        knockAllow: 'Allow this chat (chat id {id})',
         steps: 'Once on, send the bot a message in Telegram and it replies with your chat id; put that id above, save, and chat away.',
         linkPre: 'No bot yet? Go to',
       },

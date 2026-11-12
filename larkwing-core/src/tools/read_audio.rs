@@ -13,6 +13,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 
 use super::{Tool, ToolCtx, ToolSpec};
+use crate::lockext::LockExt;
 
 /// 一次最多听多长(秒):一首歌几分钟绰绰有余;有声书那种得靠 `from` 分段听,
 /// 免得一次解码几百 MB PCM 堵死内存(16k f32 ≈ 64KB/秒 → 10 分钟 ≈ 38MB)。
@@ -93,9 +94,20 @@ impl Tool for ReadAudio {
         let p = std::path::PathBuf::from(&path);
         anyhow::ensure!(p.is_file(), "{path} 不是文件或不存在");
 
-        let pcm = ctx.media.decode_file_pcm16k(&p, from, MAX_SECS).await?;
-        let heard_secs = pcm.len() as f64 / 16_000.0;
-        let lines = voice.transcribe_timed(pcm).await?;
+        // 同一段音频翻页(带 offset 取下一页)不重听(2026-11-11):原先每次调用都重新解码 +
+        // 全量切句转写,取第二页等于把最长十分钟的音频再跑一遍。只留最近一次的结果(一段几十行字)。
+        let key = audio_key(&p, from);
+        let cached = LAST_HEARD.lk().as_ref().filter(|(k, _, _)| *k == key).map(|(_, s, l)| (*s, l.clone()));
+        let (heard_secs, lines) = match cached {
+            Some(hit) => hit,
+            None => {
+                let pcm = ctx.media.decode_file_pcm16k(&p, from, MAX_SECS).await?;
+                let heard_secs = pcm.len() as f64 / 16_000.0;
+                let lines = voice.transcribe_timed(pcm).await?;
+                *LAST_HEARD.lk() = Some((key, heard_secs, lines.clone()));
+                (heard_secs, lines)
+            }
+        };
         if lines.is_empty() {
             return Ok(format!(
                 "听完了(从第 {from:.0} 秒起 {heard_secs:.0} 秒),但没听出人声 —— \
@@ -131,9 +143,43 @@ impl Tool for ReadAudio {
     }
 }
 
+/// 最近一次听出来的结果:(哪段音频, 听了多少秒, 逐句)。
+type Heard = (String, f64, Vec<(f64, String)>);
+static LAST_HEARD: std::sync::Mutex<Option<Heard>> = std::sync::Mutex::new(None);
+
+/// 「哪段音频」的身份:路径 + 起点 + 大小 + 改动时间(文件被换过 / 改过就不算同一段)。
+fn audio_key(path: &std::path::Path, from: f64) -> String {
+    let (len, mtime) = std::fs::metadata(path)
+        .map(|m| {
+            let t = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            (m.len(), t)
+        })
+        .unwrap_or((0, 0));
+    format!("{}|{from:.3}|{len}|{mtime}", path.display())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_key_changes_with_start_and_file() {
+        let dir = std::env::temp_dir().join(format!("lw-audiokey-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a.mp3");
+        std::fs::write(&f, b"1234").unwrap();
+        let k0 = audio_key(&f, 0.0);
+        assert_eq!(k0, audio_key(&f, 0.0), "同一段 = 同一个键(翻页命中)");
+        assert_ne!(k0, audio_key(&f, 600.0), "换了起点 = 另一段");
+        std::fs::write(&f, b"12345678").unwrap();
+        assert_ne!(k0, audio_key(&f, 0.0), "文件变了 = 不算同一段");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn stamp_formats_lrc_timestamps() {

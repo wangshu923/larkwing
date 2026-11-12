@@ -359,7 +359,8 @@ async fn handle_message(
     // 访问控制(非风控 §9):配了白名单只放行名单内;空 = 谁来都先发 onboarding 报 user id
     if !allowed.is_empty() {
         if !allowed.contains(&p.from_user_id) {
-            return; // 已设名单的陌生用户:静默忽略
+            super::note_stranger(CHANNEL, &p.from_user_id); // 不回话,日志留一笔(同一个 id 只记一次)
+            return;
         }
     } else {
         let hint = ONBOARD_HINT.replace("{name}", &ctx.engine.pet_name()).replace("{id}", &p.from_user_id);

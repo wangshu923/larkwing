@@ -433,7 +433,8 @@ pub fn rate_pct(rate: &str) -> i32 {
 /// 缓存键:音色|语速|文本 的 SHA-256(同句换音色 = 另一份缓存,语义正确)。
 /// 克隆音色的**渲染版本** = 掺进 cache_key 的盐。克隆产物经 `normalize_loudness` 归一,
 /// 归一参数变了旧缓存就该失效——否则改完参数,用过的句子(**含开机预合成的应答音银行**)
-/// 还照播老响度。**改任一响度常量 = 这个数字 +1**。只掺克隆音色:云端/离线音色不走归一、
+/// 还照播老响度。**改任一响度常量、或 `num_steps` 这类影响克隆输出的参数 = 这个数字 +1**
+/// (多音字补丁词表不用管,它的摘要自动进键)。只掺克隆音色:云端/离线音色不走归一、
 /// 字节与本版本无关,没必要连带作废它们的缓存(edge 作废还要重新联网合成)。
 const CLONE_RENDER_VERSION: u32 = 1;
 
@@ -446,9 +447,19 @@ pub fn cache_key(voice: &str, rate_pct: i32, text: &str) -> String {
     if voice.starts_with("clone:") {
         h.update(CLONE_RENDER_VERSION.to_le_bytes());
         h.update(b"|");
+        // 多音字补丁词表也进键(2026-11-11):它改了,受影响的字读音就变,而旧缓存照播旧读音。
+        // 原先全靠「记得把上面的版本号 +1」,规矩里又只写了响度常量 —— 干脆让它自己带上。
+        h.update(sha2::Sha256::digest(POLYPHONE_SUPPLEMENT.as_bytes()));
+        h.update(b"|");
     }
     h.update(text.as_bytes());
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 缓存件能不能用:在,且**不是空的**(2026-11-11)。写到一半被掐断会留下 0 字节的文件,
+/// 光看「在不在」会把它当命中、播一段空音频(模型下载那边 08-22 吃过同样的亏)。
+pub(super) fn cached_ok(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0)
 }
 
 // ---------------------------------------------------------------------------

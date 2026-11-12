@@ -99,7 +99,13 @@ struct WakeHandle {
 }
 
 /// 唤醒启动代次发号器(进程内单调递增;只为 wake_cleanup_gen 的认领判定)。
+/// 克隆草稿录音放多久没人保存才清(录完 → 改文字稿 → 点保存,给足时间;纯管护)。
+const CLONE_DRAFT_GRACE: Duration = Duration::from_secs(3600);
 static WAKE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// `wake_stop` 被调过几次。`wake_start` 进门记一个数、占槽前再对一遍:中间有人停过(用户在它
+/// 下载模型 / 备应答音的那一阵把开关关了)就不起循环 —— 那时槽还是空的,`wake_stop` 是空操作,
+/// 原先下载完循环照样起来:设置里是关,麦克风却开着(2026-11-11)。
+static WAKE_STOPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 struct Inner {
     store: Store,
@@ -293,7 +299,7 @@ impl VoiceRuntime {
         };
         // 文件名格式须与 synth_cached 一致(都是 cache_key + ext)
         let path = self.inner.tts_dir.join(format!("{}.{ext}", tts::cache_key(cache_voice, rate, text)));
-        if path.is_file() {
+        if tts::cached_ok(&path) {
             return Ok(path);
         }
         // 缓存未命中,才加载对应引擎合成
@@ -527,6 +533,7 @@ impl VoiceRuntime {
         // id 不可变(uuid 形,时间戳即足够:录入是人手逐次操作);重录 = 新条目。
         let id = format!("v{}", crate::store::now_ms());
         tokio::fs::create_dir_all(&self.inner.clones_dir).await?;
+        self.sweep_clone_drafts(); // 顺手清掉以前没保存的草稿
         let wav = tts::pcm_f32_to_wav(&pcm, TARGET_RATE);
         tokio::fs::write(self.inner.clones_dir.join(format!("{id}.wav")), &wav).await?;
         Ok((id, transcript, check))
@@ -546,6 +553,7 @@ impl VoiceRuntime {
         anyhow::ensure!(wav.len() > 44, "音频数据为空或过小");
         let id = format!("v{}", crate::store::now_ms());
         tokio::fs::create_dir_all(&self.inner.clones_dir).await?;
+        self.sweep_clone_drafts(); // 顺手清掉以前没保存的草稿
         let wav_path = self.inner.clones_dir.join(format!("{id}.wav"));
         tokio::fs::write(&wav_path, &wav).await?;
         // 读回 + 去噪 + ASR(同步、CPU 密集 → spawn_blocking);模型首次用时下载。
@@ -638,7 +646,7 @@ impl VoiceRuntime {
         // voice 已区分在线音色 vs 离线("vits-melo"),不同引擎产物 ext 不同、互不覆盖
         let key = tts::cache_key(voice, rate, text);
         let path = self.inner.tts_dir.join(format!("{key}.{ext}"));
-        if path.is_file() {
+        if tts::cached_ok(&path) {
             return Ok(path); // 宪法 §7:常用话不重复合成
         }
         tokio::fs::create_dir_all(&self.inner.tts_dir).await?;
@@ -649,7 +657,7 @@ impl VoiceRuntime {
             None
         } else {
             let g = self.inner.tts_lock.lock().await;
-            if path.is_file() {
+            if tts::cached_ok(&path) {
                 return Ok(path);
             }
             Some(g)
@@ -1114,6 +1122,7 @@ impl VoiceRuntime {
         if self.wake_running() {
             return Ok(());
         }
+        let stops_at_entry = WAKE_STOPS.load(std::sync::atomic::Ordering::Relaxed);
         let mirrors = self.mirrors();
         let kws_dir = self.inner.models.ensure_tar(&models::KWS_ZIPFORMER_ZH, &mirrors).await?;
         let (vad_model, asr) = self.ensure_engines().await?;
@@ -1161,6 +1170,11 @@ impl VoiceRuntime {
             if slot.is_some() {
                 return Ok(()); // 并发开关:别人抢先了
             }
+            // 准备期间(下载模型 / 备应答音,可达分钟级)被停过:不起了(见 WAKE_STOPS)
+            if WAKE_STOPS.load(std::sync::atomic::Ordering::Relaxed) != stops_at_entry {
+                tracing::info!("免手唤醒在准备期间被关掉了,不启动");
+                return Ok(());
+            }
             *slot = Some(WakeHandle { cmd: tx, prompts: prompts.clone(), gen });
         }
         let deps = wake::WakeDeps {
@@ -1202,6 +1216,7 @@ impl VoiceRuntime {
         // `wake_ctl` 本来就是「停」的通道(前端 ✕ 用它,`collect_utterance` 认 CTL_CANCEL
         // 立刻收摊、且那条路是**安静回待唤醒:不追问不告退**),正好是关机要的语义 → 一并写它,
         // 在录的那一轮当场断掉,循环随即回到轮首读到 Stop 退出。
+        WAKE_STOPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // 正在准备的 wake_start 据此作罢
         self.listen_stop(false);
         self.wake_cmd(wake::WakeCmd::Stop);
         self.wake_cleanup(); // sender 一并丢弃,线程见 Disconnected 也会退
@@ -1244,6 +1259,49 @@ impl VoiceRuntime {
 
     pub(super) fn wake_cleanup(&self) {
         *self.inner.wake.lk() = None;
+    }
+
+    /// 这一代唤醒循环还是不是「现行」的(槽里是它)。被 `wake_stop` 清掉 / 被新一代顶替后,
+    /// 老循环在开始新一段在听之前靠它收手 —— `wake_ctl` 是全进程一份,老循环 arm 一下会把
+    /// `wake_stop` 写的取消冲掉,甚至跟新循环同时在听(2026-11-11)。
+    pub(super) fn wake_is_current(&self, gen: u64) -> bool {
+        self.inner.wake.lk().as_ref().is_some_and(|h| h.gen == gen)
+    }
+
+    /// 清掉没人认领的克隆草稿录音(2026-11-11):录入 / 导入先把 wav 落盘、确认保存时才写库 ——
+    /// 用户没点保存、或转写那步失败,这份 wav 就永远留在 `voice/clones/`(还会被打进备份包)。
+    /// 只删**库里没有登记**且放了一阵的(`CLONE_DRAFT_GRACE`:正在改文字稿、还没点保存的不动)。
+    fn sweep_clone_drafts(&self) {
+        let Ok(rd) = std::fs::read_dir(&self.inner.clones_dir) else { return };
+        let known: std::collections::HashSet<String> = self
+            .inner
+            .store
+            .cloned_voices
+            .list()
+            .map(|v| v.into_iter().map(|c| c.wav_file).collect())
+            .unwrap_or_default();
+        if known.is_empty() && self.inner.store.cloned_voices.list().is_err() {
+            return; // 库都读不出来就别删东西
+        }
+        for e in rd.flatten() {
+            let path = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            if path.extension().and_then(|x| x.to_str()) != Some("wav") || known.contains(&name) {
+                continue;
+            }
+            let old_enough = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|d| d >= CLONE_DRAFT_GRACE);
+            if old_enough {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => tracing::info!(file = %name, "清掉没保存的克隆草稿录音"),
+                    Err(err) => tracing::warn!(file = %name, err = %err, "克隆草稿录音删不掉"),
+                }
+            }
+        }
     }
 
     /// loop 退出路的认领式清理:只有 slot 还是**自己那一代**才清(off→on 重启时旧线程

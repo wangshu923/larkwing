@@ -68,6 +68,81 @@ pub(crate) const ATTACH_HINT: &str =
 /// 不该混进新意图)。宽松取 30min —— 人「发文件→看着发出去→再打字」十几秒很常见,别掐太紧。
 const ATTACH_TTL: Duration = Duration::from_secs(30 * 60);
 
+/// 重连退避(Telegram / 钉钉共用,2026-11-11;数取自微信那条路早就在用的「连错 3 次转 30 秒」):
+/// 原先固定 5 秒、没有上限 —— 令牌被吊销 / 网络长时间不通时每 5 秒一行 warn,一天约 1.7 万行,
+/// 两天就把 5MB 的日志冲掉一轮。头几次仍快重试(抖动常常一两次就好)。
+pub(crate) const RETRY_SHORT: Duration = Duration::from_secs(5);
+pub(crate) const RETRY_LONG: Duration = Duration::from_secs(30);
+pub(crate) const RETRY_STREAK: u32 = 3;
+
+/// 第 `fails` 次连续失败之后等多久再连(纯函数,可测)。
+pub(crate) fn retry_wait(fails: u32) -> Duration {
+    if fails >= RETRY_STREAK {
+        RETRY_LONG
+    } else {
+        RETRY_SHORT
+    }
+}
+
+/// 白名单之外的来信只记一次日志(2026-11-11):原先直接忽略、一行不留 —— 白名单抄错一位 id
+/// 就是「手机发了没反应,日志里也查不到」。按 (渠道, 对方 id) 去重,免得被陌生人刷屏。
+pub(crate) fn note_stranger(channel: &str, ext_id: &str) {
+    static SEEN: std::sync::OnceLock<Mutex<std::collections::HashSet<(String, String)>>> =
+        std::sync::OnceLock::new();
+    let mut seen = SEEN.get_or_init(Default::default).lk();
+    if seen.len() < 256 && seen.insert((channel.to_string(), ext_id.to_string())) {
+        tracing::info!(
+            channel,
+            id = ext_id,
+            "收到白名单之外的人发来的消息,已忽略(要放行就把这个 id 加进设置·远程的白名单;同一个 id 只记这一次)"
+        );
+    }
+}
+
+/// 来「敲过门」的一条对话:白名单放行之前给 bot 发过消息的。设置页据此给「点一下放行」,
+/// 不用再去手机上抄那串 chat id(2026-11-12)。`name` = 平台上的显示名(可能为空)。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Knock {
+    pub id: String,
+    pub name: String,
+}
+
+/// 每个渠道记最近几条敲门(进程级瞬态:重启即清,对方再发一句就又有了)。
+const KNOCKS_KEEP: usize = 6;
+
+fn knocks() -> &'static Mutex<Vec<(String, Knock)>> {
+    static KNOCKS: std::sync::OnceLock<Mutex<Vec<(String, Knock)>>> = std::sync::OnceLock::new();
+    KNOCKS.get_or_init(Default::default)
+}
+
+/// 记一笔敲门:同一个 (渠道, id) 只留最新一条并挪到最前;每个渠道至多留 `KNOCKS_KEEP` 条。
+pub(crate) fn note_knock(channel: &str, ext_id: &str, name: &str) {
+    let mut list = knocks().lk();
+    list.retain(|(c, k)| !(c == channel && k.id == ext_id));
+    list.insert(0, (channel.to_string(), Knock { id: ext_id.to_string(), name: name.trim().to_string() }));
+    let mut kept = 0;
+    list.retain(|(c, _)| {
+        if c != channel {
+            return true;
+        }
+        kept += 1;
+        kept <= KNOCKS_KEEP
+    });
+}
+
+/// 这个渠道最近来敲过门的对话(新的在前)。已经在白名单里的由调用方滤掉。
+pub fn recent_knocks(channel: &str) -> Vec<Knock> {
+    knocks().lk().iter().filter(|(c, _)| c == channel).map(|(_, k)| k.clone()).collect()
+}
+
+/// 白名单一类「id 清单」的解析:逗号 / 空格 / 分号 / 换行(含全角)分隔,去空。
+pub fn parse_id_list(s: &str) -> Vec<String> {
+    s.split([',', '，', ' ', ';', '；', '\n'])
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect()
+}
+
 /// 攒批缓冲一项:等意图的附件 + 首个到达时刻(过期判定)。
 struct PendingAttach {
     items: Vec<InAttachment>,
@@ -100,9 +175,16 @@ impl AttachBuffer {
         }
     }
 
+    /// 清掉过期的(2026-11-11):原先只在「下一次有人发附件」时顺手清 —— 之后再没人发,
+    /// 一份几十 MB 文件的 base64 就留在内存里直到渠道重启。现在取用时也清、另有定时清扫。
+    fn sweep(&self) {
+        self.inner.lk().retain(|_, p| p.first_at.elapsed() < ATTACH_TTL);
+    }
+
     /// 取走并清空;超 `ATTACH_TTL` 的丢弃当没攒过(隔太久的文件不混进新意图)。
     fn take(&self, channel: &str, ext_id: &str) -> Vec<InAttachment> {
         let mut m = self.inner.lk();
+        m.retain(|_, p| p.first_at.elapsed() < ATTACH_TTL);
         match m.remove(&(channel.to_string(), ext_id.to_string())) {
             Some(p) if p.first_at.elapsed() < ATTACH_TTL => p.items,
             _ => Vec::new(),
@@ -180,6 +262,11 @@ impl ChannelCtx {
     /// 的丢弃当没攒过(隔太久的文件不该混进新意图)。没攒过 = 空 Vec(正常纯文本回合)。
     pub(crate) fn take_attachments(&self, channel: &str, ext_id: &str) -> Vec<InAttachment> {
         self.attach_buf.take(channel, ext_id)
+    }
+
+    /// 定时清扫过期的攒批附件(outbound_loop 每隔一阵调一次)。
+    fn sweep_attachments(&self) {
+        self.attach_buf.sweep();
     }
 
     /// 确认等待登记(outbound_loop 推完提示调)。同 chat 只挂一单(新单顶旧单——旧单会
@@ -302,7 +389,9 @@ pub async fn run(
 /// outbound_loop 派给工作任务的活(FIFO,保序)。
 enum OutJob {
     /// 自启回合收尾 → 把回复推回那台手机。
-    Reminder { conv_id: i64, outcome: crate::bus::TurnOutcome },
+    /// `queued` = 提醒排进了在飞回合(`TurnOutcome::Queued`)时随事件带来的原文:这时 event 行
+    /// 还没落库,推手机只能用它。
+    Reminder { conv_id: i64, outcome: crate::bus::TurnOutcome, queued: Option<String> },
     /// 确认卡 → 推到发起的 chat 等回话 / 终态清等待表。
     Confirm(Box<crate::confirm::ConfirmCard>),
 }
@@ -326,8 +415,8 @@ async fn outbound_loop(ctx: Arc<ChannelCtx>, ct: CancellationToken) {
                     return;
                 }
                 match job {
-                    OutJob::Reminder { conv_id, outcome } => {
-                        if let Err(e) = push_reminder(&ctx, &net, conv_id, outcome).await {
+                    OutJob::Reminder { conv_id, outcome, queued } => {
+                        if let Err(e) = push_reminder(&ctx, &net, conv_id, outcome, queued).await {
                             tracing::warn!(err = %scrub(&e), conv = conv_id, "提醒推回渠道失败");
                         }
                     }
@@ -336,9 +425,16 @@ async fn outbound_loop(ctx: Arc<ChannelCtx>, ct: CancellationToken) {
             }
         })
     };
+    // 搭这条常驻循环的节拍清一下过期的攒批附件(见 AttachBuffer::sweep)
+    let mut sweep = tokio::time::interval(ATTACH_TTL / 6);
+    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let ev = tokio::select! {
             _ = ct.cancelled() => break,
+            _ = sweep.tick() => {
+                ctx.sweep_attachments();
+                continue;
+            }
             r = rx.recv() => match r {
                 Ok(ev) => ev,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -358,7 +454,7 @@ async fn outbound_loop(ctx: Arc<ChannelCtx>, ct: CancellationToken) {
                 if act.kind != "reminder" && act.kind != "report" {
                     continue;
                 }
-                OutJob::Reminder { conv_id: act.conv_id, outcome: act.outcome }
+                OutJob::Reminder { conv_id: act.conv_id, outcome: act.outcome, queued: act.text }
             }
             // 确认闸(§7.8):渠道来源的确认请求推回发起的那个 chat 等回话;
             // 终态卡(超时/桌面先点)清等待表。桌面来源的卡归前端,这里不管。
@@ -420,22 +516,27 @@ const REMIND_FALLBACK_MAX: usize = 200;
 /// None = 非渠道会话(桌面提醒本就不推);文本 None = 库里没得可推(如实放弃)。
 /// Done 推**这次 event 行之后**说的全部话(多段拼接);Failed、或 Done 却一句没说 → 推提醒原文
 /// (event 行)截断保底 —— 到点必须有动静(§3.5),且绝不拿上一轮的旧回复顶替。
+/// Queued(提醒排进了在飞回合,2026-11-12)→ 推随事件带来的原文 `queued`(event 行这时还没落库);
+/// 之后那个回合的回复由它自己的出口送达(渠道回合 = `drive_turn` 的回话)。
 fn reminder_push_payload(
     store: &crate::store::Store,
     conv_id: i64,
     outcome: crate::bus::TurnOutcome,
+    queued: Option<&str>,
 ) -> anyhow::Result<Option<(crate::store::ChannelThread, Option<String>)>> {
     let Some(thread) = store.channels.thread_by_conv(conv_id)? else { return Ok(None) };
+    let fallback = |c: &str| {
+        let head: String = c.chars().take(REMIND_FALLBACK_MAX).collect();
+        format!("{REMIND_FALLBACK_PREFIX}{head}")
+    };
     let said = match outcome {
         crate::bus::TurnOutcome::Done => store.chat.assistant_text_after_last_event(conv_id)?,
         crate::bus::TurnOutcome::Failed => None,
+        crate::bus::TurnOutcome::Queued => return Ok(Some((thread, queued.map(fallback)))),
     };
     let text = match said {
         Some(t) => Some(t),
-        None => store.chat.latest_event_line(conv_id)?.map(|c| {
-            let head: String = c.chars().take(REMIND_FALLBACK_MAX).collect();
-            format!("{REMIND_FALLBACK_PREFIX}{head}")
-        }),
+        None => store.chat.latest_event_line(conv_id)?.map(|c| fallback(&c)),
     };
     Ok(Some((thread, text)))
 }
@@ -447,11 +548,13 @@ async fn push_reminder(
     net: &net::Client,
     conv_id: i64,
     outcome: crate::bus::TurnOutcome,
+    queued: Option<String>,
 ) -> anyhow::Result<()> {
     let store = ctx.engine.store().clone();
-    let looked =
-        tokio::task::spawn_blocking(move || reminder_push_payload(&store, conv_id, outcome))
-            .await??;
+    let looked = tokio::task::spawn_blocking(move || {
+        reminder_push_payload(&store, conv_id, outcome, queued.as_deref())
+    })
+    .await??;
     let Some((thread, Some(text))) = looked else { return Ok(()) };
     push_text_to_thread(ctx, net, &thread, &text).await
 }
@@ -610,6 +713,7 @@ pub(crate) async fn drive_turn(
         conv_id,
         kind: "channel".into(),
         outcome: crate::bus::TurnOutcome::Done,
+        text: None,
     }));
     Ok(Some(buf))
 }
@@ -792,6 +896,24 @@ mod tests {
         assert!(ctx.confirm_reply("weixin", "u3", "确认").is_none());
     }
 
+    /// 敲门记录:同一个对话只留最新一条并挪到最前;每个渠道只留最近几条;渠道之间互不相干。
+    #[test]
+    fn knocks_keep_latest_first_per_channel() {
+        let ch = "test-knock-channel"; // 进程级表:用一个别处不会用的渠道名,不与其它测试相干
+        for i in 0..(KNOCKS_KEEP + 2) {
+            note_knock(ch, &format!("id{i}"), &format!("人{i}"));
+        }
+        note_knock(ch, "id3", " 改了名 "); // 再敲一次:挪到最前、名字更新
+        note_knock("another-test-channel", "x", "");
+        let got = recent_knocks(ch);
+        assert_eq!(got.len(), KNOCKS_KEEP);
+        assert_eq!(got[0], Knock { id: "id3".into(), name: "改了名".into() });
+        assert_eq!(got.iter().filter(|k| k.id == "id3").count(), 1, "同一个对话不重复");
+        assert!(got.iter().all(|k| k.id != "id0"), "最早的被挤出去");
+        assert_eq!(recent_knocks("another-test-channel").len(), 1);
+        assert_eq!(parse_id_list("12, 34;56 78，90\n11"), ["12", "34", "56", "78", "90", "11"]);
+    }
+
     #[test]
     fn attach_buffer_debounces_and_merges() {
         let att = |n: &str| InAttachment {
@@ -885,7 +1007,7 @@ mod tests {
             store.chat.create_conversation_full(user.id, "companion", "telegram").unwrap();
 
         // 桌面会话(无映射)→ None,不推
-        assert!(reminder_push_payload(&store, conv.id, crate::bus::TurnOutcome::Done)
+        assert!(reminder_push_payload(&store, conv.id, crate::bus::TurnOutcome::Done, None)
             .unwrap()
             .is_none());
 
@@ -894,14 +1016,14 @@ mod tests {
         store.chat.append_message(conv.id, "assistant", "到点啦,该吃药了哦").unwrap();
 
         // Done → 推最后一条 assistant 回复
-        let (t, text) = reminder_push_payload(&store, conv.id, crate::bus::TurnOutcome::Done)
+        let (t, text) = reminder_push_payload(&store, conv.id, crate::bus::TurnOutcome::Done, None)
             .unwrap()
             .unwrap();
         assert_eq!(t.ext_id, "12345");
         assert_eq!(text.as_deref(), Some("到点啦,该吃药了哦"));
 
         // Failed → 推 event 行原文(带前缀,截断保底)
-        let (_, text) = reminder_push_payload(&store, conv.id, crate::bus::TurnOutcome::Failed)
+        let (_, text) = reminder_push_payload(&store, conv.id, crate::bus::TurnOutcome::Failed, None)
             .unwrap()
             .unwrap();
         let text = text.unwrap();
@@ -913,19 +1035,40 @@ mod tests {
         store.chat.append_message(conv.id, "assistant", "该去接孩子了。").unwrap();
         store.chat.append_message(conv.id, "tool", "晴 12°C").unwrap();
         store.chat.append_message(conv.id, "assistant", "外面 12 度,带件外套。").unwrap();
-        let (_, text) = reminder_push_payload(&store, conv.id, crate::bus::TurnOutcome::Done)
+        let (_, text) = reminder_push_payload(&store, conv.id, crate::bus::TurnOutcome::Done, None)
             .unwrap()
             .unwrap();
         assert_eq!(text.as_deref(), Some("该去接孩子了。\n\n外面 12 度,带件外套。"));
 
         // 自启回合 Done 却一句没说:推提醒原文保底,**绝不**把上一轮的旧回复推出去
         store.chat.append_message(conv.id, "event", "提醒用户:七点倒垃圾").unwrap();
-        let (_, text) = reminder_push_payload(&store, conv.id, crate::bus::TurnOutcome::Done)
+        let (_, text) = reminder_push_payload(&store, conv.id, crate::bus::TurnOutcome::Done, None)
             .unwrap()
             .unwrap();
         let text = text.unwrap();
         assert!(text.starts_with(REMIND_FALLBACK_PREFIX) && text.contains("七点倒垃圾"), "{text}");
         assert!(!text.contains("外套"), "旧回复不许顶上来");
+
+        // 提醒排进了在飞回合(Queued):event 行这时还没落库 → 推随事件带来的原文,不去翻库里的旧行
+        let (_, text) = reminder_push_payload(
+            &store,
+            conv.id,
+            crate::bus::TurnOutcome::Queued,
+            Some("提醒用户:九点关煤气"),
+        )
+        .unwrap()
+        .unwrap();
+        let text = text.unwrap();
+        assert!(text.starts_with(REMIND_FALLBACK_PREFIX) && text.contains("九点关煤气"), "{text}");
+        assert!(!text.contains("倒垃圾"), "不许拿库里上一条 event 行顶替");
+    }
+
+    #[test]
+    fn retry_backs_off_after_a_streak() {
+        assert_eq!(retry_wait(1), RETRY_SHORT);
+        assert_eq!(retry_wait(RETRY_STREAK - 1), RETRY_SHORT, "头几次快重试");
+        assert_eq!(retry_wait(RETRY_STREAK), RETRY_LONG, "连着失败就拉长,别每 5 秒刷一行日志");
+        assert_eq!(retry_wait(100), RETRY_LONG);
     }
 
     #[test]

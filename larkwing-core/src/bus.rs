@@ -134,6 +134,29 @@ pub struct ConversationActivity {
     /// 回合终态:用户不在该会话界面时,前端据此在列表项打彩色标(完成 / 失败)。
     /// 「疑问 / 等用户回话」暂不做(系统当前无此语义,见会话列表 badge 决策)。
     pub outcome: TurnOutcome,
+    /// 只在 `outcome = Queued` 时带:到点提醒的原文。这一刻它还没落库(排在在飞回合的插队
+    /// 队列里,下一个轮间才落成 event 行),要立刻出声 / 推手机只能随事件带过去。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// 自启回合起跑的载荷(见 `AppEvent::TurnStarted`)。
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnStart {
+    pub conv_id: i64,
+    /// reminder | report(与收尾那条 `ConversationActivity.kind` 同值)
+    pub kind: String,
+}
+
+/// 自启回合的一条回合事件(见 `AppEvent::Turn`)。`event` 是已序列化的 `engine::TurnEvent`
+/// (与 Channel 上过桥的同形)—— 用 JSON 值装,免得总线反过来依赖 engine 的类型(§6.1)。
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnRelay {
+    pub conv_id: i64,
+    /// 本回合内从 0 起的序号:前端据此发现中间丢了几条(事件车道有界,积压会丢),
+    /// 丢过就在收尾时整页重载对一次账。
+    pub seq: u64,
+    pub event: serde_json::Value,
 }
 
 /// 后台回合的终态(会话列表 badge 用)。done = 正常收尾;failed = 出错收尾。
@@ -142,6 +165,9 @@ pub struct ConversationActivity {
 pub enum TurnOutcome {
     Done,
     Failed,
+    /// 到点提醒撞上会话正忙:没起新回合,而是排进了在飞的那一回合(2026-11-12)。不是终态 ——
+    /// 这条事件只为「到点必有动静」:桌面念一声、渠道推回手机;会话列表不打标。
+    Queued,
 }
 
 /// 听写会话阶段(PLAN §11):前端 mood/麦克风按钮据此切表现。
@@ -250,6 +276,14 @@ pub enum AppEvent {
     Task(TaskView),
     Media(MediaEvent),
     Conversation(ConversationActivity),
+    /// 自启回合(提醒到点 / 后台汇报)**起跑了**(2026-11-11)。它没有前端 Channel,主窗原先完全
+    /// 不知道它在跑:界面是空闲态、没有停止钮、计划卡不显,打字会直接发新回合把它取消掉。
+    /// 主窗收到这条就把该会话记成在飞;收尾仍是 `Conversation(ConversationActivity)`。
+    TurnStarted(TurnStart),
+    /// 自启回合的回合事件转发(2026-11-12):它没有前端 Channel,原先回复只能等收尾后整页重载。
+    /// 起跑(`TurnStarted`)之后、收尾(`Conversation`)之前,回合的每条事件按序从这里过;
+    /// 壳层只转给主窗(悬浮窗不需要逐字)。
+    Turn(TurnRelay),
     ConvTitle(ConvTitle),
     Voice(VoiceEvent),
     /// 回合 mood(悬浮窗显示「正在想 / 正在说」;主窗不消费,用自己的 per-turn mood)。

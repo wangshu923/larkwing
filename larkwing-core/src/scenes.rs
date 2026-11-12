@@ -59,12 +59,43 @@ impl Scene {
             .unwrap_or_else(|| self.opening_line.clone())
     }
 
+    /// few-shot 的体量:(段数, 字符数)。一段 = 一条 user 消息起头的一组;字符数 = 各消息正文 +
+    /// 工具调用的名字与参数 + 工具结果(按字符数,不是字节 / token —— 只求一把不随序列化细节漂的尺子)。
+    pub fn few_shot_size(&self) -> (usize, usize) {
+        let mut segments = 0;
+        let mut chars = 0;
+        for msg in &self.few_shots {
+            match msg {
+                ChatMessage::User { content, .. } => {
+                    segments += 1;
+                    chars += content.chars().count();
+                }
+                ChatMessage::Assistant { content, tool_calls, .. } => {
+                    chars += content.chars().count();
+                    for c in tool_calls {
+                        chars += c.name.chars().count() + c.args.to_string().chars().count();
+                    }
+                }
+                ChatMessage::ToolResult { content, .. } => chars += content.chars().count(),
+            }
+        }
+        (segments, chars)
+    }
+
     /// 加载时校验(PLAN §8):白名单引用必须已注册;few-shot 引用工具 ⊆ 基础工具∪白名单、
-    /// call/result 配对完整且有序(孤儿 tool_call 会被严格端点 400)、示例 id 用 fs_ 前缀。
+    /// call/result 配对完整且有序(孤儿 tool_call 会被严格端点 400)、示例 id 用 fs_ 前缀、
+    /// 体量不超 `FEWSHOT_MAX_*`。
     pub fn validate(&self, registry: &Tools) -> Result<()> {
         for name in &self.tools {
             ensure!(registry.get(name).is_some(), "场景 {} 白名单引用未注册工具 {name}", self.id);
         }
+        let (segments, chars) = self.few_shot_size();
+        ensure!(
+            segments <= FEWSHOT_MAX_SEGMENTS && chars <= FEWSHOT_MAX_CHARS,
+            "场景 {} 的 few-shot 超出体量闸:{segments} 段 / {chars} 字符(上限 {FEWSHOT_MAX_SEGMENTS} 段 / \
+             {FEWSHOT_MAX_CHARS} 字符)。示范对话进每一个回合的稳定前缀 —— 要加新的,先替换掉一段旧的",
+            self.id
+        );
         let allowed = |name: &str| {
             crate::tools::BASE_TOOLS.contains(&name) || self.tools.iter().any(|t| t == name)
         };
@@ -117,6 +148,13 @@ pub struct Scenes {
 
 pub const DEFAULT_SCENE_ID: &str = "companion";
 
+/// few-shot 的体量闸(2026-11-12 用户拍板:规则认现状,加守卫防止继续涨)。出厂场景现在是
+/// 15 段、2175 字符(`Scene::few_shot_size` 的口径);这两个数 = 现状加一成左右的余量。示范对话进**每一个**回合的稳定前缀,多一段就是
+/// 每回合多付一段 —— 要加新示范,先想想能不能替换掉一段旧的;真要抬这两个数,回来问(§4.11)。
+pub const FEWSHOT_MAX_SEGMENTS: usize = 16;
+pub const FEWSHOT_MAX_CHARS: usize = 2400;
+
+
 impl Scenes {
     pub fn builtin() -> Scenes {
         let mut by_id = HashMap::new();
@@ -166,6 +204,13 @@ mod tests {
              "speak_to_file", "show_image", "send_file", "send_text", "note_todo", "finish_todo"]
         );
         assert!(!s.few_shots.is_empty(), "companion 必须带 few-shot 示范");
+        // 体量闸:现状必须在闸内,且闸没有被悄悄放宽到形同虚设(余量不超过两成)
+        let (segments, chars) = s.few_shot_size();
+        assert!(segments <= FEWSHOT_MAX_SEGMENTS && chars <= FEWSHOT_MAX_CHARS, "{segments} 段 / {chars} 字符");
+        assert!(
+            FEWSHOT_MAX_SEGMENTS <= segments + 3 && FEWSHOT_MAX_CHARS <= chars + chars / 5,
+            "few-shot 的闸比现状宽太多了({segments} 段 / {chars} 字符):删了示范就把闸一起收紧"
+        );
         // 反例纪律:至少一段"不调工具直接聊"的示范
         assert!(
             s.few_shots.iter().any(|m| matches!(
@@ -175,6 +220,30 @@ mod tests {
             "few-shot 必须含反例"
         );
         s.validate(&Tools::builtin()).expect("内置场景必须过校验");
+    }
+
+    /// few-shot 超出体量闸 → 校验不过(段数、字符数各验一次)。
+    #[test]
+    fn validate_rejects_few_shots_over_budget() {
+        let registry = Tools::builtin();
+        let mut s = Scenes::builtin().default_scene().clone();
+        let say = |t: &str| ChatMessage::Assistant {
+            content: t.into(),
+            reasoning: None,
+            tool_calls: vec![],
+            reasoning_state: None,
+        };
+        s.few_shots = (0..=FEWSHOT_MAX_SEGMENTS)
+            .flat_map(|_| [ChatMessage::user("在吗"), say("在")])
+            .collect();
+        let err = s.validate(&registry).unwrap_err().to_string();
+        assert!(err.contains("体量闸"), "{err}");
+
+        s.few_shots = vec![ChatMessage::user("讲个长的"), say(&"长".repeat(FEWSHOT_MAX_CHARS))];
+        assert!(s.validate(&registry).unwrap_err().to_string().contains("体量闸"));
+
+        s.few_shots = vec![ChatMessage::user("在吗"), say("在")];
+        s.validate(&registry).expect("闸内的照常通过");
     }
 
     #[test]

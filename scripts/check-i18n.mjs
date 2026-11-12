@@ -20,6 +20,7 @@
 //   ⑤ 静态引用核对:代码里 `t('x.y')` 写了、两个词典都没定义 → 界面上直接显示 key 原文。
 //      ⚠️ 大量 key 是**动态拼接**消费的(`tool.*`、`err.*`、`'reminders.repeat.' + v` …),
 //      所以只查**完整字面量**;以 `.` 结尾的前缀形、含 `${` 的模板串一律跳过(见 SKIP 判据)。
+//   ⑥ Rust(core / 壳层)发出的 key —— 工具动词 `ui_key`、任务卡标题与步骤 —— 都在词典里有定义。
 //
 // 设计取舍:
 //   · locales 是 `export default { … }` 的 TS 模块,但内容是**纯 JS 对象字面量**(无类型标注),
@@ -233,6 +234,61 @@ console.log(`词典:${LOCALES.zh} ${zhKeys.length} 键 · ${LOCALES.en} ${enKeys
     )
 }
 
+// ── ⑥ core / 壳层发出的 key 都在词典里 ─────────────────────────────────────
+// 工具泡的动词(`ui_key`)、任务卡的标题与步骤(`Text::new` / `.step` / `.fail` …)是 Rust 那头
+// 写死的字面量,前端按 key 现查 —— 词典里没有就落兜底文案或直接露出工具名,而且哪条检查都不红。
+// 2026-11-11 补:`tool.recall` 就是这么漏了几个月(「新工具四件套」里唯一没机器守的一件)。
+// 只认这几种固定的发 key 写法里的**字面量**;`format!` 拼出来的动态 key 天然不匹配。
+{
+  const RUST_DIRS = ['larkwing-core/src', 'src-tauri/src']
+  const KEY = '((?:tool|task|step)\\.[a-z0-9_]+(?:\\.[a-z0-9_]+)*)'
+  const EMIT = [
+    new RegExp(`\\bui_key:\\s*"${KEY}"`, 'g'),
+    new RegExp(`\\bText::(?:new|with)\\(\\s*"${KEY}"`, 'g'),
+    new RegExp(`\\.(?:step|step_progress|fail|fail_retryable)\\(\\s*"${KEY}"`, 'g'),
+  ]
+
+  async function walkRs(dir, acc = []) {
+    for (const e of await readdir(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name)
+      if (e.isDirectory()) await walkRs(p, acc)
+      else if (e.name.endsWith('.rs')) acc.push(p)
+    }
+    return acc
+  }
+
+  const miss = new Map()
+  const seen = new Set()
+  let files = 0
+  for (const d of RUST_DIRS) {
+    for (const f of await walkRs(path.join(ROOT, d))) {
+      files++
+      const src = await readFile(f, 'utf8')
+      for (const re of EMIT) {
+        for (const m of src.matchAll(re)) {
+          const key = m[1]
+          seen.add(key)
+          if (known.has(key)) continue
+          const rel = path.relative(ROOT, f)
+          if (!miss.has(key)) miss.set(key, new Set())
+          miss.get(key).add(rel)
+        }
+      }
+    }
+  }
+  if (seen.size < 50)
+    // 阳性对照:现在有一百多个;掉到几十以下几乎只能是路径 / 写法变了,下面的 ✓ 不可信
+    fail('⑥ Rust 侧只扫到 ' + seen.size + ' 个发出的 key(预期 100+)', [
+      '  扫描路径或发 key 的写法变了?调整本脚本的 RUST_DIRS / EMIT。',
+    ])
+  else if (miss.size)
+    fail('⑥ Rust 发出的 key 在词典里没有(界面落兜底文案,或直接露出工具名)', [
+      ...[...miss].map(([k, fs]) => `  ${k}  ←  ${[...fs].join(', ')}`),
+      '  修法:zh-CN.ts 与 en.ts 各加一条(工具动词的口径见 AGENT §6.6)。',
+    ])
+  else console.log(`✓ ⑥ Rust 发出的 key 全部有定义(扫了 ${files} 个 .rs 里 ${seen.size} 个不同的 key)`)
+}
+
 // ── 报告 ────────────────────────────────────────────────────────────────────
 if (problems.length) {
   console.error(`\n✗ i18n 体检不通过:${problems.length} 类问题\n`)
@@ -244,4 +300,4 @@ if (problems.length) {
   console.error('规则出处:AGENT.md §6.6「文案 / i18n」。')
   process.exit(1)
 }
-console.log('\n✓ i18n 体检全绿(5/5)')
+console.log('\n✓ i18n 体检全绿(6/6)')

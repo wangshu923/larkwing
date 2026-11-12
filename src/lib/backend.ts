@@ -416,6 +416,8 @@ export type TurnEvent =
   | { type: 'usage'; data: { round: UsageDigest; today: DayUsage; conv: UsageTotals } }
   // 插队(PLAN §9 B):回合在飞时注入的 user 消息已落库,之后的回复另起一段
   | { type: 'injected'; data: { message_id: number; text: string; attachments: AttachmentRef[] } }
+  // 到点提醒排进了这个在飞回合(会话正忙时不再干等):它的 event 行已落库,之后的回复另起一段
+  | { type: 'event_line'; data: { message_id: number; text: string } }
   // show_image 亮图:图卡插进当前在飞气泡组(同批 refs 已随 tool 行 payload 落库,重开会话由行派生)
   | { type: 'shown'; data: { attachments: AttachmentRef[] } }
   // 带文字的工具轮:这段回复在落库里是独立 assistant 行;前端封口当前气泡、另起新泡(结构对齐落库)
@@ -753,6 +755,8 @@ export interface RemoteChannelView {
   allowed_chats: string
   running: boolean
   last_error: string | null
+  /** 最近来敲过门、还不在白名单里的对话(现在只有 Telegram 有):设置页给「点一下放行」。 */
+  knocks?: { id: string; name: string }[]
 }
 
 /** 微信扫码登录起手:二维码 SVG(v-html 直接展示)+ 备用链接 + 轮询用 qrcode。 */
@@ -824,7 +828,18 @@ export type AppEvent =
   | { type: 'media'; data: MediaEvent }
   // 自启回合(提醒/定时)完成:某会话有动静,UI 刷新列表/重拉当前会话。
   // outcome = 回合终态(done/failed):用户不在该会话时,前端据此在列表项打彩色标。
-  | { type: 'conversation'; data: { conv_id: number; kind: string; outcome: 'done' | 'failed' } }
+  // outcome='queued'(不是终态):到点提醒撞上会话正忙、排进了在飞回合 —— 带提醒原文 text,
+  // 桌面据此立刻念一声;不刷列表、不打标。
+  | {
+      type: 'conversation'
+      data: { conv_id: number; kind: string; outcome: 'done' | 'failed' | 'queued'; text?: string }
+    }
+  // 自启回合(提醒到点 / 后台汇报)起跑了:主窗把该会话记成在飞(停止钮 / 排队区 / 计划卡跟着成立);
+  // 收尾仍是上面那条 conversation
+  | { type: 'turn_started'; data: { conv_id: number; kind: string } }
+  // 自启回合的回合事件(只发给主窗):起跑之后、收尾之前按序过来,与 Channel 上的 TurnEvent 同形。
+  // seq 从 0 起连续 —— 断了 = 事件车道积压丢过,收尾时整页重载对一次账
+  | { type: 'turn'; data: { conv_id: number; seq: number; event: TurnEvent } }
   // 后台 LLM 给新会话起好标题(替换截断占位):原位改列表项文字,不打 badge、不重排
   | { type: 'conv_title'; data: { conv_id: number; title: string } }
   | { type: 'voice'; data: VoiceEvent }
@@ -1138,6 +1153,18 @@ export function onFloatUpdate(cb: () => void): void {
 }
 
 /** 数据目录「搬家」:当前根 / 待清理旧根 / 失效路径(字段随 Rust camelCase)。 */
+/** 壳层 update_check / update_retarget 的返回:前 6 个字段与更新插件的 UpdateMetadata 同形
+ *  (直接喂 `new Update(meta)`),`downloadAlts` = 清单里那个下载地址之外还能换几个入口。 */
+export interface UpdateMeta {
+  rid: number
+  currentVersion: string
+  version: string
+  date?: string
+  body?: string
+  rawJson: Record<string, unknown>
+  downloadAlts: number
+}
+
 export interface DataLocation {
   root: string
   oldRoot: string | null
@@ -1197,6 +1224,8 @@ export const api = {
   },
 
   cancelGeneration: (convId: number) => invoke<void>('cancel_generation', { convId }),
+  /** 这个会话此刻有没有回合在飞(自启回合的「在飞」标记对账用)。 */
+  conversationBusy: (convId: number) => invoke<boolean>('conversation_busy', { convId }),
   usageToday: () => invoke<DayUsage>('usage_today'),
   usageConversation: (convId: number) => invoke<UsageTotals>('usage_conversation', { convId }),
   /** 历史/提醒气泡读数(load 会话后回填,让自启回合也能 hover 看时间/token)。 */
@@ -1434,6 +1463,12 @@ export const api = {
   quitApp: () => invoke<void>('quit_app'),
   /** 更新装完后重启(走核心 app.restart;Win 多由安装器拉起、此路主要给 mac/兜底)。 */
   relaunchApp: () => invoke<void>('relaunch_app'),
+  /** 检查更新:逐个地址试、任何一种失败都换下一个(壳层 updatecheck.rs;插件自带的 check 遇到
+   *  「回了 200 但不是清单」会直接放弃)。返回值与插件的元数据同形,拿去 `new Update(meta)`。 */
+  updateCheck: (proxy: string | undefined, timeout: number) =>
+    invoke<UpdateMeta | null>('update_check', { proxy: proxy ?? null, timeout }),
+  /** 把查到的更新换个下载入口(alt 取 0..downloadAlts-1,恒按最初那次的 rid 数)。 */
+  updateRetarget: (rid: number, alt: number) => invoke<UpdateMeta>('update_retarget', { rid, alt }),
   // ---- 数据目录「搬家」(datadir) ----
   /** 当前数据根 / 待清理旧根 / 失效路径(设置页一行 + boot 检查)。 */
   dataLocation: () => invoke<DataLocation>('data_location'),

@@ -305,7 +305,13 @@ fn wake_loop(d: &WakeDeps, cmd: &Receiver<WakeCmd>) -> Result<()> {
                     phase = Phase::Watch;
                 }
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return Ok(()),
+                Err(TryRecvError::Disconnected) => {
+                    // 同 Stop:不在待唤醒态就先把收尾通知发了再退(句柄被清掉的另一条出口)
+                    if !matches!(phase, Phase::Watch) {
+                        d.rt.publish(VoiceEvent::ListenEnded { reason: "wake_done".into() });
+                    }
+                    return Ok(());
+                }
             }
         }
         // 非纯监听态(挂起/回合中/跟进听)不累计"无帧":那些是故意不收帧
@@ -386,6 +392,10 @@ fn wake_loop(d: &WakeDeps, cmd: &Receiver<WakeCmd>) -> Result<()> {
             }
             Phase::FollowUp { window } => {
                 // 跟进窗:免唤醒接话;安静结束不追问(robot 纪律:对话自然结束别烦人)
+                // 这一代已被停掉 / 顶替:别再开听(回到轮首读 Stop 退出,收尾通知在那里发)
+                if !d.rt.wake_is_current(d.gen) {
+                    continue;
+                }
                 pipe.drain();
                 vad.reset();
                 d.rt.arm_wake_ctl(); // 在听时点停也要响应(取消 → 走 None 安静回 Watch;定稿 → 正常识别)
@@ -423,6 +433,9 @@ fn wake_loop(d: &WakeDeps, cmd: &Receiver<WakeCmd>) -> Result<()> {
                     // 念问句期间别处已点头/摇头:不用听了
                     phase = Phase::AwaitTurn(Instant::now());
                     continue;
+                }
+                if !d.rt.wake_is_current(d.gen) {
+                    continue; // 同上:已被停掉的循环不再开听
                 }
                 pipe.drain();
                 vad.reset();
@@ -800,6 +813,14 @@ fn on_wake(
     vad: &sherpa_onnx::VoiceActivityDetector,
     hangover: f32,
 ) -> Result<Phase> {
+    // 这一代已经被停掉 / 被新一代顶替(`wake_stop` 落在确认层那几秒里,那一段不读控制信号):
+    // 别再开一轮交互 —— 原先这里照常武装控制信号,把 `wake_stop` 写的取消冲掉,老线程又听又问
+    // 地跑完整整一轮,其间可能与新循环同时在听(2026-11-11)。收尾通知照发(命中时已经压了音量)。
+    if !d.rt.wake_is_current(d.gen) {
+        d.rt.publish(VoiceEvent::ListenEnded { reason: "wake_done".into() });
+        pipe.drain();
+        return Ok(Phase::Watch);
+    }
     // 取当前应答音银行快照:运行时可能已按新音色热替换,本轮交互用这一份(下轮再取新的)。
     let prompts = d.prompts.lk().clone();
     d.rt.publish(VoiceEvent::WakeTriggered);
